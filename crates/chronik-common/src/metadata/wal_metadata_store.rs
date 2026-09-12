@@ -108,6 +108,12 @@ struct MetadataState {
     acls: RwLock<Vec<AclBindingRecord>>,
     /// SCRAM credentials, keyed by (username, mechanism code).
     scram_credentials: RwLock<HashMap<(String, i8), ScramCredentialRecord>>,
+    /// Timestamp of the newest `CatalogSnapshot` applied, so an older or
+    /// replayed one cannot undo a prune. `None` until the first is seen.
+    last_catalog_snapshot: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Topic count seen on the previous anti-entropy pass, so a snapshot is
+    /// only published once the local catalog has stopped changing.
+    last_snapshot_size: RwLock<Option<usize>>,
 }
 
 impl MetadataState {
@@ -126,6 +132,8 @@ impl MetadataState {
             next_producer_id: AtomicI64::new(producer_id_base(node_id)),
             acls: RwLock::new(Vec::new()),
             scram_credentials: RwLock::new(HashMap::new()),
+            last_catalog_snapshot: RwLock::new(None),
+            last_snapshot_size: RwLock::new(None),
         }
     }
 
@@ -302,6 +310,15 @@ impl MetadataState {
                     metadata.config = config.clone();
                     metadata.updated_at = event.timestamp;
                 }
+                Ok(())
+            }
+
+            MetadataEventPayload::CatalogSnapshot { .. } => {
+                // Handled by `WalMetadataStore::apply_replicated_event`, which
+                // turns a snapshot into ordinary `TopicDeleted` events so the
+                // prune is durable and survives replay. Nothing to do at the
+                // state level, and replaying a historical snapshot must not
+                // re-prune against a catalog that has legitimately moved on.
                 Ok(())
             }
 
@@ -737,7 +754,129 @@ impl WalMetadataStore {
     ///
     /// NOTE: We intentionally do NOT publish to the event bus here — that would
     /// cause infinite replication loops (leader → follower → leader → ...).
+    /// Reconcile the local catalog against the authoritative set.
+    ///
+    /// Turns a `CatalogSnapshot` into ordinary `TopicDeleted` events rather than
+    /// mutating state directly. Three reasons: the prune becomes durable through
+    /// the same path an explicit delete takes, it survives replay without
+    /// persisting a multi-thousand-entry snapshot into the metadata WAL every
+    /// anti-entropy pass, and it reuses a code path that is already exercised.
+    ///
+    /// This is the only way a topic is removed without someone asking, so every
+    /// ambiguous case fails towards keeping data.
+    async fn reconcile_catalog(
+        &self,
+        authoritative: &[String],
+        snapshot_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        if std::env::var("CHRONIK_METADATA_CATALOG_PRUNE")
+            .map(|v| v.eq_ignore_ascii_case("false") || v == "0")
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        // An empty catalog is far more likely a node that has not finished
+        // recovering than a cluster that genuinely holds no topics. Refusing it
+        // costs a stale entry until the next pass; obeying it would wipe the
+        // local catalog.
+        if authoritative.is_empty() {
+            let local = self.state.topics.read().await.len();
+            if local > 0 {
+                tracing::warn!(
+                    local_topics = local,
+                    "Ignoring empty CatalogSnapshot: refusing to prune every topic"
+                );
+            }
+            return Ok(());
+        }
+
+        // Reject anything not newer than the last snapshot applied, so a delayed
+        // or reordered message cannot resurrect what a newer pass pruned.
+        {
+            let mut last = self.state.last_catalog_snapshot.write().await;
+            if let Some(prev) = *last {
+                if snapshot_at <= prev {
+                    return Ok(());
+                }
+            }
+            *last = Some(snapshot_at);
+        }
+
+        let keep: std::collections::HashSet<&String> = authoritative.iter().collect();
+        let stale: Vec<String> = {
+            let topics = self.state.topics.read().await;
+            topics
+                .keys()
+                // Internal topics are per-node and excluded from the snapshot, so
+                // their absence carries no meaning.
+                .filter(|name| !name.starts_with("__") && !keep.contains(name))
+                .cloned()
+                .collect()
+        };
+
+        if stale.is_empty() {
+            return Ok(());
+        }
+
+        // A leader that has not finished rebuilding its own catalog publishes a
+        // PARTIAL snapshot, and obeying it would prune everyone down to whatever
+        // it had recovered so far. Observed directly: a node 60s into a restart
+        // reported 16 topics of 5,611. The empty-snapshot guard above does not
+        // catch that — 16 is not zero.
+        //
+        // A mass prune is therefore treated as evidence of a partial snapshot
+        // rather than an instruction. Legitimate bulk deletion still happens, it
+        // just arrives as explicit `TopicDeleted` events, which this path does
+        // not gate.
+        let local_total = {
+            let topics = self.state.topics.read().await;
+            topics.keys().filter(|n| !n.starts_with("__")).count()
+        };
+        let max_fraction = std::env::var("CHRONIK_METADATA_MAX_PRUNE_FRACTION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f <= 1.0)
+            .unwrap_or(0.20);
+        if local_total > 0 && (stale.len() as f64) > (local_total as f64) * max_fraction {
+            tracing::warn!(
+                would_prune = stale.len(),
+                local_topics = local_total,
+                authoritative = authoritative.len(),
+                "Refusing CatalogSnapshot that would prune a large fraction of the 
+                 catalog - treating it as a partial snapshot from a node that is 
+                 still recovering"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            pruning = stale.len(),
+            authoritative = authoritative.len(),
+            "CatalogSnapshot: removing topics the leader no longer has"
+        );
+
+        for name in stale {
+            let event = MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicDeleted { name: name.clone() },
+                self.node_id,
+            );
+            if let Err(e) = self.write_and_apply(event).await {
+                tracing::warn!(topic = %name, error = %e, "Failed to prune stale topic");
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn apply_replicated_event(&self, event: MetadataEvent) -> Result<()> {
+        // A snapshot is a reconciliation signal, not durable state: handle it
+        // here (where the WAL is reachable) and never persist the snapshot
+        // itself.
+        if let MetadataEventPayload::CatalogSnapshot { topics } = &event.payload {
+            return self.reconcile_catalog(topics, event.timestamp).await;
+        }
+
         // 1. Persist to local WAL for durability across restarts
         let bytes = event.to_bytes()
             .map_err(|e| MetadataError::StorageError(
@@ -785,6 +924,80 @@ impl WalMetadataStore {
     ///
     /// Safe to call repeatedly — `apply_replicated_event` is idempotent for both
     /// event types (topic created only if absent; assignment is an upsert).
+
+    /// Publish the complete topic set so followers can prune what they should
+    /// no longer have.
+    ///
+    /// `broadcast_all_topics` is additive: it re-asserts what exists, which
+    /// heals a node that is *missing* topics but can never remove one it kept
+    /// through a `TopicDeleted` it never received. This states the whole set, so
+    /// absence becomes information.
+    ///
+    /// Internal (`__`-prefixed) topics are excluded here and exempt from pruning
+    /// on the apply side — they are managed per-node, not replicated, and a
+    /// snapshot that omitted them would otherwise read as "delete them".
+    ///
+    /// Returns the number of topics published, or 0 if the event bus is not
+    /// wired up.
+    pub async fn broadcast_catalog_snapshot(&self) -> usize {
+        let publish_fn = match self.event_bus_publish {
+            Some(ref f) => f,
+            None => {
+                tracing::warn!("Cannot broadcast catalog snapshot: event bus not wired up");
+                return 0;
+            }
+        };
+
+        let topics: Vec<String> = {
+            let topics = self.state.topics.read().await;
+            topics
+                .keys()
+                .filter(|name| !name.starts_with("__"))
+                .cloned()
+                .collect()
+        };
+
+        // Never publish an empty snapshot. The apply side refuses one anyway,
+        // but a node that has not finished recovering should not be sending
+        // "there are no topics" to its peers in the first place.
+        if topics.is_empty() {
+            return 0;
+        }
+
+        // Nor publish one until this node's own catalog has stopped changing.
+        //
+        // Recovery rebuilds the catalog incrementally — a node 60s into a
+        // restart reported 16 topics of 5,611 — and a snapshot published from
+        // that state tells every follower to delete almost everything. Requiring
+        // two consecutive passes to agree means the first pass after a restart
+        // only ever arms the check; nothing is asserted until the count holds
+        // still.
+        {
+            let mut last = self.state.last_snapshot_size.write().await;
+            let settled = *last == Some(topics.len());
+            *last = Some(topics.len());
+            if !settled {
+                tracing::debug!(
+                    topics = topics.len(),
+                    "Catalog still settling - not publishing a snapshot this pass"
+                );
+                return 0;
+            }
+        }
+
+        let count = topics.len();
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::CatalogSnapshot { topics },
+            self.node_id,
+        );
+        let subscribers = publish_fn(event);
+        tracing::debug!(
+            topics = count,
+            subscribers,
+            "Published CatalogSnapshot so followers can prune stale topics"
+        );
+        count
+    }
     pub async fn broadcast_all_topics(&self) -> usize {
         let publish_fn = match self.event_bus_publish {
             Some(ref f) => f,
@@ -1712,6 +1925,364 @@ mod replication_filter_tests {
 mod catalog_healing_tests {
     use super::*;
     use std::sync::Mutex;
+
+
+    /// A follower that missed a `TopicDeleted` while it was down keeps the topic
+    /// forever: the anti-entropy pass re-publishes `TopicCreated`, which can add
+    /// what is missing but never removes what should be gone.
+    ///
+    /// Measured on a 3-node cluster: one node held 886 topics the other two had
+    /// deleted, 871 of them real, for months.
+    #[tokio::test]
+    async fn a_catalog_snapshot_prunes_topics_the_leader_no_longer_has() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let store = WalMetadataStore::new(1, wal_append);
+
+        // Ten topics, one stale: 10%, inside the mass-prune ceiling. A larger
+        // fraction is treated as a partial snapshot - see
+        // `a_partial_snapshot_does_not_prune_the_catalog`.
+        let mut keep: Vec<String> = Vec::new();
+        for i in 0..9 {
+            let name = format!("kept-{}", i);
+            store.create_topic(&name, TopicConfig::default()).await.unwrap();
+            keep.push(name);
+        }
+        store
+            .create_topic("deleted-while-i-was-down", TopicConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(store.list_topics().await.unwrap().len(), 10);
+
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::CatalogSnapshot { topics: keep },
+                2,
+            ))
+            .await
+            .unwrap();
+
+        let names: Vec<String> = store
+            .list_topics()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names.len(), 9, "the stale topic was not pruned: {:?}", names);
+        assert!(!names.contains(&"deleted-while-i-was-down".to_string()));
+        assert!(names.contains(&"kept-0".to_string()));
+    }
+
+
+    /// A deleted topic must stay deleted across a restart.
+    ///
+    /// Recovery replays the metadata WAL, so a delete's durability depends
+    /// entirely on the `TopicDeleted` event being in that log and being applied
+    /// after the `TopicCreated` it cancels. If it is not, every restart
+    /// resurrects every topic ever deleted — which is what a 3-node cluster
+    /// showed: 886 topics that had been deleted were back on all three nodes
+    /// after a roll.
+    #[tokio::test]
+    async fn a_deleted_topic_stays_deleted_across_replay() {
+        let appended: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&appended);
+        let wal_append: WalAppendFn = Arc::new(move |bytes: Vec<u8>| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                if let Ok(event) = MetadataEvent::from_bytes(&bytes) {
+                    sink.lock().unwrap().push(event);
+                }
+                Ok(0i64)
+            })
+        });
+
+        let store = WalMetadataStore::new(1, wal_append);
+        store.create_topic("survivor", TopicConfig::default()).await.unwrap();
+        store.create_topic("doomed", TopicConfig::default()).await.unwrap();
+        store.delete_topic("doomed").await.unwrap();
+        assert_eq!(store.list_topics().await.unwrap().len(), 1, "delete did not apply live");
+
+        let replayed = appended.lock().unwrap().clone();
+        assert!(
+            replayed.iter().any(|e| matches!(
+                &e.payload,
+                MetadataEventPayload::TopicDeleted { name } if name == "doomed"
+            )),
+            "TopicDeleted was never written to the WAL - a delete cannot survive a restart"
+        );
+
+        // Restart: a fresh store replaying exactly what the WAL holds.
+        let noop: WalAppendFn = Arc::new(|_b| Box::pin(async { Ok(0i64) }));
+        let recovered = WalMetadataStore::new(1, noop);
+        recovered.replay_events(replayed).await.unwrap();
+
+        let names: Vec<String> = recovered
+            .list_topics()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !names.contains(&"doomed".to_string()),
+            "a deleted topic came back after replay: {:?}",
+            names
+        );
+        assert!(names.contains(&"survivor".to_string()));
+    }
+
+    /// The prune must be durable.
+    ///
+    /// A follower's WAL still contains `TopicCreated` for a phantom topic. If the
+    /// prune only changed in-memory state, the next restart would replay that
+    /// creation and the phantom would come back — the bug would heal every 5
+    /// minutes and return on every restart, forever.
+    #[tokio::test]
+    async fn pruning_writes_topic_deleted_to_the_wal() {
+        let appended: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&appended);
+        let wal_append: WalAppendFn = Arc::new(move |bytes: Vec<u8>| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                if let Ok(event) = MetadataEvent::from_bytes(&bytes) {
+                    sink.lock().unwrap().push(event);
+                }
+                Ok(0i64)
+            })
+        });
+        let store = WalMetadataStore::new(1, wal_append);
+
+        let mut keep: Vec<String> = Vec::new();
+        for i in 0..9 {
+            let name = format!("kept-{}", i);
+            store.create_topic(&name, TopicConfig::default()).await.unwrap();
+            keep.push(name);
+        }
+        store.create_topic("phantom", TopicConfig::default()).await.unwrap();
+        appended.lock().unwrap().clear();
+
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::CatalogSnapshot { topics: keep },
+                2,
+            ))
+            .await
+            .unwrap();
+
+        let written = appended.lock().unwrap().clone();
+        let deleted: Vec<&String> = written
+            .iter()
+            .filter_map(|e| match &e.payload {
+                MetadataEventPayload::TopicDeleted { name } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, vec![&"phantom".to_string()], "prune was not persisted");
+
+        // And the snapshot itself must NOT be written: it is a reconciliation
+        // signal, and persisting thousands of topic names every anti-entropy
+        // pass would bloat the metadata WAL.
+        assert!(
+            !written.iter().any(|e| matches!(
+                e.payload,
+                MetadataEventPayload::CatalogSnapshot { .. }
+            )),
+            "the snapshot event was persisted to the WAL"
+        );
+    }
+
+
+    /// A snapshot from a node that has not finished recovering must not prune.
+    ///
+    /// Observed directly on a cluster: a node 60s into a restart reported 16
+    /// topics of 5,611. The empty-snapshot guard does not catch that — 16 is not
+    /// zero — and obeying it would have deleted the catalog on every follower.
+    #[tokio::test]
+    async fn a_partial_snapshot_does_not_prune_the_catalog() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let store = WalMetadataStore::new(1, wal_append);
+        for i in 0..20 {
+            store
+                .create_topic(&format!("topic-{}", i), TopicConfig::default())
+                .await
+                .unwrap();
+        }
+
+        // A leader mid-recovery claiming only two topics exist.
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::CatalogSnapshot {
+                    topics: vec!["topic-0".to_string(), "topic-1".to_string()],
+                },
+                2,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.list_topics().await.unwrap().len(),
+            20,
+            "a partial snapshot pruned the catalog"
+        );
+    }
+
+    /// The publisher must not assert a snapshot until its own catalog has
+    /// stopped changing, so the first pass after a restart only arms the check.
+    #[tokio::test]
+    async fn no_snapshot_is_published_until_the_catalog_settles() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let mut store = WalMetadataStore::new(1, wal_append);
+        let published: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        store.set_event_bus(Arc::new(move |event: MetadataEvent| {
+            sink.lock().unwrap().push(event);
+            1
+        }));
+
+        store.create_topic("a", TopicConfig::default()).await.unwrap();
+        assert_eq!(store.broadcast_catalog_snapshot().await, 0, "first pass must only arm");
+
+        // Still recovering: the count changed, so still no assertion.
+        store.create_topic("b", TopicConfig::default()).await.unwrap();
+        assert_eq!(store.broadcast_catalog_snapshot().await, 0, "a changed count must re-arm");
+
+        // Settled: two passes agree.
+        assert_eq!(store.broadcast_catalog_snapshot().await, 2, "a settled catalog must publish");
+    }
+
+    /// An empty snapshot must never wipe the catalog.
+    ///
+    /// A node that has not finished recovering, or a truncated read, produces an
+    /// empty list far more often than a cluster genuinely holds no topics.
+    /// Pruning is destructive, so the ambiguous case has to fail towards keeping
+    /// data.
+    #[tokio::test]
+    async fn an_empty_catalog_snapshot_prunes_nothing() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let store = WalMetadataStore::new(1, wal_append);
+        store.create_topic("real", TopicConfig::default()).await.unwrap();
+
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::CatalogSnapshot { topics: Vec::new() },
+                2,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.list_topics().await.unwrap().len(),
+            1,
+            "an empty snapshot deleted a real topic"
+        );
+    }
+
+    /// A snapshot older than one already applied must be ignored, or a delayed
+    /// or replayed message would resurrect what a newer pass pruned.
+    #[tokio::test]
+    async fn an_older_catalog_snapshot_is_ignored() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let store = WalMetadataStore::new(1, wal_append);
+        // Ten topics so pruning one stays inside the mass-prune ceiling.
+        let mut nine: Vec<String> = Vec::new();
+        for i in 0..9 {
+            let name = format!("a{}", i);
+            store.create_topic(&name, TopicConfig::default()).await.unwrap();
+            nine.push(name);
+        }
+        store.create_topic("b", TopicConfig::default()).await.unwrap();
+
+        let newer = MetadataEvent::new_with_node(
+            MetadataEventPayload::CatalogSnapshot { topics: nine.clone() },
+            2,
+        );
+        let mut with_b = nine.clone();
+        with_b.push("b".to_string());
+        let mut older = MetadataEvent::new_with_node(
+            MetadataEventPayload::CatalogSnapshot { topics: with_b },
+            2,
+        );
+        older.timestamp = newer.timestamp - chrono::Duration::seconds(60);
+
+        store.apply_replicated_event(newer).await.unwrap();
+        assert_eq!(store.list_topics().await.unwrap().len(), 9, "prune did not happen");
+
+        // The older snapshot still lists "b"; applying it must not bring it back.
+        store.apply_replicated_event(older).await.unwrap();
+        assert_eq!(
+            store.list_topics().await.unwrap().len(),
+            9,
+            "a stale snapshot resurrected a pruned topic"
+        );
+    }
+
+    /// Internal `__`-prefixed topics are per-node and are excluded from the
+    /// snapshot, so pruning must exempt them — otherwise every pass would delete
+    /// a node's own internal state.
+    #[tokio::test]
+    async fn a_catalog_snapshot_never_prunes_internal_topics() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let store = WalMetadataStore::new(1, wal_append);
+        store.create_topic("__chronik_internal", TopicConfig::default()).await.unwrap();
+        store.create_topic("real", TopicConfig::default()).await.unwrap();
+
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::CatalogSnapshot { topics: vec!["real".to_string()] },
+                2,
+            ))
+            .await
+            .unwrap();
+
+        let names: Vec<String> = store
+            .list_topics()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            names.contains(&"__chronik_internal".to_string()),
+            "pruned an internal topic: {:?}",
+            names
+        );
+    }
+
+    /// The publisher must state the whole set, excluding internal topics, so the
+    /// two sides agree on what absence means.
+    #[tokio::test]
+    async fn the_published_snapshot_lists_every_non_internal_topic() {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        let mut store = WalMetadataStore::new(1, wal_append);
+        let published: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        store.set_event_bus(Arc::new(move |event: MetadataEvent| {
+            sink.lock().unwrap().push(event);
+            1
+        }));
+
+        store.create_topic("orders", TopicConfig::default()).await.unwrap();
+        store.create_topic("events", TopicConfig::default()).await.unwrap();
+        store.create_topic("__internal", TopicConfig::default()).await.unwrap();
+        published.lock().unwrap().clear();
+
+        // First pass only arms the settling check; the second asserts.
+        assert_eq!(store.broadcast_catalog_snapshot().await, 0);
+        let count = store.broadcast_catalog_snapshot().await;
+        assert_eq!(count, 2, "internal topics must be excluded");
+
+        let events = published.lock().unwrap().clone();
+        let snapshot = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                MetadataEventPayload::CatalogSnapshot { topics } => Some(topics.clone()),
+                _ => None,
+            })
+            .expect("no CatalogSnapshot was published");
+        assert!(snapshot.contains(&"orders".to_string()));
+        assert!(snapshot.contains(&"events".to_string()));
+        assert!(!snapshot.contains(&"__internal".to_string()));
+    }
 
     /// The leader's startup re-broadcast is how a follower that restarted, joined
     /// late, or missed an event gets its catalog back. It must carry partition

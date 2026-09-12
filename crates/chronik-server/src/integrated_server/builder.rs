@@ -524,6 +524,19 @@ impl IntegratedKafkaServerBuilder {
                             "Re-broadcast topic metadata for follower sync (anti-entropy)"
                         );
                     }
+
+                    // Then state the complete set, so a follower can also drop
+                    // what it should no longer have. The order matters: the
+                    // additive pass above first gives it anything it is missing,
+                    // so the snapshot it prunes against is one it has just been
+                    // brought up to date with.
+                    let snapshot = broadcast_store.broadcast_catalog_snapshot().await;
+                    if snapshot > 0 {
+                        tracing::info!(
+                            topics_in_snapshot = snapshot,
+                            "Published catalog snapshot so followers prune stale topics"
+                        );
+                    }
                 }
 
                 // `notify_one` stores a permit, so a rejoin that lands while the
