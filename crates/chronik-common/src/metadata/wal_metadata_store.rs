@@ -843,9 +843,7 @@ impl WalMetadataStore {
                 would_prune = stale.len(),
                 local_topics = local_total,
                 authoritative = authoritative.len(),
-                "Refusing CatalogSnapshot that would prune a large fraction of the 
-                 catalog - treating it as a partial snapshot from a node that is 
-                 still recovering"
+                "Refusing CatalogSnapshot that would prune a large fraction of the catalog - treating it as a partial snapshot from a node that is still recovering"
             );
             return Ok(());
         }
@@ -1627,6 +1625,16 @@ impl MetadataStore for WalMetadataStore {
     async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()> {
         // v2.2.9 Phase 7: Apply replicated events from leader WITHOUT writing to WAL
         // This is for followers receiving events via WalReplicationManager
+        //
+        // NOTE: this is the path production takes — followers hold the store as
+        // `Arc<dyn MetadataStore>`, so this trait method runs, not the inherent
+        // `WalMetadataStore::apply_replicated_event` above. They must stay in
+        // step. Routing the snapshot in only one of them is exactly the mistake
+        // that made the first version of this fix a no-op on a real cluster:
+        // every test passed, and nothing was ever pruned.
+        if let MetadataEventPayload::CatalogSnapshot { topics } = &event.payload {
+            return self.reconcile_catalog(topics, event.timestamp).await;
+        }
         self.state.apply_event(&event).await
     }
 
@@ -2091,6 +2099,96 @@ mod catalog_healing_tests {
         );
     }
 
+
+
+    /// End to end: a follower that was down during a delete converges.
+    ///
+    /// This is the whole bug in one test. Two stores, the leader's event bus
+    /// wired into the follower exactly as `MetadataWalReplicator` wires it in
+    /// production. The follower misses a `TopicDeleted` because it is down, and
+    /// then the anti-entropy pass runs. Before `CatalogSnapshot` the pass was
+    /// additive and the follower kept the phantom forever; the assertion at the
+    /// end is the one that failed.
+    #[tokio::test]
+    async fn a_follower_that_missed_a_delete_converges_on_the_next_pass() {
+        fn store() -> WalMetadataStore {
+            let noop: WalAppendFn = Arc::new(|_b| Box::pin(async { Ok(0i64) }));
+            WalMetadataStore::new(1, noop)
+        }
+
+        let mut leader = store();
+        let follower = Arc::new(store());
+
+        // The leader's event bus delivers to the follower, as in production —
+        // except while the follower is "down", when sends are dropped. That drop
+        // is the real transport's behaviour: a metadata send to a follower with
+        // no live connection is lost, not queued.
+        let follower_up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let wire: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let on_wire = Arc::clone(&wire);
+        let up = Arc::clone(&follower_up);
+        leader.set_event_bus(Arc::new(move |event: MetadataEvent| {
+            if !up.load(std::sync::atomic::Ordering::SeqCst) {
+                return 0; // dropped: no live connection, as in production
+            }
+            on_wire.lock().unwrap().push(event);
+            1
+        }));
+
+        // Deliver whatever is on the wire to the follower.
+        async fn deliver(wire: &Arc<Mutex<Vec<MetadataEvent>>>, follower: &WalMetadataStore) {
+            let batch: Vec<MetadataEvent> = wire.lock().unwrap().drain(..).collect();
+            for event in batch {
+                follower.apply_replicated_event(event).await.unwrap();
+            }
+        }
+
+        // Both nodes know the same ten topics.
+        for i in 0..10 {
+            leader
+                .create_topic(&format!("topic-{}", i), TopicConfig::default())
+                .await
+                .unwrap();
+        }
+        deliver(&wire, &follower).await;
+        assert_eq!(follower.list_topics().await.unwrap().len(), 10, "setup");
+
+        // The follower goes down, and a topic is deleted while it is away.
+        follower_up.store(false, std::sync::atomic::Ordering::SeqCst);
+        leader.delete_topic("topic-7").await.unwrap();
+        follower_up.store(true, std::sync::atomic::Ordering::SeqCst);
+        deliver(&wire, &follower).await;
+
+        assert_eq!(leader.list_topics().await.unwrap().len(), 9);
+        assert_eq!(
+            follower.list_topics().await.unwrap().len(),
+            10,
+            "precondition: the follower should still hold the phantom"
+        );
+
+        // Anti-entropy, in the order the loop runs it: re-assert what exists,
+        // then state the complete set. Two passes, because the publisher will
+        // not assert a snapshot until its own catalog has settled.
+        for _ in 0..2 {
+            leader.broadcast_all_topics().await;
+            leader.broadcast_catalog_snapshot().await;
+            deliver(&wire, &follower).await;
+        }
+
+        let names: Vec<String> = follower
+            .list_topics()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !names.contains(&"topic-7".to_string()),
+            "the follower kept a topic deleted while it was down: {:?}",
+            names
+        );
+        assert_eq!(names.len(), 9, "converged to the wrong set: {:?}", names);
+    }
 
     /// A snapshot from a node that has not finished recovering must not prune.
     ///
