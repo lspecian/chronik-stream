@@ -20,6 +20,67 @@ use crate::crds::standalone::ChronikStandaloneSpec;
 /// GCE-PD, AzureDisk, NFS-CSI, …). See chronik-stream issue #3.
 const CHRONIK_IMAGE_UID: i64 = 1001;
 
+/// Build the init container that normalises ownership of the data volume.
+///
+/// `fsGroup` is the documented way to do this and it is **not enough**: the
+/// kubelet only applies ownership management to volume types that support it,
+/// and `hostPath` — which is what microk8s' `standard` storage class provisions —
+/// is not one of them. Verified directly on a hostPath PVC: a pod with
+/// `fsGroup: 1001, runAsUser: 1001` saw `/data/rootdir` still owned `0:0` and
+/// got `Permission denied` writing into it.
+///
+/// That is issue #51: an upgrade left ~62,000 entries owned by `root:root` while
+/// the broker runs as 1001, so every WAL and columnar append failed with
+/// `IO error: Permission denied (os error 13)`. Reads kept working, so the
+/// cluster looked healthy while every produce timed out.
+///
+/// So ownership is repaired explicitly, by the only thing that can do it: a
+/// short root container that runs before the broker. It is idempotent and cheap
+/// on an already-correct volume — `find -uid` walks and changes nothing — and it
+/// touches only the mounted data directory.
+fn build_chown_init_container(image: &str) -> Container {
+    Container {
+        name: "fix-data-ownership".into(),
+        image: Some(image.to_string()),
+        // Only the entries that are wrong, so a healthy volume costs one walk
+        // rather than a full recursive chown of millions of files.
+        command: Some(vec!["sh".into(), "-c".into()]),
+        args: Some(vec![format!(
+            "find {dir} ! -uid {uid} -exec chown {uid}:{gid} {{}} + 2>/dev/null; \
+             echo \"ownership normalised for uid {uid}\"",
+            dir = constants::defaults::DATA_DIR,
+            uid = CHRONIK_IMAGE_UID,
+            gid = CHRONIK_IMAGE_UID,
+        )]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "data".into(),
+            mount_path: constants::defaults::DATA_DIR.into(),
+            ..Default::default()
+        }]),
+        // Root, because chowning someone else's files is the entire job.
+        security_context: Some(k8s_openapi::api::core::v1::SecurityContext {
+            run_as_user: Some(0),
+            run_as_group: Some(0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Whether to run the ownership-repair init container.
+///
+/// On by default: the failure it prevents is a silent write outage, and on a
+/// correctly-owned volume it does nothing. Disable it for clusters whose
+/// PodSecurity policy forbids a root container, having made the data writable by
+/// the broker's UID some other way.
+fn chown_init_containers(enabled: Option<bool>, image: &str) -> Option<Vec<Container>> {
+    if enabled.unwrap_or(true) {
+        Some(vec![build_chown_init_container(image)])
+    } else {
+        None
+    }
+}
+
 /// Resolve the Pod-level `SecurityContext` to apply to a broker Pod.
 ///
 /// Precedence: explicit `pod_security_context` from the CR spec wins.
@@ -330,6 +391,7 @@ pub fn build_standalone_pod(
             tolerations,
             image_pull_secrets,
             security_context: resolve_pod_security_context(spec.pod_security_context.as_ref()),
+            init_containers: chown_init_containers(spec.fix_data_ownership, &spec.image),
             volumes: Some(vec![Volume {
                 name: "data".into(),
                 persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
@@ -693,6 +755,7 @@ pub fn build_cluster_node_pod(
             image_pull_secrets,
             affinity,
             security_context: resolve_pod_security_context(spec.pod_security_context.as_ref()),
+            init_containers: chown_init_containers(spec.fix_data_ownership, &spec.image),
             volumes: Some(vec![
                 Volume {
                     name: "data".into(),
@@ -1057,6 +1120,67 @@ mod tests {
         assert!(
             ctx.fs_group.is_none(),
             "partial override must not inherit default fsGroup"
+        );
+    }
+
+    /// The ownership repair must be on unless someone opts out.
+    ///
+    /// The failure it prevents is a silent write outage: reads keep working, so
+    /// the cluster looks healthy while every produce times out.
+    #[test]
+    fn ownership_repair_runs_by_default() {
+        let containers = chown_init_containers(None, "chronik-server:test")
+            .expect("must default to on");
+        assert_eq!(containers.len(), 1);
+        let c = &containers[0];
+        assert_eq!(c.name, "fix-data-ownership");
+
+        // It has to be root — chowning someone else's files is the whole job.
+        let sc = c.security_context.as_ref().expect("needs a security context");
+        assert_eq!(sc.run_as_user, Some(0), "must run as root or it cannot chown");
+
+        // And it must only touch the data directory.
+        let mounts = c.volume_mounts.as_ref().expect("needs the data mount");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_path, constants::defaults::DATA_DIR);
+
+        let args = c.args.as_ref().expect("needs args").join(" ");
+        assert!(args.contains(&format!("chown {}:{}", CHRONIK_IMAGE_UID, CHRONIK_IMAGE_UID)));
+        assert!(
+            args.contains(&format!("! -uid {}", CHRONIK_IMAGE_UID)),
+            "must only touch entries that are actually wrong, so a healthy \
+             volume costs one walk instead of a full recursive chown: {}",
+            args
+        );
+    }
+
+    #[test]
+    fn ownership_repair_can_be_disabled() {
+        assert!(
+            chown_init_containers(Some(false), "chronik-server:test").is_none(),
+            "a cluster whose PodSecurity policy forbids root containers must be able to opt out"
+        );
+    }
+
+    /// `fsGroup` does not make the init container redundant.
+    ///
+    /// The kubelet applies ownership management only to volume types that
+    /// support it, and `hostPath` — what microk8s' `standard` class provisions —
+    /// is not one. Verified on a real hostPath PVC: a pod with `fsGroup: 1001`
+    /// and `runAsUser: 1001` still saw `root:root` files and got
+    /// `Permission denied` writing them. So both mechanisms ship, and this test
+    /// exists to stop someone removing the init container because the pod
+    /// already sets fsGroup.
+    #[test]
+    fn fsgroup_and_ownership_repair_are_both_present() {
+        // fsGroup is still defaulted...
+        let ctx = resolve_pod_security_context(None).expect("fsGroup default should still be set");
+        assert_eq!(ctx.fs_group, Some(CHRONIK_IMAGE_UID));
+        // ...and the init container still runs, because fsGroup does not cover
+        // hostPath and that is where the outage happened.
+        assert!(
+            chown_init_containers(None, "chronik-server:test").is_some(),
+            "fsGroup alone does not cover hostPath - the init container must still run"
         );
     }
 }

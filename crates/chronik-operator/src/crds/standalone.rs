@@ -106,6 +106,20 @@ pub struct ChronikStandaloneSpec {
     /// `root:root`. Set explicitly to override.
     #[serde(default)]
     pub pod_security_context: Option<PodSecurityContextSpec>,
+
+    /// Repair ownership of the data volume before the broker starts.
+    ///
+    /// Defaults to `true`. An init container chowns anything under the data dir
+    /// not already owned by the broker's UID (1001). `fsGroup` alone does not
+    /// cover this: the kubelet does not apply ownership management to
+    /// `hostPath` volumes, which is what microk8s' `standard` class provisions,
+    /// so an upgrade can leave data owned by `root` and every write fails with
+    /// `Permission denied` while reads keep working (issue #51).
+    ///
+    /// Set `false` where a root init container is not permitted; the data must
+    /// then be made writable by UID 1001 some other way.
+    #[serde(default)]
+    pub fix_data_ownership: Option<bool>,
 }
 
 /// Status for ChronikStandalone.
