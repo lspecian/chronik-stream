@@ -148,6 +148,26 @@ pub enum MetadataEventPayload {
         name: String,
     },
 
+    /// The complete set of topics the authoritative node holds.
+    ///
+    /// The catalog anti-entropy pass re-publishes `TopicCreated` and
+    /// `PartitionAssigned`, which heals a follower that is *missing* topics but
+    /// can never remove ones it should no longer have. A node that is down when
+    /// a `TopicDeleted` is published never receives it, and nothing afterwards
+    /// tells it the topic is gone — so it advertises a phantom topic forever.
+    /// Measured on a 3-node cluster: one node held 886 topics the other two had
+    /// deleted, 871 of them real, and it had been that way for months.
+    ///
+    /// This event closes the loop by stating the whole truth rather than a
+    /// delta: whatever is not in `topics` does not exist. Only the Raft leader
+    /// publishes it (assignments and the catalog are Raft-managed state), and
+    /// the apply side refuses a snapshot that is empty or older than the last
+    /// one applied — pruning is destructive, so every ambiguous case must fail
+    /// towards keeping data.
+    CatalogSnapshot {
+        topics: Vec<String>,
+    },
+
     // ACL events (Security Phase 3). Replicated like any other metadata so a
     // rule written on one broker is enforced by all of them, and survives a
     // restart - an in-memory-only ACL is a control that silently lapses.

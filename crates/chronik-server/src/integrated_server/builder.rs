@@ -295,6 +295,31 @@ impl IntegratedKafkaServerBuilder {
 
         // Wrap in Arc now that recovery is complete
         let wal_metadata_store = Arc::new(wal_metadata_store);
+
+        // Let a peer ask this node what topics it has.
+        //
+        // Raft lends its gRPC channel for the question — metadata replication
+        // itself runs over the WAL transport on 9291 and is push-only, so there
+        // is nowhere else to ask. What Raft gets is a callback, not the store:
+        // topic metadata deliberately lives outside the Raft state machine
+        // (v2.2.9), and it should stay that way.
+        if let Some(ref raft) = self.raft_cluster_for_metadata {
+            let store_for_query = wal_metadata_store.clone();
+            raft.set_catalog_query(Arc::new(move || {
+                let store = store_for_query.clone();
+                Box::pin(async move {
+                    store.list_topics().await.map_err(|e| e.to_string())
+                }) as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<Vec<chronik_common::metadata::TopicMetadata>, String>,
+                            > + Send,
+                    >,
+                >
+            }))
+            .await;
+        }
+
         self.wal_metadata_store = Some(wal_metadata_store.clone());
         self.metadata_store = Some(wal_metadata_store);
         Ok(())
@@ -517,12 +542,98 @@ impl IntegratedKafkaServerBuilder {
                     }
                 } else {
                     warned_not_authority = false;
+
+                    // Before asserting anything, check we are not the
+                    // impoverished one.
+                    //
+                    // Only the leader re-broadcasts, so a leader that came back
+                    // with a thin catalog is a deadlock: the one node entitled
+                    // to state the catalog is the one that knows least, and the
+                    // nodes that still have it are not allowed to speak.
+                    // Measured on a 3-node cluster: node 1 led with 17 of 5,612
+                    // partition assignments while node 2 held all of them, and
+                    // it stayed that way until leadership moved.
+                    //
+                    // So the leader asks its peers first, and adopts rather than
+                    // asserts when one of them clearly knows more. This is a
+                    // recovery path, not gossip: it runs only when a peer holds
+                    // at least twice what we do, and the pass that adopts does
+                    // not also assert.
+                    let mut adopted = false;
+                    let local_topics = broadcast_store
+                        .list_topics()
+                        .await
+                        .map(|t| t.len())
+                        .unwrap_or(0);
+                    if let Some(ref raft) = broadcast_authority {
+                        let richest = raft
+                            .peer_topic_lists()
+                            .await
+                            .into_iter()
+                            .max_by_key(|(_, topics)| topics.len());
+                        if let Some((peer_id, topics)) = richest {
+                            if topics.len() > local_topics.saturating_mul(2)
+                                && topics.len() > local_topics
+                            {
+                                let known: std::collections::HashSet<String> = broadcast_store
+                                    .list_topics()
+                                    .await
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|t| t.name)
+                                    .collect();
+                                let mut learned = 0usize;
+                                for topic in &topics {
+                                    if known.contains(&topic.name) {
+                                        continue;
+                                    }
+                                    if let Err(e) = broadcast_store
+                                        .create_topic(&topic.name, topic.config.clone())
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            topic = %topic.name,
+                                            error = %e,
+                                            "Could not adopt topic from peer"
+                                        );
+                                    } else {
+                                        learned += 1;
+                                    }
+                                }
+                                tracing::warn!(
+                                    from_peer = peer_id,
+                                    local_topics,
+                                    peer_topics = topics.len(),
+                                    learned,
+                                    "Leader had a thin catalog - adopted from a peer instead of \
+                                     asserting its own view"
+                                );
+                                adopted = true;
+                            }
+                        }
+                    }
+
+                    if !adopted {
                     let count = broadcast_store.broadcast_all_topics().await;
                     if count > 0 {
                         tracing::info!(
                             topics_broadcast = count,
                             "Re-broadcast topic metadata for follower sync (anti-entropy)"
                         );
+                    }
+
+                    // Then state the complete set, so a follower can also drop
+                    // what it should no longer have. The order matters: the
+                    // additive pass above first gives it anything it is missing,
+                    // so the snapshot it prunes against is one it has just been
+                    // brought up to date with.
+                    let snapshot = broadcast_store.broadcast_catalog_snapshot().await;
+                    if snapshot > 0 {
+                        tracing::info!(
+                            topics_in_snapshot = snapshot,
+                            "Published catalog snapshot so followers prune stale topics"
+                        );
+                    }
                     }
                 }
 
