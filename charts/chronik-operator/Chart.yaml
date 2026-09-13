@@ -2,8 +2,8 @@ apiVersion: v2
 name: chronik-operator
 description: Kubernetes operator for Chronik Stream
 type: application
-version: 0.3.0
-appVersion: "2.14.2"
+version: 0.3.1
+appVersion: "0.3.1"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/lspecian/chronik-stream
 sources:
