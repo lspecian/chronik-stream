@@ -20,80 +20,75 @@ env:
 jobs:
   check:
     name: Check & Lint
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Install build dependencies
         run: |
-          if ! command -v rustup &> /dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          fi
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup update stable
-          rustup default stable
-          rustup component add rustfmt clippy
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libsasl2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-operator-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check formatting
         run: cargo fmt -p chronik-operator -- --check
 
       - name: Clippy
-        run: cargo clippy -p chronik-operator -- -D warnings
+        run: cargo clippy -p chronik-operator --all-targets -- -D warnings
 
-      - name: Check
-        run: cargo check -p chronik-operator
+      - name: Tests
+        run: cargo test -p chronik-operator
 
-  test:
-    name: Tests
-    runs-on: self-hosted
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Unit tests
-        run: cargo test -p chronik-operator --lib
-
-      - name: Integration tests
-        run: cargo test -p chronik-operator --tests
-
-  build:
-    name: Release Build
-    runs-on: self-hosted
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Build release binary
+      - name: Release build
         run: cargo build --release --bin chronik-operator
 
-      - name: Verify CRD generation
-        run: cargo run --release --bin chronik-operator -- crd-gen > /dev/null
+      - name: CRDs in the chart match the code
+        run: |
+          # The chart's crds/ are what actually reaches a cluster, and Helm only
+          # applies them on first install — a stale file there is invisible
+          # until someone sets a field the cluster then silently prunes.
+          ./target/release/chronik-operator crd-gen > /tmp/crds-from-code.yaml
+          csplit -s -z -f /tmp/crd- -b '%02d.yaml' /tmp/crds-from-code.yaml '/^---$/' '{*}'
+          drift=0
+          for f in /tmp/crd-*.yaml; do
+            sed -i '1{/^---$/d}' "$f"
+            name=$(grep -m1 '^  name:' "$f" | awk '{print $2}' | cut -d. -f1)
+            if ! diff -u "charts/chronik-operator/crds/${name}.yaml" "$f"; then
+              echo "::error::charts/chronik-operator/crds/${name}.yaml is stale — regenerate with 'chronik-operator crd-gen'"
+              drift=1
+            fi
+          done
+          exit $drift
 
   helm-lint:
     name: Helm Lint
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # Installed explicitly: the previous version of this job skipped both
+      # steps when helm was absent and reported success, so it passed without
+      # ever linting the chart.
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
       - name: Helm lint
-        run: |
-          if command -v helm &> /dev/null; then
-            helm lint charts/chronik-operator/
-          else
-            echo "Helm not installed, skipping lint"
-          fi
+        run: helm lint charts/chronik-operator/
 
       - name: Helm template
-        run: |
-          if command -v helm &> /dev/null; then
-            helm template test charts/chronik-operator/ > /dev/null
-          else
-            echo "Helm not installed, skipping template"
-          fi
+        run: helm template test charts/chronik-operator/ > /dev/null

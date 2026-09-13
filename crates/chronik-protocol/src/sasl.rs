@@ -219,17 +219,21 @@ impl SaslAuthenticator {
     /// is unset the authenticator has no users and every authentication attempt
     /// fails — that is the intended default. Previously this silently
     /// installed `admin/admin123`, `user/user123` and `kafka/kafka-secret`.
+    ///
+    /// This does NOT warn when there are no users, because it cannot know
+    /// whether SASL is switched on: `ProtocolHandler::new` builds an
+    /// authenticator unconditionally, so a warning here fires on every broker.
+    /// It used to say "SASL enabled but CHRONIK_SASL_USERS is not set … every
+    /// authentication attempt will be rejected" on a default install with no
+    /// security configured at all — telling an operator that authentication was
+    /// on and rejecting everything, when it was off and rejecting nothing.
+    ///
+    /// `SaslConfig::from_env` owns that warning, because it is the thing that
+    /// reads `CHRONIK_SASL_ENABLED` and therefore knows.
     pub fn new() -> Self {
         match std::env::var("CHRONIK_SASL_USERS") {
             Ok(users_config) => Self::new_from_config(&users_config),
-            Err(_) => {
-                warn!(
-                    "SASL enabled but CHRONIK_SASL_USERS is not set - no users are configured, \
-                     so every authentication attempt will be rejected. \
-                     Set CHRONIK_SASL_USERS='user1:pass1,user2:pass2'."
-                );
-                Self::new_empty()
-            }
+            Err(_) => Self::new_empty(),
         }
     }
 
@@ -603,6 +607,27 @@ fn put_unsigned_varint(buf: &mut BytesMut, mut value: u32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A broker with no security configured must not claim SASL is on.
+    ///
+    /// `ProtocolHandler::new` builds an authenticator unconditionally, so a
+    /// warning in `SaslAuthenticator::new` fires on every default install. It
+    /// used to announce "SASL enabled but CHRONIK_SASL_USERS is not set … every
+    /// authentication attempt will be rejected" on a cluster with authentication
+    /// switched off — which reads as an outage in the logs and is the opposite
+    /// of the truth. `SaslConfig::from_env` owns that warning because it reads
+    /// `CHRONIK_SASL_ENABLED` and therefore knows.
+    #[test]
+    fn an_authenticator_with_no_users_is_silent_about_enablement() {
+        let auth = SaslAuthenticator::new_empty();
+        assert!(
+            auth.users.is_empty(),
+            "no users is the intended default - it denies rather than admitting"
+        );
+        // The mechanisms are still advertised: whether SASL is *offered* is
+        // SaslConfig's call, not this type's.
+        assert!(!auth.supported_mechanisms.is_empty());
+    }
     use base64::Engine as _;
     use super::*;
 

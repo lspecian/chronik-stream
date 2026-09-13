@@ -300,6 +300,16 @@ fn compute_standalone_spec_hash(spec: &crate::crds::standalone::ChronikStandalon
         format!("{:?}", os).hash(&mut hasher);
     }
 
+    // See `compute_cluster_spec_hash`: these change the generated Pod, and are
+    // mixed in only when set away from the default so that adding them does not
+    // rebuild every existing Pod on upgrade.
+    if spec.fix_data_ownership == Some(false) {
+        "fix_data_ownership=false".hash(&mut hasher);
+    }
+    if let Some(ref sc) = spec.pod_security_context {
+        format!("{:?}", sc).hash(&mut hasher);
+    }
+
     format!("{:016x}", hasher.finish())
 }
 

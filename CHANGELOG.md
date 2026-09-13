@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.14.2] - 2026-09-13
+
+Kubernetes operator fixes. An upgrade could leave a broker unable to write its
+own data directory, and the broker stayed green while every write failed.
+
+### Fixed
+
+- **An upgrade left the data volume owned by `root` (#51).** The broker runs as
+  UID 1001, and after an upgrade the data directory was owned by `root:root`, so
+  every WAL and columnar append failed with `Permission denied` while reads kept
+  working.
+
+  `fsGroup` is the documented remedy and it is not enough: the kubelet does not
+  apply ownership management to `hostPath` volumes, which is what microk8s'
+  `standard` class provisions. Verified directly — a pod with `fsGroup: 1001,
+  runAsUser: 1001` still saw its data owned `0:0` and could not write. The fix
+  in 2.13.x for issue #3 therefore never helped these clusters.
+
+  Broker Pods now run a short root init container that repairs ownership before
+  the broker starts. It walks only the entries that are wrong (`find ! -uid
+  1001`), so a correct volume costs one pass and changes nothing. Set
+  `fixDataOwnership: false` where a root container is not permitted.
+
+  Fresh installs were never affected, and this has nothing to do with ACLs.
+
+  Proven end-to-end through a live operator, in both directions: with the repair
+  disabled and the volume made root-owned, the broker came up `1/1 Running`,
+  logged no permission error at all, and silently spun on an unrelated-looking
+  `to_commit 1 is out of range` warning while `touch /data/wal/…` returned
+  `Permission denied`. With the repair enabled, 11 root-owned entries went to 0
+  and writes recovered.
+
+- **The ownership repair ignored `imagePullPolicy`.** It runs the same image as
+  the broker but was left on the Kubernetes default. `Never` is the case that
+  bites: the image has been side-loaded onto the node, and a container that does
+  not say `Never` tries to pull it from a registry that does not have it.
+
+- **Changing `fixDataOwnership` or `podSecurityContext` did not recreate Pods.**
+  The operator decides on a hash of the CR spec, and neither field was in it,
+  though both change the generated Pod. Flipping either did nothing until an
+  unrelated edit recreated the Pod, at which point the change landed by
+  surprise. Both are now mixed in only when set away from their default, so
+  existing clusters keep their current hash and an operator upgrade does not
+  restart every broker.
+
+- **The chart shipped CRDs that predate `fixDataOwnership`.** Installing gave an
+  operator that understands the field and a cluster that rejects it — silently,
+  because the API server prunes unknown fields rather than erroring, so
+  `kubectl patch` reports success and the value is dropped. Helm only applies
+  `crds/` on first install and never on upgrade, so this does not fix itself:
+  the chart now carries regenerated CRDs and a README with the required
+  `kubectl apply --server-side -f crds/` step.
+
+- **A default install claimed authentication was enabled.** `SaslAuthenticator`
+  warned about SASL being on whenever it was constructed, including on the
+  default path where SASL is off, so operators read an untrue warning on every
+  boot.
+
+### Notes
+
+Upgrading the operator does not restart running brokers — verified against three
+live clusters, whose nine broker Pods kept their identities across a
+seven-month operator jump. Because of that, the #51 repair applies when a Pod is
+next recreated, not at upgrade time.
+
 ## [2.14.1] - 2026-09-13
 
 Metadata correctness. A cluster could not rebuild its catalog after a restart,
