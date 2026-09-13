@@ -131,11 +131,20 @@ jobs:
           else
             TAG="${{ github.ref_name }}"
           fi
-          # Strip 'operator-' prefix for Docker tag (operator-v0.1.0 -> v0.1.0)
-          VERSION="${TAG#operator-}"
+          # Two forms, and both get published as image tags.
+          #
+          # The chart's default image tag is its appVersion, which Helm requires
+          # to track the bare SemVer it packages under (operator-v0.3.0 ->
+          # 0.3.0), while this job historically pushed only the v-prefixed tag.
+          # The result was a published chart whose default image did not exist:
+          # `helm install` with default values gave ImagePullBackOff, for every
+          # release up to and including 0.3.0.
+          VERSION="${TAG#operator-}"           # v0.3.0 — kept, older refs use it
+          BARE_VERSION="${TAG#operator-v}"     # 0.3.0  — what the chart resolves to
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Version: ${VERSION}"
+          echo "bare_version=${BARE_VERSION}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION} (bare: ${BARE_VERSION})"
 
       - name: Extract metadata
         id: meta
@@ -144,6 +153,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.bare_version }}
             type=raw,value=latest
 
       - name: Build and push Docker image
@@ -195,6 +205,26 @@ jobs:
 
       - name: Package Helm chart
         run: helm package charts/chronik-operator/ --destination dist/
+
+      - name: The chart's default image must actually exist
+        run: |
+          # Rendering the chart with default values is the only thing that
+          # proves what a plain `helm install` will try to pull. Releases up to
+          # 0.3.0 shipped a chart whose default tag was never published, and
+          # nothing caught it because the chart itself lints and templates fine.
+          IMAGE=$(helm template test charts/chronik-operator/ \
+            | grep -oE 'image: *"?[^"]+chronik-operator:[^"[:space:]]+' \
+            | head -1 | sed 's/.*image: *"*//')
+          if [ -z "$IMAGE" ]; then
+            echo "::error::could not find the operator image in the rendered chart"
+            exit 1
+          fi
+          echo "Chart renders with image: ${IMAGE}"
+          if ! docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "::error::${IMAGE} is not published — a default 'helm install' would ImagePullBackOff"
+            exit 1
+          fi
+          echo "OK: ${IMAGE} is published"
 
       - name: Log in to OCI registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} --username ${{ github.actor }} --password-stdin

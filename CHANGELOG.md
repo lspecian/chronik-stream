@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The published operator Helm chart pointed at an image that was never
+  published** (chart `operator-v0.3.1`). The release workflow pushed the
+  operator image as `v0.3.0` while packaging a chart whose `appVersion` — and
+  therefore its default image tag — was the bare `0.3.0`, so `helm install`
+  with default values gave `ImagePullBackOff`. True of every operator chart
+  released so far, and invisible because the chart itself lints and templates
+  cleanly. The image is now published under both forms, and the release fails
+  if the tag the chart actually renders is not present in the registry.
+
+
 ## [2.14.2] - 2026-09-13
 
 Kubernetes operator fixes. An upgrade could leave a broker unable to write its
