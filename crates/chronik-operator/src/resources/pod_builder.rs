@@ -1183,4 +1183,81 @@ mod tests {
             "fsGroup alone does not cover hostPath - the init container must still run"
         );
     }
+
+    /// The init container must actually be ON THE POD, not merely constructible.
+    ///
+    /// The other tests call `chown_init_containers` directly, so they would all
+    /// still pass if the helper were never wired into the PodSpec — which is
+    /// precisely how a fix ends up shipping as a no-op. This builds the real Pod
+    /// and looks at what Kubernetes would receive.
+    #[test]
+    fn the_built_pod_carries_the_ownership_repair() {
+        use crate::crds::cluster::ChronikClusterSpec;
+        use crate::crds::standalone::ChronikStandaloneSpec;
+
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "chronik.io/v1alpha1".into(),
+            kind: "ChronikCluster".into(),
+            name: "c".into(),
+            uid: "u".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+
+        let cluster_spec: ChronikClusterSpec = serde_json::from_str("{}").unwrap();
+        let pod = build_cluster_node_pod("c", "default", 1, &cluster_spec, owner.clone(), None);
+        let spec = pod.spec.expect("pod needs a spec");
+        let inits = spec
+            .init_containers
+            .expect("cluster pod must carry the ownership-repair init container");
+        assert_eq!(inits.len(), 1);
+        assert_eq!(inits[0].name, "fix-data-ownership");
+        assert_eq!(
+            inits[0].security_context.as_ref().and_then(|s| s.run_as_user),
+            Some(0),
+            "it cannot chown another user's files unless it runs as root"
+        );
+        assert_eq!(
+            inits[0]
+                .volume_mounts
+                .as_ref()
+                .map(|m| m[0].mount_path.clone()),
+            Some(constants::defaults::DATA_DIR.to_string()),
+            "it must be given the data volume, or it repairs nothing"
+        );
+
+        let standalone_spec: ChronikStandaloneSpec = serde_json::from_str("{}").unwrap();
+        let pod = build_standalone_pod("s", "default", &standalone_spec, owner, None);
+        assert!(
+            pod.spec
+                .expect("pod needs a spec")
+                .init_containers
+                .is_some_and(|i| i.iter().any(|c| c.name == "fix-data-ownership")),
+            "standalone pod must carry it too - the same PVC ownership applies"
+        );
+    }
+
+    /// And opting out must actually remove it from the Pod.
+    #[test]
+    fn opting_out_removes_it_from_the_built_pod() {
+        use crate::crds::cluster::ChronikClusterSpec;
+
+        let spec: ChronikClusterSpec =
+            serde_json::from_str(r#"{"fixDataOwnership": false}"#).unwrap();
+        assert_eq!(spec.fix_data_ownership, Some(false), "CRD field must deserialize");
+
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "chronik.io/v1alpha1".into(),
+            kind: "ChronikCluster".into(),
+            name: "c".into(),
+            uid: "u".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let pod = build_cluster_node_pod("c", "default", 1, &spec, owner, None);
+        assert!(
+            pod.spec.expect("pod needs a spec").init_containers.is_none(),
+            "fixDataOwnership: false must remove the root init container"
+        );
+    }
 }
