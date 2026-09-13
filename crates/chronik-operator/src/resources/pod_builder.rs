@@ -1260,4 +1260,29 @@ mod tests {
             "fixDataOwnership: false must remove the root init container"
         );
     }
+
+    /// Emit the Pod the operator would actually create, so it can be applied to
+    /// a real cluster and checked rather than asserted about.
+    ///
+    /// Run with: cargo test -p chronik-operator dump_cluster_pod_yaml -- --nocapture --ignored
+    #[test]
+    #[ignore = "prints YAML for manual cluster verification"]
+    fn dump_cluster_pod_yaml() {
+        use crate::crds::cluster::ChronikClusterSpec;
+
+        let spec: ChronikClusterSpec =
+            serde_json::from_str(r#"{"image":"chronik-server:v2.14.1","replicas":1}"#).unwrap();
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "chronik.io/v1alpha1".into(),
+            kind: "ChronikCluster".into(),
+            name: "gate".into(),
+            uid: "gate-uid".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let pod = build_cluster_node_pod("gate", "chronik-perf", 1, &spec, owner, None);
+        println!("---BEGIN POD YAML---");
+        println!("{}", serde_yaml::to_string(&pod).unwrap());
+        println!("---END POD YAML---");
+    }
 }
