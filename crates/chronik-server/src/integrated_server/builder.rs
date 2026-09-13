@@ -296,14 +296,28 @@ impl IntegratedKafkaServerBuilder {
         // Wrap in Arc now that recovery is complete
         let wal_metadata_store = Arc::new(wal_metadata_store);
 
-        // Let Raft answer peer catalog queries from the real store.
+        // Let a peer ask this node what topics it has.
         //
-        // Without this, `MetadataQuery::ListTopics` returns an empty list — and
-        // returns it successfully — so a node asking a peer what topics it holds
-        // is told "none". Every catch-up path the comments promise is built on
-        // that answer, which is why none of them work.
+        // Raft lends its gRPC channel for the question — metadata replication
+        // itself runs over the WAL transport on 9291 and is push-only, so there
+        // is nowhere else to ask. What Raft gets is a callback, not the store:
+        // topic metadata deliberately lives outside the Raft state machine
+        // (v2.2.9), and it should stay that way.
         if let Some(ref raft) = self.raft_cluster_for_metadata {
-            raft.set_metadata_store(wal_metadata_store.clone()).await;
+            let store_for_query = wal_metadata_store.clone();
+            raft.set_catalog_query(Arc::new(move || {
+                let store = store_for_query.clone();
+                Box::pin(async move {
+                    store.list_topics().await.map_err(|e| e.to_string())
+                }) as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<Vec<chronik_common::metadata::TopicMetadata>, String>,
+                            > + Send,
+                    >,
+                >
+            }))
+            .await;
         }
 
         self.wal_metadata_store = Some(wal_metadata_store.clone());

@@ -39,6 +39,17 @@ use chronik_raft::{GrpcTransport, Transport, rpc::{RaftServiceImpl, raft_service
 use tonic::transport::Server;
 
 /// Raft cluster for metadata coordination
+/// Supplies this node's topic list to the Raft gRPC query handler.
+///
+/// A callback rather than a store handle, so RaftCluster never learns what a
+/// metadata store is - see `catalog_query`.
+pub type CatalogQuery = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<chronik_common::metadata::TopicMetadata>, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 pub struct RaftCluster {
     /// Node ID in the cluster
     node_id: u64,
@@ -126,13 +137,16 @@ pub struct RaftCluster {
     /// Updated by Raft message loop when state changes
     /// Using AtomicBool for lock-free reads
 
-    /// The live metadata store, wired in after construction (the store is built
-    /// in a later builder stage than Raft).
+    /// Answers "what topics does this node have", supplied by whoever owns the
+    /// metadata.
     ///
-    /// `MetadataQuery::ListTopics` answered with an empty list before this
-    /// existed — a peer asking this node what topics it had was told "none",
-    /// successfully. That is why no catch-up path could be built on top of it.
-    metadata_store: Arc<tokio::sync::RwLock<Option<Arc<dyn chronik_common::metadata::MetadataStore>>>>,
+    /// Raft does NOT replicate metadata — that rides the WAL replication
+    /// transport on 9291 — and v2.2.9 deliberately moved topic metadata out of
+    /// the Raft state machine into WalMetadataStore. So this holds a callback,
+    /// not the store: Raft lends its gRPC channel as a request/response path
+    /// (the metadata transport is push-only and cannot answer a question) and
+    /// stays ignorant of where metadata lives or how it propagates.
+    catalog_query: Arc<tokio::sync::RwLock<Option<CatalogQuery>>>,
     cached_is_leader: Arc<AtomicBool>,
 }
 
@@ -512,19 +526,20 @@ impl RaftCluster {
             leader_change_sender, // v2.2.7 Phase 2: WAL replication leader changes
             cached_leader_id: Arc::new(AtomicU64::new(raft::INVALID_ID)), // v2.2.7 LOCK CONTENTION FIX
             cached_is_leader: Arc::new(AtomicBool::new(false)), // v2.2.7 LOCK CONTENTION FIX
-            metadata_store: Arc::new(tokio::sync::RwLock::new(None)),
+            catalog_query: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
-    /// Wire in the live metadata store.
+    /// Supply the answer to "what topics does this node have".
     ///
-    /// Called by the builder once the store exists (it is created in a later
-    /// stage than Raft). Until then `ListTopics` has nothing to answer from.
-    pub async fn set_metadata_store(
-        &self,
-        store: Arc<dyn chronik_common::metadata::MetadataStore>,
-    ) {
-        *self.metadata_store.write().await = Some(store);
+    /// Called by the builder, which owns the metadata store. Raft only lends the
+    /// channel: metadata replication itself runs over the WAL transport on 9291,
+    /// and that path is push-only, so there is no way to ask a peer a question
+    /// on it. Until this is set, `ListTopics` reports that it cannot answer —
+    /// which is the honest response, and better than the empty list it used to
+    /// return successfully.
+    pub async fn set_catalog_query(&self, query: CatalogQuery) {
+        *self.catalog_query.write().await = Some(query);
     }
 
     /// Ask a specific peer for its topic list.
@@ -1740,21 +1755,20 @@ impl RaftCluster {
             }
             // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
             MetadataQuery::ListTopics => {
-                // Answer from the live metadata store.
+                // Answered by the callback the builder supplied, not by Raft.
                 //
-                // This returned an empty list for as long as metadata lived in
-                // WalMetadataStore rather than the Raft state machine: a peer
-                // asking "what topics do you have" was told "none", and told it
-                // successfully. Nothing can be built on an answer like that,
-                // which is why no catch-up path exists anywhere in the cluster.
-                let store = self.metadata_store.read().await.clone();
-                match store {
-                    Some(store) => match store.list_topics().await {
+                // This returned an empty list — successfully — ever since
+                // metadata moved out of the Raft state machine. A peer asking
+                // "what topics do you have" was told "none", so every catch-up
+                // path built on it silently did nothing.
+                let query = self.catalog_query.read().await.clone();
+                match query {
+                    Some(query) => match query().await {
                         Ok(topics) => Ok(MetadataQueryResponse::TopicList(topics)),
-                        Err(e) => Err(anyhow::anyhow!("list_topics failed: {}", e)),
+                        Err(e) => Err(anyhow::anyhow!("catalog query failed: {}", e)),
                     },
                     None => Err(anyhow::anyhow!(
-                        "metadata store not wired into RaftCluster - cannot answer ListTopics"
+                        "no catalog query wired up - this node cannot report its topics"
                     )),
                 }
             }
