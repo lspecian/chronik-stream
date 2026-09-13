@@ -525,6 +525,20 @@ fn compute_cluster_spec_hash(spec: &ChronikClusterSpec) -> String {
         format!("{:?}", os).hash(&mut hasher);
     }
 
+    // Both of these change the generated Pod, so leaving them out means a user
+    // can flip them and watch nothing happen until some unrelated edit finally
+    // recreates the Pod — at which point the change lands by surprise.
+    //
+    // Mixed in only when set away from the default, so that adding them here
+    // does not change the hash of every cluster that has never used them and
+    // turn an operator upgrade into a rebuild of every broker Pod.
+    if spec.fix_data_ownership == Some(false) {
+        "fix_data_ownership=false".hash(&mut hasher);
+    }
+    if let Some(ref sc) = spec.pod_security_context {
+        format!("{:?}", sc).hash(&mut hasher);
+    }
+
     format!("{:016x}", hasher.finish())
 }
 
@@ -786,5 +800,76 @@ mod tests {
             ..Default::default()
         };
         assert!(cluster_pod_needs_update(&pod_no_annotation, &spec_v1));
+    }
+
+    /// The hash is an upgrade contract, not an implementation detail.
+    ///
+    /// `cluster_pod_needs_update` recreates a broker Pod whenever the computed
+    /// hash differs from the Pod's annotation, so changing how the hash is
+    /// computed restarts every broker of every managed cluster the moment the
+    /// new operator takes leadership — a whole-fleet roll nobody asked for.
+    ///
+    /// If this test fails you have changed the hash of a spec that sets none of
+    /// the new fields. That is the dangerous case: decide deliberately whether
+    /// the fleet-wide restart is acceptable, and only then update the constant.
+    /// Adding a field is safe as long as it is mixed in only when set away from
+    /// its default.
+    #[test]
+    fn the_default_spec_hash_is_stable_across_operator_versions() {
+        let spec: ChronikClusterSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            compute_cluster_spec_hash(&spec),
+            "4a01ffeff1524553",
+            "the hash of a default spec changed — every broker Pod under this \
+             operator would be recreated on upgrade"
+        );
+    }
+
+    /// ...but a field that genuinely changes the Pod must change the hash, or
+    /// flipping it does nothing until something unrelated recreates the Pod.
+    #[test]
+    fn opting_out_of_the_ownership_repair_changes_the_hash() {
+        let default: ChronikClusterSpec = serde_json::from_str("{}").unwrap();
+        let opted_out: ChronikClusterSpec =
+            serde_json::from_str(r#"{"fixDataOwnership": false}"#).unwrap();
+
+        assert_ne!(
+            compute_cluster_spec_hash(&default),
+            compute_cluster_spec_hash(&opted_out),
+            "fixDataOwnership: false removes a container from the Pod, so it has \
+             to be visible to the recreate decision"
+        );
+
+        let explicit_on: ChronikClusterSpec =
+            serde_json::from_str(r#"{"fixDataOwnership": true}"#).unwrap();
+        assert_eq!(
+            compute_cluster_spec_hash(&default),
+            compute_cluster_spec_hash(&explicit_on),
+            "spelling out the default builds the same Pod, so it must not force \
+             a restart"
+        );
+    }
+
+    /// Operational check: compute the spec hash of a live cluster's `.spec` JSON.
+    ///
+    /// Deploying a new operator build must not silently recreate every broker
+    /// pod, and `cluster_pod_needs_update` decides that purely on this hash.
+    /// Point it at a spec dumped from a running cluster and compare against the
+    /// pod's `chronik.io/spec-hash` annotation before rolling an operator out:
+    ///
+    /// ```text
+    /// kubectl get chronikcluster <name> -n <ns> -o jsonpath='{.spec}' > spec.json
+    /// CHRONIK_SPEC_JSON=spec.json cargo test -p chronik-operator \
+    ///     hash_of_a_live_spec -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "operational tool: needs CHRONIK_SPEC_JSON pointing at a live spec"]
+    fn hash_of_a_live_spec() {
+        let path = std::env::var("CHRONIK_SPEC_JSON")
+            .expect("set CHRONIK_SPEC_JSON to a file holding a ChronikCluster .spec");
+        let raw = std::fs::read_to_string(&path).expect("spec file should be readable");
+        let spec: ChronikClusterSpec =
+            serde_json::from_str(&raw).expect("spec JSON should deserialize");
+        println!("{}\t{}", compute_cluster_spec_hash(&spec), path);
     }
 }
