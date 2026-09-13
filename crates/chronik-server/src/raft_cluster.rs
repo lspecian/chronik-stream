@@ -125,6 +125,14 @@ pub struct RaftCluster {
     /// v2.2.7 LOCK CONTENTION FIX: Cached leadership state (am I the leader?)
     /// Updated by Raft message loop when state changes
     /// Using AtomicBool for lock-free reads
+
+    /// The live metadata store, wired in after construction (the store is built
+    /// in a later builder stage than Raft).
+    ///
+    /// `MetadataQuery::ListTopics` answered with an empty list before this
+    /// existed — a peer asking this node what topics it had was told "none",
+    /// successfully. That is why no catch-up path could be built on top of it.
+    metadata_store: Arc<tokio::sync::RwLock<Option<Arc<dyn chronik_common::metadata::MetadataStore>>>>,
     cached_is_leader: Arc<AtomicBool>,
 }
 
@@ -504,7 +512,82 @@ impl RaftCluster {
             leader_change_sender, // v2.2.7 Phase 2: WAL replication leader changes
             cached_leader_id: Arc::new(AtomicU64::new(raft::INVALID_ID)), // v2.2.7 LOCK CONTENTION FIX
             cached_is_leader: Arc::new(AtomicBool::new(false)), // v2.2.7 LOCK CONTENTION FIX
+            metadata_store: Arc::new(tokio::sync::RwLock::new(None)),
         })
+    }
+
+    /// Wire in the live metadata store.
+    ///
+    /// Called by the builder once the store exists (it is created in a later
+    /// stage than Raft). Until then `ListTopics` has nothing to answer from.
+    pub async fn set_metadata_store(
+        &self,
+        store: Arc<dyn chronik_common::metadata::MetadataStore>,
+    ) {
+        *self.metadata_store.write().await = Some(store);
+    }
+
+    /// Ask a specific peer for its topic list.
+    ///
+    /// The same gRPC `QueryMetadata` the leader-forwarding path uses, aimed at
+    /// an arbitrary peer rather than the leader. A node that comes back with an
+    /// impoverished catalog needs to learn from whoever still has one, and that
+    /// requires asking.
+    pub async fn query_peer_topics(
+        &self,
+        peer_id: u64,
+    ) -> Result<Vec<chronik_common::metadata::TopicMetadata>> {
+        use crate::metadata_rpc::{MetadataQuery, MetadataQueryResponse};
+        use chronik_raft::rpc::raft_service_client::RaftServiceClient;
+        use chronik_raft::rpc::QueryMetadataRequest;
+
+        let addr = self.transport.get_peer_address(peer_id).await
+            .ok_or_else(|| anyhow::anyhow!("peer {} not in transport", peer_id))?;
+
+        let query_data = bincode::serialize(&MetadataQuery::ListTopics)
+            .context("Failed to serialize ListTopics")?;
+
+        let mut client = RaftServiceClient::connect(addr.clone()).await
+            .context(format!("Failed to connect to peer {} at {}", peer_id, addr))?;
+        let response = client
+            .query_metadata(tonic::Request::new(QueryMetadataRequest { query_data }))
+            .await
+            .context("QueryMetadata RPC failed")?
+            .into_inner();
+
+        if !response.success {
+            return Err(anyhow::anyhow!("peer {} query failed: {}", peer_id, response.error));
+        }
+
+        match bincode::deserialize(&response.response_data)
+            .context("Failed to deserialize ListTopics response")?
+        {
+            MetadataQueryResponse::TopicList(topics) => Ok(topics),
+            other => Err(anyhow::anyhow!("unexpected response to ListTopics: {:?}", other)),
+        }
+    }
+
+    /// Every peer's topic list, skipping peers that cannot be reached.
+    ///
+    /// A peer that is down or slow must not block the caller: the point of this
+    /// is to find a node that still has the catalog, and one unreachable node
+    /// does not change that.
+    pub async fn peer_topic_lists(
+        &self,
+    ) -> Vec<(u64, Vec<chronik_common::metadata::TopicMetadata>)> {
+        let mut out = Vec::new();
+        for peer_id in self.transport.get_peer_ids().await {
+            if peer_id == self.node_id {
+                continue;
+            }
+            match self.query_peer_topics(peer_id).await {
+                Ok(topics) => out.push((peer_id, topics)),
+                Err(e) => {
+                    tracing::debug!(peer = peer_id, error = %e, "Could not read peer catalog");
+                }
+            }
+        }
+        out
     }
 
     /// v2.2.7 EVENT-DRIVEN NOTIFICATION: Get shared notification maps for metadata store
@@ -1543,7 +1626,7 @@ impl RaftCluster {
         // Check if we're the leader
         if self.am_i_leader().await {
             // Execute query locally on state machine
-            return self.execute_query_local(query);
+            return self.execute_query_local(query).await;
         }
 
         // Retry logic to handle intermittent leader election issues
@@ -1641,7 +1724,7 @@ impl RaftCluster {
     /// Execute a metadata query locally on the state machine (Phase 1.2)
     ///
     /// Helper method called by query_leader when this node is the leader.
-    fn execute_query_local(
+    async fn execute_query_local(
         &self,
         query: crate::metadata_rpc::MetadataQuery,
     ) -> Result<crate::metadata_rpc::MetadataQueryResponse> {
@@ -1657,18 +1740,23 @@ impl RaftCluster {
             }
             // v2.2.9 Option 4: Partition metadata moved to WalMetadataStore
             MetadataQuery::ListTopics => {
-                // Return empty list - topics now tracked in WalMetadataStore
-                Ok(MetadataQueryResponse::TopicList(Vec::new()))
-                // let topics: Vec<_> = state.topics.values().map(|t| {
-                //     chronik_common::metadata::TopicMetadata {
-                //         id: uuid::Uuid::new_v4(),
-                //         name: t.name.clone(),
-                //         config: t.config.clone(),
-                //         created_at: chrono::Utc::now(),
-                //         updated_at: chrono::Utc::now(),
-                //     }
-                // }).collect();
-                // Ok(MetadataQueryResponse::TopicList(topics))
+                // Answer from the live metadata store.
+                //
+                // This returned an empty list for as long as metadata lived in
+                // WalMetadataStore rather than the Raft state machine: a peer
+                // asking "what topics do you have" was told "none", and told it
+                // successfully. Nothing can be built on an answer like that,
+                // which is why no catch-up path exists anywhere in the cluster.
+                let store = self.metadata_store.read().await.clone();
+                match store {
+                    Some(store) => match store.list_topics().await {
+                        Ok(topics) => Ok(MetadataQueryResponse::TopicList(topics)),
+                        Err(e) => Err(anyhow::anyhow!("list_topics failed: {}", e)),
+                    },
+                    None => Err(anyhow::anyhow!(
+                        "metadata store not wired into RaftCluster - cannot answer ListTopics"
+                    )),
+                }
             }
             MetadataQuery::GetBroker { broker_id } => {
                 let broker = state.brokers.get(&broker_id).map(|b| {
@@ -2034,17 +2122,20 @@ impl RaftCluster {
         // Create query handler for metadata queries (Phase 1.2)
         let cluster_for_query = self.clone();
         let query_handler = Arc::new(move |query_data: Vec<u8>| {
-            // Deserialize query
-            let query: crate::metadata_rpc::MetadataQuery = bincode::deserialize(&query_data)
-                .map_err(|e| format!("Failed to deserialize query: {}", e))?;
+            let cluster = cluster_for_query.clone();
+            Box::pin(async move {
+                // Deserialize query
+                let query: crate::metadata_rpc::MetadataQuery = bincode::deserialize(&query_data)
+                    .map_err(|e| format!("Failed to deserialize query: {}", e))?;
 
-            // Execute query on local state machine
-            let response = cluster_for_query.execute_query_local(query)
-                .map_err(|e| format!("Failed to execute query: {}", e))?;
+                // Execute query on local state machine
+                let response = cluster.execute_query_local(query).await
+                    .map_err(|e| format!("Failed to execute query: {}", e))?;
 
-            // Serialize response
-            bincode::serialize(&response)
-                .map_err(|e| format!("Failed to serialize response: {}", e))
+                // Serialize response
+                bincode::serialize(&response)
+                    .map_err(|e| format!("Failed to serialize response: {}", e))
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
         });
 
         // Create write handler for metadata writes (Phase 1.2)

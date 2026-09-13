@@ -18,7 +18,11 @@ pub type MessageHandler = Arc<dyn Fn(raft::prelude::Message) -> Result<(), Strin
 
 /// Metadata query handler callback type.
 /// Executes metadata queries on the leader's state machine.
-pub type QueryHandler = Arc<dyn Fn(Vec<u8>) -> Result<Vec<u8>, String> + Send + Sync>;
+pub type QueryHandler = Arc<
+    dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Metadata write handler callback type.
 /// Proposes metadata write commands via Raft consensus.
@@ -187,7 +191,7 @@ impl raft_service_server::RaftService for RaftServiceImpl {
             .ok_or_else(|| Status::unimplemented("Query handler not configured"))?;
 
         // Execute query via handler
-        match handler(req.query_data) {
+        match handler(req.query_data).await {
             Ok(response_data) => Ok(Response::new(QueryMetadataResponse {
                 success: true,
                 error: String::new(),
