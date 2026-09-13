@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.14.1] - 2026-09-13
+
+Metadata correctness. A cluster could not rebuild its catalog after a restart,
+and the failure was silent.
+
+### Fixed
+
+- **Replicated metadata was never persisted.** `WalMetadataStore` has two
+  `apply_replicated_event`: an inherent one that writes to the local metadata
+  WAL, carrying a doc comment promising that replicated metadata "survives pod
+  restarts", and the `MetadataStore` trait method — the one followers actually
+  reach through `Arc<dyn MetadataStore>` — which applied to memory only.
+
+  So a follower discarded every topic and partition assignment it had learned by
+  replication on each restart, keeping only what it had written itself, and then
+  depended entirely on the leader re-broadcasting to be told again. Under
+  follower-pull a node that does not know who leads a partition cannot fetch it,
+  so the gap was not cosmetic: the node silently replicated nothing.
+
+  Measured on a 3-node cluster: a restarted node reported **17 of 5,612**
+  partition assignments and sat there for nine minutes. A full simultaneous roll
+  left the three nodes at 17 / 4,726 / 914 and needed Raft leadership moved by
+  hand to recover. After the fix the same roll converges to 5,612 on all three
+  in about two minutes.
+
+- **A leader with a thin catalog deadlocked the cluster.** Only the Raft leader
+  re-broadcasts (deliberately — every node publishing its own view is gossip
+  with no tiebreak). That makes a restarted leader the one node entitled to
+  state the catalog and the one that knows least, while the nodes that still
+  have it may not speak. The leader now asks its peers first and adopts when one
+  clearly knows more, and the pass that adopts does not also assert.
+
+- **`MetadataQuery::ListTopics` returned an empty list, successfully.** Ever
+  since topic metadata moved out of the Raft state machine, a peer asking a node
+  what topics it held was told "none". Every catch-up path the code comments
+  promise is built on that answer, which is why none of them worked.
+
+- **The catalog anti-entropy pass could only add, never remove.** It re-publishes
+  `TopicCreated` and `PartitionAssigned`, so a node that missed a `TopicDeleted`
+  while it was down kept the topic forever. Adds `CatalogSnapshot`, in which the
+  authoritative node states the complete set so that absence carries meaning.
+
+  Pruning is the only path that removes a topic without anyone asking, so it is
+  heavily guarded: an empty snapshot never prunes; a snapshot that would remove
+  more than 20% of the catalog is refused as partial; the publisher stays silent
+  until its own topic count is unchanged across two passes; older snapshots are
+  ignored; internal `__` topics are exempt. A follower turns a snapshot into
+  ordinary `TopicDeleted` events, so the prune is durable and survives replay.
+
+### Added
+
+- `CHRONIK_METADATA_CATALOG_PRUNE=false` — disable catalog pruning entirely.
+- `CHRONIK_METADATA_MAX_PRUNE_FRACTION` — the mass-prune ceiling (default `0.20`).
+
+### Notes
+
+- Raft still does not replicate metadata: that rides the WAL transport on 9291,
+  and metadata lives in `WalMetadataStore`. Raft only lends its gRPC channel for
+  the peer catalog query, because the metadata transport is push-only and cannot
+  answer a question. It receives a callback, not the store.
+
+
 ## [2.14.0] - 2026-09-11
 
 Security controls that are actually enforced, plus two consumer-group fixes.
