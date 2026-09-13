@@ -38,10 +38,14 @@ const CHRONIK_IMAGE_UID: i64 = 1001;
 /// short root container that runs before the broker. It is idempotent and cheap
 /// on an already-correct volume — `find -uid` walks and changes nothing — and it
 /// touches only the mounted data directory.
-fn build_chown_init_container(image: &str) -> Container {
+fn build_chown_init_container(image: &str, pull_policy: &str) -> Container {
     Container {
         name: "fix-data-ownership".into(),
         image: Some(image.to_string()),
+        // The same image as the broker, so it must follow the same pull rules:
+        // an explicit `Never` (side-loaded image) or `Always` must not be
+        // silently downgraded to the Kubernetes default for this container.
+        image_pull_policy: Some(pull_policy.to_string()),
         // Only the entries that are wrong, so a healthy volume costs one walk
         // rather than a full recursive chown of millions of files.
         command: Some(vec!["sh".into(), "-c".into()]),
@@ -73,9 +77,13 @@ fn build_chown_init_container(image: &str) -> Container {
 /// correctly-owned volume it does nothing. Disable it for clusters whose
 /// PodSecurity policy forbids a root container, having made the data writable by
 /// the broker's UID some other way.
-fn chown_init_containers(enabled: Option<bool>, image: &str) -> Option<Vec<Container>> {
+fn chown_init_containers(
+    enabled: Option<bool>,
+    image: &str,
+    pull_policy: &str,
+) -> Option<Vec<Container>> {
     if enabled.unwrap_or(true) {
-        Some(vec![build_chown_init_container(image)])
+        Some(vec![build_chown_init_container(image, pull_policy)])
     } else {
         None
     }
@@ -391,7 +399,11 @@ pub fn build_standalone_pod(
             tolerations,
             image_pull_secrets,
             security_context: resolve_pod_security_context(spec.pod_security_context.as_ref()),
-            init_containers: chown_init_containers(spec.fix_data_ownership, &spec.image),
+            init_containers: chown_init_containers(
+                spec.fix_data_ownership,
+                &spec.image,
+                &spec.image_pull_policy,
+            ),
             volumes: Some(vec![Volume {
                 name: "data".into(),
                 persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
@@ -755,7 +767,11 @@ pub fn build_cluster_node_pod(
             image_pull_secrets,
             affinity,
             security_context: resolve_pod_security_context(spec.pod_security_context.as_ref()),
-            init_containers: chown_init_containers(spec.fix_data_ownership, &spec.image),
+            init_containers: chown_init_containers(
+                spec.fix_data_ownership,
+                &spec.image,
+                &spec.image_pull_policy,
+            ),
             volumes: Some(vec![
                 Volume {
                     name: "data".into(),
@@ -1103,7 +1119,10 @@ mod tests {
         assert_eq!(ctx.run_as_user, Some(2000));
         assert_eq!(ctx.run_as_group, Some(2000));
         assert_eq!(ctx.run_as_non_root, Some(true));
-        assert_eq!(ctx.fs_group_change_policy.as_deref(), Some("OnRootMismatch"));
+        assert_eq!(
+            ctx.fs_group_change_policy.as_deref(),
+            Some("OnRootMismatch")
+        );
     }
 
     #[test]
@@ -1129,15 +1148,22 @@ mod tests {
     /// the cluster looks healthy while every produce times out.
     #[test]
     fn ownership_repair_runs_by_default() {
-        let containers = chown_init_containers(None, "chronik-server:test")
+        let containers = chown_init_containers(None, "chronik-server:test", "IfNotPresent")
             .expect("must default to on");
         assert_eq!(containers.len(), 1);
         let c = &containers[0];
         assert_eq!(c.name, "fix-data-ownership");
 
         // It has to be root — chowning someone else's files is the whole job.
-        let sc = c.security_context.as_ref().expect("needs a security context");
-        assert_eq!(sc.run_as_user, Some(0), "must run as root or it cannot chown");
+        let sc = c
+            .security_context
+            .as_ref()
+            .expect("needs a security context");
+        assert_eq!(
+            sc.run_as_user,
+            Some(0),
+            "must run as root or it cannot chown"
+        );
 
         // And it must only touch the data directory.
         let mounts = c.volume_mounts.as_ref().expect("needs the data mount");
@@ -1145,7 +1171,10 @@ mod tests {
         assert_eq!(mounts[0].mount_path, constants::defaults::DATA_DIR);
 
         let args = c.args.as_ref().expect("needs args").join(" ");
-        assert!(args.contains(&format!("chown {}:{}", CHRONIK_IMAGE_UID, CHRONIK_IMAGE_UID)));
+        assert!(args.contains(&format!(
+            "chown {}:{}",
+            CHRONIK_IMAGE_UID, CHRONIK_IMAGE_UID
+        )));
         assert!(
             args.contains(&format!("! -uid {}", CHRONIK_IMAGE_UID)),
             "must only touch entries that are actually wrong, so a healthy \
@@ -1157,7 +1186,7 @@ mod tests {
     #[test]
     fn ownership_repair_can_be_disabled() {
         assert!(
-            chown_init_containers(Some(false), "chronik-server:test").is_none(),
+            chown_init_containers(Some(false), "chronik-server:test", "IfNotPresent").is_none(),
             "a cluster whose PodSecurity policy forbids root containers must be able to opt out"
         );
     }
@@ -1179,7 +1208,7 @@ mod tests {
         // ...and the init container still runs, because fsGroup does not cover
         // hostPath and that is where the outage happened.
         assert!(
-            chown_init_containers(None, "chronik-server:test").is_some(),
+            chown_init_containers(None, "chronik-server:test", "IfNotPresent").is_some(),
             "fsGroup alone does not cover hostPath - the init container must still run"
         );
     }
@@ -1213,7 +1242,10 @@ mod tests {
         assert_eq!(inits.len(), 1);
         assert_eq!(inits[0].name, "fix-data-ownership");
         assert_eq!(
-            inits[0].security_context.as_ref().and_then(|s| s.run_as_user),
+            inits[0]
+                .security_context
+                .as_ref()
+                .and_then(|s| s.run_as_user),
             Some(0),
             "it cannot chown another user's files unless it runs as root"
         );
@@ -1237,6 +1269,47 @@ mod tests {
         );
     }
 
+    /// The init container runs the same image as the broker, so it has to obey
+    /// the same pull policy. `Never` is the case that bites: the image has been
+    /// side-loaded onto the node, and a container left on the Kubernetes default
+    /// would try to pull it from a registry that does not have it.
+    #[test]
+    fn the_ownership_repair_follows_the_configured_pull_policy() {
+        use crate::crds::cluster::ChronikClusterSpec;
+
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "chronik.io/v1alpha1".into(),
+            kind: "ChronikCluster".into(),
+            name: "c".into(),
+            uid: "u".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+
+        let spec: ChronikClusterSpec =
+            serde_json::from_str(r#"{"imagePullPolicy": "Never"}"#).unwrap();
+        let pod = build_cluster_node_pod("c", "default", 1, &spec, owner, None);
+        let pod_spec = pod.spec.expect("pod needs a spec");
+
+        let init = pod_spec
+            .init_containers
+            .expect("init container must be present")
+            .into_iter()
+            .find(|c| c.name == "fix-data-ownership")
+            .expect("ownership repair must be present");
+
+        assert_eq!(
+            init.image_pull_policy.as_deref(),
+            Some("Never"),
+            "the repair container must not be left on the Kubernetes default \
+             while the broker is pinned to a side-loaded image"
+        );
+        assert_eq!(
+            init.image_pull_policy, pod_spec.containers[0].image_pull_policy,
+            "both containers run the same image, so both must pull it the same way"
+        );
+    }
+
     /// And opting out must actually remove it from the Pod.
     #[test]
     fn opting_out_removes_it_from_the_built_pod() {
@@ -1244,7 +1317,11 @@ mod tests {
 
         let spec: ChronikClusterSpec =
             serde_json::from_str(r#"{"fixDataOwnership": false}"#).unwrap();
-        assert_eq!(spec.fix_data_ownership, Some(false), "CRD field must deserialize");
+        assert_eq!(
+            spec.fix_data_ownership,
+            Some(false),
+            "CRD field must deserialize"
+        );
 
         let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
             api_version: "chronik.io/v1alpha1".into(),
@@ -1256,7 +1333,10 @@ mod tests {
         };
         let pod = build_cluster_node_pod("c", "default", 1, &spec, owner, None);
         assert!(
-            pod.spec.expect("pod needs a spec").init_containers.is_none(),
+            pod.spec
+                .expect("pod needs a spec")
+                .init_containers
+                .is_none(),
             "fixDataOwnership: false must remove the root init container"
         );
     }
