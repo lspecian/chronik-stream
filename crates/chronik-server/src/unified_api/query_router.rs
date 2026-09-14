@@ -1104,6 +1104,24 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         );
     }
 
+    // Two different topics cannot be combined by fanning out. Each node holds
+    // its own partitions of both, and rows pair up by value, not by partition —
+    // so a pair whose halves lead on different nodes is never formed anywhere.
+    // Measured: a join of two 900-row topics on a shared id returned 316.
+    //
+    // A topic joined to itself is safe, because both sides of any pair are on
+    // the same node by construction; that is why the self-join came back right
+    // and hid this.
+    if distinct_relation_count(query) > 1 {
+        return SqlMerge::Unsupported(
+            "a query over more than one topic cannot be merged across nodes: rows pair up by \
+             value while the nodes are split by partition, so a pair whose sides lead on \
+             different nodes is never matched. Query one topic per request and combine in the \
+             client."
+                .to_string(),
+        );
+    }
+
     // Classify every projected column.
     let mut columns: Vec<ColumnMerge> = Vec::new();
     for item in &select.projection {
@@ -1225,6 +1243,50 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
     )
 }
 
+/// How many distinct real topics the query reads.
+///
+/// CTE names are excluded: `WITH a AS (SELECT ... FROM t) SELECT ... FROM a`
+/// reads one topic, and counting `a` as a second would refuse a query that
+/// merges correctly today.
+fn distinct_relation_count(
+    query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+) -> usize {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        visit_relations, Query, Visit, Visitor,
+    };
+    use std::collections::HashSet;
+    use std::ops::ControlFlow;
+
+    // Names bound by a WITH clause anywhere in the query.
+    struct CteNames(HashSet<String>);
+    impl Visitor for CteNames {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if let Some(with) = q.with.as_ref() {
+                for cte in &with.cte_tables {
+                    self.0.insert(cte.alias.name.value.to_ascii_lowercase());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut ctes = CteNames(HashSet::new());
+    let _ = query.visit(&mut ctes);
+
+    let mut names: HashSet<String> = HashSet::new();
+    let _: ControlFlow<()> = visit_relations(query, |name| {
+        let text = name
+            .0
+            .last()
+            .map(|i| i.value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !ctes.0.contains(&text) {
+            names.insert(text);
+        }
+        ControlFlow::Continue(())
+    });
+    names.len()
+}
 /// Whether any subquery de-duplicates: `DISTINCT`, `GROUP BY`, or a set
 /// operation that is not `UNION ALL`.
 ///
@@ -2851,6 +2913,36 @@ mod sql_merge_tests {
         );
         assert_eq!(
             sql_merge_strategy("SELECT COUNT(*) AS c FROM t WHERE sev = 'ERROR'"),
+            SqlMerge::ScalarAggregate(vec![AggMerge::Sum])
+        );
+    }
+
+    /// A join of two topics returned 316 where the answer was 900: rows pair up
+    /// by value, the nodes are split by partition, and a pair whose sides lead
+    /// on different nodes is formed nowhere.
+    #[test]
+    fn a_query_over_two_topics_is_refused() {
+        assert!(
+            refusal("SELECT COUNT(*) AS c FROM logs a JOIN side b ON a.id = b.id")
+                .contains("more than one topic")
+        );
+        assert!(
+            refusal("SELECT COUNT(*) AS c FROM logs WHERE id IN (SELECT id FROM side)")
+                .contains("more than one topic")
+        );
+    }
+
+    /// …but one topic joined to itself is co-located on every node, and a CTE
+    /// over a single topic is still a single topic. Both merged correctly before
+    /// and must keep doing so.
+    #[test]
+    fn one_topic_is_still_merged_even_when_named_twice() {
+        assert_eq!(
+            sql_merge_strategy("SELECT COUNT(*) AS c FROM logs a JOIN logs b ON a.id = b.id"),
+            SqlMerge::ScalarAggregate(vec![AggMerge::Sum])
+        );
+        assert_eq!(
+            sql_merge_strategy("WITH a AS (SELECT id FROM logs) SELECT COUNT(*) AS c FROM a"),
             SqlMerge::ScalarAggregate(vec![AggMerge::Sum])
         );
     }
