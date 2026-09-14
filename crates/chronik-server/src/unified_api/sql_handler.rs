@@ -1104,6 +1104,12 @@ pub async fn execute_sql(
                                                 response, peers, &how,
                                             )
                                         }
+                                        super::query_router::SqlMerge::GroupedAggregate {
+                                            how,
+                                            post,
+                                        } => super::query_router::merge_grouped_aggregate(
+                                            response, peers, &how, &post, row_limit,
+                                        ),
                                         super::query_router::SqlMerge::Concatenate(post) => {
                                             super::query_router::merge_sql_responses(
                                                 response, peers, row_limit, &post,

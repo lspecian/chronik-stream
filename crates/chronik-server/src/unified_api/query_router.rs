@@ -817,6 +817,12 @@ pub enum SqlMerge {
     /// One row per node; combine column by column with these functions, in the
     /// order the columns appear.
     ScalarAggregate(Vec<AggMerge>),
+    /// Grouped results: re-aggregate by group key across nodes. Runs parallel to
+    /// the response columns — `None` is a group key, `Some(op)` an aggregate.
+    GroupedAggregate {
+        how: Vec<Option<AggMerge>>,
+        post: PostMerge,
+    },
     /// Cannot be combined without changing the query. Better to say so than to
     /// return a number that looks right.
     Unsupported(String),
@@ -1132,23 +1138,46 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         .iter()
         .any(|c| matches!(c, ColumnMerge::Mergeable(_)));
 
-    if grouped {
-        return SqlMerge::Unsupported(
-            "GROUP BY cannot be merged across nodes: each node groups only its own partitions, \
-             so the same key appears once per node and the groups would need re-aggregating by \
-             key."
-                .to_string(),
-        );
-    }
-
-    if !any_agg {
-        if select.distinct.is_some() {
+    if grouped || select.distinct.is_some() {
+        // A LIMIT was applied by each node to its own groups, so a key that is
+        // large overall but small on one node can be cut there before the groups
+        // are combined — and the merged count is then short by whatever was cut.
+        // Repairing that means running the peers without the LIMIT, which is a
+        // different query from the one the caller sent.
+        if query.limit.is_some() || query.offset.is_some() {
             return SqlMerge::Unsupported(
-                "SELECT DISTINCT cannot be merged across nodes: each node de-duplicates only \
-                 its own partitions, so a value held by two nodes appears twice."
+                "GROUP BY with LIMIT/OFFSET cannot be merged across nodes: each node applies the \
+                 limit to its own groups, so a group that is small on one node can be dropped \
+                 there before the groups are combined. Remove the LIMIT and page in the client."
                     .to_string(),
             );
         }
+
+        let Some(order_by) = resolve_order_by(query, select) else {
+            return SqlMerge::Unsupported(
+                "ORDER BY cannot be applied across nodes unless every term is a projected \
+                 column: the groups are ranked only once they have been combined, and the \
+                 coordinator can only sort by values the query returned."
+                    .to_string(),
+            );
+        };
+
+        return SqlMerge::GroupedAggregate {
+            how: columns
+                .iter()
+                .map(|c| match c {
+                    ColumnMerge::Mergeable(op) => Some(*op),
+                    _ => None,
+                })
+                .collect(),
+            post: PostMerge {
+                order_by,
+                limit: None,
+            },
+        };
+    }
+
+    if !any_agg {
         // Each node applied the query's own OFFSET to its own rows, so the rows
         // it skipped are not the rows the query meant to skip. Unlike LIMIT,
         // that cannot be repaired from what came back — the skipped rows are
@@ -1465,6 +1494,108 @@ pub fn merge_scalar_aggregate(
     }
 }
 
+/// Combine grouped results from every node by re-aggregating on the group key.
+///
+/// Each node grouped only the partitions it leads, so a key present on three
+/// nodes arrives as three partial groups. Summing the counts of matching keys —
+/// and taking the extremum of MIN/MAX — reconstructs the group exactly, because
+/// the nodes' inputs are disjoint.
+///
+/// `how` runs parallel to the response columns: `None` marks a group key,
+/// `Some(op)` an aggregate and the way it combines.
+pub fn merge_grouped_aggregate(
+    local: SqlResponse,
+    peers: Vec<SqlResponse>,
+    how: &[Option<AggMerge>],
+    post: &PostMerge,
+    limit: usize,
+) -> SqlResponse {
+    // Same self-consistency guard as the other merges (#42): a coordinator that
+    // matched no rows describes no columns, so adopt the first peer's schema.
+    let mut columns = local.columns.clone();
+    let execution_time_ms = local.execution_time_ms;
+
+    let mut all_rows = local.rows;
+    for peer in peers {
+        if columns.is_empty() && !peer.columns.is_empty() {
+            columns = peer.columns.clone();
+        }
+        all_rows.extend(peer.rows);
+    }
+
+    let key_columns: Vec<&String> = columns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| how.get(*i).copied().flatten().is_none())
+        .map(|(_, c)| c)
+        .collect();
+
+    // Group key -> merged row. Insertion order is kept so that a query without
+    // ORDER BY still returns something stable rather than hash order.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, HashMap<String, serde_json::Value>> = HashMap::new();
+
+    for row in all_rows {
+        // The rendered key values identify the group; JSON values are not
+        // hashable, and rendering keeps 1 and "1" distinct.
+        let identity = key_columns
+            .iter()
+            .map(|c| {
+                row.get(c.as_str())
+                    .unwrap_or(&serde_json::Value::Null)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+
+        match groups.get_mut(&identity) {
+            None => {
+                order.push(identity.clone());
+                groups.insert(identity, row);
+            }
+            Some(existing) => {
+                for (idx, column) in columns.iter().enumerate() {
+                    let Some(op) = how.get(idx).copied().flatten() else {
+                        continue; // a key column: already equal by construction
+                    };
+                    let Some(incoming) = row.get(column) else {
+                        continue;
+                    };
+                    if incoming.is_null() {
+                        continue;
+                    }
+                    let merged = match existing.get(column) {
+                        Some(current) if !current.is_null() => {
+                            combine_numbers(current, incoming, op)
+                        }
+                        _ => incoming.clone(),
+                    };
+                    existing.insert(column.clone(), merged);
+                }
+            }
+        }
+    }
+
+    let mut rows: Vec<HashMap<String, serde_json::Value>> = order
+        .into_iter()
+        .filter_map(|k| groups.remove(&k))
+        .collect();
+
+    // The query's ORDER BY ranks the combined groups, not each node's own.
+    apply_post_merge(&mut rows, post);
+
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    let row_count = rows.len();
+
+    SqlResponse {
+        columns,
+        rows,
+        row_count,
+        execution_time_ms,
+        truncated,
+    }
+}
 /// Combine two JSON numbers. Non-numeric values keep the accumulator, since
 /// there is no meaningful sum of two strings.
 fn combine_numbers(
@@ -2449,22 +2580,79 @@ mod sql_merge_tests {
         }
     }
 
-    /// GROUP BY needs re-aggregation by key, which merging output rows cannot do.
+    /// GROUP BY is re-aggregated by key across nodes: the same key arrives once
+    /// per node and the partial groups are combined.
     #[test]
-    fn group_by_is_refused() {
-        match sql_merge_strategy("SELECT k, COUNT(*) FROM orders GROUP BY k") {
-            SqlMerge::Unsupported(why) => assert!(why.contains("GROUP BY")),
-            other => panic!("GROUP BY must not be merged: {:?}", other),
-        }
+    fn group_by_is_re_aggregated_by_key() {
+        let SqlMerge::GroupedAggregate { how, .. } =
+            sql_merge_strategy("SELECT k, COUNT(*) AS c FROM orders GROUP BY k")
+        else {
+            panic!("GROUP BY should now merge by key");
+        };
+        assert_eq!(
+            how,
+            vec![None, Some(AggMerge::Sum)],
+            "k is a key, c a count"
+        );
+
+        // Three nodes, each having grouped only its own partitions.
+        let local = resp(&["k", "c"], vec![row(&[("k", 1), ("c", 10)])]);
+        let peers = vec![
+            resp(
+                &["k", "c"],
+                vec![row(&[("k", 1), ("c", 5)]), row(&[("k", 2), ("c", 7)])],
+            ),
+            resp(&["k", "c"], vec![row(&[("k", 2), ("c", 3)])]),
+        ];
+        let merged = merge_grouped_aggregate(local, peers, &how, &PostMerge::default(), 1000);
+        assert_eq!(merged.rows.len(), 2, "two distinct keys, not four partials");
+
+        let mut counts: Vec<(i64, i64)> = merged
+            .rows
+            .iter()
+            .map(|r| (r["k"].as_i64().unwrap(), r["c"].as_i64().unwrap()))
+            .collect();
+        counts.sort();
+        assert_eq!(counts, vec![(1, 15), (2, 10)]);
     }
 
-    /// DISTINCT de-duplicates per node, so a value on two nodes survives twice.
+    /// DISTINCT is the same merge with every column a key, so a value held by
+    /// two nodes collapses to one row instead of surviving twice.
     #[test]
-    fn distinct_is_refused() {
-        match sql_merge_strategy("SELECT DISTINCT k FROM orders") {
-            SqlMerge::Unsupported(why) => assert!(why.contains("DISTINCT")),
-            other => panic!("DISTINCT must not be merged: {:?}", other),
-        }
+    fn distinct_collapses_values_held_by_more_than_one_node() {
+        let SqlMerge::GroupedAggregate { how, .. } =
+            sql_merge_strategy("SELECT DISTINCT k FROM orders")
+        else {
+            panic!("DISTINCT should now merge by key");
+        };
+        assert_eq!(how, vec![None]);
+
+        let local = resp(&["k"], vec![row(&[("k", 1)])]);
+        let peers = vec![
+            resp(&["k"], vec![row(&[("k", 1)]), row(&[("k", 2)])]),
+            resp(&["k"], vec![row(&[("k", 1)])]),
+        ];
+        let merged = merge_grouped_aggregate(local, peers, &how, &PostMerge::default(), 1000);
+        assert_eq!(merged.rows.len(), 2, "k=1 was held by all three nodes");
+    }
+
+    /// A per-node LIMIT can drop a group on one node before the groups are
+    /// combined, which is not recoverable from what came back.
+    #[test]
+    fn group_by_with_a_limit_is_refused() {
+        assert!(
+            refusal("SELECT k, COUNT(*) AS c FROM t GROUP BY k ORDER BY c DESC LIMIT 10")
+                .contains("LIMIT")
+        );
+    }
+
+    /// Grouping still refuses HAVING: each node would filter on its own partial.
+    #[test]
+    fn group_by_with_having_is_refused() {
+        assert!(
+            refusal("SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING COUNT(*) > 5")
+                .contains("HAVING")
+        );
     }
 
     /// A null from a node that holds no rows must not erase another node's value.
