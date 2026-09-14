@@ -28,7 +28,7 @@ use super::vector_handler::{
 };
 
 // Re-export for use in handlers
-pub use chronik_search::api::{SearchResponse, ShardInfo, HitsInfo, TotalHits, Hit};
+pub use chronik_search::api::{Hit, HitsInfo, SearchResponse, ShardInfo, TotalHits};
 
 /// HTTP header for loop prevention. Forwarded requests include this header.
 /// Receiving nodes with depth >= 1 execute locally only (no further fan-out).
@@ -239,14 +239,11 @@ impl QueryRouter {
                     .rsplit_once(':')
                     .map(|(h, _)| h)
                     .unwrap_or("localhost");
-                let port = std::env::var(format!(
-                    "CHRONIK_UNIFIED_API_PORT_NODE_{}",
-                    peer.id
-                ))
-                .ok()
-                .and_then(|v| v.parse::<u16>().ok())
-                .or(env_port)
-                .unwrap_or(6091 + peer.id as u16);
+                let port = std::env::var(format!("CHRONIK_UNIFIED_API_PORT_NODE_{}", peer.id))
+                    .ok()
+                    .and_then(|v| v.parse::<u16>().ok())
+                    .or(env_port)
+                    .unwrap_or(6091 + peer.id as u16);
                 PeerNode {
                     node_id: peer.id,
                     url: format!("http://{}:{}", host, port),
@@ -267,8 +264,10 @@ impl QueryRouter {
             .build()
             .expect("Failed to create reqwest client for QueryRouter");
 
-        let peer_metrics: HashMap<u64, PeerMetrics> =
-            peers.iter().map(|p| (p.node_id, PeerMetrics::new())).collect();
+        let peer_metrics: HashMap<u64, PeerMetrics> = peers
+            .iter()
+            .map(|p| (p.node_id, PeerMetrics::new()))
+            .collect();
 
         info!(
             peer_metrics_count = peer_metrics.len(),
@@ -289,11 +288,7 @@ impl QueryRouter {
     ///
     /// Called before fan-out to ensure routing is current.
     /// Uses `get_partition_assignments()` which is lock-free (DashMap).
-    pub async fn refresh_partition_map(
-        &self,
-        metadata_store: &dyn MetadataStore,
-        topic: &str,
-    ) {
+    pub async fn refresh_partition_map(&self, metadata_store: &dyn MetadataStore, topic: &str) {
         match metadata_store.get_partition_assignments(topic).await {
             Ok(assignments) => {
                 let mut map = self.partition_map.write().await;
@@ -334,8 +329,7 @@ impl QueryRouter {
                 return self.peers.iter().collect();
             }
 
-            let mut selected_ids: std::collections::HashSet<u64> =
-                std::collections::HashSet::new();
+            let mut selected_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
             for partition_replicas in replicas.values() {
                 // Skip partitions available locally (handled by local execution)
@@ -398,9 +392,9 @@ impl QueryRouter {
             if replicas.is_empty() {
                 return false; // No partition info, assume remote data exists
             }
-            replicas.values().all(|partition_replicas| {
-                partition_replicas.contains(&self.self_node_id)
-            })
+            replicas
+                .values()
+                .all(|partition_replicas| partition_replicas.contains(&self.self_node_id))
         } else {
             false // No partition info for topic
         }
@@ -494,7 +488,8 @@ impl QueryRouter {
     pub async fn refresh_all_partition_maps(&self, metadata_store: &dyn MetadataStore) {
         if let Ok(topics) = metadata_store.list_topics().await {
             for topic in &topics {
-                self.refresh_partition_map(metadata_store, &topic.name).await;
+                self.refresh_partition_map(metadata_store, &topic.name)
+                    .await;
             }
         }
     }
@@ -684,7 +679,11 @@ pub fn merge_vector_responses(
     }
 
     let mut merged: Vec<VectorSearchResultItem> = best.into_values().collect();
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     merged.truncate(k);
 
     VectorSearchResponse {
@@ -741,7 +740,11 @@ pub fn merge_hybrid_responses(
     }
 
     let mut merged: Vec<HybridSearchResultItem> = best.into_values().collect();
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     merged.truncate(k);
 
     HybridSearchResponse {
@@ -764,6 +767,7 @@ pub fn merge_sql_responses(
     local: SqlResponse,
     peers: Vec<SqlResponse>,
     limit: usize,
+    post: &PostMerge,
 ) -> SqlResponse {
     // #42: a projection (e.g. SELECT *) fanned across nodes can return zero rows
     // on the coordinator when the matching partitions live on peers — leaving
@@ -780,6 +784,11 @@ pub fn merge_sql_responses(
         }
         all_rows.extend(peer_resp.rows);
     }
+
+    // Sort and limit across the union, before the transport cap: each node only
+    // ordered and limited its own partitions, so this is where the query's
+    // ORDER BY and LIMIT actually get applied (#55).
+    apply_post_merge(&mut all_rows, post);
 
     let truncated = all_rows.len() > limit;
     all_rows.truncate(limit);
@@ -802,14 +811,42 @@ pub fn merge_sql_responses(
 /// concatenating them produces three rows where the caller asked for one number.
 #[derive(Debug, PartialEq)]
 pub enum SqlMerge {
-    /// Rows from each node are disjoint; append them.
-    Concatenate,
+    /// Rows from each node are disjoint; append them, then finish the query's
+    /// `ORDER BY` / `LIMIT` over the combined rows.
+    Concatenate(PostMerge),
     /// One row per node; combine column by column with these functions, in the
     /// order the columns appear.
     ScalarAggregate(Vec<AggMerge>),
     /// Cannot be combined without changing the query. Better to say so than to
     /// return a number that looks right.
-    Unsupported(&'static str),
+    Unsupported(String),
+}
+
+/// What the coordinator still owes the query once every node's rows are in.
+///
+/// A fanned-out `ORDER BY ... LIMIT n` is not finished when the rows arrive:
+/// each node sorted and limited only its own partitions, so the union is n rows
+/// per node in per-node order. Sorting the union and taking n is what makes it
+/// the answer — without it `ORDER BY id DESC LIMIT 5` over three nodes returned
+/// 15 rows and its first five were not the top five (#55).
+///
+/// Taking the top n globally from each node's own top n is sound: a row in the
+/// global top n is in its own node's top n, so no candidate is missing.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PostMerge {
+    /// Output columns to sort by, outermost first. Empty means the query did
+    /// not ask for an order.
+    pub order_by: Vec<OrderKey>,
+    /// The query's own `LIMIT`, to apply once over the combined rows.
+    pub limit: Option<usize>,
+}
+
+/// One `ORDER BY` term, resolved to the name of a column in the response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderKey {
+    pub column: String,
+    pub descending: bool,
+    pub nulls_first: bool,
 }
 
 /// How one aggregate column combines across nodes.
@@ -820,33 +857,227 @@ pub enum AggMerge {
     Max,
 }
 
+/// Every aggregate the query engine can evaluate, lower-cased, aliases included.
+///
+/// Read from DataFusion's own registry rather than kept by hand. The previous
+/// matcher recognised four names and treated every other function as a row-wise
+/// expression, so `median`, `stddev`, `approx_percentile_cont`, `array_agg` and
+/// the rest were fanned out and their per-node results simply concatenated —
+/// three rows where the caller asked for one number, returned as `200 OK`
+/// (issue #55). A hand-kept list is how that happens again the next time
+/// DataFusion gains an aggregate.
+fn aggregate_function_names() -> &'static std::collections::HashSet<String> {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        use chronik_columnar::datafusion::functions_aggregate::all_default_aggregate_functions;
+        let mut set = std::collections::HashSet::new();
+        for f in all_default_aggregate_functions() {
+            set.insert(f.name().to_ascii_lowercase());
+            for alias in f.aliases() {
+                set.insert(alias.to_ascii_lowercase());
+            }
+        }
+        set
+    })
+}
+
+/// What one projected column needs from the merge.
+#[derive(Debug, Clone, PartialEq)]
+enum ColumnMerge {
+    /// Carries no aggregate: a group key, or an ordinary projected value.
+    RowWise,
+    /// A whole-column aggregate that combines exactly across disjoint inputs.
+    Mergeable(AggMerge),
+    /// Anything else, with the reason to hand back to the caller.
+    Refuse(String),
+}
+
+/// Classify one projected expression for merging.
+///
+/// The rule is deliberately narrow: a column merges only when the expression is
+/// *exactly* one mergeable aggregate. An aggregate buried inside arithmetic or
+/// another call cannot be merged from its per-node results — `SUM(x)*2` fanned
+/// across three nodes gives three doubled partials, and no combination of them
+/// recovers the answer without re-deriving it from `SUM(x)` first.
+fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::Expr as SqlExpr;
+
+    let calls = scan_aggregate_calls(expr.0);
+    if calls.is_empty() {
+        return ColumnMerge::RowWise;
+    }
+
+    if let Some(AggCall::Window(name)) = calls.iter().find(|c| matches!(c, AggCall::Window(_))) {
+        return ColumnMerge::Refuse(format!(
+            "{name}() OVER (...) is evaluated over one node's partitions only, so every node \
+             restarts the window — ROW_NUMBER() returns 1, 2, 3 once per node."
+        ));
+    }
+
+    if calls.len() > 1 {
+        return ColumnMerge::Refuse(
+            "an expression combining more than one aggregate cannot be merged across nodes: \
+             each node returns its own partial of every aggregate, and the expression was \
+             already applied to them."
+                .to_string(),
+        );
+    }
+
+    // Exactly one aggregate. It has to *be* the column, not sit inside it.
+    match expr.0 {
+        SqlExpr::Function(f) if f.over.is_none() && is_aggregate_call(f) => {
+            let name = function_bare_name(f);
+            if function_is_distinct(f) {
+                return ColumnMerge::Refuse(format!(
+                    "{name}(DISTINCT ...) cannot be merged across nodes: each node de-duplicates \
+                     only its own partitions, so a value held by two nodes is counted twice."
+                ));
+            }
+            match name.as_str() {
+                "count" | "sum" => ColumnMerge::Mergeable(AggMerge::Sum),
+                "min" => ColumnMerge::Mergeable(AggMerge::Min),
+                "max" => ColumnMerge::Mergeable(AggMerge::Max),
+                "avg" | "mean" => ColumnMerge::Refuse(
+                    "AVG cannot be merged across nodes: averaging per-node averages is only \
+                     correct when every node holds the same number of rows. Use SUM(x) and \
+                     COUNT(x) as separate columns and divide in the client."
+                        .to_string(),
+                ),
+                other => ColumnMerge::Refuse(format!(
+                    "{other}(...) cannot be merged across nodes: it is not derivable from the \
+                     per-node results, which would otherwise be returned one row per node."
+                )),
+            }
+        }
+        _ => ColumnMerge::Refuse(
+            "an aggregate wrapped in an expression cannot be merged across nodes: the wrapping \
+             was already applied to each node's partial. Project the bare aggregate and apply \
+             the expression in the client."
+                .to_string(),
+        ),
+    }
+}
+
+/// An aggregate or window call found inside an expression.
+enum AggCall {
+    Aggregate,
+    Window(String),
+}
+
+/// Newtype so the helpers above can take a borrowed `Expr` without dragging the
+/// sqlparser import into every signature.
+struct SqlExprRef<'a>(&'a chronik_columnar::datafusion::sql::sqlparser::ast::Expr);
+
+fn function_bare_name(f: &chronik_columnar::datafusion::sql::sqlparser::ast::Function) -> String {
+    f.name
+        .0
+        .last()
+        .map(|i| i.value.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_aggregate_call(f: &chronik_columnar::datafusion::sql::sqlparser::ast::Function) -> bool {
+    aggregate_function_names().contains(&function_bare_name(f))
+}
+
+fn function_is_distinct(f: &chronik_columnar::datafusion::sql::sqlparser::ast::Function) -> bool {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        DuplicateTreatment, FunctionArguments,
+    };
+    matches!(&f.args, FunctionArguments::List(list)
+        if list.duplicate_treatment == Some(DuplicateTreatment::Distinct))
+}
+
+/// Find every aggregate and window call anywhere inside an expression.
+///
+/// Walks the whole tree rather than looking at the outermost node, because the
+/// outermost node is exactly what `ROUND(AVG(x), 2)` hides behind: that query
+/// used to slip past the AVG refusal and return one average per node.
+fn scan_aggregate_calls(
+    expr: &chronik_columnar::datafusion::sql::sqlparser::ast::Expr,
+) -> Vec<AggCall> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{visit_expressions, Expr as SqlExpr};
+    use std::ops::ControlFlow;
+
+    let mut found = Vec::new();
+    let _: ControlFlow<()> = visit_expressions(expr, |e| {
+        if let SqlExpr::Function(f) = e {
+            if f.over.is_some() {
+                found.push(AggCall::Window(function_bare_name(f)));
+            } else if is_aggregate_call(f) {
+                found.push(AggCall::Aggregate);
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Whether anything in this query is an aggregate or window call.
+fn query_has_aggregate(query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query) -> bool {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{visit_expressions, Expr as SqlExpr};
+    use std::ops::ControlFlow;
+
+    let mut found = false;
+    let _: ControlFlow<()> = visit_expressions(query, |e| {
+        if let SqlExpr::Function(f) = e {
+            if f.over.is_some() || is_aggregate_call(f) {
+                found = true;
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
 /// Decide how to merge, from the query itself.
 ///
 /// Deliberately conservative: anything not recognised as safely combinable is
-/// [`SqlMerge::Unsupported`] rather than guessed at. `AVG` is the clearest
-/// example — averaging three nodes' averages is not the average unless every
-/// node held the same number of rows, which is exactly what a partitioned topic
-/// does not guarantee. Computing it properly needs `SUM` and `COUNT` carried
-/// separately, which means rewriting the query, not merging its output.
+/// [`SqlMerge::Unsupported`] rather than guessed at, because the alternative is
+/// a plausible wrong number returned as `200 OK`. The previous version defaulted
+/// the other way — an unrecognised projection was assumed to be row-wise — and
+/// that default is what made `median`, `SUM(x)/COUNT(x)`, `COUNT(DISTINCT x)`
+/// and `ROUND(AVG(x),2)` all answer wrongly and silently (#55).
 pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
     use chronik_columnar::datafusion::sql::parser::{DFParser, Statement};
     use chronik_columnar::datafusion::sql::sqlparser::ast::{
-        Expr as SqlExpr, GroupByExpr, SelectItem, SetExpr, Statement as AstStatement,
+        GroupByExpr, SelectItem, SetExpr, Statement as AstStatement,
     };
 
     let Ok(statements) = DFParser::parse_sql(sql) else {
-        return SqlMerge::Concatenate; // unparseable here; the engine will reject it
+        return SqlMerge::Concatenate(PostMerge::default()); // unparseable here; the engine will reject it
     };
     let Some(Statement::Statement(ast)) = statements.front() else {
-        return SqlMerge::Concatenate;
+        return SqlMerge::Concatenate(PostMerge::default());
     };
     let AstStatement::Query(query) = ast.as_ref() else {
-        return SqlMerge::Concatenate;
+        return SqlMerge::Concatenate(PostMerge::default());
     };
+
     let SetExpr::Select(select) = query.body.as_ref() else {
-        // UNION and friends: the operands were each evaluated per node, so the
-        // shape is not something this function can reason about.
-        return SqlMerge::Concatenate;
+        // UNION / INTERSECT / EXCEPT. Each operand was evaluated per node, so an
+        // aggregate inside one of them arrives as partials that the set
+        // operation has already been applied to.
+        if query_has_aggregate(query) {
+            return SqlMerge::Unsupported(
+                "a set operation over aggregates cannot be merged across nodes: each node \
+                 contributes its own partial of every branch."
+                    .to_string(),
+            );
+        }
+        if let SetExpr::SetOperation { set_quantifier, .. } = query.body.as_ref() {
+            use chronik_columnar::datafusion::sql::sqlparser::ast::SetQuantifier;
+            if !matches!(set_quantifier, SetQuantifier::All) {
+                return SqlMerge::Unsupported(
+                    "UNION/INTERSECT/EXCEPT de-duplicate, and each node can only de-duplicate \
+                     its own partitions, so a row held by two nodes survives twice."
+                        .to_string(),
+                );
+            }
+        }
+        return SqlMerge::Concatenate(PostMerge::default());
     };
 
     let grouped = match &select.group_by {
@@ -854,57 +1085,59 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         GroupByExpr::All(_) => true,
     };
 
-    // Collect the aggregate function of each projected column, if any.
-    let mut aggs: Vec<Option<AggMerge>> = Vec::new();
+    // A DISTINCT or GROUP BY inside a subquery has already been applied to each
+    // node's own partitions before the outer query ran, so the outer result is
+    // built on per-node de-duplication. `SELECT COUNT(*) FROM (SELECT DISTINCT
+    // sev FROM t)` returned 9 on a three-node cluster where the answer was 3.
+    if query_has_nested_dedup(query) {
+        return SqlMerge::Unsupported(
+            "a DISTINCT or GROUP BY inside a subquery cannot be merged across nodes: each node \
+             de-duplicates only its own partitions, so the outer query counts the same value \
+             once per node."
+                .to_string(),
+        );
+    }
+
+    // Classify every projected column.
+    let mut columns: Vec<ColumnMerge> = Vec::new();
     for item in &select.projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) => expr,
             SelectItem::ExprWithAlias { expr, .. } => expr,
             // `*` is never an aggregate.
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                aggs.push(None);
+                columns.push(ColumnMerge::RowWise);
                 continue;
             }
         };
-
-        aggs.push(match expr {
-            SqlExpr::Function(f) => {
-                let name = f.name.to_string().to_ascii_uppercase();
-                match name.as_str() {
-                    "COUNT" | "SUM" => Some(AggMerge::Sum),
-                    "MIN" => Some(AggMerge::Min),
-                    "MAX" => Some(AggMerge::Max),
-                    "AVG" | "MEAN" => {
-                        return SqlMerge::Unsupported(
-                            "AVG cannot be merged across nodes: averaging per-node averages is \
-                             only correct when every node holds the same number of rows. Use \
-                             SUM(x) and COUNT(x) and divide.",
-                        )
-                    }
-                    // Unknown function: it may or may not be an aggregate, and
-                    // assuming wrong is how a query silently returns nonsense.
-                    _ => None,
-                }
-            }
-            _ => None,
-        });
+        columns.push(classify_projection(&SqlExprRef(expr)));
     }
 
-    let any_agg = aggs.iter().any(Option::is_some);
+    if let Some(ColumnMerge::Refuse(why)) =
+        columns.iter().find(|c| matches!(c, ColumnMerge::Refuse(_)))
+    {
+        return SqlMerge::Unsupported(why.clone());
+    }
+
+    // A HAVING clause filters groups on each node's partial counts.
+    if select.having.is_some() {
+        return SqlMerge::Unsupported(
+            "HAVING cannot be applied across nodes: each node would filter groups on its own \
+             partial aggregate before the groups are combined."
+                .to_string(),
+        );
+    }
+
+    let any_agg = columns
+        .iter()
+        .any(|c| matches!(c, ColumnMerge::Mergeable(_)));
 
     if grouped {
-        if any_agg {
-            return SqlMerge::Unsupported(
-                "GROUP BY cannot be merged across nodes: each node groups only its own \
-                 partitions, so the same key appears once per node and the groups would need \
-                 re-aggregating by key.",
-            );
-        }
-        // GROUP BY with no aggregate is a DISTINCT in disguise; concatenating
-        // can repeat a key across nodes, so it is not safe either.
         return SqlMerge::Unsupported(
-            "GROUP BY cannot be merged across nodes: the same key may be produced by more \
-             than one node.",
+            "GROUP BY cannot be merged across nodes: each node groups only its own partitions, \
+             so the same key appears once per node and the groups would need re-aggregating by \
+             key."
+                .to_string(),
         );
     }
 
@@ -912,23 +1145,270 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         if select.distinct.is_some() {
             return SqlMerge::Unsupported(
                 "SELECT DISTINCT cannot be merged across nodes: each node de-duplicates only \
-                 its own partitions, so a value held by two nodes appears twice.",
+                 its own partitions, so a value held by two nodes appears twice."
+                    .to_string(),
             );
         }
-        return SqlMerge::Concatenate;
+        // Each node applied the query's own OFFSET to its own rows, so the rows
+        // it skipped are not the rows the query meant to skip. Unlike LIMIT,
+        // that cannot be repaired from what came back — the skipped rows are
+        // simply absent.
+        if query.offset.is_some() {
+            return SqlMerge::Unsupported(
+                "OFFSET cannot be applied across nodes: each node skips that many of its own \
+                 rows, so the rows the query meant to skip are missing from every node's \
+                 result. Order and page in the client, or query a single node."
+                    .to_string(),
+            );
+        }
+
+        let Some(order_by) = resolve_order_by(query, select) else {
+            return SqlMerge::Unsupported(
+                "ORDER BY cannot be applied across nodes unless every term is a projected \
+                 column: each node sorted only its own partitions, and the coordinator can \
+                 only re-sort by values the query actually returned."
+                    .to_string(),
+            );
+        };
+
+        return SqlMerge::Concatenate(PostMerge {
+            order_by,
+            limit: query_limit(query),
+        });
     }
 
     // Mixing aggregates with bare columns without GROUP BY is not valid SQL the
     // engine would accept, but if it did there is no sound merge.
-    if aggs.iter().any(Option::is_none) {
+    if columns.iter().any(|c| matches!(c, ColumnMerge::RowWise)) {
         return SqlMerge::Unsupported(
-            "mixing aggregate and non-aggregate columns cannot be merged across nodes.",
+            "mixing aggregate and non-aggregate columns cannot be merged across nodes.".to_string(),
         );
     }
 
-    SqlMerge::ScalarAggregate(aggs.into_iter().map(Option::unwrap).collect())
+    SqlMerge::ScalarAggregate(
+        columns
+            .into_iter()
+            .map(|c| match c {
+                ColumnMerge::Mergeable(op) => op,
+                _ => unreachable!("refusals and row-wise columns are handled above"),
+            })
+            .collect(),
+    )
 }
 
+/// Whether any subquery de-duplicates: `DISTINCT`, `GROUP BY`, or a set
+/// operation that is not `UNION ALL`.
+///
+/// Only nesting matters here — the outermost query's own `DISTINCT`/`GROUP BY`
+/// is handled directly — so the outermost `Query` is skipped by depth.
+fn query_has_nested_dedup(
+    query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+) -> bool {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        GroupByExpr, Query, SetExpr, SetQuantifier, Visit, Visitor,
+    };
+    use std::ops::ControlFlow;
+
+    struct Scan {
+        depth: usize,
+        found: bool,
+    }
+    impl Visitor for Scan {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            self.depth += 1;
+            if self.depth == 1 {
+                return ControlFlow::Continue(()); // the outer query, handled elsewhere
+            }
+            match q.body.as_ref() {
+                SetExpr::Select(s) => {
+                    let grouped = match &s.group_by {
+                        GroupByExpr::Expressions(e, _) => !e.is_empty(),
+                        GroupByExpr::All(_) => true,
+                    };
+                    if s.distinct.is_some() || grouped {
+                        self.found = true;
+                        return ControlFlow::Break(());
+                    }
+                }
+                SetExpr::SetOperation { set_quantifier, .. } => {
+                    if !matches!(set_quantifier, SetQuantifier::All) {
+                        self.found = true;
+                        return ControlFlow::Break(());
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut scan = Scan {
+        depth: 0,
+        found: false,
+    };
+    let _ = query.visit(&mut scan);
+    scan.found
+}
+
+/// The query's own `LIMIT`, if it is a plain number.
+fn query_limit(query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query) -> Option<usize> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value};
+    match query.limit.as_ref()? {
+        SqlExpr::Value(Value::Number(n, _)) => n.parse().ok(),
+        _ => None,
+    }
+}
+/// Resolve the query's `ORDER BY` terms to output column names.
+///
+/// Returns `None` when a term cannot be tied to a column that is actually in
+/// the response — the coordinator only has the returned rows, so it cannot sort
+/// by a value the query did not project.
+fn resolve_order_by(
+    query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+    select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
+) -> Option<Vec<OrderKey>> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, SelectItem, Value};
+
+    let Some(order_by) = query.order_by.as_ref() else {
+        return Some(Vec::new());
+    };
+    let exprs = &order_by.exprs;
+
+    // Output name of each projected column, and the expression text it came
+    // from, so `ORDER BY <same expression>` resolves as well as `ORDER BY alias`.
+    let mut names: Vec<String> = Vec::new();
+    let mut by_expr_text: HashMap<String, String> = HashMap::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::ExprWithAlias { expr, alias } => {
+                names.push(alias.value.clone());
+                by_expr_text.insert(expr.to_string(), alias.value.clone());
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                let text = expr.to_string();
+                names.push(text.clone());
+                by_expr_text.insert(text, expr.to_string());
+            }
+            // A wildcard's columns are not known from the SQL alone.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+        }
+    }
+
+    let mut keys = Vec::new();
+    for term in exprs {
+        let column = match &term.expr {
+            SqlExpr::Identifier(id) => {
+                let want = id.value.clone();
+                if names.iter().any(|n| n.eq_ignore_ascii_case(&want)) {
+                    want
+                } else {
+                    by_expr_text.get(&term.expr.to_string())?.clone()
+                }
+            }
+            // ORDER BY 2 — an ordinal into the projection.
+            SqlExpr::Value(Value::Number(n, _)) => {
+                let idx: usize = n.parse().ok()?;
+                names.get(idx.checked_sub(1)?)?.clone()
+            }
+            other => by_expr_text.get(&other.to_string())?.clone(),
+        };
+        let descending = term.asc == Some(false);
+        keys.push(OrderKey {
+            // DataFusion and Postgres both default to NULLS LAST ascending and
+            // NULLS FIRST descending; follow that unless the query says.
+            nulls_first: term.nulls_first.unwrap_or(descending),
+            descending,
+            column,
+        });
+    }
+    Some(keys)
+}
+
+/// Order two JSON values the way SQL would.
+///
+/// Values of different types are grouped rather than interleaved, so a column
+/// that came back mixed still produces a stable, explicable order instead of a
+/// comparison that depends on which row arrived first.
+fn compare_json(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    use serde_json::Value as J;
+    use std::cmp::Ordering;
+
+    fn rank(v: &J) -> u8 {
+        match v {
+            J::Bool(_) => 0,
+            J::Number(_) => 1,
+            J::String(_) => 2,
+            J::Array(_) => 3,
+            J::Object(_) => 4,
+            J::Null => 5,
+        }
+    }
+
+    match (a, b) {
+        (J::Number(x), J::Number(y)) => x
+            .as_f64()
+            .unwrap_or(f64::NAN)
+            .partial_cmp(&y.as_f64().unwrap_or(f64::NAN))
+            .unwrap_or(Ordering::Equal),
+        (J::String(x), J::String(y)) => x.cmp(y),
+        (J::Bool(x), J::Bool(y)) => x.cmp(y),
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// Finish a fanned-out query over the combined rows: sort, then limit.
+pub fn apply_post_merge(rows: &mut Vec<HashMap<String, serde_json::Value>>, post: &PostMerge) {
+    use serde_json::Value as J;
+    use std::cmp::Ordering;
+
+    if !post.order_by.is_empty() {
+        rows.sort_by(|a, b| {
+            for key in &post.order_by {
+                let l = a.get(&key.column).unwrap_or(&J::Null);
+                let r = b.get(&key.column).unwrap_or(&J::Null);
+                let (l_null, r_null) = (l.is_null(), r.is_null());
+                let ord = match (l_null, r_null) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => {
+                        if key.nulls_first {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                    (false, true) => {
+                        if key.nulls_first {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                    (false, false) => {
+                        let c = compare_json(l, r);
+                        if key.descending {
+                            c.reverse()
+                        } else {
+                            c
+                        }
+                    }
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            Ordering::Equal
+        });
+    }
+
+    if let Some(limit) = post.limit {
+        rows.truncate(limit);
+    }
+}
 /// Combine one row per node into a single row of aggregates.
 ///
 /// Each node computed its aggregate over the partitions it leads, so the parts
@@ -961,7 +1441,9 @@ pub fn merge_scalar_aggregate(
         let mut acc: Option<serde_json::Value> = None;
 
         for row in &rows {
-            let Some(value) = row.get(column) else { continue };
+            let Some(value) = row.get(column) else {
+                continue;
+            };
             if value.is_null() {
                 continue;
             }
@@ -971,10 +1453,7 @@ pub fn merge_scalar_aggregate(
             });
         }
 
-        merged.insert(
-            column.clone(),
-            acc.unwrap_or(serde_json::Value::Null),
-        );
+        merged.insert(column.clone(), acc.unwrap_or(serde_json::Value::Null));
     }
 
     SqlResponse {
@@ -988,7 +1467,11 @@ pub fn merge_scalar_aggregate(
 
 /// Combine two JSON numbers. Non-numeric values keep the accumulator, since
 /// there is no meaningful sum of two strings.
-fn combine_numbers(a: &serde_json::Value, b: &serde_json::Value, op: AggMerge) -> serde_json::Value {
+fn combine_numbers(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    op: AggMerge,
+) -> serde_json::Value {
     // Integers stay integers: a summed COUNT rendered as 60.0 is a worse answer
     // than 60, and JSON has no separate integer type to fall back on.
     if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
@@ -1045,7 +1528,9 @@ pub fn merge_search_responses(
         let score = hit._score.unwrap_or(0.0);
         match best.get(&key) {
             Some(existing) if existing._score.unwrap_or(0.0) >= score => {}
-            _ => { best.insert(key, hit); }
+            _ => {
+                best.insert(key, hit);
+            }
         }
     }
     let mut all_hits: Vec<Hit> = best.into_values().collect();
@@ -1288,7 +1773,7 @@ mod tests {
             truncated: false,
         };
 
-        let merged = merge_sql_responses(local, vec![peer], 100);
+        let merged = merge_sql_responses(local, vec![peer], 100, &PostMerge::default());
         assert_eq!(merged.row_count, 2);
         assert_eq!(merged.rows.len(), 2);
         assert!(!merged.truncated);
@@ -1327,7 +1812,7 @@ mod tests {
             truncated: false,
         };
 
-        let merged = merge_sql_responses(local, vec![peer], 2); // limit=2
+        let merged = merge_sql_responses(local, vec![peer], 2, &PostMerge::default()); // limit=2
         assert_eq!(merged.row_count, 2);
         assert!(merged.truncated);
     }
@@ -1710,17 +2195,15 @@ mod tests {
             data_dir: "/tmp".to_string(),
             replication_factor: 3,
             min_insync_replicas: 2,
-            peers: vec![
-                chronik_config::NodeConfig {
-                    id: 99,
-                    kafka: "remote-host:9092".to_string(),
-                    wal: "remote-host:9291".to_string(),
-                    raft: "remote-host:5001".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-            ],
+            peers: vec![chronik_config::NodeConfig {
+                id: 99,
+                kafka: "remote-host:9092".to_string(),
+                wal: "remote-host:9291".to_string(),
+                raft: "remote-host:5001".to_string(),
+                replication: None,
+                addr: None,
+                raft_port: None,
+            }],
             bind: None,
             advertise: None,
             gossip: None,
@@ -1793,12 +2276,19 @@ mod partition_ownership_tests {
         let mut seen: Vec<i32> = Vec::new();
         for node in [1u64, 2, 3] {
             let router = router_with(node, &[("orders", leaders)]);
-            let led = router.led_partitions("orders").await.expect("topic is mapped");
+            let led = router
+                .led_partitions("orders")
+                .await
+                .expect("topic is mapped");
             seen.extend(led);
         }
 
         seen.sort_unstable();
-        assert_eq!(seen, vec![0, 1, 2, 3], "partitions must be covered exactly once");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2, 3],
+            "partitions must be covered exactly once"
+        );
     }
 
     /// A single node leads everything, so there is nothing to merge and no
@@ -1855,9 +2345,12 @@ mod sql_merge_tests {
     fn a_projection_is_concatenated() {
         assert_eq!(
             sql_merge_strategy("SELECT _offset, _value FROM orders"),
-            SqlMerge::Concatenate
+            SqlMerge::Concatenate(PostMerge::default())
         );
-        assert_eq!(sql_merge_strategy("SELECT * FROM orders"), SqlMerge::Concatenate);
+        assert_eq!(
+            sql_merge_strategy("SELECT * FROM orders"),
+            SqlMerge::Concatenate(PostMerge::default())
+        );
     }
 
     /// #42: a fanned-out `SELECT *` can match zero rows on the coordinator (the
@@ -1867,8 +2360,11 @@ mod sql_merge_tests {
     #[test]
     fn projection_merge_recovers_columns_from_a_peer_when_local_is_empty() {
         let local = resp(&[], vec![]); // coordinator held no matching rows
-        let peer = resp(&["_offset", "_value"], vec![row(&[("_offset", 7), ("_value", 42)])]);
-        let merged = merge_sql_responses(local, vec![peer], 100);
+        let peer = resp(
+            &["_offset", "_value"],
+            vec![row(&[("_offset", 7), ("_value", 42)])],
+        );
+        let merged = merge_sql_responses(local, vec![peer], 100, &PostMerge::default());
         assert_eq!(
             merged.columns,
             vec!["_offset", "_value"],
@@ -1923,7 +2419,11 @@ mod sql_merge_tests {
             vec![resp(&["c"], vec![row(&[("c", 3)])])],
             &[AggMerge::Sum],
         );
-        assert!(merged.rows[0]["c"].is_i64(), "got {:?}", merged.rows[0]["c"]);
+        assert!(
+            merged.rows[0]["c"].is_i64(),
+            "got {:?}",
+            merged.rows[0]["c"]
+        );
         assert_eq!(merged.rows[0]["c"], serde_json::Value::from(5));
     }
 
@@ -1970,9 +2470,200 @@ mod sql_merge_tests {
     /// A null from a node that holds no rows must not erase another node's value.
     #[test]
     fn a_node_with_no_rows_does_not_erase_the_answer() {
-        let local = resp(&["c"], vec![HashMap::from([("c".to_string(), serde_json::Value::Null)])]);
+        let local = resp(
+            &["c"],
+            vec![HashMap::from([("c".to_string(), serde_json::Value::Null)])],
+        );
         let peers = vec![resp(&["c"], vec![row(&[("c", 7)])])];
         let merged = merge_scalar_aggregate(local, peers, &[AggMerge::Sum]);
         assert_eq!(merged.rows[0]["c"], serde_json::Value::from(7));
+    }
+
+    // ---- #55: everything below returned a wrong answer as 200 OK, measured on
+    // a real three-node cluster over 900 rows whose true values were known.
+
+    fn refusal(sql: &str) -> String {
+        match sql_merge_strategy(sql) {
+            SqlMerge::Unsupported(why) => why,
+            other => panic!("expected a refusal for {sql}, got {other:?}"),
+        }
+    }
+
+    /// `COUNT(DISTINCT sev)` returned **9** where the answer was 3: the matcher
+    /// keyed on the function name and never looked at the DISTINCT, so three
+    /// nodes' de-duplicated counts were summed.
+    #[test]
+    fn count_distinct_is_refused_rather_than_summed() {
+        assert!(refusal("SELECT COUNT(DISTINCT sev) AS c FROM t").contains("DISTINCT"));
+    }
+
+    /// `median`, `stddev`, `approx_percentile_cont`, `array_agg` … every
+    /// aggregate the old four-name matcher did not know was treated as a
+    /// row-wise expression and its per-node results concatenated — one row per
+    /// node where the caller asked for one number.
+    #[test]
+    fn aggregates_that_cannot_be_combined_are_refused() {
+        for sql in [
+            "SELECT median(x) AS m FROM t",
+            "SELECT stddev(x) AS s FROM t",
+            "SELECT approx_percentile_cont(x, 0.95) AS p FROM t",
+            "SELECT approx_distinct(x) AS d FROM t",
+            "SELECT array_agg(x) AS a FROM t",
+            "SELECT corr(x, y) AS c FROM t",
+            "SELECT first_value(x) AS f FROM t",
+        ] {
+            let _ = refusal(sql);
+        }
+    }
+
+    /// The sharpest one: AVG was correctly refused, and wrapping it in any
+    /// function walked straight past that refusal. `ROUND(AVG(n),2)` returned
+    /// 8.54, 8.63, 8.31 for a column whose average was 8.5.
+    #[test]
+    fn wrapping_an_aggregate_does_not_evade_the_refusal() {
+        assert!(refusal("SELECT ROUND(AVG(x), 2) AS a FROM t").contains("wrapped"));
+        assert!(refusal("SELECT SUM(x) * 2 AS s FROM t").contains("wrapped"));
+        assert!(refusal("SELECT CAST(SUM(x) AS BIGINT) AS s FROM t").contains("wrapped"));
+    }
+
+    /// `SUM(x)/COUNT(x)` is what the AVG refusal tells the caller to do, and it
+    /// was itself unguarded: three nodes, three ratios, none of them the answer.
+    #[test]
+    fn the_avg_workaround_is_not_itself_silently_wrong() {
+        let _ = refusal("SELECT SUM(x)/COUNT(x) AS r FROM t");
+        let _ = refusal("SELECT SUM(x) + SUM(y) AS s FROM t");
+    }
+
+    /// `ROW_NUMBER() OVER (ORDER BY id)` returned 1,2,3,4,5 once per node.
+    #[test]
+    fn window_functions_are_refused() {
+        assert!(refusal("SELECT ROW_NUMBER() OVER (ORDER BY ts) AS rn FROM t").contains("OVER"));
+    }
+
+    /// `SELECT COUNT(*) FROM (SELECT DISTINCT sev FROM t)` returned 9 where the
+    /// answer was 3 — the de-duplication happened per node, one level down.
+    #[test]
+    fn a_dedup_inside_a_subquery_is_refused() {
+        assert!(
+            refusal("SELECT COUNT(*) AS c FROM (SELECT DISTINCT k FROM t)").contains("subquery")
+        );
+    }
+
+    /// `SELECT COUNT(*) FROM t UNION ALL SELECT COUNT(*) FROM t` returned six
+    /// rows of per-node partials instead of two totals.
+    #[test]
+    fn a_set_operation_over_aggregates_is_refused() {
+        let _ = refusal("SELECT COUNT(*) AS c FROM t UNION ALL SELECT COUNT(*) AS c FROM u");
+        // UNION (no ALL) de-duplicates, and each node can only de-duplicate its own.
+        let _ = refusal("SELECT k FROM t UNION SELECT k FROM u");
+        // …but UNION ALL of plain projections is still just concatenation.
+        assert!(matches!(
+            sql_merge_strategy("SELECT k FROM t UNION ALL SELECT k FROM u"),
+            SqlMerge::Concatenate(_)
+        ));
+    }
+
+    /// Per-node OFFSET skips the wrong rows and they cannot be recovered from
+    /// what came back.
+    #[test]
+    fn offset_is_refused_under_fan_out() {
+        assert!(refusal("SELECT k FROM t ORDER BY k LIMIT 5 OFFSET 10").contains("OFFSET"));
+    }
+
+    /// The coordinator can only sort by values the query actually returned.
+    #[test]
+    fn ordering_by_an_unprojected_column_is_refused() {
+        assert!(refusal("SELECT k FROM t ORDER BY ts DESC LIMIT 5").contains("ORDER BY"));
+        // A wildcard hides which columns exist, so it cannot be resolved either.
+        assert!(refusal("SELECT * FROM t ORDER BY ts DESC LIMIT 5").contains("ORDER BY"));
+    }
+
+    /// `ORDER BY id DESC LIMIT 5` over three nodes returned 15 rows whose first
+    /// five were 900, 899, 895, 889, 871 — the true top five were 900..896.
+    /// The order and the limit belong to the union, not to each node.
+    #[test]
+    fn order_by_and_limit_are_applied_to_the_merged_rows() {
+        let strategy = sql_merge_strategy("SELECT id FROM t ORDER BY id DESC LIMIT 5");
+        let SqlMerge::Concatenate(post) = strategy else {
+            panic!("a projection with ORDER BY should still concatenate");
+        };
+        assert_eq!(post.limit, Some(5));
+        assert_eq!(post.order_by.len(), 1);
+        assert_eq!(post.order_by[0].column, "id");
+        assert!(post.order_by[0].descending);
+
+        // Three nodes, each already sorted and limited to its own top rows.
+        let local = resp(&["id"], vec![row(&[("id", 900)]), row(&[("id", 895)])]);
+        let peers = vec![
+            resp(&["id"], vec![row(&[("id", 899)]), row(&[("id", 893)])]),
+            resp(&["id"], vec![row(&[("id", 898)]), row(&[("id", 897)])]),
+        ];
+        let merged = merge_sql_responses(local, peers, 1000, &post);
+        let ids: Vec<i64> = merged
+            .rows
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![900, 899, 898, 897, 895]);
+    }
+
+    /// A LIMIT with no ORDER BY still has to mean "at most n rows", not n per node.
+    #[test]
+    fn a_limit_without_an_order_still_bounds_the_merged_rows() {
+        let SqlMerge::Concatenate(post) = sql_merge_strategy("SELECT id FROM t LIMIT 5") else {
+            panic!("expected concatenation");
+        };
+        let local = resp(&["id"], vec![row(&[("id", 1)]), row(&[("id", 2)])]);
+        let peers = vec![
+            resp(&["id"], vec![row(&[("id", 3)]), row(&[("id", 4)])]),
+            resp(&["id"], vec![row(&[("id", 5)]), row(&[("id", 6)])]),
+        ];
+        let merged = merge_sql_responses(local, peers, 1000, &post);
+        assert_eq!(
+            merged.rows.len(),
+            5,
+            "LIMIT 5 must not return 5 rows per node"
+        );
+    }
+
+    /// Ascending order puts NULLs last, matching DataFusion and Postgres.
+    #[test]
+    fn nulls_sort_last_ascending_and_first_descending() {
+        let mut rows = vec![
+            HashMap::from([("v".to_string(), serde_json::Value::Null)]),
+            HashMap::from([("v".to_string(), serde_json::Value::from(2))]),
+            HashMap::from([("v".to_string(), serde_json::Value::from(1))]),
+        ];
+        apply_post_merge(
+            &mut rows,
+            &PostMerge {
+                order_by: vec![OrderKey {
+                    column: "v".into(),
+                    descending: false,
+                    nulls_first: false,
+                }],
+                limit: None,
+            },
+        );
+        assert_eq!(rows[0]["v"], serde_json::Value::from(1));
+        assert_eq!(rows[1]["v"], serde_json::Value::from(2));
+        assert!(rows[2]["v"].is_null());
+    }
+
+    /// The aggregates that genuinely do combine must keep working.
+    #[test]
+    fn the_mergeable_aggregates_are_untouched() {
+        assert_eq!(
+            sql_merge_strategy("SELECT COUNT(*) AS c, SUM(x) AS s FROM t"),
+            SqlMerge::ScalarAggregate(vec![AggMerge::Sum, AggMerge::Sum])
+        );
+        assert_eq!(
+            sql_merge_strategy("SELECT MIN(x) AS a, MAX(x) AS b FROM t"),
+            SqlMerge::ScalarAggregate(vec![AggMerge::Min, AggMerge::Max])
+        );
+        assert_eq!(
+            sql_merge_strategy("SELECT COUNT(*) AS c FROM t WHERE sev = 'ERROR'"),
+            SqlMerge::ScalarAggregate(vec![AggMerge::Sum])
+        );
     }
 }
