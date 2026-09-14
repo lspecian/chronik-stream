@@ -344,8 +344,7 @@ async fn resolve_parquet_paths(
         .collect();
 
     if paths.is_empty() {
-        let data_dir =
-            std::env::var("CHRONIK_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+        let data_dir = std::env::var("CHRONIK_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
         let columnar_dir = format!("{}/columnar/{}", data_dir, topic);
         let columnar_path = std::path::Path::new(&columnar_dir);
         if columnar_path.exists() {
@@ -447,7 +446,11 @@ async fn seed_hot_flushed_from_cold(state: &UnifiedApiState, topic: &str) {
     let Some(hot) = state.hot_buffer.as_ref() else {
         return;
     };
-    let segments = match state.metadata_store.list_parquet_segments(topic, None).await {
+    let segments = match state
+        .metadata_store
+        .list_parquet_segments(topic, None)
+        .await
+    {
         Ok(segments) => segments,
         Err(_) => return,
     };
@@ -481,7 +484,11 @@ async fn hot_cold_overlap(state: &UnifiedApiState, topic: &str) -> bool {
     let Some(hot) = state.hot_buffer.as_ref() else {
         return false;
     };
-    let segments = match state.metadata_store.list_parquet_segments(topic, None).await {
+    let segments = match state
+        .metadata_store
+        .list_parquet_segments(topic, None)
+        .await
+    {
         Ok(segments) => segments,
         Err(_) => return false,
     };
@@ -605,8 +612,7 @@ impl SqlHandler {
             // Only probe while the topic has no cold table yet: afterwards the
             // provider keeps itself current and this scan would be wasted work.
             if !has_cold && state.sql_tables.should_probe_cold(topic, probe_interval) {
-                let paths =
-                    resolve_parquet_paths(state.metadata_store.as_ref(), topic).await;
+                let paths = resolve_parquet_paths(state.metadata_store.as_ref(), topic).await;
 
                 if let Some(sample) = paths.first() {
                     let source = std::sync::Arc::new(TopicParquetSource {
@@ -653,11 +659,13 @@ impl SqlHandler {
                         // partition's un-flushed records and the fan-out would
                         // count them once per replica.
                         let provider = std::sync::Arc::new(match query_ownership(state) {
-                            Some(ownership) => chronik_columnar::LiveHotTableProvider::with_ownership(
-                                hot_buffer.clone(),
-                                topic.clone(),
-                                ownership,
-                            ),
+                            Some(ownership) => {
+                                chronik_columnar::LiveHotTableProvider::with_ownership(
+                                    hot_buffer.clone(),
+                                    topic.clone(),
+                                    ownership,
+                                )
+                            }
                             None => chronik_columnar::LiveHotTableProvider::new(
                                 hot_buffer.clone(),
                                 topic.clone(),
@@ -701,10 +709,14 @@ impl SqlHandler {
             let cold_dedup = has_cold
                 && (cold_segments_overlap(state.metadata_store.as_ref(), topic).await
                     || (has_hot && hot_cold_overlap(state, topic).await));
-            let composition = ViewComposition { has_hot, has_cold, cold_dedup };
+            let composition = ViewComposition {
+                has_hot,
+                has_cold,
+                cold_dedup,
+            };
             let current = state.sql_tables.topics.get(topic).map(|c| *c);
-            let view_exists = registered_set.contains(&base_table_name)
-                && current == Some(composition);
+            let view_exists =
+                registered_set.contains(&base_table_name) && current == Some(composition);
 
             if !view_exists && (has_hot || has_cold) {
                 // v2.2.23: Use explicit columns for UNION to handle schema differences
@@ -741,11 +753,16 @@ impl SqlHandler {
                             "SELECT {cols}, 0 AS __src FROM {hot} \
                              UNION ALL \
                              SELECT {cols}, 1 AS __src FROM {cold}",
-                            cols = common_cols, hot = hot_table_name, cold = cold_table_name
+                            cols = common_cols,
+                            hot = hot_table_name,
+                            cold = cold_table_name
                         )
                     } else {
-                        format!("SELECT {cols}, 1 AS __src FROM {cold}",
-                                cols = common_cols, cold = cold_table_name)
+                        format!(
+                            "SELECT {cols}, 1 AS __src FROM {cold}",
+                            cols = common_cols,
+                            cold = cold_table_name
+                        )
                     };
                     format!(
                         "SELECT {out} FROM (\
@@ -753,7 +770,8 @@ impl SqlHandler {
                              PARTITION BY _partition, _offset ORDER BY __src\
                            ) AS __rn FROM ({inner})\
                          ) WHERE __rn = 1",
-                        out = out_cols, inner = inner
+                        out = out_cols,
+                        inner = inner
                     )
                 } else if has_hot && has_cold {
                     // Both hot and cold available - union them with explicit columns
@@ -789,10 +807,7 @@ impl SqlHandler {
                     )
                     .await;
                 } else {
-                    state
-                        .sql_tables
-                        .topics
-                        .insert(topic.clone(), composition);
+                    state.sql_tables.topics.insert(topic.clone(), composition);
                     info!(
                         topic = %topic,
                         view_name = %base_table_name,
@@ -828,7 +843,10 @@ impl SqlHandler {
                     topic.to_string(),
                 ));
                 if let Err(e) = engine.register_table_provider(base_table_name, provider) {
-                    warn!("Fallback registration of '{}' failed: {}", base_table_name, e);
+                    warn!(
+                        "Fallback registration of '{}' failed: {}",
+                        base_table_name, e
+                    );
                 }
             }
             return;
@@ -996,17 +1014,72 @@ async fn query_topic_leadership_unknown(
 }
 
 /// Execute SQL query endpoint
+/// Whether this query has to be answered by fanning out to the other nodes.
+///
+/// Deliberately settled *before* anything is executed. The answer changes what
+/// SQL this node should run: when the coordinator is going to merge, clauses
+/// like `LIMIT` and `OFFSET` have to come out of the query every node runs —
+/// this one included — and be applied once to the merged rows instead. Deciding
+/// after the local result already existed is what forced those queries to be
+/// refused rather than answered (#55).
+async fn fan_out_needed(state: &UnifiedApiState, headers: &HeaderMap, sql: &str) -> bool {
+    let Some(router) = state.query_router.as_ref() else {
+        return false;
+    };
+    if super::query_router::is_forwarded_request(headers) {
+        return false;
+    }
+
+    // Refresh unconditionally, not just when the map is empty.
+    //
+    // `has_partition_map()` is true as soon as ONE topic is mapped, so the old
+    // guard meant a topic created later was never mapped — and an unmapped topic
+    // is invisible to the leadership check, which would then happily skip the
+    // fan-out and miss that topic's data entirely. These are in-memory metadata
+    // reads and this is a query path, not the produce path.
+    router
+        .refresh_all_partition_maps(state.metadata_store.as_ref())
+        .await;
+
+    // Skip the fan-out only when this node LEADS every partition.
+    //
+    // This used to skip when the node was a *replica* of every partition
+    // (`all_topics_local`), which at RF=node_count is always true — so on a
+    // full-replication cluster the query never fanned out and returned only what
+    // this node happened to see locally. That is #22: partial results, and
+    // different ones depending on which node answered.
+    //
+    // Leadership is the right condition on both sides: if this node leads
+    // everything there is nothing to merge, and if it does not, the providers
+    // restrict each node to its own led partitions so the union covers every
+    // partition exactly once — no gaps, no double-counting.
+    if router.leads_all_partitions().await {
+        debug!("This node leads every partition, skipping SQL fan-out");
+        return false;
+    }
+
+    // Leadership could not be resolved for a topic this query touches, even
+    // after refreshing the map. Fanning out and summing now would over-count by
+    // the replication factor, because every replica's providers fall open to
+    // "serve everything" (#41). Answer locally instead.
+    if query_topic_leadership_unknown(state, router, sql).await {
+        warn!(
+            query = %sql,
+            "Leadership unknown for a queried topic; serving locally to avoid a fan-out over-count (#41)"
+        );
+        return false;
+    }
+
+    !router.all_peers().is_empty()
+}
+
+/// Execute SQL query endpoint
 pub async fn execute_sql(
     State(state): State<UnifiedApiState>,
     headers: HeaderMap,
     Json(request): Json<SqlRequest>,
 ) -> impl IntoResponse {
     let row_limit = request.effective_limit();
-    // Peers must apply the same cap we resolved, not re-derive it.
-    let fan_out_request = SqlRequest {
-        limit: Some(row_limit),
-        ..request.clone()
-    };
     info!(query = %request.query, limit = row_limit, "Executing SQL query");
 
     // Security Phase 4: per-topic authorization.
@@ -1027,109 +1100,85 @@ pub async fn execute_sql(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response();
     }
 
-    match SqlHandler::execute(&state, &request.query, row_limit).await {
+    // How the results combine depends on the query, and getting it wrong is
+    // silent. Decide before paying for the fan-out — or for the local execution —
+    // so an unmergeable query fails fast instead of returning a plausible wrong
+    // answer, and a mergeable one can adjust the SQL the nodes are given.
+    let distributed = fan_out_needed(&state, &headers, &request.query).await;
+    let strategy = if distributed {
+        match super::query_router::sql_merge_strategy(&request.query) {
+            super::query_router::SqlMerge::Unsupported(why) => {
+                warn!(query = %request.query, reason = %why,
+                      "Refusing to merge a distributed SQL result");
+                let error_response = SqlErrorResponse {
+                    error: format!("This query cannot be answered across a cluster: {}", why),
+                    error_type: "DistributedQueryUnsupported".to_string(),
+                };
+                return (StatusCode::BAD_REQUEST, Json(error_response)).into_response();
+            }
+            strategy => Some(strategy),
+        }
+    } else {
+        None
+    };
+
+    // The SQL every node runs, which is the caller's unless a clause had to be
+    // lifted out of it for the coordinator to apply once.
+    let node_sql = strategy
+        .as_ref()
+        .and_then(|s| match s {
+            super::query_router::SqlMerge::Concatenate(plan)
+            | super::query_router::SqlMerge::GroupedAggregate { post: plan, .. }
+            | super::query_router::SqlMerge::ScalarAggregate { post: plan, .. } => {
+                plan.node_sql.clone()
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| request.query.clone());
+
+    match SqlHandler::execute(&state, &node_sql, row_limit).await {
         Ok(response) => {
-            // Distributed fan-out: merge SQL results from all peer nodes
-            let response = if let Some(ref router) = state.query_router {
-                if !super::query_router::is_forwarded_request(&headers) {
-                    // Skip the fan-out only when this node LEADS every partition.
-                    //
-                    // This used to skip when the node was a *replica* of every
-                    // partition (`all_topics_local`), which at RF=node_count is
-                    // always true — so on a full-replication cluster the query
-                    // never fanned out and returned only what this node happened
-                    // to see locally. That is #22: partial results, and different
-                    // ones depending on which node answered, because the cold
-                    // table is built from segment metadata registered by each
-                    // partition's leader and filtered by local path existence.
-                    //
-                    // Leadership is the right condition on both sides: if this
-                    // node leads everything there is nothing to merge, and if it
-                    // does not, the providers restrict each node to its own led
-                    // partitions so the union covers every partition exactly once
-                    // — no gaps, no double-counting.
-                    // Refresh unconditionally, not just when the map is empty.
-                    //
-                    // `has_partition_map()` is true as soon as ONE topic is
-                    // mapped, so the old guard meant a topic created later was
-                    // never mapped — and an unmapped topic is invisible to the
-                    // leadership check, which would then happily skip the fan-out
-                    // and miss that topic's data entirely. These are in-memory
-                    // metadata reads and this is a query path, not the produce
-                    // path.
-                    router.refresh_all_partition_maps(state.metadata_store.as_ref()).await;
-                    if router.leads_all_partitions().await {
-                        debug!("This node leads every partition, skipping SQL fan-out");
-                        response
-                    } else if query_topic_leadership_unknown(&state, router, &request.query).await {
-                        // Leadership could not be resolved for a topic this query
-                        // touches, even after refreshing the map. Fanning out and
-                        // summing now would over-count by the replication factor,
-                        // because every replica's providers fall open to "serve
-                        // everything" (#41). Answer locally instead.
-                        warn!(
-                            query = %request.query,
-                            "Leadership unknown for a queried topic; serving locally to avoid a fan-out over-count (#41)"
-                        );
-                        response
-                    } else {
-                        let all_peers = router.all_peers();
-                        if !all_peers.is_empty() {
-                            // How the results combine depends on the query, and
-                            // getting it wrong is silent. Decide before paying
-                            // for the fan-out so an unmergeable query fails fast
-                            // instead of returning a plausible wrong answer.
-                            match super::query_router::sql_merge_strategy(&request.query) {
-                                super::query_router::SqlMerge::Unsupported(why) => {
-                                    warn!(query = %request.query, reason = why,
-                                          "Refusing to merge a distributed SQL result");
-                                    let error_response = SqlErrorResponse {
-                                        error: format!(
-                                            "This query cannot be answered across a cluster: {}",
-                                            why
-                                        ),
-                                        error_type: "DistributedQueryUnsupported".to_string(),
-                                    };
-                                    return (StatusCode::BAD_REQUEST, Json(error_response))
-                                        .into_response();
-                                }
-                                strategy => {
-                                    let peers: Vec<SqlResponse> = router
-                                        .fan_out_post("/_sql", &fan_out_request, &all_peers)
-                                        .await;
-                                    debug!(peer_count = peers.len(), "Merging SQL results from peers");
-                                    match strategy {
-                                        super::query_router::SqlMerge::ScalarAggregate(how) => {
-                                            super::query_router::merge_scalar_aggregate(
-                                                response, peers, &how,
-                                            )
-                                        }
-                                        super::query_router::SqlMerge::GroupedAggregate {
-                                            how,
-                                            post,
-                                        } => super::query_router::merge_grouped_aggregate(
-                                            response, peers, &how, &post, row_limit,
-                                        ),
-                                        super::query_router::SqlMerge::Concatenate(post) => {
-                                            super::query_router::merge_sql_responses(
-                                                response, peers, row_limit, &post,
-                                            )
-                                        }
-                                        super::query_router::SqlMerge::Unsupported(_) => {
-                                            unreachable!("refusals return above")
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            response
+            let response = match (strategy, state.query_router.as_ref()) {
+                (Some(strategy), Some(router)) => {
+                    let all_peers = router.all_peers();
+                    // Peers must run the same SQL this node just ran, and apply
+                    // the cap we resolved rather than re-deriving it.
+                    let fan_out_request = SqlRequest {
+                        query: node_sql,
+                        limit: Some(row_limit),
+                        ..request.clone()
+                    };
+                    let peers: Vec<SqlResponse> = router
+                        .fan_out_post("/_sql", &fan_out_request, &all_peers)
+                        .await;
+                    debug!(peer_count = peers.len(), "Merging SQL results from peers");
+                    let (mut merged, plan) = match strategy {
+                        super::query_router::SqlMerge::ScalarAggregate { how, post } => (
+                            super::query_router::merge_scalar_aggregate(response, peers, &how),
+                            post,
+                        ),
+                        super::query_router::SqlMerge::GroupedAggregate { how, post } => (
+                            super::query_router::merge_grouped_aggregate(
+                                response, peers, &how, &post, row_limit,
+                            ),
+                            post,
+                        ),
+                        super::query_router::SqlMerge::Concatenate(post) => (
+                            super::query_router::merge_sql_responses(
+                                response, peers, row_limit, &post,
+                            ),
+                            post,
+                        ),
+                        super::query_router::SqlMerge::Unsupported(_) => {
+                            unreachable!("refusals return above")
                         }
-                    }
-                } else {
-                    response
+                    };
+                    // The nodes were asked for sums and counts where the caller
+                    // wrote AVG; divide now that the totals are whole.
+                    super::query_router::finish_averages(&mut merged, &plan.averages);
+                    merged
                 }
-            } else {
-                response
+                (_, _) => response,
             };
 
             info!(
@@ -1295,10 +1344,7 @@ pub async fn describe_table(
                 })
                 .collect();
 
-            let response = DescribeTableResponse {
-                table,
-                columns,
-            };
+            let response = DescribeTableResponse { table, columns };
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
@@ -1509,7 +1555,10 @@ mod partition_ownership_tests {
             partition_of_parquet_path("s3://bucket/columnar/orders/partition=11/seg.parquet"),
             Some(11)
         );
-        assert_eq!(partition_of_parquet_path("/data/columnar/orders/seg.parquet"), None);
+        assert_eq!(
+            partition_of_parquet_path("/data/columnar/orders/seg.parquet"),
+            None
+        );
         assert_eq!(
             partition_of_parquet_path("/data/columnar/orders/partition=abc/seg.parquet"),
             None
@@ -1604,7 +1653,10 @@ mod fanout_leadership_guard_tests {
 
     #[test]
     fn a_derived_subquery_is_walked() {
-        assert_eq!(refs("SELECT n FROM (SELECT COUNT(*) AS n FROM events) t"), vec!["events"]);
+        assert_eq!(
+            refs("SELECT n FROM (SELECT COUNT(*) AS n FROM events) t"),
+            vec!["events"]
+        );
     }
 
     #[test]
@@ -1614,8 +1666,7 @@ mod fanout_leadership_guard_tests {
 
     #[test]
     fn a_topic_matches_the_sanitized_lowercased_form_of_its_name() {
-        let referenced: HashSet<String> =
-            refs("SELECT * FROM my_topic_v2").into_iter().collect();
+        let referenced: HashSet<String> = refs("SELECT * FROM my_topic_v2").into_iter().collect();
         // Kafka topics use `.` and `-`, which sanitize to `_`.
         assert!(topic_matches_referenced("my.topic-v2", &referenced));
         assert!(!topic_matches_referenced("other", &referenced));
@@ -1641,7 +1692,10 @@ mod cold_overlap_tests {
             row_group_count: 1,
             min_timestamp: 0,
             max_timestamp: 0,
-            object_store_path: format!("/d/{}/partition={}/{}-{}.parquet", topic, partition, min, max),
+            object_store_path: format!(
+                "/d/{}/partition={}/{}-{}.parquet",
+                topic, partition, min, max
+            ),
             size_bytes: 1,
             created_at: 0,
             compression: "zstd".to_string(),
@@ -1685,9 +1739,9 @@ mod cold_overlap_tests {
     #[tokio::test]
     async fn overlap_in_any_single_partition_triggers_dedup() {
         let store = store_with(&[
-            seg("t", 0, 0, 999),       // p0 clean
-            seg("t", 1, 0, 999),       // p1 ...
-            seg("t", 1, 500, 1499),    // ... overlaps here
+            seg("t", 0, 0, 999),    // p0 clean
+            seg("t", 1, 0, 999),    // p1 ...
+            seg("t", 1, 500, 1499), // ... overlaps here
         ])
         .await;
         assert!(cold_segments_overlap(&store, "t").await);
