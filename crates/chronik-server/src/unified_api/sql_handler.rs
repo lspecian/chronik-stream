@@ -1152,6 +1152,33 @@ pub async fn execute_sql(
                         .fan_out_post("/_sql", &fan_out_request, &all_peers)
                         .await;
                     debug!(peer_count = peers.len(), "Merging SQL results from peers");
+
+                    // A distinct count is rebuilt from the values themselves, so
+                    // it is only exact while every node's values fit in one
+                    // response. If any were cut, the count would be short — and
+                    // short by an amount nobody can see. Say so instead.
+                    let counts_distinct = matches!(
+                        &strategy,
+                        super::query_router::SqlMerge::GroupedAggregate { post, .. }
+                            if post.distinct_count.is_some()
+                    );
+                    if counts_distinct
+                        && (response.truncated || peers.iter().any(|p| p.truncated))
+                    {
+                        warn!(query = %request.query,
+                              "COUNT(DISTINCT) exceeded the row limit on at least one node");
+                        let error_response = SqlErrorResponse {
+                            error: "This query cannot be answered across a cluster: COUNT(DISTINCT \
+                                    ...) is merged by collecting the distinct values, and there \
+                                    were more of them than the row limit allows, so the count \
+                                    would be short. Raise the limit, narrow the query with WHERE, \
+                                    or count within a GROUP BY."
+                                .to_string(),
+                            error_type: "DistributedQueryUnsupported".to_string(),
+                        };
+                        return (StatusCode::BAD_REQUEST, Json(error_response)).into_response();
+                    }
+
                     match strategy {
                         // The row-shaped merges finish themselves, because a
                         // HAVING or ORDER BY can name an AVG column that only

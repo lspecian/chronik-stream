@@ -857,6 +857,8 @@ pub struct MergePlan {
     pub derived: Vec<DerivedColumn>,
     /// A HAVING to apply to the combined groups, which the nodes did not run.
     pub having: Option<Predicate>,
+    /// A COUNT(DISTINCT) rebuilt from the values the nodes returned.
+    pub distinct_count: Option<DistinctCount>,
 }
 
 /// One `ORDER BY` term, resolved to the name of a column in the response.
@@ -912,6 +914,9 @@ enum ColumnMerge {
     /// instead and the division is done once, here. Carries the argument so the
     /// projection can be rewritten.
     Derived(Derived, String),
+    /// `COUNT(DISTINCT expr)`. Rebuilt by collecting the distinct values
+    /// themselves and counting them once combined. Carries the argument.
+    DistinctCount(String),
     /// Anything else, with the reason to hand back to the caller.
     Refuse(String),
 }
@@ -952,6 +957,20 @@ fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
         SqlExpr::Function(f) if f.over.is_none() && is_aggregate_call(f) => {
             let name = function_bare_name(f);
             if function_is_distinct(f) {
+                // A distinct count cannot be added up — a value held by two
+                // nodes would count twice — but it can be rebuilt: ask the nodes
+                // for their distinct values, combine those, and count what is
+                // left. That moves values rather than a number, so it only works
+                // while they fit in one response; the merge checks.
+                if name == "count" {
+                    return match single_argument(f) {
+                        Some(arg) => ColumnMerge::DistinctCount(arg),
+                        None => ColumnMerge::Refuse(
+                            "COUNT(DISTINCT ...) needs a single argument to collect across nodes."
+                                .to_string(),
+                        ),
+                    };
+                }
                 return ColumnMerge::Refuse(format!(
                     "{name}(DISTINCT ...) cannot be merged across nodes: each node de-duplicates \
                      only its own partitions, so a value held by two nodes is counted twice."
@@ -987,6 +1006,109 @@ fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
     }
 }
 
+/// Plan a `COUNT(DISTINCT x)`, which is answered by moving values rather than
+/// counts and so rewrites the query more heavily than the others.
+///
+/// `SELECT k, COUNT(DISTINCT x) AS c FROM t GROUP BY k` becomes
+/// `SELECT DISTINCT k, x AS <helper> FROM t`: every node returns the pairs it
+/// holds, the union is de-duplicated by the ordinary group merge, and the
+/// counting happens here.
+fn plan_distinct_count(
+    query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+    select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
+    columns: &[ColumnMerge],
+) -> Result<(String, Vec<Option<AggMerge>>, DistinctCount), String> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        Distinct, GroupByExpr, SelectItem, SetExpr,
+    };
+
+    // One at a time: two of them would need the values paired up, and every
+    // pair of one value with another is a different question from counting
+    // either of them.
+    if columns
+        .iter()
+        .filter(|c| matches!(c, ColumnMerge::DistinctCount(_)))
+        .count()
+        > 1
+    {
+        return Err(
+            "only one COUNT(DISTINCT ...) can be merged across nodes at a time; ask for \
+                    them one query at a time."
+                .to_string(),
+        );
+    }
+
+    // Anything else aggregated alongside it would be computed over the
+    // de-duplicated values rather than the rows.
+    if columns
+        .iter()
+        .any(|c| matches!(c, ColumnMerge::Mergeable(_) | ColumnMerge::Derived(..)))
+    {
+        return Err(
+            "COUNT(DISTINCT ...) cannot be merged across nodes alongside another \
+                    aggregate: the nodes return their distinct values, and the other aggregate \
+                    would be computed over those rather than over the rows."
+                .to_string(),
+        );
+    }
+
+    let mut projection = Vec::with_capacity(select.projection.len());
+    let mut how = Vec::with_capacity(select.projection.len());
+    let mut keys = Vec::new();
+    let mut spec = None;
+
+    for (idx, (item, class)) in select.projection.iter().zip(columns).enumerate() {
+        match class {
+            ColumnMerge::DistinctCount(arg) => {
+                let SelectItem::ExprWithAlias { alias, .. } = item else {
+                    return Err(
+                        "COUNT(DISTINCT ...) has to be given a name to be merged across \
+                                nodes, because the nodes are asked for the values instead. Write \
+                                COUNT(DISTINCT x) AS distinct_x."
+                            .to_string(),
+                    );
+                };
+                let value = format!("__chronik_distinct_{idx}");
+                projection.push(parse_projection_item(arg, &value)?);
+                how.push(None); // a key of the de-duplicating merge, not an aggregate
+                spec = Some(DistinctCount {
+                    output: alias.value.clone(),
+                    value,
+                    keys: Vec::new(),
+                });
+            }
+            _ => {
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    SelectItem::UnnamedExpr(expr) => expr.to_string(),
+                    _ => return Err(UNREWRITABLE.to_string()),
+                };
+                keys.push(name);
+                projection.push(item.clone());
+                how.push(None);
+            }
+        }
+    }
+
+    let mut spec = spec.ok_or_else(|| UNREWRITABLE.to_string())?;
+    spec.keys = keys;
+
+    // The nodes de-duplicate their own rows; the merge de-duplicates across
+    // them. The grouping is gone because the counting has moved here.
+    let mut rewritten = query.clone();
+    rewritten.order_by = None;
+    rewritten.limit = None;
+    rewritten.offset = None;
+    strip_having(&mut rewritten);
+    let SetExpr::Select(inner) = rewritten.body.as_mut() else {
+        return Err(UNREWRITABLE.to_string());
+    };
+    inner.projection = projection;
+    inner.distinct = Some(Distinct::Distinct);
+    inner.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
+
+    Ok((rewritten.to_string(), how, spec))
+}
 /// Rewrite the projection so the nodes return what an AVG can be rebuilt from.
 ///
 /// `AVG(x) AS a` becomes `SUM(x) AS <helper>, COUNT(x) AS <helper>`; the two
@@ -1152,6 +1274,85 @@ fn single_argument(
     }
 }
 
+/// A `COUNT(DISTINCT x)` carried across the fan-out as the values themselves.
+///
+/// Counts cannot be added up when they are distinct counts — a value held by
+/// two nodes would be counted twice — so the nodes are asked for their distinct
+/// values instead, the union is de-duplicated, and what is left is counted.
+///
+/// That ships values rather than a number, so it is only exact while every
+/// node's values fit in one response. When one does not, the merge says so
+/// rather than returning a count that is quietly short.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctCount {
+    /// The column the caller asked for.
+    pub output: String,
+    /// The helper column holding the values.
+    pub value: String,
+    /// The group keys the count is taken within; empty for a whole-topic count.
+    pub keys: Vec<String>,
+}
+
+/// Collapse de-duplicated values into the counts the caller asked for.
+fn finish_distinct_count(
+    columns: &mut Vec<String>,
+    rows: &mut Vec<HashMap<String, serde_json::Value>>,
+    spec: &DistinctCount,
+) {
+    let mut order: Vec<String> = Vec::new();
+    let mut counted: HashMap<String, HashMap<String, serde_json::Value>> = HashMap::new();
+
+    for row in rows.iter() {
+        let identity = spec
+            .keys
+            .iter()
+            .map(|k| row.get(k).unwrap_or(&serde_json::Value::Null).to_string())
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+
+        // SQL does not count NULL as a distinct value.
+        let counts = !row
+            .get(&spec.value)
+            .map(serde_json::Value::is_null)
+            .unwrap_or(true);
+
+        let entry = counted.entry(identity.clone()).or_insert_with(|| {
+            order.push(identity);
+            let mut group: HashMap<String, serde_json::Value> = spec
+                .keys
+                .iter()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        row.get(k).cloned().unwrap_or(serde_json::Value::Null),
+                    )
+                })
+                .collect();
+            group.insert(spec.output.clone(), serde_json::Value::from(0));
+            group
+        });
+
+        if counts {
+            let now = entry
+                .get(&spec.output)
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                + 1;
+            entry.insert(spec.output.clone(), serde_json::Value::from(now));
+        }
+    }
+
+    *rows = order
+        .into_iter()
+        .filter_map(|k| counted.remove(&k))
+        .collect();
+    *columns = spec
+        .keys
+        .iter()
+        .cloned()
+        .chain(std::iter::once(spec.output.clone()))
+        .collect();
+}
 /// A column the nodes cannot combine, carried across the fan-out as the running
 /// totals it *can* be rebuilt from.
 ///
@@ -1489,6 +1690,34 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             }
         };
 
+    // A distinct count reshapes the query rather than adjusting it, so it is
+    // planned on its own before the ordinary aggregate paths.
+    if columns
+        .iter()
+        .any(|c| matches!(c, ColumnMerge::DistinctCount(_)))
+    {
+        let (node_sql, how, spec) = match plan_distinct_count(query, select, &columns) {
+            Ok(parts) => parts,
+            Err(why) => return SqlMerge::Unsupported(why),
+        };
+        let order_by = match resolve_order_by(query, select) {
+            Some(keys) => keys,
+            None => return SqlMerge::Unsupported(UNORDERABLE.to_string()),
+        };
+        return SqlMerge::GroupedAggregate {
+            how,
+            post: MergePlan {
+                node_sql: Some(node_sql),
+                order_by,
+                offset: query_offset(query),
+                limit: query_limit(query),
+                derived: Vec::new(),
+                having,
+                distinct_count: Some(spec),
+            },
+        };
+    }
+
     // An AVG counts: it is an aggregate that produces one row per node, even
     // though it is carried across as a sum and a count rather than merged
     // directly. Leaving it out sent `SELECT AVG(x) AS a` down the row-wise path.
@@ -1532,6 +1761,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
                 limit: query_limit(query),
                 derived,
                 having,
+                distinct_count: None,
             },
         };
     }
@@ -1555,6 +1785,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             limit: query_limit(query),
             derived: Vec::new(),
             having: None,
+            distinct_count: None,
         });
     }
 
@@ -1595,6 +1826,12 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
 
 /// Said when a query parses but cannot be put back together with a replacement
 /// projection — a shape the rewriter does not know how to edit.
+
+/// Said when an ORDER BY names something the response will not carry.
+const UNORDERABLE: &str =
+    "ORDER BY cannot be applied across nodes unless every term is a projected column: the rows \
+     are only whole once they reach the coordinator, which can sort only by what the query \
+     returned.";
 const UNREWRITABLE: &str =
     "this query cannot be rewritten to merge across nodes: project the aggregate on its own \
      and combine in the client.";
@@ -2006,6 +2243,11 @@ fn finish_rows(
     plan: &MergePlan,
 ) {
     finish_derived_rows(columns, rows, &plan.derived);
+    // The distinct values have been de-duplicated across every node by now, so
+    // what is left to do is count them.
+    if let Some(spec) = plan.distinct_count.as_ref() {
+        finish_distinct_count(columns, rows, spec);
+    }
     apply_finish(rows, plan);
 }
 /// Order two JSON values the way SQL would.
@@ -3543,9 +3785,105 @@ mod sql_merge_tests {
     /// `COUNT(DISTINCT sev)` returned **9** where the answer was 3: the matcher
     /// keyed on the function name and never looked at the DISTINCT, so three
     /// nodes' de-duplicated counts were summed.
+    ///
+    /// It is not summed now — it is rebuilt. The nodes return the distinct
+    /// values they hold, the union is de-duplicated, and counting happens once.
     #[test]
-    fn count_distinct_is_refused_rather_than_summed() {
-        assert!(refusal("SELECT COUNT(DISTINCT sev) AS c FROM t").contains("DISTINCT"));
+    fn count_distinct_is_rebuilt_from_the_values() {
+        let SqlMerge::GroupedAggregate { how, post } =
+            sql_merge_strategy("SELECT COUNT(DISTINCT sev) AS c FROM t")
+        else {
+            panic!("COUNT(DISTINCT) should now be answered");
+        };
+        assert_eq!(how, vec![None], "the value is a key of the de-duplication");
+        let spec = post.distinct_count.as_ref().expect("a distinct-count plan");
+        assert_eq!(spec.output, "c");
+        assert!(
+            spec.keys.is_empty(),
+            "no GROUP BY, so one count for the topic"
+        );
+
+        let node_sql = post.node_sql.as_deref().expect("a rewritten query");
+        assert!(
+            node_sql.starts_with("SELECT DISTINCT sev AS "),
+            "the nodes must be asked for values, not a count: {node_sql}"
+        );
+
+        // sev=a is held by two of the three nodes and must still count once.
+        let value = &spec.value;
+        let of = |v: &str| HashMap::from([(value.clone(), serde_json::Value::from(v))]);
+        let as_resp = |rows: Vec<HashMap<String, serde_json::Value>>| SqlResponse {
+            columns: vec![value.clone()],
+            rows,
+            row_count: 0,
+            execution_time_ms: 0,
+            truncated: false,
+        };
+        let merged = merge_grouped_aggregate(
+            as_resp(vec![of("a"), of("b")]),
+            vec![as_resp(vec![of("a")]), as_resp(vec![of("c")])],
+            &how,
+            &post,
+            1000,
+        );
+        assert_eq!(merged.columns, vec!["c".to_string()]);
+        assert_eq!(merged.rows[0]["c"], serde_json::Value::from(3));
+    }
+
+    /// Counted within a GROUP BY, the values are de-duplicated per key.
+    #[test]
+    fn count_distinct_within_a_group_counts_per_key() {
+        let SqlMerge::GroupedAggregate { how, post } = sql_merge_strategy(
+            "SELECT day AS day, COUNT(DISTINCT user) AS users FROM t GROUP BY day",
+        ) else {
+            panic!("grouped COUNT(DISTINCT) should be answered");
+        };
+        let spec = post.distinct_count.as_ref().expect("a distinct-count plan");
+        assert_eq!(spec.keys, vec!["day".to_string()]);
+
+        let value = spec.value.clone();
+        let pair = |day: i64, user: &str| {
+            HashMap::from([
+                ("day".to_string(), serde_json::Value::from(day)),
+                (value.clone(), serde_json::Value::from(user)),
+            ])
+        };
+        let as_resp = |rows: Vec<HashMap<String, serde_json::Value>>| SqlResponse {
+            columns: vec!["day".to_string(), value.clone()],
+            rows,
+            row_count: 0,
+            execution_time_ms: 0,
+            truncated: false,
+        };
+        // ann appears on day 1 from two nodes; day 2 has only bob.
+        let merged = merge_grouped_aggregate(
+            as_resp(vec![pair(1, "ann"), pair(2, "bob")]),
+            vec![as_resp(vec![pair(1, "ann"), pair(1, "cat")])],
+            &how,
+            &post,
+            1000,
+        );
+        let mut got: Vec<(i64, i64)> = merged
+            .rows
+            .iter()
+            .map(|r| (r["day"].as_i64().unwrap(), r["users"].as_i64().unwrap()))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![(1, 2), (2, 1)]);
+    }
+
+    /// Counting distinct values alongside another aggregate would compute that
+    /// aggregate over the de-duplicated values instead of the rows.
+    #[test]
+    fn count_distinct_beside_another_aggregate_is_refused() {
+        assert!(
+            refusal("SELECT COUNT(*) AS n, COUNT(DISTINCT x) AS d FROM t")
+                .contains("alongside another aggregate")
+        );
+        assert!(
+            refusal("SELECT COUNT(DISTINCT x) AS a, COUNT(DISTINCT y) AS b FROM t")
+                .contains("one query at a time")
+        );
     }
 
     /// `median`, `stddev`, `approx_percentile_cont`, `array_agg` … every
