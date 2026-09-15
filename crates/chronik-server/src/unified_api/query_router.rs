@@ -859,6 +859,8 @@ pub struct MergePlan {
     pub having: Option<Predicate>,
     /// A COUNT(DISTINCT) rebuilt from the values the nodes returned.
     pub distinct_count: Option<DistinctCount>,
+    /// A quantile rebuilt from the value counts the nodes returned.
+    pub quantile: Option<QuantileColumn>,
 }
 
 /// One `ORDER BY` term, resolved to the name of a column in the response.
@@ -917,6 +919,9 @@ enum ColumnMerge {
     /// `COUNT(DISTINCT expr)`. Rebuilt by collecting the distinct values
     /// themselves and counting them once combined. Carries the argument.
     DistinctCount(String),
+    /// `median(x)` or `percentile_cont(x, q)`. Rebuilt from how often each
+    /// value occurs. Carries the argument and the fraction.
+    Quantile(String, f64),
     /// Anything else, with the reason to hand back to the caller.
     Refuse(String),
 }
@@ -991,6 +996,23 @@ fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
                 }
                 "stddev" | "stddev_samp" => derived_column(f, name.as_str(), Derived::StddevSample),
                 "stddev_pop" => derived_column(f, name.as_str(), Derived::StddevPopulation),
+                // A quantile is not derivable from per-node quantiles, but it is
+                // derivable from how often each value occurs — and that is just
+                // counts, which do merge.
+                "median" | "approx_median" => match single_argument(f) {
+                    Some(arg) => ColumnMerge::Quantile(arg, 0.5),
+                    None => ColumnMerge::Refuse(
+                        "median needs a single argument to count across nodes.".to_string(),
+                    ),
+                },
+                "percentile_cont" | "approx_percentile_cont" => match quantile_arguments(f) {
+                    Some((arg, q)) => ColumnMerge::Quantile(arg, q),
+                    None => ColumnMerge::Refuse(format!(
+                        "{name} can be merged across nodes only as {name}(column, <literal \
+                         fraction>): the fraction has to be known here to pick the value out of \
+                         the combined counts."
+                    )),
+                },
                 other => ColumnMerge::Refuse(format!(
                     "{other}(...) cannot be merged across nodes: it is not derivable from the \
                      per-node results, which would otherwise be returned one row per node."
@@ -1006,6 +1028,118 @@ fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
     }
 }
 
+/// Plan a quantile, which the nodes answer as a frequency table.
+///
+/// `SELECT k, median(x) AS m FROM t GROUP BY k` becomes
+/// `SELECT k, x AS <value>, COUNT(*) AS <count> FROM t GROUP BY k, x`: every
+/// node says how often it holds each value, the counts are summed per value by
+/// the ordinary group merge, and the quantile is read off the total here.
+fn plan_quantile(
+    query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+    select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
+    columns: &[ColumnMerge],
+) -> Result<(String, Vec<Option<AggMerge>>, QuantileColumn), String> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{GroupByExpr, SelectItem, SetExpr};
+
+    if columns
+        .iter()
+        .filter(|c| matches!(c, ColumnMerge::Quantile(..)))
+        .count()
+        > 1
+    {
+        return Err(
+            "only one quantile can be merged across nodes at a time: each one needs the \
+                    counts of its own column. Ask for them one query at a time."
+                .to_string(),
+        );
+    }
+    if columns
+        .iter()
+        .any(|c| matches!(c, ColumnMerge::Mergeable(_) | ColumnMerge::Derived(..)))
+    {
+        return Err(
+            "a quantile cannot be merged across nodes alongside another aggregate: the \
+                    nodes return a count per value, and the other aggregate would be computed \
+                    over those rather than over the rows."
+                .to_string(),
+        );
+    }
+
+    let mut projection = Vec::with_capacity(select.projection.len() + 1);
+    let mut how = Vec::with_capacity(select.projection.len() + 1);
+    let mut group_by = Vec::new();
+    let mut keys = Vec::new();
+    let mut spec = None;
+
+    for (idx, (item, class)) in select.projection.iter().zip(columns).enumerate() {
+        match class {
+            ColumnMerge::Quantile(arg, fraction) => {
+                let SelectItem::ExprWithAlias { alias, .. } = item else {
+                    return Err(
+                        "a quantile has to be given a name to be merged across nodes, \
+                                because the nodes are asked for value counts instead. Write \
+                                median(x) AS median_x."
+                            .to_string(),
+                    );
+                };
+                let value = format!("__chronik_q_value_{idx}");
+                let count = format!("__chronik_q_count_{idx}");
+                projection.push(parse_projection_item(arg, &value)?);
+                projection.push(parse_projection_item("COUNT(*)", &count)?);
+                how.push(None); // the value is a key of the merge
+                how.push(Some(AggMerge::Sum)); // its count is what combines
+                group_by.push(parse_group_by_expr(arg)?);
+                spec = Some(QuantileColumn {
+                    output: alias.value.clone(),
+                    value,
+                    count,
+                    keys: Vec::new(),
+                    fraction: *fraction,
+                });
+            }
+            _ => {
+                let (name, expr) = match item {
+                    SelectItem::ExprWithAlias { alias, expr } => (alias.value.clone(), expr),
+                    SelectItem::UnnamedExpr(expr) => (expr.to_string(), expr),
+                    _ => return Err(UNREWRITABLE.to_string()),
+                };
+                keys.push(name);
+                group_by.push(expr.clone());
+                projection.push(item.clone());
+                how.push(None);
+            }
+        }
+    }
+
+    let mut spec = spec.ok_or_else(|| UNREWRITABLE.to_string())?;
+    spec.keys = keys;
+
+    let mut rewritten = query.clone();
+    rewritten.order_by = None;
+    rewritten.limit = None;
+    rewritten.offset = None;
+    strip_having(&mut rewritten);
+    let SetExpr::Select(inner) = rewritten.body.as_mut() else {
+        return Err(UNREWRITABLE.to_string());
+    };
+    inner.projection = projection;
+    // Grouped by the caller's keys *and* the value, which is what turns the
+    // query into a frequency table.
+    inner.group_by = GroupByExpr::Expressions(group_by, Vec::new());
+
+    Ok((rewritten.to_string(), how, spec))
+}
+
+/// Parse one GROUP BY term from its SQL text.
+fn parse_group_by_expr(
+    expr: &str,
+) -> Result<chronik_columnar::datafusion::sql::sqlparser::ast::Expr, String> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem;
+    match parse_projection_item(expr, "__chronik_group")? {
+        SelectItem::ExprWithAlias { expr, .. } => Ok(expr),
+        _ => Err(UNREWRITABLE.to_string()),
+    }
+}
 /// Plan a `COUNT(DISTINCT x)`, which is answered by moving values rather than
 /// counts and so rewrites the query more heavily than the others.
 ///
@@ -1274,6 +1408,169 @@ fn single_argument(
     }
 }
 
+/// The column and the fraction of a `percentile_cont(x, 0.95)` call.
+fn quantile_arguments(
+    f: &chronik_columnar::datafusion::sql::sqlparser::ast::Function,
+) -> Option<(String, f64)> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        FunctionArg, FunctionArgExpr, FunctionArguments,
+    };
+    let FunctionArguments::List(list) = &f.args else {
+        return None;
+    };
+    if list.args.len() != 2 {
+        return None;
+    }
+    let expr_of = |a: &FunctionArg| match a {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+        | FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(e),
+            ..
+        } => Some(e.clone()),
+        _ => None,
+    };
+    let column = expr_of(&list.args[0])?.to_string();
+    let fraction = json_literal(&expr_of(&list.args[1])?)?.as_f64()?;
+    // A fraction outside [0, 1] picks no value; let the engine reject it.
+    (0.0..=1.0)
+        .contains(&fraction)
+        .then_some((column, fraction))
+}
+
+/// A quantile rebuilt from how often each value occurs.
+///
+/// Nodes cannot combine their own quantiles — the median of three medians is
+/// not the median — but they can each say how many times they hold each value,
+/// and counts do combine. Adding those up gives the exact distribution, and the
+/// quantile follows from walking it.
+///
+/// Exact, then, rather than estimated, and the traffic is one row per *distinct
+/// value* rather than per row: a severity or status-code column is a handful of
+/// rows however many billion records it summarises. A column of distinct floats
+/// is the case this does not suit, and there the merge says so rather than
+/// guessing — that is where a t-digest would earn its keep.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantileColumn {
+    /// The column the caller asked for.
+    pub output: String,
+    /// Helper columns holding each value and how often it occurs.
+    pub value: String,
+    pub count: String,
+    /// The group keys the quantile is taken within; empty for the whole topic.
+    pub keys: Vec<String>,
+    /// Which quantile: 0.5 for a median.
+    pub fraction: f64,
+}
+
+/// Collapse counted values into the quantile the caller asked for.
+fn finish_quantile(
+    columns: &mut Vec<String>,
+    rows: &mut Vec<HashMap<String, serde_json::Value>>,
+    spec: &QuantileColumn,
+) {
+    // Gather (value, count) per group, keeping the key values for the output.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, (HashMap<String, serde_json::Value>, Vec<(f64, f64)>)> =
+        HashMap::new();
+
+    for row in rows.iter() {
+        let identity = spec
+            .keys
+            .iter()
+            .map(|k| row.get(k).unwrap_or(&serde_json::Value::Null).to_string())
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+
+        let entry = groups.entry(identity.clone()).or_insert_with(|| {
+            order.push(identity);
+            let keys = spec
+                .keys
+                .iter()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        row.get(k).cloned().unwrap_or(serde_json::Value::Null),
+                    )
+                })
+                .collect();
+            (keys, Vec::new())
+        });
+
+        // NULLs are not part of the distribution, as in any SQL quantile.
+        let (Some(value), Some(count)) = (
+            row.get(&spec.value).and_then(serde_json::Value::as_f64),
+            row.get(&spec.count).and_then(serde_json::Value::as_f64),
+        ) else {
+            continue;
+        };
+        if count > 0.0 {
+            entry.1.push((value, count));
+        }
+    }
+
+    *rows = order
+        .into_iter()
+        .filter_map(|k| groups.remove(&k))
+        .map(|(mut out, counted)| {
+            out.insert(
+                spec.output.clone(),
+                quantile_of(counted, spec.fraction)
+                    .and_then(serde_json::Number::from_f64)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            out
+        })
+        .collect();
+
+    *columns = spec
+        .keys
+        .iter()
+        .cloned()
+        .chain(std::iter::once(spec.output.clone()))
+        .collect();
+}
+
+/// The continuous quantile of a distribution given as (value, count) pairs.
+///
+/// Continuous, meaning it interpolates between the two values the fraction
+/// falls between rather than snapping to one of them — the same definition
+/// `percentile_cont` has, and the one that makes the median of an even number
+/// of rows land halfway.
+fn quantile_of(mut counted: Vec<(f64, f64)>, fraction: f64) -> Option<f64> {
+    if counted.is_empty() {
+        return None;
+    }
+    counted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total: f64 = counted.iter().map(|(_, n)| n).sum();
+    if total <= 0.0 {
+        return None;
+    }
+
+    // Position in the sorted run of values, as SQL's percentile_cont defines it.
+    let target = fraction * (total - 1.0);
+    let lower_rank = target.floor();
+    let upper_rank = target.ceil();
+
+    // Walk the cumulative counts once, picking off both ranks.
+    let (mut seen, mut low, mut high) = (0.0_f64, None, None);
+    for (value, count) in &counted {
+        let next = seen + count;
+        if low.is_none() && lower_rank < next {
+            low = Some(*value);
+        }
+        if high.is_none() && upper_rank < next {
+            high = Some(*value);
+            break;
+        }
+        seen = next;
+    }
+
+    let low = low.or_else(|| counted.last().map(|(v, _)| *v))?;
+    let high = high.or_else(|| counted.last().map(|(v, _)| *v))?;
+    Some(low + (high - low) * (target - lower_rank))
+}
 /// A `COUNT(DISTINCT x)` carried across the fan-out as the values themselves.
 ///
 /// Counts cannot be added up when they are distinct counts — a value held by
@@ -1690,6 +1987,35 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             }
         };
 
+    // A quantile is answered as a frequency table, which reshapes the query
+    // rather than adjusting it.
+    if columns
+        .iter()
+        .any(|c| matches!(c, ColumnMerge::Quantile(..)))
+    {
+        let (node_sql, how, spec) = match plan_quantile(query, select, &columns) {
+            Ok(parts) => parts,
+            Err(why) => return SqlMerge::Unsupported(why),
+        };
+        let order_by = match resolve_order_by(query, select) {
+            Some(keys) => keys,
+            None => return SqlMerge::Unsupported(UNORDERABLE.to_string()),
+        };
+        return SqlMerge::GroupedAggregate {
+            how,
+            post: MergePlan {
+                node_sql: Some(node_sql),
+                order_by,
+                offset: query_offset(query),
+                limit: query_limit(query),
+                derived: Vec::new(),
+                having,
+                distinct_count: None,
+                quantile: Some(spec),
+            },
+        };
+    }
+
     // A distinct count reshapes the query rather than adjusting it, so it is
     // planned on its own before the ordinary aggregate paths.
     if columns
@@ -1714,6 +2040,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
                 derived: Vec::new(),
                 having,
                 distinct_count: Some(spec),
+                quantile: None,
             },
         };
     }
@@ -1762,6 +2089,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
                 derived,
                 having,
                 distinct_count: None,
+                quantile: None,
             },
         };
     }
@@ -1786,6 +2114,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             derived: Vec::new(),
             having: None,
             distinct_count: None,
+            quantile: None,
         });
     }
 
@@ -2247,6 +2576,10 @@ fn finish_rows(
     // what is left to do is count them.
     if let Some(spec) = plan.distinct_count.as_ref() {
         finish_distinct_count(columns, rows, spec);
+    }
+    // Likewise the counted values: they are the whole distribution now.
+    if let Some(spec) = plan.quantile.as_ref() {
+        finish_quantile(columns, rows, spec);
     }
     apply_finish(rows, plan);
 }
@@ -3893,8 +4226,6 @@ mod sql_merge_tests {
     #[test]
     fn aggregates_that_cannot_be_combined_are_refused() {
         for sql in [
-            "SELECT median(x) AS m FROM t",
-            "SELECT approx_percentile_cont(x, 0.95) AS p FROM t",
             "SELECT approx_distinct(x) AS d FROM t",
             "SELECT array_agg(x) AS a FROM t",
             "SELECT corr(x, y) AS c FROM t",
@@ -4200,5 +4531,95 @@ mod sql_merge_tests {
             "200 over 10 rows, not the mean of 10 and 24.3"
         );
         assert_eq!(merged.columns, vec!["k".to_string(), "avg_x".to_string()]);
+    }
+
+    /// A quantile is not derivable from per-node quantiles — the median of
+    /// three medians is not the median — but it is derivable from how often
+    /// each value occurs, and counts do combine. So the nodes are asked for a
+    /// frequency table and the answer is exact, not estimated.
+    #[test]
+    fn a_quantile_is_rebuilt_from_value_counts() {
+        let SqlMerge::GroupedAggregate { how, post } =
+            sql_merge_strategy("SELECT median(x) AS m FROM t")
+        else {
+            panic!("median should now be answered");
+        };
+        assert_eq!(
+            how,
+            vec![None, Some(AggMerge::Sum)],
+            "value, then its count"
+        );
+
+        let spec = post.quantile.as_ref().expect("a quantile plan");
+        assert_eq!(spec.fraction, 0.5);
+        let node_sql = post.node_sql.as_deref().expect("a rewritten query");
+        assert!(
+            node_sql.contains("COUNT(*)") && node_sql.contains("GROUP BY x"),
+            "the nodes must be asked for a frequency table: {node_sql}"
+        );
+        assert!(
+            !node_sql.contains("median"),
+            "no node should take a median of its own rows"
+        );
+
+        // 1 once, 2 twice, 3 once across three nodes: 1,2,2,3 has median 2.
+        let (v, c) = (spec.value.clone(), spec.count.clone());
+        let bucket = |value: i64, count: i64| {
+            HashMap::from([
+                (v.clone(), serde_json::Value::from(value)),
+                (c.clone(), serde_json::Value::from(count)),
+            ])
+        };
+        let as_resp = |rows: Vec<HashMap<String, serde_json::Value>>| SqlResponse {
+            columns: vec![v.clone(), c.clone()],
+            rows,
+            row_count: 0,
+            execution_time_ms: 0,
+            truncated: false,
+        };
+        let merged = merge_grouped_aggregate(
+            as_resp(vec![bucket(1, 1), bucket(2, 1)]),
+            vec![as_resp(vec![bucket(2, 1)]), as_resp(vec![bucket(3, 1)])],
+            &how,
+            &post,
+            1000,
+        );
+        assert_eq!(merged.columns, vec!["m".to_string()]);
+        assert_eq!(merged.rows[0]["m"], serde_json::Value::from(2.0));
+    }
+
+    /// Worked out by hand against the definition `percentile_cont` uses, so an
+    /// off-by-one in the walk over cumulative counts cannot hide.
+    #[test]
+    fn the_quantile_walk_matches_percentile_cont() {
+        // 10, 20, 30, 40 — position is fraction * (n - 1), interpolated.
+        let d = || vec![(10.0, 1.0), (20.0, 1.0), (30.0, 1.0), (40.0, 1.0)];
+        assert_eq!(quantile_of(d(), 0.0), Some(10.0));
+        assert_eq!(quantile_of(d(), 1.0), Some(40.0));
+        assert_eq!(
+            quantile_of(d(), 0.5),
+            Some(25.0),
+            "halfway between 20 and 30"
+        );
+        assert_eq!(quantile_of(d(), 0.25), Some(17.5));
+
+        // Repeated values must count as many times as they occur: 1,1,1,9 has
+        // median 1, not 5.
+        assert_eq!(quantile_of(vec![(1.0, 3.0), (9.0, 1.0)], 0.5), Some(1.0));
+
+        // Order of arrival must not matter — the nodes answer in any order.
+        assert_eq!(quantile_of(vec![(9.0, 1.0), (1.0, 3.0)], 0.5), Some(1.0));
+
+        assert_eq!(quantile_of(Vec::new(), 0.5), None);
+    }
+
+    /// The fraction has to be a literal, because it is applied here rather than
+    /// by the nodes.
+    #[test]
+    fn a_quantile_needs_a_literal_fraction_and_a_name() {
+        assert!(refusal("SELECT median(x) FROM t").contains("has to be given a name"));
+        assert!(
+            refusal("SELECT approx_percentile_cont(x, y) AS p FROM t").contains("literal fraction")
+        );
     }
 }

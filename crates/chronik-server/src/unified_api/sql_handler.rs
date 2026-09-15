@@ -1157,22 +1157,22 @@ pub async fn execute_sql(
                     // it is only exact while every node's values fit in one
                     // response. If any were cut, the count would be short — and
                     // short by an amount nobody can see. Say so instead.
-                    let counts_distinct = matches!(
+                    let moves_values = matches!(
                         &strategy,
                         super::query_router::SqlMerge::GroupedAggregate { post, .. }
-                            if post.distinct_count.is_some()
+                            if post.distinct_count.is_some() || post.quantile.is_some()
                     );
-                    if counts_distinct
+                    if moves_values
                         && (response.truncated || peers.iter().any(|p| p.truncated))
                     {
                         warn!(query = %request.query,
-                              "COUNT(DISTINCT) exceeded the row limit on at least one node");
+                              "value-collecting merge exceeded the row limit on at least one node");
                         let error_response = SqlErrorResponse {
-                            error: "This query cannot be answered across a cluster: COUNT(DISTINCT \
-                                    ...) is merged by collecting the distinct values, and there \
-                                    were more of them than the row limit allows, so the count \
-                                    would be short. Raise the limit, narrow the query with WHERE, \
-                                    or count within a GROUP BY."
+                            error: "This query cannot be answered across a cluster: it is merged by \
+                                    collecting one row per distinct value, and there were more of \
+                                    those than the row limit allows, so the answer would be built \
+                                    from part of the data. Raise the limit, narrow the query with \
+                                    WHERE, or group it more coarsely."
                                 .to_string(),
                             error_type: "DistributedQueryUnsupported".to_string(),
                         };
