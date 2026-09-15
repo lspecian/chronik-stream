@@ -1152,31 +1152,33 @@ pub async fn execute_sql(
                         .fan_out_post("/_sql", &fan_out_request, &all_peers)
                         .await;
                     debug!(peer_count = peers.len(), "Merging SQL results from peers");
-                    let (mut merged, plan) = match strategy {
-                        super::query_router::SqlMerge::ScalarAggregate { how, post } => (
-                            super::query_router::merge_scalar_aggregate(response, peers, &how),
-                            post,
-                        ),
-                        super::query_router::SqlMerge::GroupedAggregate { how, post } => (
+                    match strategy {
+                        // The row-shaped merges finish themselves, because a
+                        // HAVING or ORDER BY can name an AVG column that only
+                        // exists once the totals have been divided.
+                        super::query_router::SqlMerge::GroupedAggregate { how, post } => {
                             super::query_router::merge_grouped_aggregate(
                                 response, peers, &how, &post, row_limit,
-                            ),
-                            post,
-                        ),
-                        super::query_router::SqlMerge::Concatenate(post) => (
+                            )
+                        }
+                        super::query_router::SqlMerge::Concatenate(post) => {
                             super::query_router::merge_sql_responses(
                                 response, peers, row_limit, &post,
-                            ),
-                            post,
-                        ),
+                            )
+                        }
+                        // A single row has nothing to filter or order, so it is
+                        // only the division that is left.
+                        super::query_router::SqlMerge::ScalarAggregate { how, post } => {
+                            let mut merged = super::query_router::merge_scalar_aggregate(
+                                response, peers, &how,
+                            );
+                            super::query_router::finish_derived(&mut merged, &post.derived);
+                            merged
+                        }
                         super::query_router::SqlMerge::Unsupported(_) => {
                             unreachable!("refusals return above")
                         }
-                    };
-                    // The nodes were asked for sums and counts where the caller
-                    // wrote AVG; divide now that the totals are whole.
-                    super::query_router::finish_averages(&mut merged, &plan.averages);
-                    merged
+                    }
                 }
                 (_, _) => response,
             };

@@ -785,10 +785,10 @@ pub fn merge_sql_responses(
         all_rows.extend(peer_resp.rows);
     }
 
-    // Sort and limit across the union, before the transport cap: each node only
-    // ordered and limited its own partitions, so this is where the query's
-    // ORDER BY and LIMIT actually get applied (#55).
-    apply_finish(&mut all_rows, post);
+    // Finished across the union, before the transport cap: each node ordered
+    // and limited only its own partitions, so this is where the query's own
+    // clauses actually get applied (#55).
+    finish_rows(&mut columns, &mut all_rows, post);
 
     let truncated = all_rows.len() > limit;
     all_rows.truncate(limit);
@@ -854,7 +854,9 @@ pub struct MergePlan {
     pub limit: Option<usize>,
     /// AVG columns the nodes were asked for as a sum and a count, to divide
     /// once the partials are combined.
-    pub averages: Vec<AverageColumn>,
+    pub derived: Vec<DerivedColumn>,
+    /// A HAVING to apply to the combined groups, which the nodes did not run.
+    pub having: Option<Predicate>,
 }
 
 /// One `ORDER BY` term, resolved to the name of a column in the response.
@@ -905,11 +907,11 @@ enum ColumnMerge {
     RowWise,
     /// A whole-column aggregate that combines exactly across disjoint inputs.
     Mergeable(AggMerge),
-    /// `AVG(expr)`. Not combinable from per-node averages, but exactly
+    /// `AVG(expr)`. Not combinable from per-node derived, but exactly
     /// recoverable if the nodes are asked for `SUM(expr)` and `COUNT(expr)`
     /// instead and the division is done once, here. Carries the argument so the
     /// projection can be rewritten.
-    Average(String),
+    Derived(Derived, String),
     /// Anything else, with the reason to hand back to the caller.
     Refuse(String),
 }
@@ -959,15 +961,17 @@ fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
                 "count" | "sum" => ColumnMerge::Mergeable(AggMerge::Sum),
                 "min" => ColumnMerge::Mergeable(AggMerge::Min),
                 "max" => ColumnMerge::Mergeable(AggMerge::Max),
-                "avg" | "mean" => match single_argument(f) {
-                    Some(arg) => ColumnMerge::Average(arg),
-                    // AVG(*) and friends: nothing to sum and count.
-                    None => ColumnMerge::Refuse(
-                        "AVG cannot be merged across nodes unless it has a single argument to \
-                         rewrite as SUM and COUNT."
-                            .to_string(),
-                    ),
-                },
+                // Each of these is a fixed formula over running totals, so the
+                // nodes are asked for the totals and the formula is applied once.
+                "avg" | "mean" => derived_column(f, name.as_str(), Derived::Average),
+                "var" | "var_samp" | "var_sample" => {
+                    derived_column(f, name.as_str(), Derived::VarSample)
+                }
+                "var_pop" | "var_population" => {
+                    derived_column(f, name.as_str(), Derived::VarPopulation)
+                }
+                "stddev" | "stddev_samp" => derived_column(f, name.as_str(), Derived::StddevSample),
+                "stddev_pop" => derived_column(f, name.as_str(), Derived::StddevPopulation),
                 other => ColumnMerge::Refuse(format!(
                     "{other}(...) cannot be merged across nodes: it is not derivable from the \
                      per-node results, which would otherwise be returned one row per node."
@@ -990,16 +994,16 @@ fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
 /// Everything else is passed through untouched.
 ///
 /// Returns the new projection, the merge op per resulting column, and the
-/// averages to finish afterwards.
+/// derived to finish afterwards.
 #[allow(clippy::type_complexity)]
-fn rewrite_projection_for_averages(
+fn rewrite_projection_for_derived(
     select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
     columns: &[ColumnMerge],
 ) -> Result<
     (
         Vec<chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem>,
         Vec<Option<AggMerge>>,
-        Vec<AverageColumn>,
+        Vec<DerivedColumn>,
     ),
     String,
 > {
@@ -1007,10 +1011,10 @@ fn rewrite_projection_for_averages(
 
     let mut projection = Vec::with_capacity(select.projection.len());
     let mut how = Vec::with_capacity(select.projection.len());
-    let mut averages = Vec::new();
+    let mut derived = Vec::new();
 
     for (idx, (item, class)) in select.projection.iter().zip(columns).enumerate() {
-        let ColumnMerge::Average(arg) = class else {
+        let ColumnMerge::Derived(kind, arg) = class else {
             projection.push(item.clone());
             how.push(match class {
                 ColumnMerge::Mergeable(op) => Some(*op),
@@ -1024,26 +1028,43 @@ fn rewrite_projection_for_averages(
         // would have generated one from an expression that is no longer there.
         let SelectItem::ExprWithAlias { alias, .. } = item else {
             return Err(
-                "AVG has to be given a name to be merged across nodes, because the nodes are \
-                 asked for its SUM and COUNT instead. Write AVG(x) AS avg_x."
+                "this aggregate has to be given a name to be merged across nodes, because the \
+                 nodes are asked for the totals it is built from instead. Write AVG(x) AS \
+                 avg_x."
                     .to_string(),
             );
         };
 
-        let sum = format!("__chronik_avg_sum_{idx}");
-        let count = format!("__chronik_avg_count_{idx}");
+        let sum = format!("__chronik_sum_{idx}");
+        let count = format!("__chronik_count_{idx}");
         projection.push(parse_projection_item(&format!("SUM({arg})"), &sum)?);
         projection.push(parse_projection_item(&format!("COUNT({arg})"), &count)?);
         how.push(Some(AggMerge::Sum));
         how.push(Some(AggMerge::Sum));
-        averages.push(AverageColumn {
+
+        // A variance also needs the squares. Summing them is exact and needs no
+        // second pass: the nodes never have to see each other's rows.
+        let sum_sq = kind
+            .needs_squares()
+            .then(|| format!("__chronik_sumsq_{idx}"));
+        if let Some(name) = sum_sq.as_ref() {
+            projection.push(parse_projection_item(
+                &format!("SUM(({arg}) * ({arg}))"),
+                name,
+            )?);
+            how.push(Some(AggMerge::Sum));
+        }
+
+        derived.push(DerivedColumn {
             output: alias.value.clone(),
+            kind: *kind,
             sum,
             count,
+            sum_sq,
         });
     }
 
-    Ok((projection, how, averages))
+    Ok((projection, how, derived))
 }
 
 /// Build one `SELECT` item by parsing it, rather than assembling the AST by
@@ -1085,11 +1106,28 @@ fn sql_with_projection(
     rewritten.order_by = None;
     rewritten.limit = None;
     rewritten.offset = None;
+    strip_having(&mut rewritten);
     let SetExpr::Select(select) = rewritten.body.as_mut() else {
         return None;
     };
     select.projection = projection;
     Some(rewritten.to_string())
+}
+
+/// Classify a function whose value is a formula over running totals.
+fn derived_column(
+    f: &chronik_columnar::datafusion::sql::sqlparser::ast::Function,
+    name: &str,
+    kind: Derived,
+) -> ColumnMerge {
+    match single_argument(f) {
+        Some(arg) => ColumnMerge::Derived(kind, arg),
+        // `AVG(*)` and the like: nothing to total up.
+        None => ColumnMerge::Refuse(format!(
+            "{name} cannot be merged across nodes unless it has a single argument, which is \
+             what the nodes are asked to total."
+        )),
+    }
 }
 /// The single argument of a function call, rendered back to SQL.
 fn single_argument(
@@ -1114,60 +1152,143 @@ fn single_argument(
     }
 }
 
-/// An `AVG` column carried across the fan-out as a sum and a count.
+/// A column the nodes cannot combine, carried across the fan-out as the running
+/// totals it *can* be rebuilt from.
+///
+/// An average is a sum over a count. A variance is those two plus the sum of
+/// squares, since `E[x²] - E[x]²` needs nothing else — which makes both exact
+/// here, not estimates: no sketch, no sampling, the same number a single node
+/// holding all the rows would have produced.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AverageColumn {
+pub struct DerivedColumn {
     /// The column the caller asked for.
     pub output: String,
+    /// What to rebuild from the totals.
+    pub kind: Derived,
     /// The helper columns the nodes were asked for instead.
     pub sum: String,
     pub count: String,
+    /// Only variance and standard deviation need the squares.
+    pub sum_sq: Option<String>,
 }
 
-/// Finish the averages: divide, name the result what the caller asked for, and
+/// What a [`DerivedColumn`] rebuilds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Derived {
+    Average,
+    /// Sample variance and its root: the `n - 1` denominator, which is what
+    /// plain `var` and `stddev` mean in this engine as in most.
+    VarSample,
+    StddevSample,
+    /// Population variance and its root: the `n` denominator.
+    VarPopulation,
+    StddevPopulation,
+}
+
+impl Derived {
+    fn needs_squares(self) -> bool {
+        !matches!(self, Derived::Average)
+    }
+
+    /// Rebuild the value from the combined totals.
+    fn combine(self, sum: f64, sum_sq: f64, count: f64) -> Option<f64> {
+        if count == 0.0 {
+            return None;
+        }
+        match self {
+            Derived::Average => Some(sum / count),
+            Derived::VarPopulation | Derived::StddevPopulation => {
+                // Clamped at zero: with floating point, a column of identical
+                // values can land a hair below it and a negative variance is
+                // worse than a zero one.
+                let var = (sum_sq / count - (sum / count).powi(2)).max(0.0);
+                Some(match self {
+                    Derived::StddevPopulation => var.sqrt(),
+                    _ => var,
+                })
+            }
+            Derived::VarSample | Derived::StddevSample => {
+                if count < 2.0 {
+                    return None; // undefined for a single row, as in SQL
+                }
+                let var = ((sum_sq - sum * sum / count) / (count - 1.0)).max(0.0);
+                Some(match self {
+                    Derived::StddevSample => var.sqrt(),
+                    _ => var,
+                })
+            }
+        }
+    }
+}
+
+/// Finish the derived: divide, name the result what the caller asked for, and
 /// drop the helpers.
 ///
-/// Averaging per-node averages is only right when every node holds the same
+/// Averaging per-node derived is only right when every node holds the same
 /// number of rows, which a partitioned topic does not guarantee. Summing the
 /// sums and the counts and dividing once is exact regardless of how the rows
 /// are spread.
-pub fn finish_averages(response: &mut SqlResponse, averages: &[AverageColumn]) {
-    if averages.is_empty() {
+pub fn finish_derived(response: &mut SqlResponse, derived: &[DerivedColumn]) {
+    finish_derived_rows(&mut response.columns, &mut response.rows, derived);
+}
+
+/// The same, over the parts, for callers that have not built a response yet.
+fn finish_derived_rows(
+    columns: &mut Vec<String>,
+    rows: &mut Vec<HashMap<String, serde_json::Value>>,
+    derived: &[DerivedColumn],
+) {
+    if derived.is_empty() {
         return;
     }
 
-    for row in &mut response.rows {
-        for avg in averages {
-            let sum = row.get(&avg.sum).and_then(serde_json::Value::as_f64);
-            let count = row.get(&avg.count).and_then(serde_json::Value::as_f64);
+    for row in rows.iter_mut() {
+        for column in derived {
+            let sum = row.get(&column.sum).and_then(serde_json::Value::as_f64);
+            let count = row.get(&column.count).and_then(serde_json::Value::as_f64);
+            let sum_sq = column
+                .sum_sq
+                .as_ref()
+                .and_then(|c| row.get(c))
+                .and_then(serde_json::Value::as_f64);
+
+            // No rows contributed, so there is no value here — not zero.
             let value = match (sum, count) {
-                // No rows contributed, so there is no average — not zero.
-                (_, Some(c)) if c == 0.0 => serde_json::Value::Null,
-                (Some(s), Some(c)) => serde_json::Number::from_f64(s / c)
+                (Some(s), Some(c)) => column
+                    .kind
+                    .combine(s, sum_sq.unwrap_or(0.0), c)
+                    .and_then(serde_json::Number::from_f64)
                     .map(serde_json::Value::Number)
                     .unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             };
-            row.remove(&avg.sum);
-            row.remove(&avg.count);
-            row.insert(avg.output.clone(), value);
+
+            row.remove(&column.sum);
+            row.remove(&column.count);
+            if let Some(sq) = column.sum_sq.as_ref() {
+                row.remove(sq);
+            }
+            row.insert(column.output.clone(), value);
         }
     }
 
     // Put the caller's column back where the helpers were, so the response
     // describes the query that was asked rather than the one that was sent.
-    let mut columns = Vec::with_capacity(response.columns.len());
-    for column in response.columns.drain(..) {
-        match averages.iter().find(|a| a.sum == column) {
-            Some(avg) => columns.push(avg.output.clone()),
+    let mut rebuilt = Vec::with_capacity(columns.len());
+    for column in columns.drain(..) {
+        match derived.iter().find(|a| a.sum == column) {
+            Some(avg) => rebuilt.push(avg.output.clone()),
             None => {
-                if !averages.iter().any(|a| a.count == column) {
-                    columns.push(column);
+                let helper = derived
+                    .iter()
+                    .any(|d| d.count == column || d.sum_sq.as_deref() == Some(column.as_str()));
+                if !helper {
+                    rebuilt.push(column);
                 }
             }
         }
     }
-    response.columns = columns;
+    *columns = rebuilt;
 }
 /// An aggregate or window call found inside an expression.
 enum AggCall {
@@ -1347,21 +1468,33 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         return SqlMerge::Unsupported(why.clone());
     }
 
-    // A HAVING clause filters groups on each node's partial counts.
-    if select.having.is_some() {
-        return SqlMerge::Unsupported(
-            "HAVING cannot be applied across nodes: each node would filter groups on its own \
-             partial aggregate before the groups are combined."
-                .to_string(),
-        );
-    }
+    // A HAVING is meant for the combined groups, so it is resolved to the
+    // columns the response will carry and applied here rather than by the nodes.
+    let having =
+        match &select.having {
+            None => None,
+            Some(expr) => {
+                let resolved = projection_names(select)
+                    .and_then(|(names, by_text)| resolve_having(expr, &names, &by_text));
+                match resolved {
+                    Some(predicate) => Some(predicate),
+                    None => return SqlMerge::Unsupported(
+                        "this HAVING cannot be applied across nodes: it has to compare a column \
+                         the query also projects against a literal, because the groups are only \
+                         whole once they reach the coordinator. Project the aggregate and filter \
+                         on that column."
+                            .to_string(),
+                    ),
+                }
+            }
+        };
 
     // An AVG counts: it is an aggregate that produces one row per node, even
     // though it is carried across as a sum and a count rather than merged
     // directly. Leaving it out sent `SELECT AVG(x) AS a` down the row-wise path.
     let any_agg = columns
         .iter()
-        .any(|c| matches!(c, ColumnMerge::Mergeable(_) | ColumnMerge::Average(_)));
+        .any(|c| matches!(c, ColumnMerge::Mergeable(_) | ColumnMerge::Derived(..)));
 
     if grouped || select.distinct.is_some() {
         let Some(order_by) = resolve_order_by(query, select) else {
@@ -1377,11 +1510,11 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         // large overall but small there, before the groups are ever combined —
         // so the nodes are sent the query without it and it lands once, on the
         // merged groups. An AVG is rewritten here too.
-        let (projection, how, averages) = match rewrite_projection_for_averages(select, &columns) {
+        let (projection, how, derived) = match rewrite_projection_for_derived(select, &columns) {
             Ok(parts) => parts,
             Err(why) => return SqlMerge::Unsupported(why),
         };
-        let rewritten = !averages.is_empty() || needs_rewrite(query);
+        let rewritten = !derived.is_empty() || having.is_some() || needs_rewrite(query);
 
         return SqlMerge::GroupedAggregate {
             how,
@@ -1397,7 +1530,8 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
                 order_by,
                 offset: query_offset(query),
                 limit: query_limit(query),
-                averages,
+                derived,
+                having,
             },
         };
     }
@@ -1419,7 +1553,8 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             order_by,
             offset: query_offset(query),
             limit: query_limit(query),
-            averages: Vec::new(),
+            derived: Vec::new(),
+            having: None,
         });
     }
 
@@ -1431,11 +1566,11 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         );
     }
 
-    let (projection, how, averages) = match rewrite_projection_for_averages(select, &columns) {
+    let (projection, how, derived) = match rewrite_projection_for_derived(select, &columns) {
         Ok(parts) => parts,
         Err(why) => return SqlMerge::Unsupported(why),
     };
-    let node_sql = if averages.is_empty() {
+    let node_sql = if derived.is_empty() {
         None
     } else {
         match sql_with_projection(query, projection) {
@@ -1451,7 +1586,8 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             .collect(),
         post: MergePlan {
             node_sql,
-            averages,
+            derived,
+            having,
             ..Default::default()
         },
     }
@@ -1592,6 +1728,206 @@ fn query_limit(query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query)
         _ => None,
     }
 }
+
+/// A `HAVING` clause resolved against the response's own columns.
+///
+/// Held apart from the SQL because it is evaluated after the groups are
+/// combined, not by the nodes: each node would otherwise filter on its own
+/// partial count and drop groups that clear the threshold only once the
+/// partials are added up.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predicate {
+    Compare {
+        column: String,
+        op: CmpOp,
+        value: serde_json::Value,
+    },
+    And(Box<Predicate>, Box<Predicate>),
+    Or(Box<Predicate>, Box<Predicate>),
+    Not(Box<Predicate>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CmpOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl Predicate {
+    /// Whether a merged row survives the filter.
+    pub fn admits(&self, row: &HashMap<String, serde_json::Value>) -> bool {
+        match self {
+            Predicate::And(a, b) => a.admits(row) && b.admits(row),
+            Predicate::Or(a, b) => a.admits(row) || b.admits(row),
+            Predicate::Not(inner) => !inner.admits(row),
+            Predicate::Compare { column, op, value } => {
+                let Some(actual) = row.get(column) else {
+                    return false;
+                };
+                // SQL comparisons against NULL are unknown, which filters out.
+                if actual.is_null() || value.is_null() {
+                    return false;
+                }
+                let ord = compare_json(actual, value);
+                match op {
+                    CmpOp::Eq => ord == std::cmp::Ordering::Equal,
+                    CmpOp::NotEq => ord != std::cmp::Ordering::Equal,
+                    CmpOp::Lt => ord == std::cmp::Ordering::Less,
+                    CmpOp::LtEq => ord != std::cmp::Ordering::Greater,
+                    CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+                    CmpOp::GtEq => ord != std::cmp::Ordering::Less,
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a `HAVING` expression against the projected columns.
+///
+/// `HAVING COUNT(*) > 5` filters on a value the query also projects, so the
+/// aggregate is matched to the column it was projected as and the comparison is
+/// made there. Anything that cannot be tied to a projected column — or any
+/// shape beyond comparisons joined by AND/OR/NOT — yields `None`, and the
+/// caller turns that into a refusal rather than a guess.
+fn resolve_having(
+    expr: &chronik_columnar::datafusion::sql::sqlparser::ast::Expr,
+    names: &[String],
+    by_expr_text: &HashMap<String, String>,
+) -> Option<Predicate> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        BinaryOperator, Expr as SqlExpr, UnaryOperator, Value,
+    };
+
+    match expr {
+        SqlExpr::Nested(inner) => resolve_having(inner, names, by_expr_text),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => Some(Predicate::Not(Box::new(resolve_having(
+            inner,
+            names,
+            by_expr_text,
+        )?))),
+        SqlExpr::BinaryOp { left, op, right } => {
+            if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                let l = Box::new(resolve_having(left, names, by_expr_text)?);
+                let r = Box::new(resolve_having(right, names, by_expr_text)?);
+                return Some(match op {
+                    BinaryOperator::And => Predicate::And(l, r),
+                    _ => Predicate::Or(l, r),
+                });
+            }
+
+            let cmp = match op {
+                BinaryOperator::Eq => CmpOp::Eq,
+                BinaryOperator::NotEq => CmpOp::NotEq,
+                BinaryOperator::Lt => CmpOp::Lt,
+                BinaryOperator::LtEq => CmpOp::LtEq,
+                BinaryOperator::Gt => CmpOp::Gt,
+                BinaryOperator::GtEq => CmpOp::GtEq,
+                _ => return None,
+            };
+
+            // Either side may be the literal; `5 < COUNT(*)` means the same as
+            // `COUNT(*) > 5` with the comparison turned around.
+            if let Some(value) = json_literal(right) {
+                let column = resolve_output_column(left, names, by_expr_text)?;
+                return Some(Predicate::Compare {
+                    column,
+                    op: cmp,
+                    value,
+                });
+            }
+            let value = json_literal(left)?;
+            let column = resolve_output_column(right, names, by_expr_text)?;
+            let flipped = match cmp {
+                CmpOp::Lt => CmpOp::Gt,
+                CmpOp::LtEq => CmpOp::GtEq,
+                CmpOp::Gt => CmpOp::Lt,
+                CmpOp::GtEq => CmpOp::LtEq,
+                other => other,
+            };
+            Some(Predicate::Compare {
+                column,
+                op: flipped,
+                value,
+            })
+        }
+        _ => {
+            let _ = Value::Null;
+            None
+        }
+    }
+}
+
+/// Tie an expression to the name it was projected under.
+fn resolve_output_column(
+    expr: &chronik_columnar::datafusion::sql::sqlparser::ast::Expr,
+    names: &[String],
+    by_expr_text: &HashMap<String, String>,
+) -> Option<String> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::Expr as SqlExpr;
+    if let SqlExpr::Identifier(id) = expr {
+        if names.iter().any(|n| n.eq_ignore_ascii_case(&id.value)) {
+            return Some(id.value.clone());
+        }
+    }
+    by_expr_text.get(&expr.to_string()).cloned()
+}
+
+/// A literal as JSON, if that is what this expression is.
+fn json_literal(
+    expr: &chronik_columnar::datafusion::sql::sqlparser::ast::Expr,
+) -> Option<serde_json::Value> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value};
+    match expr {
+        SqlExpr::Nested(inner) => json_literal(inner),
+        SqlExpr::Value(Value::Number(n, _)) => n.parse::<f64>().ok().and_then(|f| {
+            if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
+                Some(serde_json::Value::from(f as i64))
+            } else {
+                serde_json::Number::from_f64(f).map(serde_json::Value::Number)
+            }
+        }),
+        SqlExpr::Value(Value::SingleQuotedString(s) | Value::DoubleQuotedString(s)) => {
+            Some(serde_json::Value::String(s.clone()))
+        }
+        SqlExpr::Value(Value::Boolean(b)) => Some(serde_json::Value::Bool(*b)),
+        _ => None,
+    }
+}
+
+/// The output name of every projected column, plus a lookup from the text of
+/// the expression it came from.
+#[allow(clippy::type_complexity)]
+fn projection_names(
+    select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
+) -> Option<(Vec<String>, HashMap<String, String>)> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem;
+
+    let mut names = Vec::new();
+    let mut by_expr_text = HashMap::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::ExprWithAlias { expr, alias } => {
+                names.push(alias.value.clone());
+                by_expr_text.insert(expr.to_string(), alias.value.clone());
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                let text = expr.to_string();
+                names.push(text.clone());
+                by_expr_text.insert(text.clone(), text);
+            }
+            // A wildcard's columns are not known from the SQL alone.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+        }
+    }
+    Some((names, by_expr_text))
+}
 /// Resolve the query's `ORDER BY` terms to output column names.
 ///
 /// Returns `None` when a term cannot be tied to a column that is actually in
@@ -1658,6 +1994,20 @@ fn resolve_order_by(
     Some(keys)
 }
 
+/// Finish a merged result: everything the nodes could not do for themselves,
+/// in the order SQL means it.
+///
+/// The derived come first because the rest may refer to them — `HAVING
+/// AVG(x) > 5` and `ORDER BY avg_x` name a column that does not exist until the
+/// sums and counts have been divided.
+fn finish_rows(
+    columns: &mut Vec<String>,
+    rows: &mut Vec<HashMap<String, serde_json::Value>>,
+    plan: &MergePlan,
+) {
+    finish_derived_rows(columns, rows, &plan.derived);
+    apply_finish(rows, plan);
+}
 /// Order two JSON values the way SQL would.
 ///
 /// Values of different types are grouped rather than interleaved, so a column
@@ -1734,6 +2084,12 @@ pub fn apply_finish(rows: &mut Vec<HashMap<String, serde_json::Value>>, post: &M
         });
     }
 
+    // HAVING first, and only now that the groups are whole: a threshold applied
+    // to a node's partial count drops groups that clear it once added up.
+    if let Some(predicate) = post.having.as_ref() {
+        rows.retain(|row| predicate.admits(row));
+    }
+
     // Offset before limit, and both over the union: the nodes ran a query with
     // these clauses removed precisely so that they land once, here.
     if let Some(offset) = post.offset {
@@ -1749,6 +2105,17 @@ pub fn apply_finish(rows: &mut Vec<HashMap<String, serde_json::Value>>, post: &M
     }
 }
 
+/// Drop the `HAVING` from a query bound for the nodes.
+///
+/// The threshold is meant for the combined groups. Left in, each node applies
+/// it to its own partial count, so a group that only clears the bar once the
+/// partials are added up is dropped before anyone can add them up.
+fn strip_having(query: &mut chronik_columnar::datafusion::sql::sqlparser::ast::Query) {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::SetExpr;
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        select.having = None;
+    }
+}
 /// The caller's query with `ORDER BY`, `LIMIT` and `OFFSET` removed.
 ///
 /// Those clauses mean something different on a node than they do to the caller:
@@ -1763,6 +2130,7 @@ fn sql_without_ordering(
     stripped.order_by = None;
     stripped.limit = None;
     stripped.offset = None;
+    strip_having(&mut stripped);
     stripped.to_string()
 }
 /// Combine one row per node into a single row of aggregates.
@@ -1908,8 +2276,9 @@ pub fn merge_grouped_aggregate(
         .filter_map(|k| groups.remove(&k))
         .collect();
 
-    // The query's ORDER BY ranks the combined groups, not each node's own.
-    apply_finish(&mut rows, post);
+    // The query's own HAVING and ORDER BY apply to the combined groups, not to
+    // any one node's partial view of them.
+    finish_rows(&mut columns, &mut rows, post);
 
     let truncated = rows.len() > limit;
     rows.truncate(limit);
@@ -2896,7 +3265,7 @@ mod sql_merge_tests {
 
     /// AVG must be refused, not approximated.
     ///
-    /// The average of per-node averages equals the true average only when every
+    /// The average of per-node derived equals the true average only when every
     /// node holds the same number of rows, which a partitioned topic does not
     /// guarantee. So the nodes are asked for the sum and the count instead, and
     /// the division happens once — exact however the rows are spread.
@@ -2922,8 +3291,8 @@ mod sql_merge_tests {
         );
 
         // Two nodes holding very different row counts: the naive mean of the
-        // per-node averages would be 15, the true average is 12.
-        let avg = &post.averages[0];
+        // per-node derived would be 15, the true average is 12.
+        let avg = &post.derived[0];
         let mut merged = SqlResponse {
             columns: vec![avg.sum.clone(), avg.count.clone()],
             rows: vec![HashMap::from([
@@ -2934,7 +3303,7 @@ mod sql_merge_tests {
             execution_time_ms: 0,
             truncated: false,
         };
-        finish_averages(&mut merged, &post.averages);
+        finish_derived(&mut merged, &post.derived);
         assert_eq!(merged.columns, vec!["avg_amount".to_string()]);
         assert_eq!(merged.rows[0]["avg_amount"], serde_json::Value::from(12.0));
     }
@@ -2942,10 +3311,12 @@ mod sql_merge_tests {
     /// Dividing by a zero count is no rows, not zero.
     #[test]
     fn an_average_over_no_rows_is_null() {
-        let averages = vec![AverageColumn {
+        let derived = vec![DerivedColumn {
             output: "a".into(),
+            kind: Derived::Average,
             sum: "s".into(),
             count: "n".into(),
+            sum_sq: None,
         }];
         let mut merged = SqlResponse {
             columns: vec!["s".into(), "n".into()],
@@ -2957,7 +3328,7 @@ mod sql_merge_tests {
             execution_time_ms: 0,
             truncated: false,
         };
-        finish_averages(&mut merged, &averages);
+        finish_derived(&mut merged, &derived);
         assert!(merged.rows[0]["a"].is_null());
     }
 
@@ -3064,13 +3435,80 @@ mod sql_merge_tests {
         assert_eq!(ranked, vec![(2, 11), (1, 5)], "the top two groups overall");
     }
 
-    /// Grouping still refuses HAVING: each node would filter on its own partial.
+    /// A threshold belongs to the combined groups. Left with the nodes, a group
+    /// of 4 + 4 would be dropped by both for failing `> 5`, when together it is
+    /// 8 and clears it.
     #[test]
-    fn group_by_with_having_is_refused() {
-        assert!(
-            refusal("SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING COUNT(*) > 5")
-                .contains("HAVING")
+    fn having_filters_the_combined_groups_not_each_node_s() {
+        let SqlMerge::GroupedAggregate { how, post } =
+            sql_merge_strategy("SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING COUNT(*) > 5")
+        else {
+            panic!("GROUP BY with HAVING should now be answered");
+        };
+        assert_eq!(
+            post.node_sql.as_deref(),
+            Some("SELECT k, COUNT(*) AS c FROM t GROUP BY k"),
+            "the nodes must not apply the threshold to their own partials"
         );
+
+        let local = resp(&["k", "c"], vec![row(&[("k", 1), ("c", 4)])]);
+        let peers = vec![
+            resp(
+                &["k", "c"],
+                vec![row(&[("k", 1), ("c", 4)]), row(&[("k", 2), ("c", 2)])],
+            ),
+            resp(&["k", "c"], vec![row(&[("k", 2), ("c", 1)])]),
+        ];
+        let merged = merge_grouped_aggregate(local, peers, &how, &post, 1000);
+        let kept: Vec<(i64, i64)> = merged
+            .rows
+            .iter()
+            .map(|r| (r["k"].as_i64().unwrap(), r["c"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![(1, 8)],
+            "k=1 is 8 once combined and stays; k=2 is 3 and goes"
+        );
+    }
+
+    /// The threshold may be written either way round, and joined with AND/OR.
+    #[test]
+    fn having_handles_the_comparison_either_way_round() {
+        let plan = |sql: &str| match sql_merge_strategy(sql) {
+            SqlMerge::GroupedAggregate { post, .. } => post.having.expect("a predicate"),
+            other => panic!("expected a grouped merge, got {other:?}"),
+        };
+
+        let row_of = |c: i64| {
+            HashMap::from([
+                ("k".to_string(), serde_json::Value::from(1)),
+                ("c".to_string(), serde_json::Value::from(c)),
+            ])
+        };
+
+        let gt = plan("SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING COUNT(*) > 5");
+        assert!(gt.admits(&row_of(6)) && !gt.admits(&row_of(5)));
+
+        // `5 < COUNT(*)` is the same threshold written backwards.
+        let flipped = plan("SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING 5 < COUNT(*)");
+        assert!(flipped.admits(&row_of(6)) && !flipped.admits(&row_of(5)));
+
+        // Filtering on the projected name works too.
+        let by_alias = plan("SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING c >= 6");
+        assert!(by_alias.admits(&row_of(6)) && !by_alias.admits(&row_of(5)));
+
+        let ranged = plan("SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING c > 2 AND c < 10");
+        assert!(
+            ranged.admits(&row_of(6)) && !ranged.admits(&row_of(1)) && !ranged.admits(&row_of(11))
+        );
+    }
+
+    /// A HAVING that names something the query does not project cannot be
+    /// applied here, and is said so rather than dropped.
+    #[test]
+    fn a_having_on_an_unprojected_aggregate_is_refused() {
+        assert!(refusal("SELECT k FROM t GROUP BY k HAVING SUM(amount) > 5").contains("HAVING"));
     }
 
     /// A null from a node that holds no rows must not erase another node's value.
@@ -3118,7 +3556,6 @@ mod sql_merge_tests {
     fn aggregates_that_cannot_be_combined_are_refused() {
         for sql in [
             "SELECT median(x) AS m FROM t",
-            "SELECT stddev(x) AS s FROM t",
             "SELECT approx_percentile_cont(x, 0.95) AS p FROM t",
             "SELECT approx_distinct(x) AS d FROM t",
             "SELECT array_agg(x) AS a FROM t",
@@ -3127,6 +3564,52 @@ mod sql_merge_tests {
         ] {
             let _ = refusal(sql);
         }
+    }
+
+    /// A variance needs no sketch and no second pass: the sum, the sum of
+    /// squares and the count are each summable, and `E[x²] - E[x]²` does the
+    /// rest. So the nodes are asked for those three and the answer is exact —
+    /// the same number one node holding every row would have produced.
+    #[test]
+    fn variance_and_stddev_are_rebuilt_from_running_totals() {
+        for (sql, kind) in [
+            ("SELECT stddev(x) AS s FROM t", Derived::StddevSample),
+            (
+                "SELECT stddev_pop(x) AS s FROM t",
+                Derived::StddevPopulation,
+            ),
+            ("SELECT var(x) AS s FROM t", Derived::VarSample),
+            ("SELECT var_pop(x) AS s FROM t", Derived::VarPopulation),
+        ] {
+            let SqlMerge::ScalarAggregate { how, post } = sql_merge_strategy(sql) else {
+                panic!("{sql} should now be answered");
+            };
+            assert_eq!(how, vec![AggMerge::Sum; 3], "sum, count and sum of squares");
+            assert_eq!(post.derived[0].kind, kind);
+            let node_sql = post.node_sql.as_deref().expect("a rewritten query");
+            assert!(
+                node_sql.contains("SUM((x) * (x))"),
+                "the nodes must be asked for the squares, got {node_sql}"
+            );
+        }
+    }
+
+    /// Checked against values worked out by hand: 2, 4, 4, 4, 5, 5, 7, 9 has
+    /// mean 5, population variance 4 and sample variance 32/7.
+    #[test]
+    fn the_variance_formula_matches_the_textbook() {
+        let (sum, sum_sq, n) = (40.0, 232.0, 8.0);
+        assert_eq!(Derived::Average.combine(sum, sum_sq, n), Some(5.0));
+        assert_eq!(Derived::VarPopulation.combine(sum, sum_sq, n), Some(4.0));
+        assert_eq!(Derived::StddevPopulation.combine(sum, sum_sq, n), Some(2.0));
+        assert_eq!(Derived::VarSample.combine(sum, sum_sq, n), Some(32.0 / 7.0));
+
+        // A single row has no sample variance, and no rows has nothing at all.
+        assert_eq!(Derived::VarSample.combine(3.0, 9.0, 1.0), None);
+        assert_eq!(Derived::Average.combine(0.0, 0.0, 0.0), None);
+
+        // Identical values must not come out as a negative variance.
+        assert_eq!(Derived::VarPopulation.combine(9.0, 27.0, 3.0), Some(0.0));
     }
 
     /// The sharpest one: AVG was correctly refused, and wrapping it in any
@@ -3328,5 +3811,56 @@ mod sql_merge_tests {
             scalar_ops("WITH a AS (SELECT id FROM logs) SELECT COUNT(*) AS c FROM a"),
             vec![AggMerge::Sum]
         );
+    }
+
+    /// A grouped AVG must survive the merge with its value intact.
+    ///
+    /// It did not: the division ran inside the merge and then again in the
+    /// handler, where the sum and count columns had already been consumed, so
+    /// the second pass overwrote every value with null. Only the cluster caught
+    /// it, which is why it is pinned here.
+    #[test]
+    fn a_grouped_average_is_divided_exactly_once() {
+        let SqlMerge::GroupedAggregate { how, post } =
+            sql_merge_strategy("SELECT k, AVG(x) AS avg_x FROM t GROUP BY k")
+        else {
+            panic!("grouped AVG should be answered");
+        };
+
+        let d = &post.derived[0];
+        let group = |k: i64, sum: i64, count: i64| {
+            HashMap::from([
+                ("k".to_string(), serde_json::Value::from(k)),
+                (d.sum.clone(), serde_json::Value::from(sum)),
+                (d.count.clone(), serde_json::Value::from(count)),
+            ])
+        };
+        let cols = vec!["k".to_string(), d.sum.clone(), d.count.clone()];
+        let as_resp = |rows: Vec<HashMap<String, serde_json::Value>>| SqlResponse {
+            columns: cols.clone(),
+            rows,
+            row_count: 0,
+            execution_time_ms: 0,
+            truncated: false,
+        };
+
+        // 30 over 3 rows here, 70 over 7 there: the true average is 10, while
+        // averaging the per-node averages would give 10 only by luck — use
+        // lopsided values so the difference shows.
+        let merged = merge_grouped_aggregate(
+            as_resp(vec![group(1, 30, 3)]),
+            vec![as_resp(vec![group(1, 170, 7)])],
+            &how,
+            &post,
+            1000,
+        );
+
+        assert_eq!(merged.rows.len(), 1);
+        assert_eq!(
+            merged.rows[0]["avg_x"],
+            serde_json::Value::from(20.0),
+            "200 over 10 rows, not the mean of 10 and 24.3"
+        );
+        assert_eq!(merged.columns, vec!["k".to_string(), "avg_x".to_string()]);
     }
 }
