@@ -1184,9 +1184,43 @@ pub async fn execute_sql(
                         // HAVING or ORDER BY can name an AVG column that only
                         // exists once the totals have been divided.
                         super::query_router::SqlMerge::GroupedAggregate { how, post } => {
-                            super::query_router::merge_grouped_aggregate(
+                            let merged = super::query_router::merge_grouped_aggregate(
                                 response, peers, &how, &post, row_limit,
-                            )
+                            );
+                            match post.finish_sql.as_deref() {
+                                None => merged,
+                                // The nodes returned only what combines; the
+                                // shape around it is rebuilt here by the engine,
+                                // and only then can the query be filtered and
+                                // ordered — those may name a column that does
+                                // not exist until it has run.
+                                Some(finish_sql) => {
+                                    match super::query_router::run_finish_sql(merged, finish_sql)
+                                        .await
+                                    {
+                                        Ok(mut finished) => {
+                                            super::query_router::apply_finish(
+                                                &mut finished.rows,
+                                                &post,
+                                            );
+                                            finished.truncated |= finished.rows.len() > row_limit;
+                                            finished.rows.truncate(row_limit);
+                                            finished.row_count = finished.rows.len();
+                                            finished
+                                        }
+                                        Err(why) => {
+                                            error!(query = %request.query, reason = %why,
+                                                   "Could not finish a distributed query");
+                                            let error_response = SqlErrorResponse {
+                                                error: why,
+                                                error_type: "QueryError".to_string(),
+                                            };
+                                            return (StatusCode::BAD_REQUEST, Json(error_response))
+                                                .into_response();
+                                        }
+                                    }
+                                }
+                            }
                         }
                         super::query_router::SqlMerge::Concatenate(post) => {
                             super::query_router::merge_sql_responses(
@@ -1408,7 +1442,7 @@ fn discover_parquet_files(dir: &std::path::Path) -> std::io::Result<Vec<String>>
 }
 
 /// Convert an Arrow array value at a given index to JSON
-fn arrow_value_to_json(
+pub(super) fn arrow_value_to_json(
     column: &chronik_columnar::datafusion::arrow::array::ArrayRef,
     row_idx: usize,
 ) -> serde_json::Value {

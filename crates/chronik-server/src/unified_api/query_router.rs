@@ -861,6 +861,9 @@ pub struct MergePlan {
     pub distinct_count: Option<DistinctCount>,
     /// A quantile rebuilt from the value counts the nodes returned.
     pub quantile: Option<QuantileColumn>,
+    /// SQL the coordinator runs over the merged rows to rebuild the shape the
+    /// nodes could not be asked for.
+    pub finish_sql: Option<String>,
 }
 
 /// One `ORDER BY` term, resolved to the name of a column in the response.
@@ -919,6 +922,12 @@ enum ColumnMerge {
     /// `COUNT(DISTINCT expr)`. Rebuilt by collecting the distinct values
     /// themselves and counting them once combined. Carries the argument.
     DistinctCount(String),
+    /// An expression with aggregates inside it: the aggregates are projected
+    /// for the nodes and the shape around them is rebuilt by the engine here.
+    Computed {
+        rewritten: String,
+        inner: Vec<String>,
+    },
     /// `median(x)` or `percentile_cont(x, q)`. Rebuilt from how often each
     /// value occurs. Carries the argument and the fraction.
     Quantile(String, f64),
@@ -948,14 +957,10 @@ fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
         ));
     }
 
-    if calls.len() > 1 {
-        return ColumnMerge::Refuse(
-            "an expression combining more than one aggregate cannot be merged across nodes: \
-             each node returns its own partial of every aggregate, and the expression was \
-             already applied to them."
-                .to_string(),
-        );
-    }
+    // More than one aggregate in a column is no harder than one: each is asked
+    // for separately and the expression joining them is applied to the combined
+    // values. `SUM(x)/COUNT(x)` is exactly this, and it is what the old AVG
+    // refusal used to recommend.
 
     // Exactly one aggregate. It has to *be* the column, not sit inside it.
     match expr.0 {
@@ -1019,15 +1024,171 @@ fn classify_projection(expr: &SqlExprRef<'_>) -> ColumnMerge {
                 )),
             }
         }
-        _ => ColumnMerge::Refuse(
-            "an aggregate wrapped in an expression cannot be merged across nodes: the wrapping \
-             was already applied to each node's partial. Project the bare aggregate and apply \
-             the expression in the client."
-                .to_string(),
-        ),
+        // An aggregate inside an expression cannot be merged from the wrapped
+        // per-node values — the wrapping was already applied to each partial —
+        // but the aggregates it is built from can be. So the nodes are asked for
+        // those, and the wrapping is applied once, here, by the query engine
+        // itself rather than by an evaluator written for the purpose.
+        other => match detach_aggregates(other) {
+            Some((rewritten, inner)) => ColumnMerge::Computed { rewritten, inner },
+            None => ColumnMerge::Refuse(
+                "an aggregate wrapped in an expression cannot be merged across nodes: the \
+                 wrapping was already applied to each node's partial, and this expression is \
+                 not one the coordinator can re-apply. Project the bare aggregate and apply \
+                 the expression in the client."
+                    .to_string(),
+            ),
+        },
     }
 }
 
+/// Pull the aggregates out of an expression, leaving a column reference behind.
+///
+/// `ROUND(AVG(x), 2)` becomes `ROUND(<name>, 2)` plus the `AVG(x)` that has to
+/// be computed first. The nodes are then asked only for things that merge, and
+/// the shape around them is rebuilt afterwards from the combined values.
+fn detach_aggregates(
+    expr: &chronik_columnar::datafusion::sql::sqlparser::ast::Expr,
+) -> Option<(String, Vec<String>)> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        visit_expressions_mut, Expr as SqlExpr, Ident,
+    };
+    use std::ops::ControlFlow;
+
+    let mut rewritten = expr.clone();
+    let mut inner: Vec<String> = Vec::new();
+
+    let _: ControlFlow<()> = visit_expressions_mut(&mut rewritten, |e| {
+        if let SqlExpr::Function(f) = e {
+            if f.over.is_none() && is_aggregate_call(f) {
+                let name = format!("__chronik_inner_{}", inner.len());
+                inner.push(e.to_string());
+                *e = SqlExpr::Identifier(Ident::new(name));
+            }
+        }
+        ControlFlow::Continue(())
+    });
+
+    (!inner.is_empty()).then(|| (rewritten.to_string(), inner))
+}
+
+/// Plan the columns whose shape has to be rebuilt after the merge.
+///
+/// Each aggregate that was buried inside an expression is projected on its own
+/// so the nodes return something that merges, and the expression is kept aside
+/// to be applied to the combined values.
+///
+/// The classification of each detached aggregate goes through exactly the same
+/// path as a top-level one, so an `AVG` inside a `ROUND` is still carried as a
+/// sum and a count rather than being averaged per node.
+fn plan_computed(
+    query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+    select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
+    columns: &[ColumnMerge],
+) -> Result<(String, Vec<Option<AggMerge>>, Vec<DerivedColumn>, String), String> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem;
+
+    let mut projection = Vec::new();
+    let mut how: Vec<Option<AggMerge>> = Vec::new();
+    let mut derived = Vec::new();
+    // What the coordinator projects from the merged rows, in the caller's order.
+    let mut finish_projection: Vec<String> = Vec::new();
+
+    for (idx, (item, class)) in select.projection.iter().zip(columns).enumerate() {
+        let name = match item {
+            SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+            SelectItem::UnnamedExpr(expr) => expr.to_string(),
+            _ => return Err(UNREWRITABLE.to_string()),
+        };
+
+        let ColumnMerge::Computed { rewritten, inner } = class else {
+            // A group key or a plain aggregate: the nodes project it as it is,
+            // and the coordinator passes it through.
+            projection.push(item.clone());
+            how.push(match class {
+                ColumnMerge::Mergeable(op) => Some(*op),
+                _ => None,
+            });
+            finish_projection.push(format!("{} AS {}", quote_ident(&name), quote_ident(&name)));
+            continue;
+        };
+
+        // Name the detached aggregates apart per column, so two columns that
+        // each contain `SUM(x)` do not collide on one helper.
+        let mut expression = rewritten.clone();
+        for (slot, aggregate) in inner.iter().enumerate() {
+            let placeholder = format!("__chronik_inner_{slot}");
+            let helper = format!("__chronik_inner_{idx}_{slot}");
+            expression = expression.replace(&placeholder, &helper);
+
+            match classify_projection(&SqlExprRef(&parse_expression(aggregate)?)) {
+                ColumnMerge::Mergeable(op) => {
+                    projection.push(parse_projection_item(aggregate, &helper)?);
+                    how.push(Some(op));
+                }
+                ColumnMerge::Derived(kind, arg) => {
+                    let sum = format!("{helper}_sum");
+                    let count = format!("{helper}_count");
+                    projection.push(parse_projection_item(&format!("SUM({arg})"), &sum)?);
+                    projection.push(parse_projection_item(&format!("COUNT({arg})"), &count)?);
+                    how.push(Some(AggMerge::Sum));
+                    how.push(Some(AggMerge::Sum));
+                    let sum_sq = kind.needs_squares().then(|| format!("{helper}_sumsq"));
+                    if let Some(sq) = sum_sq.as_ref() {
+                        projection.push(parse_projection_item(
+                            &format!("SUM(({arg}) * ({arg}))"),
+                            sq,
+                        )?);
+                        how.push(Some(AggMerge::Sum));
+                    }
+                    derived.push(DerivedColumn {
+                        output: helper.clone(),
+                        kind,
+                        sum,
+                        count,
+                        sum_sq,
+                    });
+                }
+                ColumnMerge::Refuse(why) => return Err(why),
+                _ => {
+                    return Err(format!(
+                        "{aggregate} cannot be merged across nodes inside an expression."
+                    ))
+                }
+            }
+        }
+
+        finish_projection.push(format!("{expression} AS {}", quote_ident(&name)));
+    }
+
+    let node_sql =
+        sql_with_projection(query, projection).ok_or_else(|| UNREWRITABLE.to_string())?;
+    let finish_sql = format!(
+        "SELECT {} FROM {MERGED_TABLE}",
+        finish_projection.join(", ")
+    );
+    Ok((node_sql, how, derived, finish_sql))
+}
+
+/// The name the merged rows are registered under while the coordinator finishes
+/// the query over them.
+pub const MERGED_TABLE: &str = "__chronik_merged";
+
+/// Quote an identifier so a generated column name cannot be read as syntax.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Parse a bare expression from its SQL text.
+fn parse_expression(
+    text: &str,
+) -> Result<chronik_columnar::datafusion::sql::sqlparser::ast::Expr, String> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem;
+    match parse_projection_item(text, "__chronik_expr")? {
+        SelectItem::ExprWithAlias { expr, .. } => Ok(expr),
+        _ => Err(UNREWRITABLE.to_string()),
+    }
+}
 /// Plan a quantile, which the nodes answer as a frequency table.
 ///
 /// `SELECT k, median(x) AS m FROM t GROUP BY k` becomes
@@ -1987,6 +2148,37 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             }
         };
 
+    // An expression with an aggregate inside it: the nodes are asked for the
+    // aggregates alone, and the shape around them is rebuilt over the merged
+    // values by the engine itself.
+    if columns
+        .iter()
+        .any(|c| matches!(c, ColumnMerge::Computed { .. }))
+    {
+        let (node_sql, how, derived, finish_sql) = match plan_computed(query, select, &columns) {
+            Ok(parts) => parts,
+            Err(why) => return SqlMerge::Unsupported(why),
+        };
+        let order_by = match resolve_order_by(query, select) {
+            Some(keys) => keys,
+            None => return SqlMerge::Unsupported(UNORDERABLE.to_string()),
+        };
+        let plan = MergePlan {
+            node_sql: Some(node_sql),
+            order_by,
+            offset: query_offset(query),
+            limit: query_limit(query),
+            derived,
+            having,
+            distinct_count: None,
+            quantile: None,
+            finish_sql: Some(finish_sql),
+        };
+        // Grouped or not, the merge is the same shape once the aggregates are
+        // projected on their own: keys combine by key, aggregates by operator.
+        return SqlMerge::GroupedAggregate { how, post: plan };
+    }
+
     // A quantile is answered as a frequency table, which reshapes the query
     // rather than adjusting it.
     if columns
@@ -2012,6 +2204,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
                 having,
                 distinct_count: None,
                 quantile: Some(spec),
+                finish_sql: None,
             },
         };
     }
@@ -2041,6 +2234,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
                 having,
                 distinct_count: Some(spec),
                 quantile: None,
+                finish_sql: None,
             },
         };
     }
@@ -2090,6 +2284,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
                 having,
                 distinct_count: None,
                 quantile: None,
+                finish_sql: None,
             },
         };
     }
@@ -2115,6 +2310,7 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             having: None,
             distinct_count: None,
             quantile: None,
+            finish_sql: None,
         });
     }
 
@@ -2572,6 +2768,11 @@ fn finish_rows(
     plan: &MergePlan,
 ) {
     finish_derived_rows(columns, rows, &plan.derived);
+    // When the coordinator still has a query to run, the filtering and ordering
+    // wait for it: they may name a column that does not exist until it has.
+    if plan.finish_sql.is_some() {
+        return;
+    }
     // The distinct values have been de-duplicated across every node by now, so
     // what is left to do is count them.
     if let Some(spec) = plan.distinct_count.as_ref() {
@@ -2764,6 +2965,162 @@ pub fn merge_scalar_aggregate(
     }
 }
 
+/// Finish a merged result by running the rest of the query over it.
+///
+/// The nodes were asked only for things that combine; what is left — the shape
+/// wrapped around those aggregates — is applied here, once, to the combined
+/// values. It is executed by the query engine rather than by an evaluator
+/// written for the purpose, so the arithmetic, the null handling and the type
+/// coercion are the same ones the query would have got on a single node.
+///
+/// Only the merged rows are involved, which is one row, or one per group.
+pub async fn run_finish_sql(
+    response: SqlResponse,
+    finish_sql: &str,
+) -> Result<SqlResponse, String> {
+    use chronik_columnar::datafusion::prelude::SessionContext;
+
+    let execution_time_ms = response.execution_time_ms;
+    let truncated = response.truncated;
+
+    let batch = rows_to_record_batch(&response.columns, &response.rows)?;
+    let ctx = SessionContext::new();
+    chronik_columnar::udfs::register_udfs(&ctx)
+        .map_err(|e| format!("could not prepare the coordinator's query context: {e}"))?;
+    ctx.register_batch(MERGED_TABLE, batch)
+        .map_err(|e| format!("could not stage the merged rows: {e}"))?;
+
+    let batches = ctx
+        .sql(finish_sql)
+        .await
+        .map_err(|e| format!("could not plan the final step of this query: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| format!("could not run the final step of this query: {e}"))?;
+
+    let mut columns = Vec::new();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        if columns.is_empty() {
+            columns = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+        }
+        for row_idx in 0..batch.num_rows() {
+            let mut row = HashMap::new();
+            for (col_idx, name) in columns.iter().enumerate() {
+                row.insert(
+                    name.clone(),
+                    super::sql_handler::arrow_value_to_json(batch.column(col_idx), row_idx),
+                );
+            }
+            rows.push(row);
+        }
+    }
+
+    let row_count = rows.len();
+    Ok(SqlResponse {
+        columns,
+        rows,
+        row_count,
+        execution_time_ms,
+        truncated,
+    })
+}
+
+/// Build an Arrow batch from merged rows.
+///
+/// The type of each column is taken from the values actually present: the
+/// merged rows are JSON and carry no schema of their own. Integers stay
+/// integers so a summed count does not come back as `60.0`, and a column that
+/// mixes shapes falls back to text rather than guessing which one was meant.
+fn rows_to_record_batch(
+    columns: &[String],
+    rows: &[HashMap<String, serde_json::Value>],
+) -> Result<chronik_columnar::datafusion::arrow::record_batch::RecordBatch, String> {
+    use chronik_columnar::datafusion::arrow::array::{
+        ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
+    };
+    use chronik_columnar::datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use chronik_columnar::datafusion::arrow::record_batch::RecordBatch;
+    use serde_json::Value as J;
+    use std::sync::Arc;
+
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+
+    for name in columns {
+        let values: Vec<&J> = rows
+            .iter()
+            .map(|r| r.get(name).unwrap_or(&J::Null))
+            .collect();
+
+        let (kind, nullable) = column_kind(&values);
+        let array: ArrayRef = match kind {
+            DataType::Int64 => Arc::new(values.iter().map(|v| v.as_i64()).collect::<Int64Array>()),
+            DataType::Float64 => {
+                Arc::new(values.iter().map(|v| v.as_f64()).collect::<Float64Array>())
+            }
+            DataType::Boolean => {
+                Arc::new(values.iter().map(|v| v.as_bool()).collect::<BooleanArray>())
+            }
+            _ => Arc::new(
+                values
+                    .iter()
+                    .map(|v| match v {
+                        J::Null => None,
+                        J::String(s) => Some(s.clone()),
+                        other => Some(other.to_string()),
+                    })
+                    .collect::<StringArray>(),
+            ),
+        };
+        fields.push(Field::new(name, array.data_type().clone(), nullable));
+        arrays.push(array);
+    }
+
+    if arrays.is_empty() {
+        return Err("the merged result has no columns to finish over".to_string());
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|e| format!("could not stage the merged rows: {e}"))
+}
+
+/// Decide one column's type from the values in it.
+fn column_kind(
+    values: &[&serde_json::Value],
+) -> (
+    chronik_columnar::datafusion::arrow::datatypes::DataType,
+    bool,
+) {
+    use chronik_columnar::datafusion::arrow::datatypes::DataType;
+    use serde_json::Value as J;
+
+    let mut nullable = false;
+    let (mut ints, mut floats, mut bools, mut strings) = (0, 0, 0, 0);
+    for value in values {
+        match value {
+            J::Null => nullable = true,
+            J::Number(n) if n.is_f64() && !n.is_i64() => floats += 1,
+            J::Number(_) => ints += 1,
+            J::Bool(_) => bools += 1,
+            _ => strings += 1,
+        }
+    }
+
+    let kind = match (ints, floats, bools, strings) {
+        (_, 0, 0, 0) => DataType::Int64,
+        // Integers and floats together are one numeric column.
+        (_, _, 0, 0) => DataType::Float64,
+        (0, 0, _, 0) => DataType::Boolean,
+        _ => DataType::Utf8,
+    };
+    (kind, nullable)
+}
 /// Combine grouped results from every node by re-aggregating on the group key.
 ///
 /// Each node grouped only the partitions it leads, so a key present on three
@@ -4284,19 +4641,52 @@ mod sql_merge_tests {
     /// The sharpest one: AVG was correctly refused, and wrapping it in any
     /// function walked straight past that refusal. `ROUND(AVG(n),2)` returned
     /// 8.54, 8.63, 8.31 for a column whose average was 8.5.
+    ///
+    /// It does not evade anything now because there is nothing to evade: the
+    /// wrapping is taken off, the aggregate underneath is merged properly, and
+    /// the wrapping goes back on over the combined value.
     #[test]
-    fn wrapping_an_aggregate_does_not_evade_the_refusal() {
-        assert!(refusal("SELECT ROUND(AVG(x), 2) AS a FROM t").contains("wrapped"));
-        assert!(refusal("SELECT SUM(x) * 2 AS s FROM t").contains("wrapped"));
-        assert!(refusal("SELECT CAST(SUM(x) AS BIGINT) AS s FROM t").contains("wrapped"));
+    fn wrapping_an_aggregate_no_longer_evades_the_merge() {
+        for sql in [
+            "SELECT ROUND(AVG(x), 2) AS a FROM t",
+            "SELECT SUM(x) * 2 AS s FROM t",
+            "SELECT CAST(SUM(x) AS BIGINT) AS s FROM t",
+        ] {
+            let SqlMerge::GroupedAggregate { post, .. } = sql_merge_strategy(sql) else {
+                panic!("{sql} should be taken apart, not refused");
+            };
+            let node_sql = post.node_sql.as_deref().expect("a rewritten query");
+            assert!(
+                !node_sql.contains("ROUND") && !node_sql.contains("CAST"),
+                "the wrapping must not go to the nodes: {node_sql}"
+            );
+            assert!(
+                post.finish_sql.is_some(),
+                "and must be applied here instead"
+            );
+        }
     }
 
-    /// `SUM(x)/COUNT(x)` is what the AVG refusal tells the caller to do, and it
-    /// was itself unguarded: three nodes, three ratios, none of them the answer.
+    /// `SUM(x)/COUNT(x)` is what the AVG refusal used to tell callers to write,
+    /// and it was itself unguarded: three nodes, three ratios, none of them the
+    /// answer. Several aggregates in one column are no harder than one — each
+    /// is asked for separately and the expression joins the combined values.
     #[test]
-    fn the_avg_workaround_is_not_itself_silently_wrong() {
-        let _ = refusal("SELECT SUM(x)/COUNT(x) AS r FROM t");
-        let _ = refusal("SELECT SUM(x) + SUM(y) AS s FROM t");
+    fn several_aggregates_in_one_column_are_each_merged() {
+        for sql in [
+            "SELECT SUM(x)/COUNT(x) AS r FROM t",
+            "SELECT SUM(x) + SUM(y) AS s FROM t",
+        ] {
+            let SqlMerge::GroupedAggregate { how, post } = sql_merge_strategy(sql) else {
+                panic!("{sql} should be taken apart, not refused");
+            };
+            assert_eq!(
+                how,
+                vec![Some(AggMerge::Sum), Some(AggMerge::Sum)],
+                "both aggregates go to the nodes on their own"
+            );
+            assert!(post.finish_sql.is_some());
+        }
     }
 
     /// `ROW_NUMBER() OVER (ORDER BY id)` returned 1,2,3,4,5 once per node.
@@ -4621,5 +5011,169 @@ mod sql_merge_tests {
         assert!(
             refusal("SELECT approx_percentile_cont(x, y) AS p FROM t").contains("literal fraction")
         );
+    }
+
+    /// `ROUND(AVG(x), 2)` walked past the AVG refusal and returned one average
+    /// per node. The wrapping cannot be merged, but what it wraps can: the
+    /// nodes are asked for the sum and the count, and the rounding is applied
+    /// once, here.
+    #[test]
+    fn an_aggregate_inside_an_expression_is_taken_apart() {
+        let SqlMerge::GroupedAggregate { how, post } =
+            sql_merge_strategy("SELECT ROUND(AVG(x), 2) AS a FROM t")
+        else {
+            panic!("a wrapped aggregate should now be answered");
+        };
+
+        let node_sql = post.node_sql.as_deref().expect("a rewritten query");
+        assert!(
+            node_sql.contains("SUM(x)") && node_sql.contains("COUNT(x)"),
+            "the nodes must be asked for the totals: {node_sql}"
+        );
+        assert!(
+            !node_sql.contains("ROUND"),
+            "no node should round its own partial: {node_sql}"
+        );
+        assert_eq!(how, vec![Some(AggMerge::Sum), Some(AggMerge::Sum)]);
+
+        let finish = post.finish_sql.as_deref().expect("a finishing query");
+        assert!(
+            finish.contains("ROUND") && finish.contains(MERGED_TABLE),
+            "the rounding belongs to the coordinator: {finish}"
+        );
+    }
+
+    /// `SUM(x)/COUNT(x)` is what the old AVG refusal told callers to write, and
+    /// it was unguarded. Both aggregates are now projected and the division is
+    /// done over the totals.
+    #[test]
+    fn a_ratio_of_two_aggregates_is_taken_apart() {
+        let SqlMerge::GroupedAggregate { how, post } =
+            sql_merge_strategy("SELECT SUM(x) / COUNT(x) AS r FROM t")
+        else {
+            panic!("a ratio of aggregates should now be answered");
+        };
+        assert_eq!(how, vec![Some(AggMerge::Sum), Some(AggMerge::Sum)]);
+        let node_sql = post.node_sql.as_deref().unwrap();
+        assert!(node_sql.contains("SUM(x)") && node_sql.contains("COUNT(x)"));
+    }
+
+    /// Two columns that each contain `SUM(x)` must not share one helper.
+    #[test]
+    fn two_computed_columns_do_not_collide() {
+        let SqlMerge::GroupedAggregate { post, .. } =
+            sql_merge_strategy("SELECT SUM(x) * 2 AS a, SUM(x) * 3 AS b FROM t")
+        else {
+            panic!("expected a computed plan");
+        };
+        let finish = post.finish_sql.as_deref().unwrap();
+        assert!(finish.contains("__chronik_inner_0_0"));
+        assert!(finish.contains("__chronik_inner_1_0"));
+    }
+
+    /// The finishing step is run by the query engine over the merged rows, so
+    /// the arithmetic is the engine's. Exercised end to end on real values.
+    #[tokio::test]
+    async fn the_coordinator_finishes_the_query_with_the_engine() {
+        let SqlMerge::GroupedAggregate { how, post } =
+            sql_merge_strategy("SELECT ROUND(AVG(x), 2) AS a FROM t")
+        else {
+            panic!("expected a computed plan");
+        };
+
+        let d = &post.derived[0];
+        let partial = |sum: i64, count: i64| SqlResponse {
+            columns: vec![d.sum.clone(), d.count.clone()],
+            rows: vec![HashMap::from([
+                (d.sum.clone(), serde_json::Value::from(sum)),
+                (d.count.clone(), serde_json::Value::from(count)),
+            ])],
+            row_count: 1,
+            execution_time_ms: 0,
+            truncated: false,
+        };
+
+        // 10 over 3 and 90 over 7: the true average is 10, and the mean of the
+        // per-node averages would have been about 8.1.
+        let merged =
+            merge_grouped_aggregate(partial(10, 3), vec![partial(90, 7)], &how, &post, 100);
+        let finished = run_finish_sql(merged, post.finish_sql.as_deref().unwrap())
+            .await
+            .expect("the coordinator should finish the query");
+
+        assert_eq!(finished.columns, vec!["a".to_string()]);
+        assert_eq!(finished.rows[0]["a"], serde_json::Value::from(10.0));
+    }
+
+    /// A group key rides through the finishing step untouched, and the
+    /// expression is applied per group.
+    #[tokio::test]
+    async fn a_computed_column_is_finished_per_group() {
+        let SqlMerge::GroupedAggregate { how, post } =
+            sql_merge_strategy("SELECT k, SUM(x) * 2 AS doubled FROM t GROUP BY k")
+        else {
+            panic!("expected a computed plan");
+        };
+
+        let helper = "__chronik_inner_1_0";
+        let group = |k: i64, sum: i64| {
+            HashMap::from([
+                ("k".to_string(), serde_json::Value::from(k)),
+                (helper.to_string(), serde_json::Value::from(sum)),
+            ])
+        };
+        let as_resp = |rows: Vec<HashMap<String, serde_json::Value>>| SqlResponse {
+            columns: vec!["k".to_string(), helper.to_string()],
+            rows,
+            row_count: 0,
+            execution_time_ms: 0,
+            truncated: false,
+        };
+
+        let merged = merge_grouped_aggregate(
+            as_resp(vec![group(1, 5)]),
+            vec![as_resp(vec![group(1, 3), group(2, 4)])],
+            &how,
+            &post,
+            100,
+        );
+        let finished = run_finish_sql(merged, post.finish_sql.as_deref().unwrap())
+            .await
+            .expect("finishes");
+
+        let mut got: Vec<(i64, i64)> = finished
+            .rows
+            .iter()
+            .map(|r| (r["k"].as_i64().unwrap(), r["doubled"].as_i64().unwrap()))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![(1, 16), (2, 8)], "k=1 is 5+3 doubled");
+    }
+
+    /// The merged rows carry no schema of their own, so the staging has to take
+    /// the type from the values — and keep integers integral.
+    #[test]
+    fn staged_columns_take_their_type_from_the_values() {
+        use chronik_columnar::datafusion::arrow::datatypes::DataType;
+        let j = serde_json::Value::from;
+
+        assert_eq!(column_kind(&[&j(1), &j(2)]).0, DataType::Int64);
+        let f = serde_json::Value::from(2.5_f64);
+        assert_eq!(column_kind(&[&j(1), &f]).0, DataType::Float64);
+        assert_eq!(
+            column_kind(&[&serde_json::Value::Bool(true)]).0,
+            DataType::Boolean
+        );
+        assert_eq!(
+            column_kind(&[&serde_json::Value::String("a".into())]).0,
+            DataType::Utf8
+        );
+        // A column that mixes shapes falls back to text rather than guessing.
+        assert_eq!(
+            column_kind(&[&j(1), &serde_json::Value::String("a".into())]).0,
+            DataType::Utf8
+        );
+        // Nulls alone are still a column, and every case is nullable-aware.
+        assert!(column_kind(&[&serde_json::Value::Null, &j(1)]).1);
     }
 }
