@@ -1072,6 +1072,47 @@ fn detach_aggregates(
     (!inner.is_empty()).then(|| (rewritten.to_string(), inner))
 }
 
+/// Project the running totals an `AVG` or a variance is rebuilt from.
+///
+/// Shared by the two places that need it — a column that *is* one of these, and
+/// one that has one buried inside an expression — so the two cannot drift. They
+/// did: the second path used to pass the aggregate through to the nodes
+/// untouched, which turned each node's own average into a group key.
+fn emit_derived_helpers(
+    projection: &mut Vec<chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem>,
+    how: &mut Vec<Option<AggMerge>>,
+    derived: &mut Vec<DerivedColumn>,
+    output: &str,
+    kind: Derived,
+    arg: &str,
+) -> Result<(), String> {
+    let sum = format!("__chronik_sum_{}", derived.len());
+    let count = format!("__chronik_count_{}", derived.len());
+    projection.push(parse_projection_item(&format!("SUM({arg})"), &sum)?);
+    projection.push(parse_projection_item(&format!("COUNT({arg})"), &count)?);
+    how.push(Some(AggMerge::Sum));
+    how.push(Some(AggMerge::Sum));
+
+    let sum_sq = kind
+        .needs_squares()
+        .then(|| format!("__chronik_sumsq_{}", derived.len()));
+    if let Some(name) = sum_sq.as_ref() {
+        projection.push(parse_projection_item(
+            &format!("SUM(({arg}) * ({arg}))"),
+            name,
+        )?);
+        how.push(Some(AggMerge::Sum));
+    }
+
+    derived.push(DerivedColumn {
+        output: output.to_string(),
+        kind,
+        sum,
+        count,
+        sum_sq,
+    });
+    Ok(())
+}
 /// Plan the columns whose shape has to be rebuilt after the merge.
 ///
 /// Each aggregate that was buried inside an expression is projected on its own
@@ -1102,13 +1143,46 @@ fn plan_computed(
         };
 
         let ColumnMerge::Computed { rewritten, inner } = class else {
-            // A group key or a plain aggregate: the nodes project it as it is,
-            // and the coordinator passes it through.
-            projection.push(item.clone());
-            how.push(match class {
-                ColumnMerge::Mergeable(op) => Some(*op),
-                _ => None,
-            });
+            match class {
+                // A group key, or an aggregate that merges as it stands: the
+                // nodes project it unchanged and the coordinator passes it on.
+                ColumnMerge::RowWise => {
+                    projection.push(item.clone());
+                    how.push(None);
+                }
+                ColumnMerge::Mergeable(op) => {
+                    projection.push(item.clone());
+                    how.push(Some(*op));
+                }
+                // An AVG or a variance beside a computed column still has to be
+                // taken apart. Passing it through would have sent `AVG(x)` to
+                // the nodes and then treated each node's own average as a group
+                // key of its own — one row per node, quietly.
+                ColumnMerge::Derived(kind, arg) => {
+                    emit_derived_helpers(
+                        &mut projection,
+                        &mut how,
+                        &mut derived,
+                        &name,
+                        *kind,
+                        arg,
+                    )?;
+                }
+                // These rewrite the query into something of a different shape —
+                // a frequency table, or de-duplicated values — which cannot be
+                // the same query as one carrying a computed column.
+                ColumnMerge::Quantile(..) | ColumnMerge::DistinctCount(_) => {
+                    return Err(
+                        "a quantile or a distinct count cannot be merged across nodes in \
+                                the same query as an aggregate wrapped in an expression: the two \
+                                need the nodes to return different shapes. Ask for them \
+                                separately."
+                            .to_string(),
+                    )
+                }
+                ColumnMerge::Refuse(why) => return Err(why.clone()),
+                ColumnMerge::Computed { .. } => unreachable!("handled by the outer pattern"),
+            }
             finish_projection.push(format!("{} AS {}", quote_ident(&name), quote_ident(&name)));
             continue;
         };
@@ -1126,29 +1200,14 @@ fn plan_computed(
                     projection.push(parse_projection_item(aggregate, &helper)?);
                     how.push(Some(op));
                 }
-                ColumnMerge::Derived(kind, arg) => {
-                    let sum = format!("{helper}_sum");
-                    let count = format!("{helper}_count");
-                    projection.push(parse_projection_item(&format!("SUM({arg})"), &sum)?);
-                    projection.push(parse_projection_item(&format!("COUNT({arg})"), &count)?);
-                    how.push(Some(AggMerge::Sum));
-                    how.push(Some(AggMerge::Sum));
-                    let sum_sq = kind.needs_squares().then(|| format!("{helper}_sumsq"));
-                    if let Some(sq) = sum_sq.as_ref() {
-                        projection.push(parse_projection_item(
-                            &format!("SUM(({arg}) * ({arg}))"),
-                            sq,
-                        )?);
-                        how.push(Some(AggMerge::Sum));
-                    }
-                    derived.push(DerivedColumn {
-                        output: helper.clone(),
-                        kind,
-                        sum,
-                        count,
-                        sum_sq,
-                    });
-                }
+                ColumnMerge::Derived(kind, arg) => emit_derived_helpers(
+                    &mut projection,
+                    &mut how,
+                    &mut derived,
+                    &helper,
+                    kind,
+                    &arg,
+                )?,
                 ColumnMerge::Refuse(why) => return Err(why),
                 _ => {
                     return Err(format!(
@@ -2349,14 +2408,14 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
     }
 }
 
-/// Said when a query parses but cannot be put back together with a replacement
-/// projection — a shape the rewriter does not know how to edit.
-
 /// Said when an ORDER BY names something the response will not carry.
 const UNORDERABLE: &str =
     "ORDER BY cannot be applied across nodes unless every term is a projected column: the rows \
      are only whole once they reach the coordinator, which can sort only by what the query \
      returned.";
+
+/// Said when a query parses but cannot be put back together with a replacement
+/// projection — a shape the rewriter does not know how to edit.
 const UNREWRITABLE: &str =
     "this query cannot be rewritten to merge across nodes: project the aggregate on its own \
      and combine in the client.";
@@ -5175,5 +5234,87 @@ mod sql_merge_tests {
         );
         // Nulls alone are still a column, and every case is nullable-aware.
         assert!(column_kind(&[&serde_json::Value::Null, &j(1)]).1);
+    }
+
+    /// An AVG or a variance sitting *beside* a computed column still has to be
+    /// taken apart.
+    ///
+    /// It was not: the computed planner passed anything that was not a plain
+    /// mergeable aggregate straight through to the nodes, so `AVG(x)` went out
+    /// as `AVG(x)` and each node's own average came back as a group key of its
+    /// own — one row per node, quietly, which is the exact failure this whole
+    /// issue is about. Found by reviewing the code rather than by a test, so
+    /// here is the test.
+    #[test]
+    fn an_aggregate_beside_a_computed_column_is_still_taken_apart() {
+        for sql in [
+            "SELECT AVG(x) AS a, ROUND(AVG(y), 2) AS b FROM t",
+            "SELECT stddev(x) AS s, SUM(y) * 2 AS d FROM t",
+            "SELECT k, AVG(x) AS a, SUM(y) * 2 AS d FROM t GROUP BY k",
+        ] {
+            let SqlMerge::GroupedAggregate { how, post } = sql_merge_strategy(sql) else {
+                panic!("{sql} should be answered");
+            };
+            let node_sql = post.node_sql.as_deref().expect("a rewritten query");
+            for forbidden in ["AVG(", "STDDEV(", "stddev("] {
+                assert!(
+                    !node_sql.contains(forbidden),
+                    "{forbidden} must not reach the nodes in {sql}: {node_sql}"
+                );
+            }
+            // Every aggregate column combines; only a group key may be a key.
+            let keys = how.iter().filter(|h| h.is_none()).count();
+            assert_eq!(
+                keys,
+                usize::from(sql.contains("GROUP BY")),
+                "no per-node aggregate may be treated as a group key: {how:?}"
+            );
+        }
+    }
+
+    /// A quantile and a computed column need the nodes to return different
+    /// shapes — a frequency table and bare aggregates — so asking for both in
+    /// one query is refused rather than answered from the wrong one.
+    #[test]
+    fn a_quantile_beside_a_computed_column_is_refused() {
+        assert!(
+            refusal("SELECT median(x) AS m, SUM(y) * 2 AS d FROM t").contains("separately"),
+            "the two shapes cannot be asked for at once"
+        );
+        assert!(
+            refusal("SELECT COUNT(DISTINCT x) AS c, SUM(y) * 2 AS d FROM t").contains("separately")
+        );
+    }
+
+    /// A scalar aggregate can carry a HAVING — `SELECT COUNT(*) FROM t HAVING
+    /// COUNT(*) > 5` is a row or no row — and it belongs to the combined total.
+    ///
+    /// The plan carried it and nothing applied it: the handler's scalar branch
+    /// divided the averages and stopped, so the threshold was silently dropped
+    /// and a count of 3 came back from a query that asked for counts above 5.
+    /// Found by reading the branches, not by a test.
+    #[test]
+    fn a_having_on_a_scalar_aggregate_is_not_dropped() {
+        let SqlMerge::ScalarAggregate { how, post } =
+            sql_merge_strategy("SELECT COUNT(*) AS c FROM t HAVING COUNT(*) > 5")
+        else {
+            panic!("a scalar aggregate with HAVING should be answered");
+        };
+        assert_eq!(how, vec![AggMerge::Sum]);
+        let predicate = post.having.as_ref().expect("the threshold is in the plan");
+
+        // Three nodes totalling 3 must not survive `> 5`; totalling 9 must.
+        let short = HashMap::from([("c".to_string(), serde_json::Value::from(3))]);
+        let over = HashMap::from([("c".to_string(), serde_json::Value::from(9))]);
+        assert!(!predicate.admits(&short));
+        assert!(predicate.admits(&over));
+
+        // And applying the plan has to actually remove the row.
+        let mut rows = vec![short];
+        apply_finish(&mut rows, &post);
+        assert!(
+            rows.is_empty(),
+            "the threshold has to be applied, not carried"
+        );
     }
 }

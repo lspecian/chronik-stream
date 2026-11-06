@@ -1234,6 +1234,12 @@ pub async fn execute_sql(
                                 response, peers, &how,
                             );
                             super::query_router::finish_derived(&mut merged, &post.derived);
+                            // A scalar aggregate can still carry a HAVING —
+                            // `SELECT COUNT(*) FROM t HAVING COUNT(*) > 5` is a
+                            // row or no row — and it belongs to the combined
+                            // total, so it is applied here like any other.
+                            super::query_router::apply_finish(&mut merged.rows, &post);
+                            merged.row_count = merged.rows.len();
                             merged
                         }
                         super::query_router::SqlMerge::Unsupported(_) => {
