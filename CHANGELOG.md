@@ -126,6 +126,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `load_all_indexes` returned early when the directory was absent, before the
   one line that cleared the flag, and nothing sets it afterwards.
 
+- **A hit did not say which backend found it** (#56). RRF flattens every
+  backend into one list and the candidate's origin was dropped on the way out,
+  so a caller could not tell where a hit came from — and a hit with no
+  `text_preview` was indistinguishable from one whose content failed to parse.
+  Each hit now carries `backends`, the sorted set that found it, so the two
+  cases separate: a backend named and no preview means the content could not be
+  read, not that nothing matched.
+
+- **Every `/_query` filter was parsed and then ignored** (#56). `filters` was
+  read by nothing at all, so a query narrowed to a time window or a partition
+  got the unnarrowed result back as `200 OK`; and `filters.key`, which was
+  never a field, was dropped in silence — filtering on a key that matched
+  everything and one that matched nothing returned identical results.
+  `partitions` is now applied, `timestamp_gte`/`timestamp_lte` are refused with
+  a `400` naming them (only the text backend sets a per-hit timestamp, so
+  filtering there would drop every vector hit as "outside the window"), and an
+  unknown filter field is a parse error that names it.
+
 - **A text preview over 300 bytes could panic the request.** Three sites in
   `/_query` cut with `&cleaned[..300]`, and `len()` counts bytes, so any preview
   whose 300th byte fell inside a character panicked — ordinary for accented, CJK
