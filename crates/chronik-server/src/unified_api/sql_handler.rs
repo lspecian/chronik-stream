@@ -1181,27 +1181,39 @@ pub async fn execute_sql(
                     // A distinct count and a quantile are the acute case, since
                     // they carry a row per value rather than per group, but the
                     // exposure is the same for a plain COUNT.
-                    let needs_every_row = matches!(
-                        &strategy,
-                        super::query_router::SqlMerge::GroupedAggregate { .. }
-                    );
-                    if needs_every_row
-                        && (response.truncated || peers.iter().any(|p| p.truncated))
-                    {
-                        warn!(query = %request.query, limit = fetch_limit,
-                              "grouped merge exceeded the row limit on at least one node");
-                        let error_response = SqlErrorResponse {
-                            error: format!(
-                                "This query cannot be answered across a cluster: its groups are \
-                                 combined from each node's partial totals, and at least one node \
-                                 had more rows to send than the {fetch_limit}-row limit allows. A \
-                                 group left out there would come back short rather than missing, \
-                                 so there is no honest partial answer. Raise the limit, narrow \
-                                 the query with WHERE, or group it more coarsely."
-                            ),
-                            error_type: "DistributedQueryUnsupported".to_string(),
-                        };
-                        return (StatusCode::BAD_REQUEST, Json(error_response)).into_response();
+                    // All three shapes are the same defect, but naming the wrong
+                    // one sends the reader looking for the wrong fix: someone who
+                    // asked for COUNT(DISTINCT x) wrote no GROUP BY, so being told
+                    // about "groups" reads as a message about a different query.
+                    let shipped = match &strategy {
+                        super::query_router::SqlMerge::GroupedAggregate { post, .. } => {
+                            if post.distinct_count.is_some() {
+                                Some("one row per distinct value")
+                            } else if post.quantile.is_some() {
+                                Some("one row per distinct value and its count")
+                            } else {
+                                Some("one row per group")
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(shipped) = shipped {
+                        if response.truncated || peers.iter().any(|p| p.truncated) {
+                            warn!(query = %request.query, limit = fetch_limit, shipped,
+                                  "value-collecting merge exceeded the row limit on at least one node");
+                            let error_response = SqlErrorResponse {
+                                error: format!(
+                                    "This query cannot be answered across a cluster: it is merged \
+                                     by collecting {shipped} from each node, and at least one node \
+                                     had more of those to send than the {fetch_limit}-row limit \
+                                     allows. What was cut would come back short rather than \
+                                     missing, so there is no honest partial answer. Raise the \
+                                     limit, narrow the query with WHERE, or group it more coarsely."
+                                ),
+                                error_type: "DistributedQueryUnsupported".to_string(),
+                            };
+                            return (StatusCode::BAD_REQUEST, Json(error_response)).into_response();
+                        }
                     }
 
                     match strategy {
