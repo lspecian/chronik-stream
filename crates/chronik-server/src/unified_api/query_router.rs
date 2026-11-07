@@ -1221,7 +1221,7 @@ fn plan_computed(
     }
 
     let node_sql =
-        sql_with_projection(query, projection).ok_or_else(|| UNREWRITABLE.to_string())?;
+        sql_with_projection(query, projection, false).ok_or_else(|| UNREWRITABLE.to_string())?;
     let finish_sql = format!(
         "SELECT {} FROM {MERGED_TABLE}",
         finish_projection.join(", ")
@@ -1284,6 +1284,21 @@ fn plan_quantile(
                 .to_string(),
         );
     }
+    // A distinct count is neither of those, and fell through this check to be
+    // treated as a group key — which put `COUNT(DISTINCT x)` into the nodes'
+    // GROUP BY and made them reject the query with a message about the rewrite
+    // rather than about what was asked.
+    if columns
+        .iter()
+        .any(|c| matches!(c, ColumnMerge::DistinctCount(_)))
+    {
+        return Err(
+            "a quantile and a COUNT(DISTINCT ...) cannot be merged across nodes in the \
+                    same query: one needs a count per value from the nodes and the other needs \
+                    the values themselves. Ask for them separately."
+                .to_string(),
+        );
+    }
 
     let mut projection = Vec::with_capacity(select.projection.len() + 1);
     let mut how = Vec::with_capacity(select.projection.len() + 1);
@@ -1294,6 +1309,8 @@ fn plan_quantile(
     for (idx, (item, class)) in select.projection.iter().zip(columns).enumerate() {
         match class {
             ColumnMerge::Quantile(arg, fraction) => {
+                // Named by `alias_bare_projection` if the caller left it out,
+                // so this is a guard rather than the common path.
                 let SelectItem::ExprWithAlias { alias, .. } = item else {
                     return Err(
                         "a quantile has to be given a name to be merged across nodes, \
@@ -1414,6 +1431,8 @@ fn plan_distinct_count(
     for (idx, (item, class)) in select.projection.iter().zip(columns).enumerate() {
         match class {
             ColumnMerge::DistinctCount(arg) => {
+                // Named by `alias_bare_projection` if the caller left it out,
+                // so this is a guard rather than the common path.
                 let SelectItem::ExprWithAlias { alias, .. } = item else {
                     return Err(
                         "COUNT(DISTINCT ...) has to be given a name to be merged across \
@@ -1502,6 +1521,10 @@ fn rewrite_projection_for_derived(
         // The response has to describe the query the caller wrote, and without
         // an alias there is no name to put the average back under — the engine
         // would have generated one from an expression that is no longer there.
+        //
+        // `alias_bare_projection` supplies that name before this runs, so this
+        // is a guard on the planner rather than something a caller can hit by
+        // leaving the alias out.
         let SelectItem::ExprWithAlias { alias, .. } = item else {
             return Err(
                 "this aggregate has to be given a name to be merged across nodes, because the \
@@ -1572,14 +1595,19 @@ fn parse_projection_item(
 }
 
 /// The caller's query with a replacement projection and no ordering clauses.
+///
+/// `keep_order` has the same meaning as in [`sql_without_ordering`].
 fn sql_with_projection(
     query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
     projection: Vec<chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem>,
+    keep_order: bool,
 ) -> Option<String> {
     use chronik_columnar::datafusion::sql::sqlparser::ast::SetExpr;
 
     let mut rewritten = query.clone();
-    rewritten.order_by = None;
+    if !keep_order {
+        rewritten.order_by = None;
+    }
     rewritten.limit = None;
     rewritten.offset = None;
     strip_having(&mut rewritten);
@@ -2186,6 +2214,54 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         return SqlMerge::Unsupported(why.clone());
     }
 
+    // Everything below applies the rest of the query by name over the merged
+    // rows, and those names come from the SQL. The engine names an unaliased
+    // column differently from the parser (`count(*)` against `COUNT(*)`), so
+    // where a name is going to be used, the nodes are asked for the parser's —
+    // see [`alias_bare_projection`] for what each of those lookups did when the
+    // two disagreed. Queries that need no name keep the engine's own, so a
+    // working query's column names do not change under it.
+    let needs_names = query.order_by.is_some()
+        || select.having.is_some()
+        || columns.iter().any(|c| {
+            matches!(
+                c,
+                // A derived column is rebuilt from running totals, so the name
+                // it goes back under has to be known. Naming it here means a
+                // bare `SELECT AVG(x) FROM t` is answered rather than refused
+                // for want of an alias the caller should not have to write.
+                ColumnMerge::Computed { .. }
+                    | ColumnMerge::Quantile(..)
+                    | ColumnMerge::DistinctCount(_)
+                    | ColumnMerge::Derived(..)
+            )
+        });
+    let base: &chronik_columnar::datafusion::sql::sqlparser::ast::Query = query;
+    let normalized_query = needs_names
+        .then(|| alias_bare_projection(select))
+        .and_then(|(projection, changed)| {
+            changed.then(|| {
+                let mut rewritten = base.clone();
+                if let SetExpr::Select(select) = rewritten.body.as_mut() {
+                    select.projection = projection;
+                }
+                rewritten
+            })
+        });
+    let normalized = normalized_query.is_some();
+    let query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query =
+        normalized_query.as_ref().unwrap_or(base);
+    let select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select =
+        match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => unreachable!("a non-Select body returned above"),
+        };
+
+    // A `SELECT *` orders by a column the SQL never names, so the nodes keep
+    // their own ORDER BY: the engine then rejects a name that is not a column,
+    // rather than the coordinator sorting by a column that is not there.
+    let keep_node_ordering = projection_has_wildcard(select);
+
     // A HAVING is meant for the combined groups, so it is resolved to the
     // columns the response will carry and applied here rather than by the nodes.
     let having =
@@ -2323,13 +2399,14 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
             Ok(parts) => parts,
             Err(why) => return SqlMerge::Unsupported(why),
         };
-        let rewritten = !derived.is_empty() || having.is_some() || needs_rewrite(query);
+        let rewritten =
+            !derived.is_empty() || having.is_some() || needs_rewrite(query) || normalized;
 
         return SqlMerge::GroupedAggregate {
             how,
             post: MergePlan {
                 node_sql: if rewritten {
-                    match sql_with_projection(query, projection) {
+                    match sql_with_projection(query, projection, keep_node_ordering) {
                         Some(sql) => Some(sql),
                         None => return SqlMerge::Unsupported(UNREWRITABLE.to_string()),
                     }
@@ -2361,7 +2438,8 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         // An OFFSET is the clause that most needs this: each node skipping its
         // own ten rows skips thirty, and none of them the ten the caller meant.
         return SqlMerge::Concatenate(MergePlan {
-            node_sql: needs_rewrite(query).then(|| sql_without_ordering(query)),
+            node_sql: (needs_rewrite(query) || normalized)
+                .then(|| sql_without_ordering(query, keep_node_ordering)),
             order_by,
             offset: query_offset(query),
             limit: query_limit(query),
@@ -2385,10 +2463,12 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         Ok(parts) => parts,
         Err(why) => return SqlMerge::Unsupported(why),
     };
-    let node_sql = if derived.is_empty() {
+    // Normalized as well as rewritten: a scalar `HAVING` is applied here by
+    // name, so the nodes have to return the name it was resolved to.
+    let node_sql = if derived.is_empty() && !normalized {
         None
     } else {
-        match sql_with_projection(query, projection) {
+        match sql_with_projection(query, projection, false) {
             Some(sql) => Some(sql),
             None => return SqlMerge::Unsupported(UNREWRITABLE.to_string()),
         }
@@ -2749,6 +2829,69 @@ fn projection_names(
     }
     Some((names, by_expr_text))
 }
+
+/// Give every unaliased projected column the name the planner resolved for it.
+///
+/// `ORDER BY`, `HAVING`, and the group keys of a reshaped query are all applied
+/// by name over the merged rows, and the name the planner computes is the
+/// parser's rendering of the expression — `COUNT(*)`, `UPPER(k)`. The engine
+/// names those same columns `count(*)` and `upper(t.k)`, so every one of those
+/// lookups missed, each one quietly:
+///
+/// - `ORDER BY COUNT(*) DESC LIMIT 10` found no such column, so the sort
+///   compared null to null, did nothing, and the limit returned ten arbitrary
+///   groups as the top ten.
+/// - `HAVING COUNT(*) > 1` admitted no row at all, because a missing column
+///   fails the comparison — the query returned empty.
+/// - A quantile's or a distinct count's group keys all hashed to the same
+///   identity, collapsing every group into one.
+///
+/// Asking the nodes for the name the planner already resolved makes the two
+/// agree at the source, rather than teaching each of those three places to
+/// guess what the engine would have called the column.
+fn alias_bare_projection(
+    select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
+) -> (
+    Vec<chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem>,
+    bool,
+) {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Ident, SelectItem};
+
+    let mut projection = Vec::with_capacity(select.projection.len());
+    let mut changed = false;
+    for item in &select.projection {
+        match item {
+            // A bare column is already named what the planner calls it, so it
+            // is left exactly as the caller wrote it. Only the names the engine
+            // would render differently need saying — `t.k` among them, which
+            // the engine returns as `k`.
+            SelectItem::UnnamedExpr(SqlExpr::Identifier(_)) => projection.push(item.clone()),
+            SelectItem::UnnamedExpr(expr) => {
+                changed = true;
+                projection.push(SelectItem::ExprWithAlias {
+                    expr: expr.clone(),
+                    // Quoted, so a name like `COUNT(*)` is read as a name.
+                    alias: Ident::with_quote('"', expr.to_string()),
+                });
+            }
+            other => projection.push(other.clone()),
+        }
+    }
+    (projection, changed)
+}
+
+/// Whether this projection returns columns the SQL does not name.
+fn projection_has_wildcard(
+    select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
+) -> bool {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem;
+    select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+        )
+    })
+}
 /// Resolve the query's `ORDER BY` terms to output column names.
 ///
 /// Returns `None` when a term cannot be tied to a column that is actually in
@@ -2769,6 +2912,7 @@ fn resolve_order_by(
     // from, so `ORDER BY <same expression>` resolves as well as `ORDER BY alias`.
     let mut names: Vec<String> = Vec::new();
     let mut by_expr_text: HashMap<String, String> = HashMap::new();
+    let mut has_wildcard = false;
     for item in &select.projection {
         match item {
             SelectItem::ExprWithAlias { expr, alias } => {
@@ -2780,8 +2924,11 @@ fn resolve_order_by(
                 names.push(text.clone());
                 by_expr_text.insert(text, expr.to_string());
             }
-            // A wildcard's columns are not known from the SQL alone.
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+            // A wildcard's columns are not named by the SQL, but they are all
+            // in the response, so a bare column name is still orderable — see
+            // below. Refusing here turned `SELECT * FROM t ORDER BY ts LIMIT 10`
+            // away, which is the commonest query there is against a stream.
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => has_wildcard = true,
         }
     }
 
@@ -2791,6 +2938,13 @@ fn resolve_order_by(
             SqlExpr::Identifier(id) => {
                 let want = id.value.clone();
                 if names.iter().any(|n| n.eq_ignore_ascii_case(&want)) {
+                    want
+                } else if has_wildcard {
+                    // `SELECT *` returns every column of the topic, so a bare
+                    // name is one of them or the query does not run at all: the
+                    // nodes keep their own ORDER BY in this case precisely so
+                    // the engine rejects a name that is not a column, rather
+                    // than the coordinator sorting by a column that is absent.
                     want
                 } else {
                     by_expr_text.get(&term.expr.to_string())?.clone()
@@ -2880,6 +3034,14 @@ pub fn apply_finish(rows: &mut Vec<HashMap<String, serde_json::Value>>, post: &M
     use serde_json::Value as J;
     use std::cmp::Ordering;
 
+    // HAVING first, and only now that the groups are whole: a threshold applied
+    // to a node's partial count drops groups that clear it once added up. It
+    // comes before the sort so the sort is not done over rows that are about to
+    // be dropped.
+    if let Some(predicate) = post.having.as_ref() {
+        rows.retain(|row| predicate.admits(row));
+    }
+
     if !post.order_by.is_empty() {
         rows.sort_by(|a, b| {
             for key in &post.order_by {
@@ -2919,12 +3081,6 @@ pub fn apply_finish(rows: &mut Vec<HashMap<String, serde_json::Value>>, post: &M
         });
     }
 
-    // HAVING first, and only now that the groups are whole: a threshold applied
-    // to a node's partial count drops groups that clear it once added up.
-    if let Some(predicate) = post.having.as_ref() {
-        rows.retain(|row| predicate.admits(row));
-    }
-
     // Offset before limit, and both over the union: the nodes ran a query with
     // these clauses removed precisely so that they land once, here.
     if let Some(offset) = post.offset {
@@ -2958,11 +3114,18 @@ fn strip_having(query: &mut chronik_columnar::datafusion::sql::sqlparser::ast::Q
 /// them makes each node return its full contribution, which is what lets the
 /// coordinator apply them once over the union. The `ORDER BY` goes too — it
 /// costs each node a sort whose result is discarded by the merge.
+/// `keep_order` leaves the `ORDER BY` in place. That is for a `SELECT *`, whose
+/// sort column the SQL never names: letting the nodes sort makes the engine
+/// reject a column that does not exist, instead of the coordinator sorting by
+/// an absent column and quietly returning the rows unsorted.
 fn sql_without_ordering(
     query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+    keep_order: bool,
 ) -> String {
     let mut stripped = query.clone();
-    stripped.order_by = None;
+    if !keep_order {
+        stripped.order_by = None;
+    }
     stripped.limit = None;
     stripped.offset = None;
     strip_having(&mut stripped);
@@ -4323,11 +4486,20 @@ mod sql_merge_tests {
         assert!(merged.rows[0]["a"].is_null());
     }
 
-    /// Without a name there is nowhere to put the result back, since the column
-    /// the engine would have generated is for an expression that is gone.
+    /// An unnamed AVG used to be refused: the nodes are asked for a sum and a
+    /// count, so the column the engine would have generated is for an
+    /// expression that is no longer in the query, and there was nowhere to put
+    /// the average back. The nodes are now asked for that name too, so the
+    /// average comes back under the expression the caller wrote.
     #[test]
-    fn an_unnamed_avg_is_refused_with_a_way_out() {
-        assert!(refusal("SELECT AVG(amount) FROM orders").contains("AVG(x) AS avg_x"));
+    fn an_unnamed_avg_is_answered_under_the_name_the_caller_wrote() {
+        let SqlMerge::ScalarAggregate { post, .. } =
+            sql_merge_strategy("SELECT AVG(amount) FROM orders")
+        else {
+            panic!("an unnamed average is answered, not refused");
+        };
+        assert_eq!(post.derived.len(), 1);
+        assert_eq!(post.derived[0].output, "AVG(amount)");
     }
 
     /// GROUP BY is re-aggregated by key across nodes: the same key arrives once
@@ -4805,11 +4977,12 @@ mod sql_merge_tests {
     }
 
     /// The coordinator can only sort by values the query actually returned.
+    ///
+    /// A wildcard *does* return them, which is why it is no longer refused —
+    /// see [`planner_name_tests::a_wildcard_can_be_ordered_by_a_column_it_returns`](super::planner_name_tests).
     #[test]
     fn ordering_by_an_unprojected_column_is_refused() {
         assert!(refusal("SELECT k FROM t ORDER BY ts DESC LIMIT 5").contains("ORDER BY"));
-        // A wildcard hides which columns exist, so it cannot be resolved either.
-        assert!(refusal("SELECT * FROM t ORDER BY ts DESC LIMIT 5").contains("ORDER BY"));
     }
 
     /// `ORDER BY id DESC LIMIT 5` over three nodes returned 15 rows whose first
@@ -5064,12 +5237,24 @@ mod sql_merge_tests {
 
     /// The fraction has to be a literal, because it is applied here rather than
     /// by the nodes.
+    ///
+    /// An unnamed quantile used to be refused too, for want of a name to put
+    /// the answer back under. The nodes are now asked for that name, so
+    /// `SELECT median(x) FROM t` is answered — see
+    /// [`planner_name_tests`](super::planner_name_tests).
     #[test]
-    fn a_quantile_needs_a_literal_fraction_and_a_name() {
-        assert!(refusal("SELECT median(x) FROM t").contains("has to be given a name"));
+    fn a_quantile_needs_a_literal_fraction() {
         assert!(
             refusal("SELECT approx_percentile_cont(x, y) AS p FROM t").contains("literal fraction")
         );
+
+        let SqlMerge::GroupedAggregate { post, .. } = sql_merge_strategy("SELECT median(x) FROM t")
+        else {
+            panic!("an unnamed median is answered under the name the caller wrote");
+        };
+        let spec = post.quantile.as_ref().expect("a quantile plan");
+        assert_eq!(spec.output, "median(x)");
+        assert!(spec.keys.is_empty(), "no GROUP BY means one distribution");
     }
 
     /// `ROUND(AVG(x), 2)` walked past the AVG refusal and returned one average
@@ -5316,5 +5501,407 @@ mod sql_merge_tests {
             rows.is_empty(),
             "the threshold has to be applied, not carried"
         );
+    }
+}
+
+/// A coordinator that applies the rest of a query by name must be asking the
+/// nodes for those names.
+///
+/// The planner's name for an unaliased column is the parser's rendering of the
+/// expression — `COUNT(*)`, `UPPER(k)`. The engine names the same columns
+/// `count(*)` and `upper(t.k)`. Every name-based step was therefore looking up
+/// a column that was not there, and each failed quietly in its own way: the
+/// sort did nothing and `LIMIT` returned arbitrary rows as the top N, `HAVING`
+/// admitted nothing and returned empty, and a quantile's groups collapsed into
+/// one. The tests here hold the two sides together.
+#[cfg(test)]
+mod planner_name_tests {
+    use super::*;
+
+    fn row(pairs: &[(&str, i64)]) -> HashMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::from(*v)))
+            .collect()
+    }
+
+    fn plan_of(sql: &str) -> MergePlan {
+        match sql_merge_strategy(sql) {
+            SqlMerge::Concatenate(post)
+            | SqlMerge::GroupedAggregate { post, .. }
+            | SqlMerge::ScalarAggregate { post, .. } => post,
+            SqlMerge::Unsupported(why) => panic!("expected a plan for {sql}, refused: {why}"),
+        }
+    }
+
+    /// Every column name this predicate looks up.
+    fn predicate_columns(predicate: &Predicate, into: &mut Vec<String>) {
+        match predicate {
+            Predicate::And(a, b) | Predicate::Or(a, b) => {
+                predicate_columns(a, into);
+                predicate_columns(b, into);
+            }
+            Predicate::Not(inner) => predicate_columns(inner, into),
+            Predicate::Compare { column, .. } => into.push(column.clone()),
+        }
+    }
+
+    /// The output names a query is *guaranteed* to come back with: explicit
+    /// aliases, and bare column references, which the engine names as written.
+    /// An unaliased expression is not one of them — that is the whole bug.
+    fn guaranteed_names(sql: &str) -> Option<Vec<String>> {
+        use chronik_columnar::datafusion::sql::parser::{DFParser, Statement};
+        use chronik_columnar::datafusion::sql::sqlparser::ast::{
+            Expr as SqlExpr, SelectItem, SetExpr, Statement as AstStatement,
+        };
+
+        let statements = DFParser::parse_sql(sql).expect("the planner's own SQL must parse");
+        let Some(Statement::Statement(ast)) = statements.front() else {
+            panic!("not a statement: {sql}");
+        };
+        let AstStatement::Query(query) = ast.as_ref() else {
+            panic!("not a query: {sql}");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Some(Vec::new());
+        };
+
+        let mut names = Vec::new();
+        for item in &select.projection {
+            match item {
+                SelectItem::ExprWithAlias { alias, .. } => names.push(alias.value.clone()),
+                SelectItem::UnnamedExpr(SqlExpr::Identifier(id)) => names.push(id.value.clone()),
+                // `SELECT *` returns columns this cannot enumerate; the engine
+                // validates the name instead, because the ORDER BY is left in.
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+                SelectItem::UnnamedExpr(_) => {}
+            }
+        }
+        Some(names)
+    }
+
+    /// The invariant, over every shape the planner can produce. This is the
+    /// test that catches the whole family at once: all three bugs were one
+    /// root cause, and each was found only by reading a different branch.
+    #[test]
+    fn every_name_the_coordinator_uses_is_one_the_nodes_are_asked_for() {
+        for sql in [
+            "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY COUNT(*) DESC LIMIT 2",
+            "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY 2 DESC LIMIT 2",
+            "SELECT k, COUNT(*) FROM t GROUP BY k HAVING COUNT(*) > 1",
+            "SELECT k, COUNT(*) FROM t GROUP BY k HAVING COUNT(*) > 1 ORDER BY COUNT(*)",
+            "SELECT k, AVG(v) FROM t GROUP BY k ORDER BY AVG(v) DESC",
+            "SELECT UPPER(k), SUM(v) FROM t GROUP BY UPPER(k) ORDER BY UPPER(k)",
+            "SELECT t.k, COUNT(*) FROM t GROUP BY t.k ORDER BY COUNT(*) DESC",
+            "SELECT COUNT(*) FROM t HAVING COUNT(*) > 5",
+            "SELECT AVG(v) FROM t",
+            "SELECT k, median(v) AS m FROM t GROUP BY k ORDER BY m DESC LIMIT 2",
+            "SELECT UPPER(k), median(v) AS m FROM t GROUP BY UPPER(k)",
+            "SELECT UPPER(k), COUNT(DISTINCT v) AS d FROM t GROUP BY UPPER(k)",
+            "SELECT k, ROUND(AVG(v), 2) FROM t GROUP BY k ORDER BY 2 DESC",
+            "SELECT UPPER(k), ROUND(AVG(v), 2) AS b FROM t GROUP BY UPPER(k)",
+            "SELECT k, SUM(v) * 2 FROM t GROUP BY k ORDER BY 2 DESC",
+            "SELECT k, COUNT(*) AS c FROM t GROUP BY k ORDER BY c DESC LIMIT 2",
+            "SELECT _offset, _value FROM t ORDER BY _offset DESC LIMIT 5",
+            // No aggregate at all, and still a name the engine renders its own
+            // way: `lower(t.k)` against the planner's `LOWER(k)`.
+            "SELECT LOWER(k) FROM t ORDER BY LOWER(k) LIMIT 3",
+            "SELECT k, COUNT(*), ROUND(AVG(v), 2) AS b FROM t GROUP BY k ORDER BY b DESC",
+        ] {
+            let plan = plan_of(sql);
+            // With no rewrite the caller's SQL went out as it stood, and the
+            // planner then used no names of its own.
+            let node_sql = plan.node_sql.clone().unwrap_or_else(|| sql.to_string());
+            let Some(guaranteed) = guaranteed_names(&node_sql) else {
+                continue; // a wildcard; the engine checks the name
+            };
+
+            let mut wanted: Vec<String> = plan.order_by.iter().map(|k| k.column.clone()).collect();
+            if let Some(predicate) = plan.having.as_ref() {
+                predicate_columns(predicate, &mut wanted);
+            }
+            if let Some(spec) = plan.quantile.as_ref() {
+                wanted.extend(spec.keys.iter().cloned());
+            }
+            if let Some(spec) = plan.distinct_count.as_ref() {
+                wanted.extend(spec.keys.iter().cloned());
+            }
+            // A derived column is created by the coordinator after the merge,
+            // so it is a name the plan supplies rather than one it looks up.
+            let created: Vec<String> = plan.derived.iter().map(|d| d.output.clone()).collect();
+            let quantile_output = plan.quantile.as_ref().map(|s| s.output.clone());
+            let distinct_output = plan.distinct_count.as_ref().map(|s| s.output.clone());
+
+            for name in wanted {
+                let known = guaranteed.contains(&name)
+                    || created.contains(&name)
+                    || quantile_output.as_deref() == Some(name.as_str())
+                    || distinct_output.as_deref() == Some(name.as_str())
+                    // The computed path aliases its own output in finish_sql.
+                    || plan.finish_sql.as_deref().is_some_and(|s| {
+                        s.contains(&format!("AS \"{}\"", name.replace('"', "\"\"")))
+                    });
+                assert!(
+                    known,
+                    "{sql}\n  the coordinator looks up {name:?}, which the nodes are never \
+                     asked for.\n  node SQL: {node_sql}\n  guaranteed: {guaranteed:?}"
+                );
+            }
+        }
+    }
+
+    /// `ORDER BY COUNT(*) DESC LIMIT 10` — the canonical top-N. The nodes are
+    /// asked for the name the sort will use, so the sort happens; before this,
+    /// the comparison found null against null on every row, left the order
+    /// untouched, and `LIMIT` returned ten arbitrary groups as the top ten.
+    #[test]
+    fn top_n_by_an_unaliased_count_is_actually_sorted() {
+        let plan = plan_of("SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY COUNT(*) DESC LIMIT 2");
+        assert_eq!(plan.order_by.len(), 1);
+        assert_eq!(plan.order_by[0].column, "COUNT(*)");
+        assert!(plan.order_by[0].descending);
+        assert_eq!(plan.limit, Some(2));
+        let node_sql = plan.node_sql.as_deref().expect("the name has to be asked for");
+        assert!(
+            node_sql.contains(r#"COUNT(*) AS "COUNT(*)""#),
+            "the nodes must be asked for the name the sort uses: {node_sql}"
+        );
+        assert!(
+            !node_sql.contains("LIMIT"),
+            "the limit belongs to the merged groups: {node_sql}"
+        );
+
+        // And the sort does order the rows it is given.
+        let mut rows = vec![
+            row(&[("COUNT(*)", 3)]),
+            row(&[("COUNT(*)", 9)]),
+            row(&[("COUNT(*)", 5)]),
+        ];
+        apply_finish(&mut rows, &plan);
+        let counts: Vec<i64> = rows
+            .iter()
+            .map(|r| r["COUNT(*)"].as_i64().unwrap())
+            .collect();
+        assert_eq!(counts, vec![9, 5], "descending, then cut to the limit");
+    }
+
+    /// `HAVING COUNT(*) > 1` on an unaliased count returned *no rows at all*: a
+    /// column that is absent fails the comparison, so every group was dropped.
+    #[test]
+    fn having_on_an_unaliased_count_keeps_the_groups_that_clear_it() {
+        let plan = plan_of("SELECT k, COUNT(*) FROM t GROUP BY k HAVING COUNT(*) > 1");
+        let node_sql = plan.node_sql.as_deref().expect("the name has to be asked for");
+        assert!(
+            node_sql.contains(r#"COUNT(*) AS "COUNT(*)""#),
+            "the nodes must be asked for the name HAVING filters on: {node_sql}"
+        );
+        assert!(
+            !node_sql.contains("HAVING"),
+            "the threshold belongs to the combined groups: {node_sql}"
+        );
+
+        let mut rows = vec![row(&[("COUNT(*)", 1)]), row(&[("COUNT(*)", 4)])];
+        apply_finish(&mut rows, &plan);
+        assert_eq!(rows.len(), 1, "the group with 4 rows clears the threshold");
+        assert_eq!(rows[0]["COUNT(*)"], serde_json::Value::from(4));
+    }
+
+    /// An expression group key is looked up per row to decide which group a
+    /// quantile's counts belong to. Named `UPPER(k)` by the planner and
+    /// `upper(t.k)` by the engine, every row hashed to the same identity and
+    /// the groups collapsed into one.
+    #[test]
+    fn an_expression_group_key_is_named_so_a_quantiles_groups_survive() {
+        let plan = plan_of("SELECT UPPER(k), median(v) AS m FROM t GROUP BY UPPER(k)");
+        let spec = plan.quantile.as_ref().expect("a quantile plan");
+        assert_eq!(spec.keys, vec!["UPPER(k)".to_string()]);
+        let node_sql = plan.node_sql.as_deref().expect("a reshaped query");
+        assert!(
+            node_sql.contains(r#"UPPER(k) AS "UPPER(k)""#),
+            "the nodes must be asked for the key the groups are gathered by: {node_sql}"
+        );
+    }
+
+    /// `SELECT * FROM t ORDER BY ts LIMIT 10` is the commonest query there is
+    /// against a stream, and it was refused: a wildcard's columns are not named
+    /// by the SQL, so the sort column could not be proved to be in the
+    /// response. It is — the nodes keep their own ORDER BY, so the engine
+    /// rejects a name that is not a column instead of the coordinator sorting
+    /// by one that is absent.
+    #[test]
+    fn a_wildcard_can_be_ordered_by_a_column_it_returns() {
+        let plan = plan_of("SELECT * FROM t WHERE v > 1 ORDER BY v DESC LIMIT 5 OFFSET 2");
+        assert_eq!(plan.order_by.len(), 1);
+        assert_eq!(plan.order_by[0].column, "v");
+        assert!(plan.order_by[0].descending);
+        assert_eq!(plan.limit, Some(5));
+        assert_eq!(plan.offset, Some(2));
+
+        let node_sql = plan.node_sql.as_deref().expect("limit and offset are stripped");
+        assert!(
+            node_sql.contains("ORDER BY"),
+            "the nodes keep the sort so the engine validates the column: {node_sql}"
+        );
+        assert!(
+            !node_sql.contains("LIMIT") && !node_sql.contains("OFFSET"),
+            "the cut belongs to the merged rows: {node_sql}"
+        );
+    }
+
+    /// An ORDER BY a wildcard cannot supply is still refused: the response
+    /// carries `k`, not `LOWER(k)`, so there is nothing to sort by.
+    #[test]
+    fn a_wildcard_does_not_excuse_an_unprojected_expression() {
+        assert!(matches!(
+            sql_merge_strategy("SELECT * FROM t ORDER BY LOWER(k) LIMIT 2"),
+            SqlMerge::Unsupported(_)
+        ));
+    }
+
+    /// A quantile is answered as a count per value and a distinct count as the
+    /// values themselves. Asked together, the distinct count matched neither
+    /// guard and was treated as a group key — which put `COUNT(DISTINCT v)`
+    /// into the nodes' GROUP BY, so the engine rejected the rewrite with a
+    /// message about SQL the caller never wrote.
+    #[test]
+    fn a_quantile_and_a_distinct_count_are_refused_together() {
+        let SqlMerge::Unsupported(why) = sql_merge_strategy(
+            "SELECT k, median(v) AS m, COUNT(DISTINCT v) AS d FROM t GROUP BY k",
+        ) else {
+            panic!("a quantile beside a distinct count has no single node shape");
+        };
+        assert!(why.contains("separately"), "{why}");
+    }
+
+    /// With the name now asked for, a bare `AVG` no longer has to be aliased by
+    /// the caller to be answered at all.
+    #[test]
+    fn a_bare_average_is_answered_rather_than_refused() {
+        let plan = plan_of("SELECT AVG(v) FROM t");
+        assert_eq!(plan.derived.len(), 1);
+        assert_eq!(plan.derived[0].output, "AVG(v)");
+    }
+
+    /// The names only change where they were wrong. A query that needs no name
+    /// of its own is still sent exactly as the caller wrote it, so its columns
+    /// come back named as the engine names them — the same on one node as on
+    /// three.
+    #[test]
+    fn a_query_needing_no_name_is_sent_unchanged() {
+        for sql in [
+            "SELECT k, COUNT(*) FROM t GROUP BY k",
+            "SELECT COUNT(*) FROM t",
+            "SELECT k, SUM(v) FROM t GROUP BY k",
+            "SELECT _offset, _value FROM t",
+        ] {
+            assert!(
+                plan_of(sql).node_sql.is_none(),
+                "{sql} must reach the nodes unchanged, keeping the engine's column names"
+            );
+        }
+    }
+}
+
+/// The coordinator's own finishing query, run for real.
+///
+/// The names the planner resolves are now asked of the nodes, which means the
+/// finishing step has to be able to *reference* a column called `UPPER(k)` or
+/// `COUNT(*)`. That is what [`quote_ident`] is for, and nothing proved it
+/// worked end to end: the computed path builds its SQL as text at plan time,
+/// so a name the engine cannot parse fails only when a query runs.
+#[cfg(test)]
+mod finish_sql_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_finishing_query_can_name_an_unaliased_group_key() {
+        let SqlMerge::GroupedAggregate { post, .. } = sql_merge_strategy(
+            "SELECT UPPER(k), ROUND(AVG(v), 2) AS b FROM t GROUP BY UPPER(k)",
+        ) else {
+            panic!("a wrapped aggregate is answered by finishing on the coordinator");
+        };
+        let finish_sql = post.finish_sql.as_deref().expect("a finishing step");
+        let derived = post.derived.first().expect("the inner AVG is carried as totals");
+
+        // What the nodes return, merged: the group key under the name the
+        // planner asked for, plus the totals the average is rebuilt from.
+        let mut merged = SqlResponse {
+            columns: vec![
+                "UPPER(k)".to_string(),
+                derived.sum.clone(),
+                derived.count.clone(),
+            ],
+            rows: vec![HashMap::from([
+                ("UPPER(k)".to_string(), serde_json::json!("A")),
+                (derived.sum.clone(), serde_json::json!(10)),
+                (derived.count.clone(), serde_json::json!(4)),
+            ])],
+            row_count: 1,
+            execution_time_ms: 1,
+            truncated: false,
+        };
+        finish_derived(&mut merged, &post.derived);
+
+        let finished = run_finish_sql(merged, finish_sql)
+            .await
+            .expect("the finishing query must be valid SQL over the merged rows");
+
+        assert_eq!(finished.row_count, 1);
+        let row = &finished.rows[0];
+        assert_eq!(
+            row.get("UPPER(k)"),
+            Some(&serde_json::json!("A")),
+            "the group key keeps the name the nodes were asked for: {:?}",
+            finished.columns
+        );
+        assert_eq!(
+            row.get("b").and_then(|v| v.as_f64()),
+            Some(2.5),
+            "10 / 4, rounded: {:?}",
+            finished.columns
+        );
+    }
+
+    /// The same for a name that is only a name because it is quoted.
+    #[tokio::test]
+    async fn a_finishing_query_can_name_a_count_star_column() {
+        let sql = "SELECT COUNT(*), ROUND(AVG(v), 2) AS b FROM t";
+        let SqlMerge::GroupedAggregate { how, post } = sql_merge_strategy(sql) else {
+            panic!("a wrapped aggregate is answered by finishing on the coordinator");
+        };
+        // The count must be summed, not treated as a key: keyed, each node's
+        // own count would become a group of its own and the query would return
+        // one row per node.
+        assert_eq!(
+            how,
+            vec![Some(AggMerge::Sum), Some(AggMerge::Sum), Some(AggMerge::Sum)],
+            "count, then the average's sum and count"
+        );
+        let finish_sql = post.finish_sql.as_deref().expect("a finishing step");
+        let derived = post.derived.first().expect("the inner AVG is carried as totals");
+
+        let mut merged = SqlResponse {
+            columns: vec![
+                "COUNT(*)".to_string(),
+                derived.sum.clone(),
+                derived.count.clone(),
+            ],
+            rows: vec![HashMap::from([
+                ("COUNT(*)".to_string(), serde_json::json!(7)),
+                (derived.sum.clone(), serde_json::json!(9)),
+                (derived.count.clone(), serde_json::json!(2)),
+            ])],
+            row_count: 1,
+            execution_time_ms: 1,
+            truncated: false,
+        };
+        finish_derived(&mut merged, &post.derived);
+
+        let finished = run_finish_sql(merged, finish_sql)
+            .await
+            .expect("the finishing query must be valid SQL over the merged rows");
+        let row = &finished.rows[0];
+        assert_eq!(row.get("COUNT(*)"), Some(&serde_json::json!(7)));
+        assert_eq!(row.get("b").and_then(|v| v.as_f64()), Some(4.5));
     }
 }
