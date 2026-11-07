@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.1] - 2026-11-07
+
+### Fixed
+
+- **An optional developer CLI could withhold the entire release.** The
+  `chronik` CLI links librdkafka against whatever OpenSSL the runner image
+  ships, and that drifts: `macos-latest` moved to a Homebrew OpenSSL 3 built
+  for macOS 26, the link failed on `_BIO_eof` against rustc's default 11.0
+  deployment target, and because a failed step skips the rest of the job the
+  darwin **server** binary — which had already built successfully — was never
+  packaged. Both downstream jobs `needs: build-binaries`, so the Docker images
+  and the GitHub release were skipped as well and v2.15.0 shipped no artifacts
+  at all, despite all four Linux targets building cleanly. That step is now
+  non-blocking; packaging already tolerated a missing CLI, so a failure there
+  now costs that platform's CLI and nothing else.
+
+  The darwin arm64 `chronik` CLI is absent from this release for that reason.
+  The darwin `chronik-server` binary, the Linux binaries and the Docker images
+  are all present.
+
 ## [2.15.0] - 2026-11-07
 
 ### Added

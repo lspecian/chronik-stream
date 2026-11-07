@@ -139,8 +139,25 @@ jobs:
       # rdkafka -> librdkafka, which only compiles on a NATIVE build (never the
       # cross/musl targets). So it ships alongside chronik-server on the native
       # artifacts (gnu + darwin) only.
+      #
+      # Non-blocking, because this step links a C library against whatever
+      # OpenSSL the runner image happens to ship, and that drifts underneath us.
+      # It cost the whole v2.15.0 release: `macos-latest` moved to a Homebrew
+      # OpenSSL 3 built for macOS 26, the link failed on `_BIO_eof` against
+      # rustc's default 11.0 deployment target, and because a failed step skips
+      # the rest of the job the darwin **server** binary — which had already
+      # built successfully in the step above — was never packaged. Docker and
+      # the GitHub release both `needs: build-binaries`, so they skipped too and
+      # the tag shipped nothing at all.
+      #
+      # An optional developer CLI must not be able to withhold the server
+      # binaries. "Package binary" below already tolerates a missing `chronik`
+      # (`if [ -f ... ]`), so a failure here now costs exactly the CLI for that
+      # platform and nothing else. Check the step's annotation after a release:
+      # a silently absent CLI is the trade here, not an invisible one.
       - name: Build chronik CLI (native only)
         if: "!matrix.use_cross"
+        continue-on-error: true
         env:
           RUSTC_WRAPPER: ""
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
