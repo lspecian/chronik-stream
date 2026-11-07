@@ -81,6 +81,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second round-trip to be usable for RAG. The hits now get their text in one
   query keyed on the exact `(partition, offset)` pairs.
 
+- **A cluster configured only by environment embedded nothing, and said so at
+  INFO.** The query side builds its embedding provider from
+  `CHRONIK_EMBEDDING_PROVIDER`/`_ENDPOINT`; the indexing side built one per
+  topic from the topic's own config, which read topic keys only and fell back to
+  a hardcoded OpenAI default. On the same node: `✓ Embedding provider
+  initialized: external` and, seconds later, `Failed to create embedding
+  provider ... OPENAI_API_KEY environment variable not set` followed by
+  `Generated vector embeddings ... embeddings=0` — the topic permanently not
+  vector-searchable with nothing above WARN to say so. Topic config now falls
+  back to the server-wide environment before the hardcoded default, matching
+  the precedence of every other per-topic switch, and the warning names what it
+  costs and what to set.
+
+- **`/_vector/{topic}/stats` reported `"loading": true` forever** on any node
+  that had not yet written a vector index — the ordinary case for a new
+  cluster, and exactly when that field is being read to debug something else.
+  `load_all_indexes` returned early when the directory was absent, before the
+  one line that cleared the flag, and nothing sets it afterwards.
+
 - **A text preview over 300 bytes could panic the request.** Three sites in
   `/_query` cut with `&cleaned[..300]`, and `len()` counts bytes, so any preview
   whose 300th byte fell inside a character panicked — ordinary for accented, CJK
