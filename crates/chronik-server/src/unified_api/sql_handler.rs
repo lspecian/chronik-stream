@@ -1136,7 +1136,23 @@ pub async fn execute_sql(
         })
         .unwrap_or_else(|| request.query.clone());
 
-    match SqlHandler::execute(&state, &node_sql, row_limit).await {
+    // What each node may contribute, which is not the same as what the caller
+    // gets back: a page's candidates can outnumber the response cap, and a cap
+    // applied to a node's reply discards them after the query has already
+    // picked them out. The response is still held to `row_limit` below.
+    let fetch_limit = strategy
+        .as_ref()
+        .and_then(|s| match s {
+            super::query_router::SqlMerge::Concatenate(plan)
+            | super::query_router::SqlMerge::GroupedAggregate { post: plan, .. }
+            | super::query_router::SqlMerge::ScalarAggregate { post: plan, .. } => {
+                Some(plan.node_fetch_rows(row_limit).min(MAX_ROW_LIMIT))
+            }
+            _ => None,
+        })
+        .unwrap_or(row_limit);
+
+    match SqlHandler::execute(&state, &node_sql, fetch_limit).await {
         Ok(response) => {
             let response = match (strategy, state.query_router.as_ref()) {
                 (Some(strategy), Some(router)) => {
@@ -1145,7 +1161,7 @@ pub async fn execute_sql(
                     // the cap we resolved rather than re-deriving it.
                     let fan_out_request = SqlRequest {
                         query: node_sql,
-                        limit: Some(row_limit),
+                        limit: Some(fetch_limit),
                         ..request.clone()
                     };
                     let peers: Vec<SqlResponse> = router

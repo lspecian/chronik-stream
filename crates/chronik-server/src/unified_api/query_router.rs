@@ -866,6 +866,29 @@ pub struct MergePlan {
     pub finish_sql: Option<String>,
 }
 
+impl MergePlan {
+    /// How many rows each node must be allowed to return for this merge to be
+    /// exact, given the cap the response itself is held to.
+    ///
+    /// The node query asks for `offset + limit` candidates, which is all the
+    /// merge can need — but a node cuts its reply to the cap *after* running
+    /// the query, so a cap below that figure throws away candidates the page
+    /// is made of. `LIMIT 3 OFFSET 3` over nodes capped at 4 returned
+    /// `27, 20, 19` where the answer was `27, 26, 25`: the node holding 26 and
+    /// 25 had offered them and had them cut off.
+    ///
+    /// The response cap is untouched by this — it still bounds what is sent
+    /// back. This only widens what the nodes may contribute to the merge.
+    pub fn node_fetch_rows(&self, response_limit: usize) -> usize {
+        match self.limit {
+            Some(limit) => {
+                response_limit.max(limit.saturating_add(self.offset.unwrap_or(0)))
+            }
+            None => response_limit,
+        }
+    }
+}
+
 /// One `ORDER BY` term, resolved to the name of a column in the response.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderKey {
@@ -2437,12 +2460,32 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
 
         // An OFFSET is the clause that most needs this: each node skipping its
         // own ten rows skips thirty, and none of them the ten the caller meant.
+        // The ORDER BY, by contrast, the nodes keep — see
+        // [`sql_for_row_wise_nodes`] for why dropping it was what made a
+        // top-N wrong as soon as the rows outnumbered the cap.
+        let offset = query_offset(query);
+        let limit = query_limit(query);
+        // A page deeper than any node may return cannot be assembled: the
+        // coordinator would be ranking rows it was never shown. The nodes can
+        // be asked for more than the response cap, but not without limit.
+        if let Some(limit) = limit {
+            let needed = limit.saturating_add(offset.unwrap_or(0));
+            if !order_by.is_empty() && needed > super::sql_handler::MAX_ROW_LIMIT {
+                return SqlMerge::Unsupported(format!(
+                    "this page is too deep to assemble across nodes: ordering it needs the \
+                     first {needed} rows of every node, and a node may return at most {}. \
+                     Narrow the query with WHERE, or page by a value — `WHERE id < <last \
+                     seen>` — instead of by offset.",
+                    super::sql_handler::MAX_ROW_LIMIT
+                ));
+            }
+        }
         return SqlMerge::Concatenate(MergePlan {
             node_sql: (needs_rewrite(query) || normalized)
-                .then(|| sql_without_ordering(query, keep_node_ordering)),
+                .then(|| sql_for_row_wise_nodes(query, offset, limit)),
             order_by,
-            offset: query_offset(query),
-            limit: query_limit(query),
+            offset,
+            limit,
             derived: Vec::new(),
             having: None,
             distinct_count: None,
@@ -3114,22 +3157,39 @@ fn strip_having(query: &mut chronik_columnar::datafusion::sql::sqlparser::ast::Q
 /// them makes each node return its full contribution, which is what lets the
 /// coordinator apply them once over the union. The `ORDER BY` goes too — it
 /// costs each node a sort whose result is discarded by the merge.
-/// `keep_order` leaves the `ORDER BY` in place. That is for a `SELECT *`, whose
-/// sort column the SQL never names: letting the nodes sort makes the engine
-/// reject a column that does not exist, instead of the coordinator sorting by
-/// an absent column and quietly returning the rows unsorted.
-fn sql_without_ordering(
+/// The caller's query as the nodes should run it, for a row-wise result.
+///
+/// The `ORDER BY` stays, and the `LIMIT` becomes `offset + limit`. That is the
+/// whole of distributed top-k: a row in the global top n is in its own node's
+/// top n, so each node's own n candidates are all that can matter and the rest
+/// need never be sent. The `OFFSET` does not go — each node skipping its own
+/// ten skips thirty, and none of them the ten the caller meant.
+///
+/// Dropping the `ORDER BY` along with the `LIMIT`, which is what this used to
+/// do, is what made `ORDER BY id DESC LIMIT 5` wrong on any topic larger than
+/// the row cap: each node returned an arbitrary [`DEFAULT_ROW_LIMIT`] rows of
+/// its own and the top five of *those* is not the top five. Under a thousand
+/// rows nothing is cut and the answer is exact, which is why this measured as
+/// correct over 900.
+fn sql_for_row_wise_nodes(
     query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
-    keep_order: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
 ) -> String {
-    let mut stripped = query.clone();
-    if !keep_order {
-        stripped.order_by = None;
-    }
-    stripped.limit = None;
-    stripped.offset = None;
-    strip_having(&mut stripped);
-    stripped.to_string()
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value};
+
+    let mut rewritten = query.clone();
+    rewritten.offset = None;
+    // Only a limit this understands is pushed down. A limit it cannot read is
+    // not applied here either, so the nodes may as well return what they have.
+    rewritten.limit = limit.map(|n| {
+        SqlExpr::Value(Value::Number(
+            n.saturating_add(offset.unwrap_or(0)).to_string(),
+            false,
+        ))
+    });
+    strip_having(&mut rewritten);
+    rewritten.to_string()
 }
 /// Combine one row per node into a single row of aggregates.
 ///
@@ -4984,7 +5044,12 @@ mod sql_merge_tests {
         else {
             panic!("OFFSET should now be answered");
         };
-        assert_eq!(post.node_sql.as_deref(), Some("SELECT k FROM t"));
+        // The nodes keep the order and fetch `offset + limit` candidates —
+        // enough that the page cannot be missing a row — but never the OFFSET.
+        assert_eq!(
+            post.node_sql.as_deref(),
+            Some("SELECT k FROM t ORDER BY k LIMIT 5")
+        );
         assert_eq!((post.offset, post.limit), (Some(3), Some(2)));
 
         let local = resp(&["k"], vec![row(&[("k", 1)]), row(&[("k", 4)])]);
@@ -5762,14 +5827,19 @@ mod planner_name_tests {
         assert_eq!(plan.limit, Some(5));
         assert_eq!(plan.offset, Some(2));
 
-        let node_sql = plan.node_sql.as_deref().expect("limit and offset are stripped");
+        let node_sql = plan.node_sql.as_deref().expect("the offset is taken here");
         assert!(
             node_sql.contains("ORDER BY"),
             "the nodes keep the sort so the engine validates the column: {node_sql}"
         );
         assert!(
-            !node_sql.contains("LIMIT") && !node_sql.contains("OFFSET"),
-            "the cut belongs to the merged rows: {node_sql}"
+            node_sql.contains("LIMIT 7"),
+            "each node need only offer the 7 candidates the page could come \
+             from, not everything it holds: {node_sql}"
+        );
+        assert!(
+            !node_sql.contains("OFFSET"),
+            "a node skipping its own rows skips the wrong ones: {node_sql}"
         );
     }
 
@@ -6062,5 +6132,227 @@ mod ordering_merge_tests {
             serde_json::json!("warn"),
             "the greatest across the three, not the coordinator's own"
         );
+    }
+}
+
+/// A top-N over more rows than one response can carry.
+///
+/// Every node caps its reply at [`super::sql_handler::DEFAULT_ROW_LIMIT`]
+/// rows. The node query used to have its `ORDER BY` removed along with its
+/// `LIMIT`, so each node returned an arbitrary thousand of its own rows and the
+/// coordinator ranked *those* — the true top five need not have been among
+/// them. Nothing smaller than the cap can show it: over 900 rows nothing is
+/// cut and the answer comes out exact, which is how this was measured as
+/// correct on a real cluster.
+#[cfg(test)]
+mod top_k_tests {
+    use super::*;
+
+    /// The node's cap, small enough to bite.
+    const CAP: usize = 4;
+
+    /// Run a node's share of the query, as a node would: execute, then cut to
+    /// the cap, which is the step that loses rows.
+    async fn node_answer(ids: &[i64], sql: &str, cap: usize) -> SqlResponse {
+        use chronik_columnar::datafusion::arrow::array::Int64Array;
+        use chronik_columnar::datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use chronik_columnar::datafusion::arrow::record_batch::RecordBatch;
+        use chronik_columnar::datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids.to_vec()))]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", batch).unwrap();
+
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            for row_idx in 0..batch.num_rows() {
+                rows.push(HashMap::from([(
+                    "id".to_string(),
+                    super::super::sql_handler::arrow_value_to_json(batch.column(0), row_idx),
+                )]));
+            }
+        }
+        let truncated = rows.len() > cap;
+        rows.truncate(cap);
+        SqlResponse {
+            columns: vec!["id".to_string()],
+            row_count: rows.len(),
+            rows,
+            execution_time_ms: 1,
+            truncated,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_top_n_is_exact_when_a_node_holds_more_rows_than_the_cap() {
+        let sql = "SELECT id FROM t ORDER BY id DESC LIMIT 3";
+        let SqlMerge::Concatenate(post) = sql_merge_strategy(sql) else {
+            panic!("a projection with ORDER BY concatenates");
+        };
+        let node_sql = post.node_sql.as_deref().expect("the limit is re-applied here");
+        // Exactly what the handler allows each node to contribute.
+        let cap = post.node_fetch_rows(CAP);
+
+        // Ten rows per node, three nodes, and the whole of the true top three
+        // sitting on one of them.
+        let answers = [
+            node_answer(&(1..=10).collect::<Vec<_>>(), node_sql, cap).await,
+            node_answer(&(11..=20).collect::<Vec<_>>(), node_sql, cap).await,
+            node_answer(&(21..=30).collect::<Vec<_>>(), node_sql, cap).await,
+        ];
+        let [local, peer_a, peer_b] = answers;
+
+        let merged = merge_sql_responses(local, vec![peer_a, peer_b], 1000, &post);
+        let ids: Vec<i64> = merged
+            .rows
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![30, 29, 28],
+            "the true top three of 1..30, not the top three of whatever each \
+             node happened to return first"
+        );
+    }
+
+    /// The reason it works: each node is asked for the order, so the rows it
+    /// gives up are its own best candidates and never reach the cap.
+    #[tokio::test]
+    async fn a_node_offers_only_the_candidates_that_could_win() {
+        let SqlMerge::Concatenate(post) =
+            sql_merge_strategy("SELECT id FROM t ORDER BY id DESC LIMIT 3")
+        else {
+            panic!("a projection with ORDER BY concatenates");
+        };
+        let node_sql = post.node_sql.as_deref().unwrap();
+        let cap = post.node_fetch_rows(CAP);
+        let answer = node_answer(&(1..=10).collect::<Vec<_>>(), node_sql, cap).await;
+        assert!(
+            !answer.truncated,
+            "asked for three of its ten rows, a node has nothing to truncate"
+        );
+        let ids: Vec<i64> = answer
+            .rows
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![10, 9, 8], "its own top three, in order");
+    }
+
+    /// With a page, the candidates are `offset + limit` deep: the row that ends
+    /// up first on page two is the third-best on some node, and dropping it
+    /// would shift the whole page.
+    #[tokio::test]
+    async fn a_page_asks_each_node_for_enough_to_fill_it() {
+        let SqlMerge::Concatenate(post) =
+            sql_merge_strategy("SELECT id FROM t ORDER BY id DESC LIMIT 3 OFFSET 3")
+        else {
+            panic!("a projection with ORDER BY concatenates");
+        };
+        let node_sql = post.node_sql.as_deref().unwrap();
+        let cap = post.node_fetch_rows(CAP);
+        assert!(node_sql.contains("LIMIT 6"), "{node_sql}");
+
+        let answers = [
+            node_answer(&(1..=10).collect::<Vec<_>>(), node_sql, cap).await,
+            node_answer(&(11..=20).collect::<Vec<_>>(), node_sql, cap).await,
+            node_answer(&(21..=30).collect::<Vec<_>>(), node_sql, cap).await,
+        ];
+        let [local, peer_a, peer_b] = answers;
+        let merged = merge_sql_responses(local, vec![peer_a, peer_b], 1000, &post);
+        let ids: Vec<i64> = merged
+            .rows
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![27, 26, 25], "rows 4..6 of 30 down to 1");
+    }
+}
+
+#[cfg(test)]
+mod fetch_cap_tests {
+    use super::*;
+
+    /// The response cap and what the nodes may contribute are different
+    /// numbers, and conflating them cost the page its rows.
+    #[test]
+    fn a_page_widens_what_the_nodes_may_return_without_widening_the_response() {
+        let plan = MergePlan {
+            offset: Some(2_000),
+            limit: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan.node_fetch_rows(super::super::sql_handler::DEFAULT_ROW_LIMIT),
+            2_020,
+            "every candidate for rows 2000..2020 has to be allowed through"
+        );
+    }
+
+    /// Never narrower than the response cap: a query with a small LIMIT still
+    /// lets the nodes answer as fully as they otherwise would.
+    #[test]
+    fn a_small_limit_does_not_narrow_what_the_nodes_may_return() {
+        let plan = MergePlan {
+            limit: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(plan.node_fetch_rows(1_000), 1_000);
+    }
+
+    #[test]
+    fn no_limit_leaves_the_cap_alone() {
+        assert_eq!(MergePlan::default().node_fetch_rows(1_000), 1_000);
+    }
+
+    /// Past the point where a node could supply the candidates, the answer
+    /// cannot be assembled at all — so it is refused rather than approximated.
+    /// Keyset pagination is the way through, and the message says so.
+    #[test]
+    fn a_page_deeper_than_a_node_may_return_is_refused() {
+        let sql = format!(
+            "SELECT id FROM t ORDER BY id DESC LIMIT 20 OFFSET {}",
+            super::super::sql_handler::MAX_ROW_LIMIT
+        );
+        let SqlMerge::Unsupported(why) = sql_merge_strategy(&sql) else {
+            panic!("a page past the fetch ceiling cannot be assembled");
+        };
+        assert!(why.contains("page by a value"), "{why}");
+    }
+
+    /// Up to the ceiling it is answered, so the refusal is a ceiling and not a
+    /// discouragement.
+    #[test]
+    fn a_page_within_reach_is_answered() {
+        let sql = format!(
+            "SELECT id FROM t ORDER BY id DESC LIMIT 20 OFFSET {}",
+            super::super::sql_handler::MAX_ROW_LIMIT - 20
+        );
+        let SqlMerge::Concatenate(post) = sql_merge_strategy(&sql) else {
+            panic!("a page within the ceiling is answered");
+        };
+        assert_eq!(
+            post.node_fetch_rows(1_000),
+            super::super::sql_handler::MAX_ROW_LIMIT
+        );
+    }
+
+    /// Without an ORDER BY there is no ranking to get wrong — which rows a
+    /// bare OFFSET skips is unspecified in SQL — so it is not refused.
+    #[test]
+    fn an_unordered_deep_offset_is_not_refused() {
+        let sql = format!(
+            "SELECT id FROM t LIMIT 20 OFFSET {}",
+            super::super::sql_handler::MAX_ROW_LIMIT + 1
+        );
+        assert!(matches!(
+            sql_merge_strategy(&sql),
+            SqlMerge::Concatenate(_)
+        ));
     }
 }
