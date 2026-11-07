@@ -22,6 +22,7 @@ use chronik_query::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use datafusion::arrow::array::Array;
 use tracing::{debug, warn};
 
 /// Backend adapter that delegates to real server backends.
@@ -30,6 +31,98 @@ use tracing::{debug, warn};
 /// ColumnarQueryEngine, VectorSearchService, and WalManager.
 struct ServerBackendAdapter {
     state: UnifiedApiState,
+}
+
+impl ServerBackendAdapter {
+    /// Fill in `text_preview` for hits that arrived as coordinates only.
+    ///
+    /// One query covers every hit. Best-effort by design: a missing preview is
+    /// the status quo for these hits, so a failure here leaves them as they
+    /// were rather than failing a search that did find the right records.
+    async fn attach_text_previews(&self, topic: &str, candidates: &mut [Candidate]) {
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(engine) = self.state.query_engine.as_ref() else {
+            return;
+        };
+
+        let sanitized = super::sql_handler::SqlHandler::sanitize_table_name(topic);
+        let table = if engine.table_exists(&sanitized).await {
+            sanitized
+        } else if engine.table_exists(&format!("{}_cold", sanitized)).await {
+            format!("{}_cold", sanitized)
+        } else if engine.table_exists(&format!("{}_hot", sanitized)).await {
+            format!("{}_hot", sanitized)
+        } else {
+            debug!(topic = %topic, "No SQL table for topic; vector hits keep coordinates only");
+            return;
+        };
+
+        // An exact pair per hit rather than `_partition IN (..) AND _offset IN
+        // (..)`, which would be a cross product and could drag in unrelated
+        // rows from other partitions.
+        let predicate = candidates
+            .iter()
+            .map(|c| format!("(_partition = {} AND _offset = {})", c.partition, c.offset))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        // decode_utf8 yields NULL rather than erroring on a non-UTF-8 payload,
+        // so a binary topic degrades to no preview instead of a failed query.
+        let sql = format!(
+            "SELECT _partition, _offset, decode_utf8(_value) AS _text \
+             FROM {table} WHERE {predicate}"
+        );
+
+        let batches = match engine.execute_sql(&sql).await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(topic = %topic, error = %e, "Could not read text for vector hits");
+                return;
+            }
+        };
+
+        let mut by_coord: std::collections::HashMap<(i32, i64), String> =
+            std::collections::HashMap::new();
+        for batch in &batches {
+            let schema = batch.schema();
+            let (Ok(p_idx), Ok(o_idx), Ok(t_idx)) = (
+                schema.index_of("_partition"),
+                schema.index_of("_offset"),
+                schema.index_of("_text"),
+            ) else {
+                continue;
+            };
+            let (Some(parts), Some(offs), Some(texts)) = (
+                batch.column(p_idx).as_any().downcast_ref::<Int32Array>(),
+                batch.column(o_idx).as_any().downcast_ref::<Int64Array>(),
+                batch
+                    .column(t_idx)
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>(),
+            ) else {
+                continue;
+            };
+            for row in 0..batch.num_rows() {
+                if texts.is_null(row) {
+                    continue;
+                }
+                by_coord.insert(
+                    (parts.value(row), offs.value(row)),
+                    texts.value(row).to_string(),
+                );
+            }
+        }
+
+        for c in candidates.iter_mut() {
+            if let Some(text) = by_coord.get(&(c.partition, c.offset)) {
+                let cleaned = strip_system_fields(text);
+                *c = c
+                    .clone()
+                    .with_text_preview(truncate_preview(&cleaned, PREVIEW_MAX_BYTES));
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -65,12 +158,10 @@ impl BackendAdapter for ServerBackendAdapter {
                             }
                             if !h.value.is_empty() {
                                 let cleaned = strip_system_fields(&h.value);
-                                let truncated = if cleaned.len() > 300 {
-                                    format!("{}...", &cleaned[..300])
-                                } else {
-                                    cleaned
-                                };
-                                c = c.with_text_preview(truncated);
+                                c = c.with_text_preview(truncate_preview(
+                                    &cleaned,
+                                    PREVIEW_MAX_BYTES,
+                                ));
                             }
                             candidates.push(c);
                         }
@@ -198,7 +289,7 @@ impl BackendAdapter for ServerBackendAdapter {
         merged.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         merged.truncate(k);
 
-        let candidates: Vec<Candidate> = merged
+        let mut candidates: Vec<Candidate> = merged
             .into_iter()
             .enumerate()
             .map(|(rank, (partition, offset, score))| {
@@ -212,6 +303,14 @@ impl BackendAdapter for ServerBackendAdapter {
                 )
             })
             .collect();
+
+        // #56: an HNSW index stores vectors and coordinates, no text. Without
+        // this a vector hit reaches the caller as a bare (topic, partition,
+        // offset) and is unusable for RAG without a second round-trip — and,
+        // because RRF flattens both backends into one list with no marker of
+        // origin, indistinguishable from a text hit whose content failed to
+        // parse. Text hits carry the field, so these must too.
+        self.attach_text_previews(topic, &mut candidates).await;
 
         Ok(candidates)
     }
@@ -435,7 +534,7 @@ fn search_index_for_candidates(
         if let Some(text) = preview {
             // Strip system fields from JSON content for cleaner preview
             let cleaned = strip_system_fields(&text);
-            let truncated = if cleaned.len() > 300 { format!("{}...", &cleaned[..300]) } else { cleaned };
+            let truncated = truncate_preview(&cleaned, PREVIEW_MAX_BYTES);
             candidate = candidate.with_text_preview(truncated);
         }
 
@@ -579,7 +678,7 @@ fn search_wal_topic_for_candidates(
                 });
             if let Some(text) = preview {
                 let cleaned = strip_system_fields(&text);
-                let truncated = if cleaned.len() > 300 { format!("{}...", &cleaned[..300]) } else { cleaned };
+                let truncated = truncate_preview(&cleaned, PREVIEW_MAX_BYTES);
                 candidate = candidate.with_text_preview(truncated);
             }
 
@@ -801,6 +900,26 @@ pub async fn handle_capabilities(
     }
 }
 
+/// How much of a record's text a hit carries back as a preview, in bytes.
+const PREVIEW_MAX_BYTES: usize = 300;
+
+/// Cut a preview to at most `max` bytes without splitting a character.
+///
+/// `&text[..max]` panics when `max` lands inside a multi-byte character, and
+/// `len()` counts bytes — so any accented, CJK or emoji text whose 300th byte
+/// falls mid-character took down the request. A preview is a courtesy field;
+/// it must not be able to fail the query it decorates.
+fn truncate_preview(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
 /// Strip internal system fields (prefixed with _) from a JSON string for cleaner previews.
 fn strip_system_fields(text: &str) -> String {
     if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) {
@@ -842,5 +961,54 @@ pub async fn handle_profiles(
                 "type": "internal_error"
             }))).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    /// The reason this helper exists. `&text[..300]` panics when byte 300 is
+    /// inside a character, and `len()` counts bytes — so a preview containing
+    /// any accented, CJK or emoji text near the cut took the request down.
+    #[test]
+    fn a_multibyte_character_on_the_boundary_does_not_panic() {
+        // 'é' is two bytes, spanning 299..301, so 300 is not a char boundary.
+        let text = format!("{}é", "a".repeat(299));
+        assert_eq!(text.len(), 301);
+        assert!(!text.is_char_boundary(300));
+
+        let out = truncate_preview(&text, 300);
+        assert_eq!(out, format!("{}...", "a".repeat(299)));
+    }
+
+    /// Characters wider than two bytes have to back up further.
+    #[test]
+    fn a_four_byte_character_backs_up_to_the_last_boundary() {
+        // "😀" is four bytes at 298..302.
+        let text = format!("{}😀tail", "a".repeat(298));
+        let out = truncate_preview(&text, 300);
+        assert_eq!(out, format!("{}...", "a".repeat(298)));
+    }
+
+    #[test]
+    fn text_within_the_limit_is_returned_whole_and_unmarked() {
+        assert_eq!(truncate_preview("short", 300), "short");
+        let exact = "a".repeat(300);
+        assert_eq!(truncate_preview(&exact, 300), exact);
+    }
+
+    #[test]
+    fn ascii_is_cut_at_the_limit_and_marked() {
+        let text = "a".repeat(400);
+        let out = truncate_preview(&text, 300);
+        assert_eq!(out, format!("{}...", "a".repeat(300)));
+    }
+
+    /// A single character longer than the budget leaves nothing to keep; the
+    /// loop must terminate at 0 rather than run past it.
+    #[test]
+    fn a_limit_inside_the_first_character_yields_just_the_marker() {
+        assert_eq!(truncate_preview("😀😀", 2), "...");
     }
 }
