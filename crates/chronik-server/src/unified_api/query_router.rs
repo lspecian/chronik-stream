@@ -3446,8 +3446,14 @@ pub fn merge_grouped_aggregate(
         truncated,
     }
 }
-/// Combine two JSON numbers. Non-numeric values keep the accumulator, since
-/// there is no meaningful sum of two strings.
+/// Combine two aggregate values.
+///
+/// `MIN` and `MAX` are orderings rather than arithmetic, so they combine even
+/// when the values are not numbers — and plenty of them are not. Only
+/// millisecond timestamps survive as numbers; dates, timestamps of any other
+/// precision, decimals, text and booleans all reach here as JSON strings or
+/// bools. Keeping the accumulator for those returned whichever node answered
+/// first, so `MAX(level)` and `MIN(created_at)` were right only by luck.
 fn combine_numbers(
     a: &serde_json::Value,
     b: &serde_json::Value,
@@ -3475,7 +3481,26 @@ fn combine_numbers(
             .unwrap_or(serde_json::Value::Null);
     }
 
-    a.clone()
+    match op {
+        // Ordered by the same rules the coordinator sorts by, so text, booleans
+        // and formatted dates all compare. ISO-8601 is ordered lexically, which
+        // is why a formatted timestamp compares correctly as text.
+        AggMerge::Min | AggMerge::Max => {
+            let ord = compare_json(a, b);
+            let take_b = match op {
+                AggMerge::Min => ord == std::cmp::Ordering::Greater,
+                _ => ord == std::cmp::Ordering::Less,
+            };
+            if take_b {
+                b.clone()
+            } else {
+                a.clone()
+            }
+        }
+        // A SUM of values that are not numbers is not a query the engine
+        // accepts, so there is nothing better to hand back than what came in.
+        AggMerge::Sum => a.clone(),
+    }
 }
 
 /// Merge Elasticsearch-compatible SearchResponse results from multiple nodes.
@@ -5903,5 +5928,139 @@ mod finish_sql_tests {
         let row = &finished.rows[0];
         assert_eq!(row.get("COUNT(*)"), Some(&serde_json::json!(7)));
         assert_eq!(row.get("b").and_then(|v| v.as_f64()), Some(4.5));
+    }
+}
+
+/// `MIN` and `MAX` over values that are not numbers.
+///
+/// Only millisecond timestamps come back from Arrow as JSON numbers. Dates,
+/// timestamps of every other precision, decimals, text and booleans arrive as
+/// strings or bools, and the combiner kept the accumulator for anything it
+/// could not read as a number — so the answer was whichever node replied
+/// first. Measured against nothing: it is right one time in three.
+#[cfg(test)]
+mod ordering_merge_tests {
+    use super::*;
+
+    fn combine_all(values: &[serde_json::Value], op: AggMerge) -> serde_json::Value {
+        values
+            .iter()
+            .skip(1)
+            .fold(values[0].clone(), |acc, v| combine_numbers(&acc, v, op))
+    }
+
+    #[test]
+    fn max_of_text_is_the_greatest_not_the_first() {
+        let nodes = [
+            serde_json::json!("warn"),
+            serde_json::json!("error"),
+            serde_json::json!("info"),
+        ];
+        assert_eq!(combine_all(&nodes, AggMerge::Max), serde_json::json!("warn"));
+        assert_eq!(
+            combine_all(&nodes, AggMerge::Min),
+            serde_json::json!("error")
+        );
+    }
+
+    /// The order of arrival must not matter: the nodes answer in any order, and
+    /// the coordinator's own partitions are merely the ones that arrive first.
+    #[test]
+    fn the_order_the_nodes_answer_in_does_not_change_the_answer() {
+        let a = serde_json::json!("2026-01-02T00:00:00");
+        let b = serde_json::json!("2026-03-04T05:06:07");
+        let c = serde_json::json!("2025-12-31T23:59:59");
+
+        for order in [[&a, &b, &c], [&c, &b, &a], [&b, &a, &c]] {
+            let values: Vec<serde_json::Value> = order.iter().map(|v| (*v).clone()).collect();
+            assert_eq!(
+                combine_all(&values, AggMerge::Min),
+                c,
+                "the earliest timestamp, whichever node holds it"
+            );
+            assert_eq!(combine_all(&values, AggMerge::Max), b);
+        }
+    }
+
+    /// A timestamp that reaches the merge already formatted is ordered as text,
+    /// and ISO-8601 is ordered lexically — which is the only reason this works.
+    #[test]
+    fn a_formatted_timestamp_orders_chronologically() {
+        let earlier = serde_json::json!("2026-11-07T09:00:00");
+        let later = serde_json::json!("2026-11-07T09:00:00.123");
+        assert_eq!(
+            combine_numbers(&later, &earlier, AggMerge::Min),
+            earlier,
+            "sub-second precision must not sort before the whole second"
+        );
+        assert_eq!(combine_numbers(&earlier, &later, AggMerge::Max), later);
+    }
+
+    #[test]
+    fn booleans_compare_as_false_then_true() {
+        let f = serde_json::json!(false);
+        let t = serde_json::json!(true);
+        assert_eq!(combine_numbers(&f, &t, AggMerge::Max), t);
+        assert_eq!(combine_numbers(&t, &f, AggMerge::Min), f);
+    }
+
+    /// Numbers keep the paths they had: an integer count stays an integer, so a
+    /// summed COUNT does not come back as `60.0`.
+    #[test]
+    fn numbers_are_unaffected() {
+        let x = serde_json::json!(3);
+        let y = serde_json::json!(9);
+        assert_eq!(combine_numbers(&x, &y, AggMerge::Sum), serde_json::json!(12));
+        assert_eq!(combine_numbers(&x, &y, AggMerge::Min), serde_json::json!(3));
+        assert_eq!(combine_numbers(&x, &y, AggMerge::Max), serde_json::json!(9));
+        assert!(combine_numbers(&x, &y, AggMerge::Sum).is_i64());
+    }
+
+    /// Through the real merge, not just the combiner: three nodes each
+    /// reporting their own maximum level.
+    #[test]
+    fn the_grouped_merge_takes_the_greatest_text_across_nodes() {
+        let node = |k: &str, level: &str| {
+            HashMap::from([
+                ("k".to_string(), serde_json::json!(k)),
+                ("m".to_string(), serde_json::json!(level)),
+            ])
+        };
+        let local = SqlResponse {
+            columns: vec!["k".to_string(), "m".to_string()],
+            rows: vec![node("a", "info")],
+            row_count: 1,
+            execution_time_ms: 1,
+            truncated: false,
+        };
+        let peers = vec![
+            SqlResponse {
+                columns: vec!["k".to_string(), "m".to_string()],
+                rows: vec![node("a", "warn")],
+                row_count: 1,
+                execution_time_ms: 1,
+                truncated: false,
+            },
+            SqlResponse {
+                columns: vec!["k".to_string(), "m".to_string()],
+                rows: vec![node("a", "error")],
+                row_count: 1,
+                execution_time_ms: 1,
+                truncated: false,
+            },
+        ];
+        let merged = merge_grouped_aggregate(
+            local,
+            peers,
+            &[None, Some(AggMerge::Max)],
+            &MergePlan::default(),
+            100,
+        );
+        assert_eq!(merged.row_count, 1, "one group");
+        assert_eq!(
+            merged.rows[0]["m"],
+            serde_json::json!("warn"),
+            "the greatest across the three, not the coordinator's own"
+        );
     }
 }
