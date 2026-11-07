@@ -215,12 +215,54 @@ impl MetadataState {
                         return Ok(());
                     }
 
+                    // A strictly newer assertion replaces the config outright.
+                    //
+                    // The additive merge below adopts keys this node is missing
+                    // but can never carry a *changed* or *removed* one, so a
+                    // config altered on one node stayed wrong everywhere else:
+                    // the anti-entropy pass re-broadcast `TopicCreated` with the
+                    // full config every round and the apply side threw the
+                    // config away. Measured on a 3-node cluster, one
+                    // `vector.enabled=true` set on node 1 — node 1 had it, node
+                    // 2 had it for a different topic, the leader had neither.
+                    //
+                    // `broadcast_all_topics` stamps each re-assertion with the
+                    // topic's own `updated_at`, not the time it was sent, so
+                    // this compares the age of the data rather than the age of
+                    // the message. Without that an anti-entropy round would
+                    // always look newest and would overwrite a genuine change
+                    // with the broadcaster's stale copy.
+                    //
+                    // Provenance still outranks recency. An auto-create carries
+                    // a *guessed* config — `TopicConfig::default()`, three
+                    // partitions — and arrives after the explicit create it
+                    // raced. The arm above deliberately only logs and falls
+                    // through to the key merge for exactly this case, so
+                    // adopting the config here would re-open the bug that arm
+                    // exists to prevent: a topic asked for with
+                    // `--partitions 1` silently becoming 3.
+                    let shape_is_guessed = *auto_created && !existing.auto_created;
+                    if !shape_is_guessed && event.timestamp > existing.updated_at {
+                        tracing::debug!(
+                            topic = %name,
+                            keys = config.config.len(),
+                            "Adopting a newer topic config from a peer"
+                        );
+                        existing.config = config.clone();
+                        existing.updated_at = event.timestamp;
+                        return Ok(());
+                    }
+
                     // v2.3.1: Merge config from the new event into the existing topic.
                     // In a Raft cluster, auto_create_topics() on a follower can race
                     // with the real CreateTopics event from the leader. The auto-created
                     // topic has a bare config, so we adopt any keys from the incoming
                     // event that the existing topic doesn't have (e.g., vector.enabled,
                     // searchable, columnar.enabled set by the real CreateTopics call).
+                    //
+                    // Still reached for an assertion that is not newer: adding a
+                    // key nobody else has cannot lose information, so an older
+                    // message may still fill a gap.
                     let mut merged = false;
                     for (key, value) in &config.config {
                         if !existing.config.config.contains_key(key) {
@@ -229,7 +271,6 @@ impl MetadataState {
                         }
                     }
                     if merged {
-                        existing.updated_at = event.timestamp;
                         tracing::debug!(
                             topic = %name,
                             "Merged config keys from duplicate TopicCreated event"
@@ -307,6 +348,13 @@ impl MetadataState {
             MetadataEventPayload::TopicUpdated { name, config } => {
                 let mut topics = self.topics.write().await;
                 if let Some(metadata) = topics.get_mut(name) {
+                    // An update older than what this node already has is a
+                    // replay or a late re-assertion, not news. Applying it
+                    // would undo a newer change — and these are re-asserted
+                    // periodically for catch-up, so late arrivals are normal.
+                    if event.timestamp < metadata.updated_at {
+                        return Ok(());
+                    }
                     metadata.config = config.clone();
                     metadata.updated_at = event.timestamp;
                 }
@@ -996,6 +1044,74 @@ impl WalMetadataStore {
         );
         count
     }
+    /// Re-assert the configs of topics changed within `window`, so a peer that
+    /// missed the original `TopicUpdated` adopts it.
+    ///
+    /// Metadata replication is a fire-and-forget publish over a bounded
+    /// channel, and `broadcast_all_topics` — the only catch-up there was — runs
+    /// on the leader alone. So a config altered on a follower reached whichever
+    /// peers happened to receive the push and nothing ever corrected the rest,
+    /// including the leader. Measured on a 3-node cluster, immediately after
+    /// two `vector.enabled=true` alters handled by node 1: node 1 knew both,
+    /// node 2 one, the leader neither. Every per-topic switch —
+    /// `vector.enabled`, `columnar.enabled`, `searchable`, retention — reaches
+    /// an existing topic only through that path, so the operator got an
+    /// explicit success and a feature that ran on one node out of three.
+    ///
+    /// Unlike `broadcast_all_topics` this is safe to run on **every** node,
+    /// which is the point: the change has to travel outward from wherever it
+    /// was written, not just down from the leader. Convergence is last-write-
+    /// wins on the topic's `updated_at`, which each event carries.
+    ///
+    /// Bounded by design. Re-stating a 5,611-topic catalog every pass from
+    /// three nodes at once is the burst this subsystem is least able to absorb
+    /// — dropping events there is what diverged the catalog in the first place
+    /// — so only recent changes are re-stated. In steady state that is nothing
+    /// at all, and a window a few multiples of the pass interval is enough for
+    /// a peer to hear a change it missed.
+    ///
+    /// Returns the number of topics re-asserted.
+    pub async fn rebroadcast_recent_config_changes(
+        &self,
+        window: chrono::Duration,
+    ) -> usize {
+        let publish_fn = match self.event_bus_publish {
+            Some(ref f) => f,
+            None => return 0,
+        };
+
+        let cutoff = chrono::Utc::now() - window;
+        let recent: Vec<(String, TopicConfig, chrono::DateTime<chrono::Utc>)> = {
+            let topics = self.state.topics.read().await;
+            topics
+                .iter()
+                .filter(|(name, meta)| !name.starts_with("__") && meta.updated_at > cutoff)
+                .map(|(name, meta)| (name.clone(), meta.config.clone(), meta.updated_at))
+                .collect()
+        };
+
+        for (name, config, updated_at) in &recent {
+            let mut event = MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicUpdated {
+                    name: name.clone(),
+                    config: config.clone(),
+                },
+                self.node_id,
+            );
+            // The age of the change, not of this message — see the apply side.
+            event.timestamp = *updated_at;
+            publish_fn(event);
+        }
+
+        if !recent.is_empty() {
+            tracing::info!(
+                topics = recent.len(),
+                "Re-asserted recently changed topic configs for peer catch-up"
+            );
+        }
+        recent.len()
+    }
+
     pub async fn broadcast_all_topics(&self) -> usize {
         let publish_fn = match self.event_bus_publish {
             Some(ref f) => f,
@@ -1013,7 +1129,12 @@ impl WalMetadataStore {
                 continue;
             }
 
-            let event = MetadataEvent::new_with_node(
+            // Stamped with the topic's own `updated_at`, not `now`: this is a
+            // re-assertion of existing state, and the apply side compares
+            // timestamps to decide whose config is newer. Stamping `now` would
+            // make every anti-entropy round look like the freshest write in the
+            // cluster and overwrite a real change with this node's stale copy.
+            let mut event = MetadataEvent::new_with_node(
                 MetadataEventPayload::TopicCreated {
                     name: name.clone(),
                     config: meta.config.clone(),
@@ -1021,6 +1142,7 @@ impl WalMetadataStore {
                 },
                 self.node_id,
             );
+            event.timestamp = meta.updated_at;
             let subscribers = publish_fn(event);
             count += 1;
             tracing::info!(
@@ -2944,5 +3066,227 @@ mod topic_provenance_tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod config_convergence_tests {
+    use super::*;
+
+    fn store(node_id: u64) -> WalMetadataStore {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        WalMetadataStore::new(node_id, wal_append)
+    }
+
+    /// Collects what a node publishes, so one node's output can be fed to another.
+    fn recording_store(node_id: u64) -> (WalMetadataStore, Arc<std::sync::Mutex<Vec<MetadataEvent>>>) {
+        let mut s = store(node_id);
+        let seen: Arc<std::sync::Mutex<Vec<MetadataEvent>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        s.set_event_bus(Arc::new(move |event: MetadataEvent| {
+            sink.lock().unwrap().push(event);
+            1
+        }));
+        (s, seen)
+    }
+
+    fn with_key(key: &str, value: &str) -> TopicConfig {
+        let mut c = TopicConfig::default();
+        c.config.insert(key.to_string(), value.to_string());
+        c
+    }
+
+    async fn key_of(store: &WalMetadataStore, topic: &str, key: &str) -> Option<String> {
+        store
+            .get_topic(topic)
+            .await
+            .unwrap()
+            .expect("topic exists")
+            .config
+            .config
+            .get(key)
+            .cloned()
+    }
+
+    /// The reported defect, end to end: a config altered on one node reaches a
+    /// peer that missed the original push, via the catch-up re-assertion.
+    ///
+    /// Measured on a 3-node cluster before this: two `vector.enabled=true`
+    /// alters handled by a follower left node 1 knowing both, node 2 one, and
+    /// the leader neither — and nothing ever corrected it, because the only
+    /// catch-up ran on the leader and re-asserted the leader's own stale copy.
+    #[tokio::test]
+    async fn a_config_altered_on_one_node_reaches_a_peer_that_missed_the_push() {
+        let (writer, published) = recording_store(1);
+        let peer = store(2);
+
+        // Both know the topic.
+        writer.create_topic("orders", TopicConfig::default()).await.unwrap();
+        peer.create_topic("orders", TopicConfig::default()).await.unwrap();
+
+        // The alter lands on the writer. The peer misses the push entirely.
+        writer.update_topic("orders", with_key("vector.enabled", "true")).await.unwrap();
+        assert_eq!(key_of(&writer, "orders", "vector.enabled").await.as_deref(), Some("true"));
+        assert_eq!(key_of(&peer, "orders", "vector.enabled").await, None);
+
+        // The catch-up pass re-asserts it; the peer applies what it hears.
+        published.lock().unwrap().clear();
+        assert_eq!(writer.rebroadcast_recent_config_changes(chrono::Duration::hours(1)).await, 1);
+        for event in published.lock().unwrap().iter() {
+            peer.apply_replicated_event(event.clone()).await.unwrap();
+        }
+
+        assert_eq!(
+            key_of(&peer, "orders", "vector.enabled").await.as_deref(),
+            Some("true"),
+            "the peer must converge on the altered config"
+        );
+    }
+
+    /// The catch-up must not undo a newer change made elsewhere. Convergence is
+    /// last-write-wins on the topic's own `updated_at`.
+    #[tokio::test]
+    async fn an_older_re_assertion_does_not_overwrite_a_newer_change() {
+        let peer = store(2);
+        peer.create_topic("orders", TopicConfig::default()).await.unwrap();
+        peer.update_topic("orders", with_key("vector.enabled", "true")).await.unwrap();
+        let newer_at = peer.get_topic("orders").await.unwrap().unwrap().updated_at;
+
+        // A stale peer re-asserts the config as it was a minute ago.
+        let mut stale = MetadataEvent::new_with_node(
+            MetadataEventPayload::TopicUpdated {
+                name: "orders".to_string(),
+                config: TopicConfig::default(),
+            },
+            1,
+        );
+        stale.timestamp = newer_at - chrono::Duration::minutes(1);
+        peer.apply_replicated_event(stale).await.unwrap();
+
+        assert_eq!(
+            key_of(&peer, "orders", "vector.enabled").await.as_deref(),
+            Some("true"),
+            "an older assertion must not revert a newer change"
+        );
+    }
+
+    /// `broadcast_all_topics` carries each topic's own `updated_at`, not the
+    /// time of the broadcast. Stamping `now` would make every anti-entropy
+    /// round look like the freshest write in the cluster.
+    #[tokio::test]
+    async fn an_anti_entropy_re_assertion_carries_the_age_of_the_data() {
+        let (node, published) = recording_store(1);
+        node.create_topic("orders", TopicConfig::default()).await.unwrap();
+        let created_at = node.get_topic("orders").await.unwrap().unwrap().updated_at;
+
+        published.lock().unwrap().clear();
+        node.broadcast_all_topics().await;
+
+        let events = published.lock().unwrap();
+        let topic_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(&e.payload, MetadataEventPayload::TopicCreated { name, .. } if name == "orders"))
+            .collect();
+        assert_eq!(topic_events.len(), 1);
+        assert_eq!(
+            topic_events[0].timestamp, created_at,
+            "a re-assertion must carry the data's age, not the message's"
+        );
+    }
+
+    /// A newer `TopicCreated` re-assertion replaces a changed key. The old
+    /// apply was additive only, so it could fill a gap but never correct a
+    /// value — which is why a changed config stayed wrong on every other node.
+    #[tokio::test]
+    async fn a_newer_assertion_corrects_a_changed_key_not_just_a_missing_one() {
+        let peer = store(2);
+        peer.create_topic("orders", with_key("vector.enabled", "false")).await.unwrap();
+        let old_at = peer.get_topic("orders").await.unwrap().unwrap().updated_at;
+
+        let mut newer = MetadataEvent::new_with_node(
+            MetadataEventPayload::TopicCreated {
+                name: "orders".to_string(),
+                config: with_key("vector.enabled", "true"),
+                auto_created: false,
+            },
+            1,
+        );
+        newer.timestamp = old_at + chrono::Duration::seconds(5);
+        peer.apply_replicated_event(newer).await.unwrap();
+
+        assert_eq!(
+            key_of(&peer, "orders", "vector.enabled").await.as_deref(),
+            Some("true"),
+            "a newer assertion must correct the value, not just add missing keys"
+        );
+    }
+
+    /// Steady state must be silent: re-stating a large catalog from every node
+    /// each pass is the burst this subsystem is least able to absorb.
+    #[tokio::test]
+    async fn nothing_is_re_asserted_when_no_config_changed_recently() {
+        let (node, published) = recording_store(1);
+        for i in 0..5 {
+            node.create_topic(&format!("t{i}"), TopicConfig::default()).await.unwrap();
+        }
+        published.lock().unwrap().clear();
+
+        // A window that excludes the creations above.
+        assert_eq!(
+            node.rebroadcast_recent_config_changes(chrono::Duration::zero()).await,
+            0
+        );
+        assert!(published.lock().unwrap().is_empty());
+    }
+
+    /// Provenance outranks recency. An auto-create carries a guessed config
+    /// and arrives AFTER the explicit create it raced, so a plain last-write-
+    /// wins rule would let it widen a topic asked for with one partition —
+    /// re-opening the bug the provenance arm exists to prevent. Caught by an
+    /// existing test only after the fact.
+    #[tokio::test]
+    async fn a_later_auto_create_still_does_not_widen_an_explicit_topic() {
+        let peer = store(2);
+        let mut explicit = TopicConfig::default();
+        explicit.partition_count = 1;
+        peer.create_topic("orders", explicit).await.unwrap();
+        let created_at = peer.get_topic("orders").await.unwrap().unwrap().updated_at;
+
+        // An auto-create, newer, carrying the default three partitions.
+        let mut guessed = MetadataEvent::new_with_node(
+            MetadataEventPayload::TopicCreated {
+                name: "orders".to_string(),
+                config: with_key("searchable", "true"),
+                auto_created: true,
+            },
+            1,
+        );
+        guessed.timestamp = created_at + chrono::Duration::seconds(5);
+        peer.apply_replicated_event(guessed).await.unwrap();
+
+        let meta = peer.get_topic("orders").await.unwrap().unwrap();
+        assert_eq!(
+            meta.config.partition_count, 1,
+            "a newer auto-create must not widen an explicitly created topic"
+        );
+        // ...but it may still contribute a key the explicit config never set.
+        assert_eq!(
+            meta.config.config.get("searchable").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    /// Internal topics are per-node and must never be re-asserted.
+    #[tokio::test]
+    async fn internal_topics_are_left_out_of_the_catch_up() {
+        let (node, _published) = recording_store(1);
+        node.create_topic("__consumer_offsets", TopicConfig::default()).await.unwrap();
+        node.create_topic("orders", TopicConfig::default()).await.unwrap();
+
+        assert_eq!(
+            node.rebroadcast_recent_config_changes(chrono::Duration::hours(1)).await,
+            1,
+            "only the real topic is re-asserted"
+        );
     }
 }

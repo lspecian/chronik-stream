@@ -533,6 +533,17 @@ impl IntegratedKafkaServerBuilder {
                     None => true,
                 };
 
+                // Runs on every node, leader or not, and before the gate below.
+                // A config altered on a follower has to travel outward from
+                // there: the leader-only re-broadcast can never carry it,
+                // because the leader is one of the nodes that never heard it.
+                // Bounded to recent changes, so this is normally a no-op.
+                broadcast_store
+                    .rebroadcast_recent_config_changes(chrono::Duration::seconds(
+                        (rebroadcast_secs as i64).saturating_mul(4).max(300),
+                    ))
+                    .await;
+
                 if !may_broadcast {
                     if !warned_not_authority {
                         tracing::debug!(
