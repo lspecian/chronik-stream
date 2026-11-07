@@ -2168,12 +2168,20 @@ impl WalIndexer {
         let provider = match create_provider(&vector_config) {
             Ok(p) => p,
             Err(e) => {
-                // Log error but don't fail - embedding is optional enhancement
+                // Not fatal — the rest of the segment still indexes. But say
+                // what it costs and what to set, because the caller logs
+                // "embeddings=0" right after this and that reads as success:
+                // the topic stays permanently unsearchable by vector while
+                // every other signal looks healthy.
                 warn!(
                     topic = %tp.topic,
                     partition = tp.partition,
+                    provider = %vector_config.embedding.provider,
                     error = %e,
-                    "Failed to create embedding provider, skipping embedding generation"
+                    "No embedding provider, so this topic's records will NOT be \
+                     vector-searchable. Set vector.provider (with vector.endpoint \
+                     for 'external', or OPENAI_API_KEY for 'openai') on the topic, \
+                     or CHRONIK_EMBEDDING_PROVIDER/_ENDPOINT on the server"
                 );
                 return Ok(0);
             }

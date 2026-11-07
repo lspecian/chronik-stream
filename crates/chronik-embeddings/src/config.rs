@@ -232,12 +232,56 @@ impl Default for EmbeddingModelConfig {
 }
 
 impl EmbeddingModelConfig {
+    /// The server-wide embedding settings, as read by the query side.
+    ///
+    /// Mirrors `try_create_embedding_provider` in chronik-server so a cluster
+    /// configured only by environment gets the same provider on both the query
+    /// and the indexing side. An unparseable value is ignored rather than
+    /// fatal: the same string already produced a warning where the query-side
+    /// provider was built, and failing topic-config parsing here would take
+    /// out indexing for every topic on the node.
+    pub fn from_env() -> Self {
+        let mut result = Self::default();
+
+        if let Ok(v) = std::env::var("CHRONIK_EMBEDDING_PROVIDER") {
+            if let Ok(p) = v.parse() {
+                result.provider = p;
+            }
+        }
+        if let Ok(v) = std::env::var("CHRONIK_EMBEDDING_MODEL") {
+            result.model = v.clone();
+            result.dimensions = known_model_dimensions(&v).unwrap_or(result.dimensions);
+        }
+        if let Ok(v) = std::env::var("CHRONIK_EMBEDDING_ENDPOINT") {
+            result.endpoint = Some(v);
+        }
+        // Last, so it overrides a dimension implied by the model name.
+        if let Ok(v) = std::env::var("CHRONIK_EMBEDDING_DIMENSIONS") {
+            if let Ok(d) = v.parse() {
+                result.dimensions = d;
+            }
+        }
+
+        result
+    }
+
     /// Parse from topic config.
     ///
     /// Accepts both short-form (`vector.provider`) and long-form (`vector.embedding.provider`)
     /// keys. Short-form takes priority if both are present.
     pub fn from_topic_config(config: &HashMap<String, String>) -> Result<Self> {
-        let mut result = Self::default();
+        // Precedence: topic config, then the server-wide environment, then the
+        // hardcoded default — the same order as `is_columnar_enabled` and the
+        // other per-topic switches.
+        //
+        // The environment step is not a convenience. The indexing path builds
+        // its provider from *this* config while the query path builds one from
+        // the environment, so without it a cluster configured the documented
+        // env-only way (CHRONIK_EMBEDDING_PROVIDER/_ENDPOINT) got a working
+        // query side and an indexing side that embedded nothing: the topic
+        // config named no provider, so this fell back to OpenAI, failed on a
+        // missing OPENAI_API_KEY, and reported "embeddings=0" as success.
+        let mut result = Self::from_env();
 
         // vector.provider (short-form) or vector.embedding.provider (long-form)
         if let Some(v) = config.get("vector.provider").or_else(|| config.get("vector.embedding.provider")) {
@@ -690,5 +734,111 @@ mod tests {
         topic_config.insert("vector.search_dimensions".to_string(), "2000".to_string());
         let result = VectorSearchConfig::from_topic_config(&topic_config);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod env_fallback_tests {
+    use super::*;
+
+    /// Env vars are process-global, so these run under one lock and clean up.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard(Vec<&'static str>);
+    impl EnvGuard {
+        fn set(pairs: &[(&'static str, &str)]) -> Self {
+            let keys = pairs.iter().map(|(k, _)| *k).collect();
+            for (k, v) in pairs {
+                std::env::set_var(k, v);
+            }
+            EnvGuard(keys)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    /// The defect this fixes: a cluster configured only by environment had a
+    /// working query side and an indexing side that fell back to OpenAI,
+    /// failed on a missing key, and embedded nothing.
+    #[test]
+    fn a_topic_naming_no_provider_inherits_the_server_wide_one() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _e = EnvGuard::set(&[
+            ("CHRONIK_EMBEDDING_PROVIDER", "external"),
+            ("CHRONIK_EMBEDDING_ENDPOINT", "http://embedder:8090/embed"),
+            ("CHRONIK_EMBEDDING_DIMENSIONS", "768"),
+        ]);
+
+        let cfg = EmbeddingModelConfig::from_topic_config(&HashMap::new()).unwrap();
+        assert_eq!(cfg.provider, EmbeddingProvider::External);
+        assert_eq!(cfg.endpoint.as_deref(), Some("http://embedder:8090/embed"));
+        assert_eq!(cfg.dimensions, 768);
+        // With a provider and endpoint it is now usable, where before it was
+        // OpenAI-with-no-key.
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Topic config still wins — the env is only the fallback.
+    #[test]
+    fn the_topic_overrides_the_server_wide_setting() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _e = EnvGuard::set(&[
+            ("CHRONIK_EMBEDDING_PROVIDER", "external"),
+            ("CHRONIK_EMBEDDING_DIMENSIONS", "768"),
+        ]);
+
+        let mut topic = HashMap::new();
+        topic.insert("vector.provider".to_string(), "openai".to_string());
+        topic.insert("vector.dimensions".to_string(), "1536".to_string());
+
+        let cfg = EmbeddingModelConfig::from_topic_config(&topic).unwrap();
+        assert_eq!(cfg.provider, EmbeddingProvider::OpenAI);
+        assert_eq!(cfg.dimensions, 1536);
+    }
+
+    /// With nothing set anywhere, the old hardcoded default stands.
+    #[test]
+    fn no_topic_and_no_env_keeps_the_hardcoded_default() {
+        let _g = ENV_LOCK.lock().unwrap();
+        for k in [
+            "CHRONIK_EMBEDDING_PROVIDER",
+            "CHRONIK_EMBEDDING_ENDPOINT",
+            "CHRONIK_EMBEDDING_DIMENSIONS",
+            "CHRONIK_EMBEDDING_MODEL",
+        ] {
+            std::env::remove_var(k);
+        }
+        let cfg = EmbeddingModelConfig::from_topic_config(&HashMap::new()).unwrap();
+        assert_eq!(cfg.provider, EmbeddingProvider::OpenAI);
+        assert_eq!(cfg.dimensions, 1536);
+        assert_eq!(cfg.model, "text-embedding-3-small");
+    }
+
+    /// An explicit dimension beats one implied by the model name, whichever
+    /// order the two env vars happen to be read in.
+    #[test]
+    fn an_explicit_env_dimension_beats_the_model_implied_one() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _e = EnvGuard::set(&[
+            ("CHRONIK_EMBEDDING_MODEL", "text-embedding-3-small"),
+            ("CHRONIK_EMBEDDING_DIMENSIONS", "256"),
+        ]);
+        let cfg = EmbeddingModelConfig::from_topic_config(&HashMap::new()).unwrap();
+        assert_eq!(cfg.dimensions, 256);
+    }
+
+    /// A typo in the server-wide provider must not take out indexing for every
+    /// topic on the node; it is already reported where the query provider is built.
+    #[test]
+    fn an_unparseable_env_provider_is_ignored_not_fatal() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _e = EnvGuard::set(&[("CHRONIK_EMBEDDING_PROVIDER", "not-a-provider")]);
+        let cfg = EmbeddingModelConfig::from_topic_config(&HashMap::new()).unwrap();
+        assert_eq!(cfg.provider, EmbeddingProvider::OpenAI);
     }
 }

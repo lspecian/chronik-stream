@@ -1732,6 +1732,20 @@ impl VectorIndexManager {
     /// VO-5: Scans the base path for index files and loads each one.
     /// Supports both legacy (`{partition}.idx`) and model-tagged (`{partition}_{model_id}.idx`) files.
     pub async fn load_all_indexes(&self) -> Result<usize> {
+        // Whatever happens below, warm-up is over once this returns. Nothing
+        // sets this flag afterwards, so an early exit left it false for the
+        // life of the process and `/_vector/{topic}/stats` reported
+        // `"loading": true` forever — on a node that had simply never written
+        // a vector index yet, which is the ordinary case for a new cluster and
+        // exactly when someone is reading that field to debug something else.
+        struct MarkLoaded<'a>(&'a AtomicBool);
+        impl Drop for MarkLoaded<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _mark = MarkLoaded(&self.loading_complete);
+
         let base_path = &self.config.base_path;
 
         if !base_path.exists() {
@@ -1786,7 +1800,6 @@ impl VectorIndexManager {
             }
         }
 
-        self.loading_complete.store(true, Ordering::Release);
         info!(loaded = loaded, "Loaded all indexes from disk");
         Ok(loaded)
     }
@@ -3781,5 +3794,45 @@ mod tests {
 
         // Partition 1 should NOT be in the list
         assert!(!partitions.contains(&1));
+    }
+}
+
+#[cfg(test)]
+mod loading_flag_tests {
+    use super::*;
+
+    /// A node that has never written a vector index takes the early return in
+    /// `load_all_indexes`, which used to skip the only line that set the flag
+    /// — so `/_vector/{topic}/stats` reported `"loading": true` for the life
+    /// of the process, on the ordinary path for a new cluster.
+    #[tokio::test]
+    async fn warm_up_over_a_missing_directory_still_finishes_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-written");
+        assert!(!missing.exists());
+
+        let manager = VectorIndexManager::new(VectorIndexConfig {
+            base_path: missing,
+            ..Default::default()
+        });
+
+        assert_eq!(manager.load_all_indexes().await.unwrap(), 0);
+        assert!(
+            manager.loading_complete.load(Ordering::Acquire),
+            "warm-up returned, so nothing is still loading"
+        );
+    }
+
+    /// The normal path must keep setting it too.
+    #[tokio::test]
+    async fn warm_up_over_an_empty_directory_finishes_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = VectorIndexManager::new(VectorIndexConfig {
+            base_path: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+
+        assert_eq!(manager.load_all_indexes().await.unwrap(), 0);
+        assert!(manager.loading_complete.load(Ordering::Acquire));
     }
 }
