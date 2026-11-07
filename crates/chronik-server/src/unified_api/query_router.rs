@@ -3387,7 +3387,11 @@ fn column_kind(
     for value in values {
         match value {
             J::Null => nullable = true,
-            J::Number(n) if n.is_f64() && !n.is_i64() => floats += 1,
+            // Anything that is not an i64 is carried as a float. That includes
+            // a u64 above `i64::MAX`, which would otherwise be counted as an
+            // integer and then read back with `as_i64` as *null* — losing the
+            // value outright rather than approximating it.
+            J::Number(n) if !n.is_i64() => floats += 1,
             J::Number(_) => ints += 1,
             J::Bool(_) => bools += 1,
             _ => strings += 1,
@@ -6354,5 +6358,62 @@ mod fetch_cap_tests {
             sql_merge_strategy(&sql),
             SqlMerge::Concatenate(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod staging_type_tests {
+    use super::*;
+    use chronik_columnar::datafusion::arrow::datatypes::DataType;
+
+    fn kind(values: &[serde_json::Value]) -> (DataType, bool) {
+        let refs: Vec<&serde_json::Value> = values.iter().collect();
+        column_kind(&refs)
+    }
+
+    #[test]
+    fn counts_stay_integers() {
+        let (ty, nullable) = kind(&[serde_json::json!(1), serde_json::json!(60)]);
+        assert_eq!(ty, DataType::Int64, "a summed COUNT must not become 60.0");
+        assert!(!nullable);
+    }
+
+    /// A u64 past `i64::MAX` was counted as an integer and then read back with
+    /// `as_i64`, which gives `None` — so the value was staged as null and the
+    /// finishing query computed over nothing.
+    #[test]
+    fn a_number_too_large_for_i64_survives_as_a_float() {
+        let big = serde_json::json!(u64::MAX);
+        assert_eq!(kind(&[big.clone()]).0, DataType::Float64);
+        assert!(
+            big.as_f64().is_some(),
+            "and the staged array can read it back"
+        );
+    }
+
+    #[test]
+    fn mixed_shapes_fall_back_to_text_rather_than_guessing() {
+        assert_eq!(
+            kind(&[serde_json::json!(1), serde_json::json!("x")]).0,
+            DataType::Utf8
+        );
+        assert_eq!(
+            kind(&[serde_json::json!(true), serde_json::json!(1)]).0,
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn integers_and_floats_are_one_numeric_column() {
+        assert_eq!(
+            kind(&[serde_json::json!(1), serde_json::json!(1.5)]).0,
+            DataType::Float64
+        );
+    }
+
+    #[test]
+    fn an_all_null_column_is_nullable() {
+        let (_, nullable) = kind(&[serde_json::Value::Null, serde_json::Value::Null]);
+        assert!(nullable);
     }
 }
