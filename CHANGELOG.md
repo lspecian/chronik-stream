@@ -55,7 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing.** A row-wise result that is cut off is simply fewer rows and says so,
   but a group cut off on one node arrived present and short — its total missing
   that node's share, indistinguishable from a correct one. Such a query is now
-  refused, naming the limit it hit.
+  refused, naming the limit it hit, and naming what the nodes were asked to
+  ship — one row per group, per distinct value, or per distinct value and its
+  count. A `COUNT(DISTINCT x)` or a percentile has no `GROUP BY` in it, so
+  being refused with a message about "groups" read as a message about some
+  other query.
 
 - **The published operator Helm chart pointed at an image that was never
   published** (chart `operator-v0.3.1`). The release workflow pushed the
