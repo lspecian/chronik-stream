@@ -81,6 +81,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   second round-trip to be usable for RAG. The hits now get their text in one
   query keyed on the exact `(partition, offset)` pairs.
 
+- **A topic config altered on a running cluster took effect on one broker
+  only.** `TopicUpdated` had no arm in the event conversion, so it fell through
+  to "skip this event type" and was discarded at debug level — it had never
+  replicated. The write was real: local WAL, local apply, `AlterConfigs`
+  answered OK, and the event went nowhere. Every per-topic switch on an
+  existing topic goes through that path — `vector.enabled`, `columnar.enabled`,
+  `searchable`, retention — so an operator got an explicit success and a
+  feature running on one node in three. Measured on a 3-node cluster after two
+  alters handled by a follower: node 1 knew both, node 2 one, the leader
+  neither.
+
+  Nor could it heal. The anti-entropy pass re-broadcast each topic's full
+  config every round and the apply side merged only keys the receiver was
+  *missing*, so it could fill a gap but never correct a changed value; and that
+  pass runs on the leader alone, which could never learn a change written on a
+  follower. Config catch-up now runs on every node, a strictly newer assertion
+  replaces the config outright, and re-assertions carry the config's own
+  `updated_at` so a stale broadcaster cannot overwrite a real change.
+  Provenance still outranks recency: an auto-create's guessed config never
+  widens a topic that was created explicitly.
+
+  Catch-up is bounded to recently changed topics — re-stating a 5,611-topic
+  catalog from every node each pass is the burst this subsystem is least able
+  to absorb — so divergence already present from before this fix is corrected
+  by re-applying the config, which now propagates.
+
 - **A cluster configured only by environment embedded nothing, and said so at
   INFO.** The query side builds its embedding provider from
   `CHRONIK_EMBEDDING_PROVIDER`/`_ENDPOINT`; the indexing side built one per
