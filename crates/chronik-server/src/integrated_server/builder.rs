@@ -377,6 +377,23 @@ impl IntegratedKafkaServerBuilder {
                     rack: metadata.rack.clone(),
                 })
             }
+            // A config change replicates by the same route as a creation: the
+            // replicator re-reads the topic and ships its current config, so
+            // `TopicCreated` is simply "here is this topic's config now", and
+            // the apply side treats a newer one as an update.
+            //
+            // Without this arm `TopicUpdated` fell into the `_ => None` below
+            // and was dropped as a "non-replication event" — it had never
+            // replicated at all. So every per-topic switch set on a running
+            // cluster (`vector.enabled`, `columnar.enabled`, `searchable`,
+            // retention) took effect only on the broker that served the
+            // request, with the client told it had succeeded.
+            MetadataEventPayload::TopicUpdated { name, config } => {
+                Some(ServerEvent::TopicCreated {
+                    topic: name.clone(),
+                    num_partitions: config.partition_count as i32,
+                })
+            }
             _ => None, // Skip other event types (e.g., OffsetUpdated)
         };
 

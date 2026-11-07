@@ -290,7 +290,8 @@ impl MetadataWalReplicator {
                 // partition count, followers keep stale metadata and return
                 // UnknownTopicOrPartitionError for new partitions.
                 if let Ok(Some(topic_meta)) = self.metadata_store.get_topic(&topic).await {
-                    let metadata_event = chronik_common::metadata::MetadataEvent::new(
+                    let updated_at = topic_meta.updated_at;
+                    let mut metadata_event = chronik_common::metadata::MetadataEvent::new(
                         chronik_common::metadata::MetadataEventPayload::TopicCreated {
                             name: topic.clone(),
                             config: topic_meta.config,
@@ -299,6 +300,15 @@ impl MetadataWalReplicator {
                             auto_created: topic_meta.auto_created,
                         },
                     );
+                    // Carry the age of the config, not the time it was sent.
+                    //
+                    // The config here is re-read from this node's own store, so
+                    // this arm also carries anti-entropy re-assertions of state
+                    // that may be old. The receiver resolves a conflict by
+                    // comparing timestamps, so stamping `now` would make every
+                    // re-assertion look like the newest write in the cluster and
+                    // let a stale broadcaster overwrite a real change.
+                    metadata_event.timestamp = updated_at;
 
                     match metadata_event.to_bytes() {
                         Ok(data) => {
