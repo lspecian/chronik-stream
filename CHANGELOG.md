@@ -7,7 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/_sql` answers distributed GROUP BY, percentiles and exact aggregates
+  (#55).** On a cluster, queries whose results have to be combined from several
+  nodes are now either answered correctly or refused with the reason. These are
+  answered exactly, not approximately: `GROUP BY`, `DISTINCT`, `ORDER BY` /
+  `LIMIT` / `OFFSET`, `HAVING`, `AVG`, `stddev` and the variances, `median` and
+  the percentiles, `COUNT(DISTINCT ...)`, top-N-per-group, and aggregates
+  wrapped in expressions such as `ROUND(AVG(x), 2)`.
+
+  Queries that cannot be merged — joins across two topics, window functions,
+  `DISTINCT` inside a subquery — now return a `400` naming what cannot be done
+  and what to do instead, rather than a plausible wrong number as `200 OK`.
+  A deep `OFFSET` page is refused with a pointer to keyset pagination.
+
+  `SELECT AVG(x) FROM t`, `SELECT median(x) FROM t` and `SELECT * FROM t ORDER
+  BY ts LIMIT 10` no longer have to be rewritten by the caller to be answered.
+
 ### Fixed
+
+- **A distributed top-N was ranked from an arbitrary slice of each node's
+  rows.** Each node caps its reply at 1,000 rows, and the query sent to the
+  nodes had its `ORDER BY` removed along with its `LIMIT`, so each node returned
+  an arbitrary thousand of its own rows and the coordinator ranked those. Any
+  topic with more than a thousand rows on a node got a top-N that was not the
+  top N. Nothing below the cap can show it, which is why it measured as correct
+  over 900 rows. The nodes now keep the order and return only the `offset +
+  limit` candidates that could win — exact, and far less data on the wire.
+
+- **`MIN` and `MAX` across nodes returned whichever node answered first.** Of
+  everything the query engine hands back, only millisecond timestamps survive as
+  JSON numbers; dates, timestamps of any other precision, decimals, text and
+  booleans arrive as strings or bools, and the combiner kept the accumulator for
+  anything it could not read as a number. So `MAX(level)` and `MIN(created_at)`
+  were right one time in three, with nothing to say which.
+
+- **`ORDER BY COUNT(*)` did not sort, and `HAVING COUNT(*) > n` returned
+  nothing.** The coordinator applies the rest of the query by name, and its name
+  for an unaliased column is the one the parser renders (`COUNT(*)`) while the
+  engine names the column `count(*)`. Every such lookup missed: the sort
+  compared null to null and did nothing before `LIMIT` cut arbitrary rows, a
+  `HAVING` admitted no row at all, and a quantile's groups collapsed into one.
+  The nodes are now asked for the name the coordinator will use.
+
+- **A truncated node made a grouped total come back short rather than
+  missing.** A row-wise result that is cut off is simply fewer rows and says so,
+  but a group cut off on one node arrived present and short — its total missing
+  that node's share, indistinguishable from a correct one. Such a query is now
+  refused, naming the limit it hit.
 
 - **The published operator Helm chart pointed at an image that was never
   published** (chart `operator-v0.3.1`). The release workflow pushed the
