@@ -382,6 +382,112 @@ struct ViewComposition {
     /// ([`hot_cold_overlap`]) — so a plain scan over-counts. When set, the view
     /// keeps one row per `(_partition, _offset)`.
     cold_dedup: bool,
+    /// Fingerprint of the JSON columns the cold table exposes beyond the core
+    /// envelope ([`cold_json_columns`]). The view names them one by one, so a
+    /// topic whose payloads gain a field needs its view rebuilt — otherwise the
+    /// new column stays invisible under the topic's own name until a restart.
+    /// A fingerprint rather than the names themselves, to keep this `Copy`.
+    json_cols: u64,
+}
+
+/// A JSON column's type, as both sides of the union have to spell it.
+///
+/// The inferred schema only ever produces these four: nested objects and arrays
+/// are stored as their serialized JSON text
+/// (`chronik-columnar/src/json_schema.rs`), so they arrive here as `Text`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonColKind {
+    Text,
+    Int,
+    Float,
+    Bool,
+}
+
+impl JsonColKind {
+    fn from_arrow(dt: &datafusion::arrow::datatypes::DataType) -> Option<Self> {
+        use datafusion::arrow::datatypes::DataType as D;
+        match dt {
+            D::Utf8 | D::LargeUtf8 | D::Utf8View => Some(Self::Text),
+            D::Int8 | D::Int16 | D::Int32 | D::Int64 => Some(Self::Int),
+            D::UInt8 | D::UInt16 | D::UInt32 => Some(Self::Int),
+            D::Float16 | D::Float32 | D::Float64 => Some(Self::Float),
+            D::Boolean => Some(Self::Bool),
+            // Anything else (lists, structs, decimals, timestamps) is not
+            // something the JSON inference produces, so it is not a message
+            // field and is left out rather than guessed at.
+            _ => None,
+        }
+    }
+
+    /// The canonical SQL type. Both union inputs are cast to it, for the reason
+    /// in the `common_cols` comment below: letting DataFusion coerce the two
+    /// sides itself breaks every query touching the column.
+    fn sql_type(self) -> &'static str {
+        match self {
+            Self::Text => "VARCHAR",
+            Self::Int => "BIGINT",
+            Self::Float => "DOUBLE",
+            Self::Bool => "BOOLEAN",
+        }
+    }
+
+    /// How the hot side produces the column. The hot buffer's schema is fixed
+    /// and carries only the envelope, so the value is extracted from `_value`
+    /// with the same UDFs the hot-buffer docs point callers at. Projecting NULL
+    /// instead would be cheaper and wrong: hot holds exactly the rows cold does
+    /// not, so every aggregate over recent data would come back quietly short.
+    fn extract_from_value(self, path_literal: &str) -> String {
+        let f = match self {
+            Self::Text | Self::Bool => "json_extract_string",
+            Self::Int => "json_extract_int",
+            Self::Float => "json_extract_float",
+        };
+        format!("{f}(_value, '$.{path_literal}')")
+    }
+}
+
+/// The JSON columns a cold Parquet table carries beyond the core envelope.
+///
+/// The WalIndexer infers a schema from the message values and writes one typed
+/// column per top-level JSON field. Those columns exist only on the cold side,
+/// so unless the unified view names them they are unreachable under the topic's
+/// own name — `SELECT sev FROM orders` fails while `orders_cold` has `sev`.
+///
+/// Reserved `_`-prefixed names are skipped: `_headers` belongs to the cold
+/// envelope rather than the message body, and the core seven are projected
+/// separately. A payload field actually named `_x` would already be
+/// indistinguishable from an envelope column, so losing it here changes nothing.
+fn cold_json_columns(
+    schema: &datafusion::arrow::datatypes::Schema,
+) -> Vec<(String, JsonColKind)> {
+    schema
+        .fields()
+        .iter()
+        .filter(|f| !f.name().starts_with('_'))
+        .filter_map(|f| JsonColKind::from_arrow(f.data_type()).map(|k| (f.name().clone(), k)))
+        .collect()
+}
+
+/// Order-independent fingerprint of a column set, for [`ViewComposition`].
+fn json_cols_fingerprint(cols: &[(String, JsonColKind)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut total: u64 = 0;
+    for (name, kind) in cols {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut h);
+        (*kind as u8).hash(&mut h);
+        // Sum, so the fingerprint does not depend on the field order a given
+        // Parquet file happens to use.
+        total = total.wrapping_add(h.finish());
+    }
+    total
+}
+
+/// Double a character to escape it, for SQL identifiers (`"`) and string
+/// literals (`'`). A JSON key may contain either, and a key that is simply
+/// dropped or spliced in raw would be a wrong answer or broken SQL.
+fn sql_escape(s: &str, quote: char) -> String {
+    s.replace(quote, &format!("{quote}{quote}"))
 }
 
 /// Whether a topic's cold Parquet segments overlap in offset range within any
@@ -709,10 +815,31 @@ impl SqlHandler {
             let cold_dedup = has_cold
                 && (cold_segments_overlap(state.metadata_store.as_ref(), topic).await
                     || (has_hot && hot_cold_overlap(state, topic).await));
+
+            // The typed JSON columns live only on the cold side. Read them off
+            // the cold schema so the view can name them; without this the
+            // inferred columns are written to Parquet and then dropped by the
+            // one table callers actually query.
+            let json_cols: Vec<(String, JsonColKind)> = if has_cold {
+                match engine.get_table_schema(&cold_table_name).await {
+                    Ok(schema) => cold_json_columns(&schema),
+                    Err(e) => {
+                        debug!(
+                            topic = %topic,
+                            error = %e,
+                            "Could not read cold schema; unified view will carry the envelope only"
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let composition = ViewComposition {
                 has_hot,
                 has_cold,
                 cold_dedup,
+                json_cols: json_cols_fingerprint(&json_cols),
             };
             let current = state.sql_tables.topics.get(topic).map(|c| *c);
             let view_exists =
@@ -733,13 +860,37 @@ impl SqlHandler {
                 // unified view — including `SELECT _value FROM {topic}` and any
                 // json_extract_*() aggregation. Identical casts on both sides make
                 // the union inputs schema-identical, so no coercion is inserted.
-                let common_cols = "CAST(_topic AS VARCHAR) AS _topic, _partition, _offset, \
-                                   _timestamp, _timestamp_type, CAST(_key AS BYTEA) AS _key, \
-                                   CAST(_value AS BYTEA) AS _value";
+                let core_cols = "CAST(_topic AS VARCHAR) AS _topic, _partition, _offset, \
+                                 _timestamp, _timestamp_type, CAST(_key AS BYTEA) AS _key, \
+                                 CAST(_value AS BYTEA) AS _value";
+
+                // The inferred JSON columns, spelled three ways: read off the
+                // typed column on the cold side, extracted from `_value` on the
+                // hot side, and named plainly on the way out. The casts are
+                // identical on both sides for the same reason as above.
+                let mut hot_cols = String::from(core_cols);
+                let mut cold_cols = String::from(core_cols);
+                let mut out_extra = String::new();
+                for (name, kind) in &json_cols {
+                    let ident = sql_escape(name, '"');
+                    let literal = sql_escape(name, '\'');
+                    let ty = kind.sql_type();
+                    hot_cols.push_str(&format!(
+                        ", CAST({} AS {ty}) AS \"{ident}\"",
+                        kind.extract_from_value(&literal)
+                    ));
+                    cold_cols.push_str(&format!(", CAST(\"{ident}\" AS {ty}) AS \"{ident}\""));
+                    out_extra.push_str(&format!(", \"{ident}\""));
+                }
+                let hot_cols = hot_cols.as_str();
+                let cold_cols = cold_cols.as_str();
 
                 // The output column list, shared by every view shape below.
-                let out_cols = "_topic, _partition, _offset, _timestamp, \
-                                _timestamp_type, _key, _value";
+                let out_cols = format!(
+                    "_topic, _partition, _offset, _timestamp, \
+                     _timestamp_type, _key, _value{out_extra}"
+                );
+                let out_cols = out_cols.as_str();
 
                 let view_sql = if cold_dedup {
                     // #41: cold segments overlap, so the same (_partition, _offset)
@@ -750,17 +901,18 @@ impl SqlHandler {
                     // during the flush hand-off; hot itself is never duplicated.
                     let inner = if has_hot {
                         format!(
-                            "SELECT {cols}, 0 AS __src FROM {hot} \
+                            "SELECT {hot_cols}, 0 AS __src FROM {hot} \
                              UNION ALL \
-                             SELECT {cols}, 1 AS __src FROM {cold}",
-                            cols = common_cols,
+                             SELECT {cold_cols}, 1 AS __src FROM {cold}",
+                            hot_cols = hot_cols,
+                            cold_cols = cold_cols,
                             hot = hot_table_name,
                             cold = cold_table_name
                         )
                     } else {
                         format!(
                             "SELECT {cols}, 1 AS __src FROM {cold}",
-                            cols = common_cols,
+                            cols = cold_cols,
                             cold = cold_table_name
                         )
                     };
@@ -778,14 +930,15 @@ impl SqlHandler {
                     // Hot data has priority (more recent), cold provides historical
                     format!(
                         "SELECT {} FROM {} UNION ALL SELECT {} FROM {}",
-                        common_cols, hot_table_name, common_cols, cold_table_name
+                        hot_cols, hot_table_name, cold_cols, cold_table_name
                     )
                 } else if has_hot {
-                    // Only hot data
-                    format!("SELECT {} FROM {}", common_cols, hot_table_name)
+                    // Only hot data. No cold table, so no inferred JSON columns
+                    // to carry: `hot_cols` is the bare envelope here.
+                    format!("SELECT {} FROM {}", hot_cols, hot_table_name)
                 } else {
                     // Only cold data
-                    format!("SELECT {} FROM {}", common_cols, cold_table_name)
+                    format!("SELECT {} FROM {}", cold_cols, cold_table_name)
                 };
 
                 if let Err(e) = engine.register_view(&base_table_name, &view_sql).await {
@@ -1955,4 +2108,151 @@ async fn authorize_sql_query(
         )
             .into_response(),
     )
+}
+
+#[cfg(test)]
+mod cold_json_column_tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    fn schema(fields: Vec<Field>) -> Schema {
+        Schema::new(fields)
+    }
+
+    /// The whole point of the feature: a typed column written to Parquet has to
+    /// be reachable under the topic's own name, not only under `{topic}_cold`.
+    #[test]
+    fn the_inferred_json_columns_are_picked_out_of_a_cold_schema() {
+        let s = schema(vec![
+            Field::new("_topic", DataType::Utf8, false),
+            Field::new("_partition", DataType::Int32, false),
+            Field::new("_offset", DataType::Int64, false),
+            Field::new("_value", DataType::Binary, false),
+            Field::new("sev", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new("ok", DataType::Boolean, true),
+        ]);
+        assert_eq!(
+            cold_json_columns(&s),
+            vec![
+                ("sev".to_string(), JsonColKind::Text),
+                ("n".to_string(), JsonColKind::Int),
+                ("ratio".to_string(), JsonColKind::Float),
+                ("ok".to_string(), JsonColKind::Bool),
+            ]
+        );
+    }
+
+    /// `_headers` is part of the cold envelope, not a message field. Including
+    /// it would put a column on the view that the hot side cannot produce.
+    #[test]
+    fn envelope_columns_are_not_mistaken_for_message_fields() {
+        let s = schema(vec![
+            Field::new("_headers", DataType::Utf8, true),
+            Field::new("_timestamp_type", DataType::Int8, false),
+            Field::new("id", DataType::Int64, true),
+        ]);
+        assert_eq!(
+            cold_json_columns(&s),
+            vec![("id".to_string(), JsonColKind::Int)]
+        );
+    }
+
+    /// A type the JSON inference never produces is left out rather than
+    /// guessed at: there is no UDF that would rebuild it on the hot side, so
+    /// naming it in the view would fail every query against the topic.
+    #[test]
+    fn a_type_with_no_hot_side_equivalent_is_left_out() {
+        let s = schema(vec![
+            Field::new("when", DataType::Date32, true),
+            Field::new(
+                "tags",
+                DataType::List(std::sync::Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        assert_eq!(
+            cold_json_columns(&s),
+            vec![("name".to_string(), JsonColKind::Text)]
+        );
+    }
+
+    /// Cold Parquet hands back the `View` string/binary variants, so these must
+    /// map like their plain counterparts or a real topic's columns get dropped.
+    #[test]
+    fn the_view_string_variants_map_like_plain_utf8() {
+        assert_eq!(
+            JsonColKind::from_arrow(&DataType::Utf8View),
+            Some(JsonColKind::Text)
+        );
+        assert_eq!(
+            JsonColKind::from_arrow(&DataType::LargeUtf8),
+            Some(JsonColKind::Text)
+        );
+        assert_eq!(JsonColKind::from_arrow(&DataType::Binary), None);
+    }
+
+    /// The view names its columns one by one, so it has to be rebuilt when the
+    /// set changes — and must NOT be rebuilt on every refresh just because a
+    /// Parquet file lists the same fields in a different order.
+    #[test]
+    fn the_fingerprint_tracks_the_column_set_not_its_order() {
+        let a = vec![
+            ("sev".to_string(), JsonColKind::Text),
+            ("n".to_string(), JsonColKind::Int),
+        ];
+        let reordered = vec![
+            ("n".to_string(), JsonColKind::Int),
+            ("sev".to_string(), JsonColKind::Text),
+        ];
+        let gained = vec![
+            ("sev".to_string(), JsonColKind::Text),
+            ("n".to_string(), JsonColKind::Int),
+            ("grp".to_string(), JsonColKind::Text),
+        ];
+        let retyped = vec![
+            ("sev".to_string(), JsonColKind::Text),
+            ("n".to_string(), JsonColKind::Float),
+        ];
+        assert_eq!(json_cols_fingerprint(&a), json_cols_fingerprint(&reordered));
+        assert_ne!(json_cols_fingerprint(&a), json_cols_fingerprint(&gained));
+        assert_ne!(json_cols_fingerprint(&a), json_cols_fingerprint(&retyped));
+        assert_eq!(json_cols_fingerprint(&[]), 0);
+    }
+
+    /// A hot row must carry the real value. Projecting NULL would be cheaper
+    /// and would quietly understate every aggregate over recent data, because
+    /// hot holds exactly the rows cold does not.
+    #[test]
+    fn the_hot_side_reads_the_field_out_of_the_value() {
+        assert_eq!(
+            JsonColKind::Text.extract_from_value("sev"),
+            "json_extract_string(_value, '$.sev')"
+        );
+        assert_eq!(
+            JsonColKind::Int.extract_from_value("n"),
+            "json_extract_int(_value, '$.n')"
+        );
+        assert_eq!(
+            JsonColKind::Float.extract_from_value("ratio"),
+            "json_extract_float(_value, '$.ratio')"
+        );
+        // No boolean UDF exists; the text one plus the cast in the view does it.
+        assert_eq!(
+            JsonColKind::Bool.extract_from_value("ok"),
+            "json_extract_string(_value, '$.ok')"
+        );
+        assert_eq!(JsonColKind::Bool.sql_type(), "BOOLEAN");
+    }
+
+    /// A JSON key may contain a quote. Splicing it in raw would produce SQL
+    /// that fails to parse, taking the whole topic's view down with it.
+    #[test]
+    fn a_quote_in_a_field_name_is_escaped_not_spliced() {
+        assert_eq!(sql_escape(r#"we"ird"#, '"'), r#"we""ird"#);
+        assert_eq!(sql_escape("it's", '\''), "it''s");
+        assert_eq!(sql_escape("plain", '"'), "plain");
+    }
 }
