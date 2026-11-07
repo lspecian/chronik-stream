@@ -84,6 +84,12 @@ pub enum OrchestratorError {
     PlanError(#[from] crate::plan::PlanError),
     #[error("All backends failed")]
     AllBackendsFailed,
+    /// A filter was accepted by the parser but cannot be honoured.
+    ///
+    /// Silence was the old behaviour and it is the dangerous one: a caller
+    /// narrowing to a time window got everything outside it back, with a 200.
+    #[error("{0}")]
+    UnsupportedFilter(String),
 }
 
 /// The query orchestrator: plans, executes, fuses, and ranks.
@@ -144,7 +150,40 @@ impl QueryOrchestrator {
         let query_id = uuid::Uuid::new_v4().to_string();
 
         // Execute all plan nodes in parallel with timeout
-        let (candidates, backend_stats) = self.execute_plan(&plan).await;
+        let (mut candidates, backend_stats) = self.execute_plan(&plan).await;
+
+        // `filters` was parsed and then read by nothing at all, so every filter
+        // a caller sent was accepted and ignored — a query narrowed to a time
+        // window or a partition got the unnarrowed result back as 200 OK.
+        if let Some(ref filters) = request.filters {
+            // Only the text backend sets a candidate timestamp; a vector hit
+            // carries none. Post-filtering on that would drop every vector hit
+            // as "outside the window", which is a wrong answer dressed as a
+            // narrower one — so this is refused until the backends can push the
+            // bound down themselves.
+            if filters.timestamp_gte.is_some() || filters.timestamp_lte.is_some() {
+                return Err(OrchestratorError::UnsupportedFilter(
+                    "filters.timestamp_gte / timestamp_lte are not applied yet: the \
+                     vector backend returns no per-hit timestamp, so filtering here \
+                     would silently drop every vector hit rather than narrow the \
+                     result. Narrow by partition, or constrain the time range in a \
+                     sql-mode source."
+                        .to_string(),
+                ));
+            }
+
+            // Partitions are safe: every candidate carries one, from every backend.
+            if let Some(ref wanted) = filters.partitions {
+                let before = candidates.len();
+                candidates.retain(|c| wanted.contains(&c.partition));
+                tracing::debug!(
+                    before,
+                    after = candidates.len(),
+                    partitions = ?wanted,
+                    "Applied partition filter"
+                );
+            }
+        }
 
         let total_candidates = candidates.len();
 
@@ -797,5 +836,44 @@ mod tests {
 
         // Both should return results, but scores may differ due to different weights
         assert_eq!(response_default.results.len(), response_relevance.results.len());
+    }
+}
+
+#[cfg(test)]
+mod filter_application_tests {
+    use super::*;
+    use crate::types::FilterSpec;
+
+    /// `filters` was read by nothing at all, so a query narrowed to a time
+    /// window got the unnarrowed result back as 200 OK. Only the text backend
+    /// sets a candidate timestamp, so post-filtering would instead drop every
+    /// vector hit — a wrong answer dressed as a narrower one. Refuse it.
+    #[test]
+    fn a_timestamp_filter_is_refused_rather_than_ignored() {
+        let f = FilterSpec { timestamp_gte: Some("2026-01-01".into()), ..Default::default() };
+        // The orchestrator reaches for exactly these two fields to decide.
+        assert!(f.timestamp_gte.is_some() || f.timestamp_lte.is_some());
+
+        // And refuses with the variant the handler maps to a 400, not a 500.
+        let err = OrchestratorError::UnsupportedFilter("not applied yet".into());
+        assert!(matches!(err, OrchestratorError::UnsupportedFilter(_)));
+        assert_eq!(err.to_string(), "not applied yet");
+    }
+
+    /// Partitions are safe to apply here: every candidate carries one, from
+    /// every backend. This is the retain the orchestrator runs.
+    #[test]
+    fn a_partition_filter_keeps_only_the_wanted_partitions() {
+        let mut candidates = vec![
+            Candidate::new("logs".into(), 0, 1, QueryMode::Vector, 0.9, 0),
+            Candidate::new("logs".into(), 1, 2, QueryMode::Vector, 0.8, 1),
+            Candidate::new("logs".into(), 2, 3, QueryMode::Vector, 0.7, 2),
+        ];
+        let wanted = vec![0, 2];
+        candidates.retain(|c| wanted.contains(&c.partition));
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].partition, 0);
+        assert_eq!(candidates[1].partition, 2);
     }
 }

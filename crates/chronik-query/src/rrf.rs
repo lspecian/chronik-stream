@@ -47,6 +47,9 @@ impl RrfMerger {
             let rrf_score = self.compute_rrf_score(&entry.ranks);
             entry.primary.features.insert("rrf_score".to_string(), rrf_score);
             entry.primary.final_score = rrf_score;
+            // RRF is where several backends become one hit, so this is the
+            // point at which the full origin set is known.
+            entry.primary.backends = entry.ranks.keys().copied().collect();
         }
 
         // Sort by RRF score descending

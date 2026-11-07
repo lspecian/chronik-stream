@@ -119,6 +119,9 @@ impl Ranker for RuleRanker {
                 entry.primary.features.insert(name.clone(), if value.is_finite() { *value } else { 0.0 });
             }
             entry.primary.final_score = final_score;
+            // The ranker may be used without the RRF merger, so set the origin
+            // set here too rather than relying on one path having run.
+            entry.primary.backends = entry.ranks.keys().copied().collect();
             entry.primary.explanation =
                 Some(Self::explain(&features, &profile.weights, final_score));
         }

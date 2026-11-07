@@ -38,6 +38,9 @@ pub struct Candidate {
     pub features: HashMap<String, f64>,
     /// Human-readable ranking explanation
     pub explanation: Option<String>,
+    /// Every backend that found this candidate, set when the deduplicated
+    /// entries are ranked. `source` alone is only the first one to find it.
+    pub backends: Vec<QueryMode>,
 }
 
 impl Candidate {
@@ -63,6 +66,7 @@ impl Candidate {
             final_score: 0.0,
             features: HashMap::new(),
             explanation: None,
+            backends: vec![source],
         }
     }
 
@@ -93,6 +97,15 @@ impl Candidate {
             features: self.features,
             explanation: self.explanation,
             text_preview: self.text_preview,
+            backends: {
+                // Sorted, so the field is stable across runs — the set comes
+                // from a HashMap and callers compare responses.
+                let mut names: Vec<String> =
+                    self.backends.iter().map(|m| m.to_string()).collect();
+                names.sort();
+                names.dedup();
+                names
+            },
         }
     }
 }
@@ -241,5 +254,52 @@ mod tests {
         assert_eq!(result.topic, "logs");
         assert_eq!(result.final_score, 0.92);
         assert!(result.features.contains_key("text_rank"));
+    }
+}
+
+#[cfg(test)]
+mod backend_origin_tests {
+    use super::*;
+
+    /// Issue #56: RRF flattens every backend into one list, so without a
+    /// per-hit origin a caller cannot tell where a hit came from — and a hit
+    /// with no `text_preview` is indistinguishable from one whose content
+    /// failed to parse.
+    #[test]
+    fn a_hit_carries_the_backend_that_found_it() {
+        let c = Candidate::new("logs".into(), 0, 10, QueryMode::Vector, 0.9, 0);
+        let r = c.into_ranked_result();
+        assert_eq!(r.backends, vec!["vector".to_string()]);
+    }
+
+    /// A hit both backends found names both, sorted so the field is stable —
+    /// the set comes from a HashMap and callers compare responses.
+    #[test]
+    fn a_hit_found_by_two_backends_names_both_in_a_stable_order() {
+        let mut set = CandidateSet::new();
+        set.add_candidates(vec![Candidate::new(
+            "logs".into(), 0, 10, QueryMode::Vector, 0.9, 0,
+        )]);
+        set.add_candidates(vec![Candidate::new(
+            "logs".into(), 0, 10, QueryMode::Text, 0.8, 0,
+        )]);
+
+        let mut entries = set.into_entries();
+        assert_eq!(entries.len(), 1, "same (topic, partition, offset) is one hit");
+
+        // What the mergers do: hand the full origin set to the primary.
+        entries[0].primary.backends = entries[0].ranks.keys().copied().collect();
+        let r = entries.pop().unwrap().primary.into_ranked_result();
+        assert_eq!(r.backends, vec!["text".to_string(), "vector".to_string()]);
+    }
+
+    /// The pair of fields is the point: a backend named, no preview, means the
+    /// content could not be read — not that nothing matched.
+    #[test]
+    fn a_content_free_hit_is_distinguishable_from_a_miss() {
+        let c = Candidate::new("logs".into(), 0, 10, QueryMode::Vector, 0.9, 0);
+        let r = c.into_ranked_result();
+        assert!(r.text_preview.is_none());
+        assert!(!r.backends.is_empty(), "a hit always says which backend found it");
     }
 }

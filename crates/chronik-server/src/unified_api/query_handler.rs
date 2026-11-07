@@ -845,6 +845,20 @@ pub async fn handle_query(
                 }
             }
         }
+        // A filter the server cannot honour is the caller's to fix, so it is a
+        // 400 naming the filter — not a 500, and not the silent 200 it used to
+        // be.
+        Err(chronik_query::orchestrator::OrchestratorError::UnsupportedFilter(msg)) => {
+            chronik_monitoring::MetricsRecorder::record_query_error("unsupported_filter");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": msg,
+                    "type": "unsupported_filter"
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             chronik_monitoring::MetricsRecorder::record_query_error("execution");
             (

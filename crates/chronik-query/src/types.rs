@@ -117,8 +117,14 @@ fn default_max_bytes() -> usize {
     1_048_576 // 1MB
 }
 
-/// Filters applied to all query backends
+/// Filters applied to all query backends.
+///
+/// `deny_unknown_fields`, so a filter this does not support is an error
+/// rather than silence. A reporter lost time on `filter.key`: it is not a
+/// field here, serde dropped it, and filtering on a key that matched
+/// everything and one that matched nothing returned identical results.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilterSpec {
     /// Minimum timestamp (inclusive, ISO-8601 or epoch millis)
     #[serde(default)]
@@ -176,6 +182,16 @@ pub struct RankedResult {
     /// Original text preview (if available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_preview: Option<String>,
+    /// Which backends found this hit, sorted — `["text"]`, `["vector"]`, or
+    /// both when they agreed.
+    ///
+    /// RRF flattens every backend into one list, so without this a caller
+    /// cannot tell where a hit came from, and a hit carrying no
+    /// `text_preview` is indistinguishable from one whose content failed to
+    /// parse. With both fields the two cases separate: a hit with a backend
+    /// and no preview is a hit whose content could not be read, not a miss.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<String>,
 }
 
 /// Query execution statistics
@@ -205,4 +221,43 @@ pub struct BackendStats {
     pub latency_ms: u64,
     /// Whether the backend timed out
     pub timed_out: bool,
+}
+
+#[cfg(test)]
+mod filter_spec_tests {
+    use super::*;
+
+    /// Issue #56's closing note: filtering on a key present in the topic and on
+    /// a key matching nothing returned identical results. `key` is not a field
+    /// here, so serde dropped it and the filter never existed.
+    #[test]
+    fn an_unsupported_filter_field_is_an_error_not_silence() {
+        let err = serde_json::from_str::<FilterSpec>(r#"{"key": "user-42"}"#)
+            .expect_err("an unknown filter must not be silently accepted");
+        assert!(
+            err.to_string().contains("key"),
+            "the error should name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn the_supported_filters_still_parse() {
+        let f: FilterSpec =
+            serde_json::from_str(r#"{"partitions": [0, 2], "timestamp_gte": "2026-01-01"}"#)
+                .expect("documented fields must parse");
+        assert_eq!(f.partitions, Some(vec![0, 2]));
+        assert_eq!(f.timestamp_gte.as_deref(), Some("2026-01-01"));
+    }
+
+    /// A whole-request parse must fail the same way, since that is where a
+    /// caller's filter actually arrives.
+    #[test]
+    fn a_request_carrying_an_unsupported_filter_is_rejected() {
+        let body = r#"{
+            "sources": [{"topic": "logs", "modes": ["vector"]}],
+            "q": {"text": "anything"},
+            "filters": {"key": "user-42"}
+        }"#;
+        assert!(serde_json::from_str::<QueryRequest>(body).is_err());
+    }
 }

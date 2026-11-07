@@ -226,6 +226,7 @@ mod tests {
                 },
                 explanation: Some("Top match".into()),
                 text_preview: None,
+                backends: vec!["text".into()],
             }],
             grouped_results: None,
             stats: QueryStats {
