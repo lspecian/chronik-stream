@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.15.0] - 2026-11-07
+
 ### Added
 
 - **`/_sql` answers distributed GROUP BY, percentiles and exact aggregates
