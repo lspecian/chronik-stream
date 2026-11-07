@@ -61,6 +61,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being refused with a message about "groups" read as a message about some
   other query.
 
+- **The inferred JSON columns never reached the topic's own table.** The
+  WalIndexer infers a schema from message values and writes a typed column per
+  top-level JSON field into Parquet, and the unified view then projected a
+  hardcoded list of the seven envelope columns — so every one of those fields
+  was dropped by the one table callers query by name. `SELECT sev FROM orders`
+  failed with "No field named sev" while `orders_cold` had `sev` all along. The
+  view now names those columns on both sides, extracting them from `_value` on
+  the hot side with the `json_extract_*` UDFs, because hot holds exactly the
+  rows cold does not and a NULL there would make every aggregate over recent
+  data come back quietly short.
+
+- **Vector hits carried no text, so vector-only matches were unusable** (#56).
+  An HNSW index stores vectors and coordinates, no text, and the hits were built
+  straight from those tuples — `text_preview` was never set, and being
+  `skip_serializing_if = none` it was absent rather than null. Since RRF merges
+  both backends into one list with no marker of origin, a vector-only hit was
+  indistinguishable from a text hit whose content failed to parse, and needed a
+  second round-trip to be usable for RAG. The hits now get their text in one
+  query keyed on the exact `(partition, offset)` pairs.
+
+- **A text preview over 300 bytes could panic the request.** Three sites in
+  `/_query` cut with `&cleaned[..300]`, and `len()` counts bytes, so any preview
+  whose 300th byte fell inside a character panicked — ordinary for accented, CJK
+  or emoji content. They now back up to the preceding character boundary.
+
 - **The published operator Helm chart pointed at an image that was never
   published** (chart `operator-v0.3.1`). The release workflow pushed the
   operator image as `v0.3.0` while packaging a chart whose `appVersion` — and
