@@ -1068,8 +1068,7 @@ mod tests {
 
         let cluster: crate::crds::cluster::ChronikClusterSpec =
             serde_json::from_str(r#"{"replicas": 3}"#).unwrap();
-        let cluster_pod =
-            build_cluster_node_pod("test", "ns", 1, &cluster, test_owner_ref(), None);
+        let cluster_pod = build_cluster_node_pod("test", "ns", 1, &cluster, test_owner_ref(), None);
 
         for (what, pod) in [("standalone", &standalone_pod), ("cluster", &cluster_pod)] {
             let container = &pod.spec.as_ref().unwrap().containers[0];
