@@ -214,10 +214,20 @@ async fn search_all_fanout(
             // Local search failed — still try peers, return their merged results
             let peers = state.query_router.all_peers();
             if !peers.is_empty() {
-                let peer_responses: Vec<chronik_search::api::SearchResponse> = state
+                let fan_out = state
                     .query_router
-                    .fan_out_post("/_search", &request, &peers)
+                    .fan_out_post::<_, chronik_search::api::SearchResponse>(
+                        "/_search", &request, &peers,
+                    )
                     .await;
+                let unanswered = fan_out.failures.len();
+                if !fan_out.is_complete() {
+                    tracing::warn!(
+                        failures = %fan_out.failure_summary(),
+                        "Serving a partial _search: some nodes did not answer"
+                    );
+                }
+                let peer_responses = fan_out.responses;
                 if !peer_responses.is_empty() {
                     let empty = chronik_search::api::SearchResponse {
                         took: 0,
@@ -238,12 +248,16 @@ async fn search_all_fanout(
                         },
                         aggregations: None,
                     };
-                    return axum::Json(super::query_router::merge_search_responses(
+                    let mut merged = super::query_router::merge_search_responses(
                         empty,
                         peer_responses,
                         size,
-                    ))
-                    .into_response();
+                    );
+                    // The local search already failed here, so this answer is
+                    // short by the local node too — count it with the peers that
+                    // did not reply rather than reporting all-successful.
+                    super::query_router::note_unanswered_peers(&mut merged, unanswered + 1);
+                    return axum::Json(merged).into_response();
                 }
             }
             // No local or peer results — return local error
@@ -259,15 +273,28 @@ async fn search_all_fanout(
     // Fan out to peers
     let peers = state.query_router.all_peers();
     let response = if !peers.is_empty() {
-        let peer_responses: Vec<chronik_search::api::SearchResponse> = state
+        let fan_out = state
             .query_router
-            .fan_out_post("/_search", &request, &peers)
+            .fan_out_post::<_, chronik_search::api::SearchResponse>("/_search", &request, &peers)
             .await;
+        let unanswered = fan_out.failures.len();
+        if !fan_out.is_complete() {
+            tracing::warn!(
+                failures = %fan_out.failure_summary(),
+                "Serving a partial _search: some nodes did not answer"
+            );
+        }
         tracing::debug!(
-            peer_count = peer_responses.len(),
+            peer_count = fan_out.responses.len(),
             "Merging ES search results from peers"
         );
-        super::query_router::merge_search_responses(local_response, peer_responses, size)
+        let mut merged =
+            super::query_router::merge_search_responses(local_response, fan_out.responses, size);
+        // Hits are ranked, so a partial answer is still worth serving — but
+        // `_shards.failed` has to say so, or a search that missed a node is
+        // indistinguishable from one where that node held no match (issue #57).
+        super::query_router::note_unanswered_peers(&mut merged, unanswered);
+        merged
     } else {
         local_response
     };
@@ -315,26 +342,46 @@ async fn search_index_fanout(
     if let Some(local_resp) = local_response {
         // Local succeeded — merge with peers
         let response = if !peers.is_empty() {
-            let peer_responses: Vec<chronik_search::api::SearchResponse> = state
+            let fan_out = state
                 .query_router
-                .fan_out_post(&path, &request, &peers)
+                .fan_out_post::<_, chronik_search::api::SearchResponse>(&path, &request, &peers)
                 .await;
+            let unanswered = fan_out.failures.len();
+            if !fan_out.is_complete() {
+                tracing::warn!(
+                    index = %index,
+                    failures = %fan_out.failure_summary(),
+                    "Serving a partial index _search: some nodes did not answer"
+                );
+            }
             tracing::debug!(
                 index = %index,
-                peer_count = peer_responses.len(),
+                peer_count = fan_out.responses.len(),
                 "Merging ES index search results from peers"
             );
-            super::query_router::merge_search_responses(local_resp, peer_responses, size)
+            let mut merged =
+                super::query_router::merge_search_responses(local_resp, fan_out.responses, size);
+            super::query_router::note_unanswered_peers(&mut merged, unanswered);
+            merged
         } else {
             local_resp
         };
         axum::Json(response).into_response()
     } else if !peers.is_empty() {
         // Local failed but peers might have the index
-        let peer_responses: Vec<chronik_search::api::SearchResponse> = state
+        let fan_out = state
             .query_router
-            .fan_out_post(&path, &request, &peers)
+            .fan_out_post::<_, chronik_search::api::SearchResponse>(&path, &request, &peers)
             .await;
+        let unanswered = fan_out.failures.len();
+        if !fan_out.is_complete() {
+            tracing::warn!(
+                index = %index,
+                failures = %fan_out.failure_summary(),
+                "Serving a partial index _search: some nodes did not answer"
+            );
+        }
+        let peer_responses = fan_out.responses;
         if !peer_responses.is_empty() {
             let empty = chronik_search::api::SearchResponse {
                 took: 0,
@@ -355,12 +402,12 @@ async fn search_index_fanout(
                 },
                 aggregations: None,
             };
-            axum::Json(super::query_router::merge_search_responses(
-                empty,
-                peer_responses,
-                size,
-            ))
-            .into_response()
+            let mut merged =
+                super::query_router::merge_search_responses(empty, peer_responses, size);
+            // The local index search failed, so count this node among the
+            // shards that did not contribute.
+            super::query_router::note_unanswered_peers(&mut merged, unanswered + 1);
+            axum::Json(merged).into_response()
         } else {
             // No results from anywhere — return original local error
             let result = chronik_search::handlers::search_index(

@@ -32,6 +32,35 @@ pub struct SqlRequest {
     /// Query timeout in seconds (default: 30)
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Accept an answer that is missing the nodes which did not reply.
+    ///
+    /// Off by default, because a merged aggregate cannot tell a node that
+    /// returned nothing from a node that never answered: the result comes back
+    /// short rather than missing (issue #57). Set it when a node is knowingly
+    /// down and a short answer is still worth having — the response then carries
+    /// `partial: true` and the nodes it is missing, so the shortfall is on the
+    /// answer rather than in a log line nobody reads. `CHRONIK_SQL_ALLOW_PARTIAL`
+    /// sets the default for a cluster that runs degraded on purpose.
+    #[serde(default)]
+    pub allow_partial: Option<bool>,
+}
+
+/// Whether this request accepts an answer missing the nodes that did not reply.
+///
+/// The request decides; `CHRONIK_SQL_ALLOW_PARTIAL=true` sets the default for a
+/// cluster that runs a node down on purpose, so its dashboards keep working
+/// without every caller being changed. Either way the answer is labelled
+/// `partial`, so allowing it is not the same as hiding it.
+pub fn allow_partial(request: &SqlRequest) -> bool {
+    if let Some(explicit) = request.allow_partial {
+        return explicit;
+    }
+    std::env::var("CHRONIK_SQL_ALLOW_PARTIAL")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "true" || v == "1" || v == "yes"
+        })
+        .unwrap_or(false)
 }
 
 /// Rows returned when neither the request nor the query says otherwise.
@@ -184,6 +213,17 @@ pub struct SqlResponse {
     pub execution_time_ms: u64,
     /// Whether results were truncated
     pub truncated: bool,
+    /// Whether this answer is missing one or more nodes' data.
+    ///
+    /// Distinct from `truncated`, which means "there was more and we cut it".
+    /// `partial` means "some of the cluster never answered, so a total here is
+    /// lower than the truth". Only ever true when the caller asked for a partial
+    /// answer with `allow_partial`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
+    /// The nodes missing from a `partial` answer, as `node N: reason`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_nodes: Vec<String>,
 }
 
 /// Error response
@@ -1114,6 +1154,8 @@ impl SqlHandler {
             rows,
             row_count,
             execution_time_ms,
+            partial: false,
+            incomplete_nodes: Vec::new(),
             truncated,
         })
     }
@@ -1140,6 +1182,38 @@ fn topic_matches_referenced(topic: &str, referenced: &HashSet<String>) -> bool {
 /// path. On a healthy cluster leadership is always known (the partition map is
 /// populated from Raft), so this returns `false` there and the fan-out is
 /// unchanged — it only diverges in the degraded, unpopulated-map state.
+/// The peers whose answers this query actually needs: those leading at least one
+/// partition of a topic it reads.
+///
+/// A fan-out goes to every peer, but each node's providers restrict it to the
+/// partitions it leads, so a peer leading nothing contributes nothing. On a
+/// cluster deliberately running a node short, that down node leads nothing —
+/// leadership failed over long ago — and treating its silence as data loss would
+/// refuse a query whose answer is complete. Returns `None` when the query's
+/// topics cannot be resolved, which means "cannot tell": the caller then treats
+/// every unanswered peer as load-bearing rather than guessing in the unsafe
+/// direction.
+async fn peers_this_query_needs(
+    state: &UnifiedApiState,
+    router: &super::query_router::QueryRouter,
+    sql: &str,
+) -> Option<HashSet<u64>> {
+    let referenced: HashSet<String> = referenced_base_tables(sql)?.into_iter().collect();
+    if referenced.is_empty() {
+        return None;
+    }
+    let topics = state.metadata_store.list_topics().await.ok()?;
+    let matched: HashSet<String> = topics
+        .into_iter()
+        .filter(|t| topic_matches_referenced(&t.name, &referenced))
+        .map(|t| t.name)
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    Some(router.peers_leading_any(&matched).await)
+}
+
 async fn query_topic_leadership_unknown(
     state: &UnifiedApiState,
     router: &super::query_router::QueryRouter,
@@ -1317,9 +1391,91 @@ pub async fn execute_sql(
                         limit: Some(fetch_limit),
                         ..request.clone()
                     };
-                    let peers: Vec<SqlResponse> = router
-                        .fan_out_post("/_sql", &fan_out_request, &all_peers)
+                    let fan_out = router
+                        .fan_out_post::<_, SqlResponse>("/_sql", &fan_out_request, &all_peers)
                         .await;
+
+                    // A node that did not answer must not be merged over.
+                    //
+                    // Issue #57: the fan-out used to drop a peer that timed out
+                    // or errored, and the merge then combined what was left into
+                    // a confident 200. On a cluster whose nodes were busy, every
+                    // peer dropped and `SELECT COUNT(*)` returned 0 — for a topic
+                    // holding 2.55M records, for half an hour, with no indication
+                    // anything was missing. Every merge here, aggregate or
+                    // row-wise, assumes it was given every node's contribution;
+                    // none of them can tell a node that said "nothing" from a
+                    // node that said nothing at all.
+                    //
+                    // So this refuses. A query that cannot be answered completely
+                    // gets an error naming the nodes that did not reply, which an
+                    // operator can act on, instead of a number they cannot tell
+                    // is wrong.
+                    // Only a peer that leads part of this query's data can make
+                    // the answer short. A peer that leads nothing was asked out
+                    // of simplicity and contributes nothing, so its silence is
+                    // not a reason to refuse — a cluster running a node down on
+                    // purpose would otherwise lose SQL entirely.
+                    let needed = peers_this_query_needs(&state, router, &request.query).await;
+                    let load_bearing: Vec<&super::query_router::PeerFailure> = fan_out
+                        .failures
+                        .iter()
+                        .filter(|f| needed.as_ref().is_none_or(|n| n.contains(&f.node_id)))
+                        .collect();
+                    if !fan_out.failures.is_empty() && load_bearing.is_empty() {
+                        debug!(
+                            query = %request.query,
+                            ignorable = %fan_out.failure_summary(),
+                            "Peers did not answer but lead none of this query's partitions"
+                        );
+                    }
+
+                    let mut missing_nodes: Vec<String> = Vec::new();
+                    if !load_bearing.is_empty() {
+                        let summary = load_bearing
+                            .iter()
+                            .map(|f| format!("node {}: {}", f.node_id, f.reason))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        if !allow_partial(&request) {
+                            warn!(
+                                query = %request.query,
+                                answered = fan_out.responses.len(),
+                                asked = all_peers.len(),
+                                failures = %summary,
+                                "Refusing a distributed SQL answer: not every node replied"
+                            );
+                            let error_response = SqlErrorResponse {
+                                error: format!(
+                                    "This query spans the cluster and {} of {} other node(s) did \
+                                     not answer, so any result would silently omit their data — a \
+                                     COUNT would come back short, not missing. Unanswered: {}. \
+                                     Retry once the nodes are reachable, raise \
+                                     CHRONIK_QUERY_TIMEOUT_SECS if they are merely slow under \
+                                     load, or re-send with \"allow_partial\": true to accept an \
+                                     answer labelled as missing them.",
+                                    load_bearing.len(),
+                                    all_peers.len(),
+                                    summary,
+                                ),
+                                error_type: "IncompleteClusterResult".to_string(),
+                            };
+                            return (StatusCode::SERVICE_UNAVAILABLE, Json(error_response))
+                                .into_response();
+                        }
+                        warn!(
+                            query = %request.query,
+                            failures = %summary,
+                            "Serving a partial SQL answer on request: totals are short by the \
+                             nodes that did not reply"
+                        );
+                        missing_nodes = load_bearing
+                            .iter()
+                            .map(|f| format!("node {}: {}", f.node_id, f.reason))
+                            .collect();
+                    }
+
+                    let peers = fan_out.responses;
                     debug!(peer_count = peers.len(), "Merging SQL results from peers");
 
                     // A grouped merge needs every node's whole contribution.
@@ -1369,7 +1525,7 @@ pub async fn execute_sql(
                         }
                     }
 
-                    match strategy {
+                    let mut merged_response = match strategy {
                         // The row-shaped merges finish themselves, because a
                         // HAVING or ORDER BY can name an AVG column that only
                         // exists once the totals have been divided.
@@ -1435,7 +1591,16 @@ pub async fn execute_sql(
                         super::query_router::SqlMerge::Unsupported(_) => {
                             unreachable!("refusals return above")
                         }
+                    };
+
+                    // Label an answer the caller agreed to take incomplete. The
+                    // merge functions cannot do this: they only ever see the
+                    // responses that arrived.
+                    if !missing_nodes.is_empty() {
+                        merged_response.partial = true;
+                        merged_response.incomplete_nodes = missing_nodes;
                     }
+                    merged_response
                 }
                 (_, _) => response,
             };
@@ -1443,6 +1608,7 @@ pub async fn execute_sql(
             info!(
                 rows = response.row_count,
                 time_ms = response.execution_time_ms,
+                partial = response.partial,
                 "SQL query completed"
             );
             (StatusCode::OK, Json(response)).into_response()
@@ -2254,5 +2420,107 @@ mod cold_json_column_tests {
         assert_eq!(sql_escape(r#"we"ird"#, '"'), r#"we""ird"#);
         assert_eq!(sql_escape("it's", '\''), "it''s");
         assert_eq!(sql_escape("plain", '"'), "plain");
+    }
+}
+
+/// Issue #57: a cluster query whose peers did not answer returned a merged
+/// number anyway — `COUNT(*)` came back 0 at HTTP 200 for a topic holding
+/// millions of records.
+#[cfg(test)]
+mod partial_answer_tests {
+    use super::*;
+
+    /// `CHRONIK_SQL_ALLOW_PARTIAL` is process-wide and cargo runs tests on
+    /// threads, so without this the tests below would set and clear the same
+    /// variable under each other and fail at random.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn request() -> SqlRequest {
+        SqlRequest {
+            query: "SELECT COUNT(*) FROM logs".to_string(),
+            limit: None,
+            timeout_secs: 30,
+            allow_partial: None,
+        }
+    }
+
+    /// The default has to be refusal. Anything else re-creates the reported
+    /// bug for every caller that does not know to ask.
+    #[test]
+    fn an_incomplete_answer_is_refused_unless_asked_for() {
+        let _g = ENV.lock().unwrap();
+        std::env::remove_var("CHRONIK_SQL_ALLOW_PARTIAL");
+        assert!(!allow_partial(&request()));
+    }
+
+    /// An operator who knows a node is down can still get a number, and the
+    /// response says what it is missing.
+    #[test]
+    fn a_caller_may_opt_in_per_request() {
+        let _g = ENV.lock().unwrap();
+        std::env::remove_var("CHRONIK_SQL_ALLOW_PARTIAL");
+        let mut req = request();
+        req.allow_partial = Some(true);
+        assert!(allow_partial(&req));
+    }
+
+    /// A request that explicitly says `false` must keep refusing even where the
+    /// cluster default allows it — the narrower statement wins.
+    #[test]
+    fn an_explicit_refusal_beats_the_cluster_default() {
+        let _g = ENV.lock().unwrap();
+        std::env::set_var("CHRONIK_SQL_ALLOW_PARTIAL", "true");
+        let mut req = request();
+        req.allow_partial = Some(false);
+        assert!(!allow_partial(&req));
+        std::env::remove_var("CHRONIK_SQL_ALLOW_PARTIAL");
+    }
+
+    #[test]
+    fn the_cluster_default_is_read_from_the_environment() {
+        let _g = ENV.lock().unwrap();
+        let req = request();
+        for yes in ["true", "TRUE", " yes ", "1"] {
+            std::env::set_var("CHRONIK_SQL_ALLOW_PARTIAL", yes);
+            assert!(allow_partial(&req), "{yes:?} should enable partial answers");
+        }
+        for no in ["false", "0", "no", "", "nonsense"] {
+            std::env::set_var("CHRONIK_SQL_ALLOW_PARTIAL", no);
+            assert!(
+                !allow_partial(&req),
+                "{no:?} must not enable partial answers"
+            );
+        }
+        std::env::remove_var("CHRONIK_SQL_ALLOW_PARTIAL");
+    }
+
+    /// `partial` and `truncated` are different claims and must serialize
+    /// separately: "we cut the tail off" is not "a node is missing from this
+    /// total". Both stay out of the JSON when there is nothing to report.
+    #[test]
+    fn partial_is_reported_separately_from_truncated() {
+        let mut resp = SqlResponse {
+            columns: vec!["c".into()],
+            rows: Vec::new(),
+            row_count: 0,
+            execution_time_ms: 1,
+            truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
+        };
+
+        let clean = serde_json::to_string(&resp).unwrap();
+        assert!(!clean.contains("partial"), "{clean}");
+        assert!(!clean.contains("incomplete_nodes"), "{clean}");
+
+        resp.partial = true;
+        resp.incomplete_nodes = vec!["node 3: peer returned HTTP 503".into()];
+        let labelled = serde_json::to_string(&resp).unwrap();
+        assert!(labelled.contains("\"partial\":true"), "{labelled}");
+        assert!(labelled.contains("node 3"), "{labelled}");
+        assert!(
+            labelled.contains("\"truncated\":false"),
+            "truncated must stay its own claim: {labelled}"
+        );
     }
 }

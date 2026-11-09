@@ -481,6 +481,33 @@ impl QueryRouter {
         )
     }
 
+    /// Node ids that lead at least one partition of any topic in `topics`.
+    ///
+    /// This is who a fan-out actually depends on. Each node's providers restrict
+    /// it to the partitions it leads, so a node leading none of the queried
+    /// topics contributes nothing and its silence costs nothing — refusing a
+    /// query because such a node is down would take a correct answer away. A
+    /// cluster running one node short on purpose is the normal case for that:
+    /// leadership has already failed over, the remaining nodes hold every
+    /// partition, and the answer is whole.
+    ///
+    /// `self_node_id` is excluded: this node answered locally.
+    pub async fn peers_leading_any(&self, topics: &HashSet<String>) -> HashSet<u64> {
+        let map = self.partition_map.read().await;
+        let mut leaders = HashSet::new();
+        for (topic, partitions) in &map.leaders {
+            if !topics.contains(topic) {
+                continue;
+            }
+            for leader in partitions.values() {
+                if *leader != self.self_node_id {
+                    leaders.insert(*leader);
+                }
+            }
+        }
+        leaders
+    }
+
     /// Refresh partition maps for all topics from the metadata store.
     ///
     /// Used by SQL handler before checking `all_topics_local()` to ensure
@@ -526,28 +553,48 @@ impl QueryRouter {
     ///
     /// - Sends the serialized request body to `{peer_url}{path}` with X-Chronik-Depth: 1
     /// - All peer requests run in parallel via tokio::spawn
-    /// - Graceful degradation: failed peers are logged but don't fail the request
     /// - ARS metrics: tracks outstanding requests and records response latency
-    /// - Returns Vec of successful peer responses
+    /// - Returns both the responses and the peers that did not answer
+    ///
+    /// The caller is handed the failures because only the caller knows what a
+    /// missing peer costs. Issue #57: this used to return just the responses,
+    /// so a peer that timed out, refused, or sent something unparseable was
+    /// logged at `warn` and dropped, and the merge then summed whatever was
+    /// left. `SELECT COUNT(*)` came back **0 with HTTP 200** on a loaded
+    /// cluster, non-converging, indistinguishable from an empty topic. A
+    /// relevance-ranked search can honestly serve a partial answer and say so;
+    /// an aggregate cannot.
     pub async fn fan_out_post<Req, Resp>(
         &self,
         path: &str,
         request_body: &Req,
         target_nodes: &[&PeerNode],
-    ) -> Vec<Resp>
+    ) -> FanOut<Resp>
     where
         Req: serde::Serialize + Send + Sync,
         Resp: serde::de::DeserializeOwned + Send + 'static,
     {
         if target_nodes.is_empty() {
-            return Vec::new();
+            return FanOut::default();
         }
 
         let body = match serde_json::to_vec(request_body) {
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "Failed to serialize fan-out request body");
-                return Vec::new();
+                // Nothing was asked of anyone, so every peer counts as failed:
+                // reporting zero failures here would tell the caller the
+                // cluster agreed with a local-only answer.
+                return FanOut {
+                    responses: Vec::new(),
+                    failures: target_nodes
+                        .iter()
+                        .map(|p| PeerFailure {
+                            node_id: p.node_id,
+                            reason: format!("request body could not be serialized: {e}"),
+                        })
+                        .collect(),
+                };
             }
         };
 
@@ -588,47 +635,136 @@ impl QueryRouter {
                                 latency_ms = start.elapsed().as_millis(),
                                 "Peer response received"
                             );
-                            Some(parsed)
+                            Ok(parsed)
                         }
                         Err(e) => {
                             if let Some(m) = metrics.get(&peer_id) {
                                 m.request_failed();
                             }
                             warn!(peer_id = peer_id, url = %url, error = %e, "Failed to parse peer response");
-                            None
+                            Err(format!("response could not be parsed: {e}"))
                         }
                     },
                     Ok(resp) => {
                         if let Some(m) = metrics.get(&peer_id) {
                             m.request_failed();
                         }
-                        warn!(peer_id = peer_id, url = %url, status = %resp.status(), "Peer returned error");
-                        None
+                        let status = resp.status();
+                        warn!(peer_id = peer_id, url = %url, status = %status, "Peer returned error");
+                        Err(format!("peer returned HTTP {status}"))
                     }
                     Err(e) => {
                         if let Some(m) = metrics.get(&peer_id) {
                             m.request_failed();
                         }
                         warn!(peer_id = peer_id, url = %url, error = %e, "Peer request failed");
-                        None
+                        Err(if e.is_timeout() {
+                            format!("peer did not answer within the query timeout: {e}")
+                        } else {
+                            format!("request failed: {e}")
+                        })
                     }
                 }
             });
 
-            handles.push(handle);
+            handles.push((peer.node_id, handle));
         }
 
-        let mut results = Vec::new();
-        for handle in handles {
+        let mut out = FanOut {
+            responses: Vec::with_capacity(handles.len()),
+            failures: Vec::new(),
+        };
+        for (node_id, handle) in handles {
             match handle.await {
-                Ok(Some(resp)) => results.push(resp),
-                Ok(None) => {} // Already logged
-                Err(e) => warn!(error = %e, "Peer task panicked"),
+                Ok(Ok(resp)) => out.responses.push(resp),
+                Ok(Err(reason)) => out.failures.push(PeerFailure { node_id, reason }),
+                Err(e) => {
+                    // A panicked task is still a peer that did not answer. It
+                    // was previously logged and forgotten, which is the same
+                    // silent under-count as a timeout.
+                    warn!(node_id, error = %e, "Peer task panicked");
+                    out.failures.push(PeerFailure {
+                        node_id,
+                        reason: format!("the task querying this peer panicked: {e}"),
+                    });
+                }
             }
         }
 
-        results
+        out
     }
+}
+
+/// A peer that was asked and did not answer usefully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerFailure {
+    pub node_id: u64,
+    pub reason: String,
+}
+
+/// The outcome of a fan-out: what answered, and what did not.
+///
+/// Both halves matter. A caller that looks only at `responses` is back to the
+/// behaviour that made `SELECT COUNT(*)` return 0 on a loaded cluster.
+#[derive(Debug, Clone)]
+pub struct FanOut<Resp> {
+    pub responses: Vec<Resp>,
+    pub failures: Vec<PeerFailure>,
+}
+
+impl<Resp> Default for FanOut<Resp> {
+    fn default() -> Self {
+        Self { responses: Vec::new(), failures: Vec::new() }
+    }
+}
+
+impl<Resp> FanOut<Resp> {
+    /// Whether every peer asked came back.
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// `node_id: reason; node_id: reason` for an error message or a log line.
+    pub fn failure_summary(&self) -> String {
+        self.failures
+            .iter()
+            .map(|f| format!("node {}: {}", f.node_id, f.reason))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// The responses, for a caller that has already decided what an incomplete
+    /// fan-out means for it. Named so that discarding the failures is a visible
+    /// choice at the call site rather than the default.
+    pub fn into_responses_ignoring_failures(self) -> Vec<Resp> {
+        self.responses
+    }
+
+    /// Split into the responses and the `node N: reason` lines, for a caller
+    /// that serves a partial answer and reports which nodes are missing from it.
+    pub fn into_parts(self) -> (Vec<Resp>, Vec<String>) {
+        let notes = self
+            .failures
+            .iter()
+            .map(|f| format!("node {}: {}", f.node_id, f.reason))
+            .collect();
+        (self.responses, notes)
+    }
+}
+
+/// Record unanswered peers in the Elasticsearch `_shards` counters.
+///
+/// `merge_search_responses` sums `_shards` over the nodes that *replied*, so a
+/// node that never answered left `failed` at zero and the response claimed every
+/// shard succeeded. ES's own contract for a partial result is `_shards.failed`,
+/// which is what a client checks, so that is what this sets.
+pub fn note_unanswered_peers(resp: &mut chronik_search::api::SearchResponse, unanswered: usize) {
+    if unanswered == 0 {
+        return;
+    }
+    let missing = unanswered as u32;
+    resp._shards.total = resp._shards.total.saturating_add(missing);
+    resp._shards.failed = resp._shards.failed.saturating_add(missing);
 }
 
 // ============================================================================
@@ -693,6 +829,8 @@ pub fn merge_vector_responses(
         execution_time_ms,
         reranked: any_reranked,
         model,
+        // The caller sets this: only it knows which peers it asked.
+        incomplete_nodes: Vec::new(),
     }
 }
 
@@ -755,6 +893,8 @@ pub fn merge_hybrid_responses(
         execution_time_ms,
         reranked: any_reranked,
         model,
+        // The caller sets this: only it knows which peers it asked.
+        incomplete_nodes: Vec::new(),
     }
 }
 
@@ -799,6 +939,8 @@ pub fn merge_sql_responses(
         rows: all_rows,
         row_count,
         execution_time_ms,
+        partial: false,
+        incomplete_nodes: Vec::new(),
         truncated,
     }
 }
@@ -3243,6 +3385,8 @@ pub fn merge_scalar_aggregate(
         rows: vec![merged],
         row_count: 1,
         execution_time_ms,
+        partial: false,
+        incomplete_nodes: Vec::new(),
         truncated: false,
     }
 }
@@ -3309,6 +3453,8 @@ pub async fn run_finish_sql(
         rows,
         row_count,
         execution_time_ms,
+        partial: false,
+        incomplete_nodes: Vec::new(),
         truncated,
     })
 }
@@ -3507,6 +3653,8 @@ pub fn merge_grouped_aggregate(
         rows,
         row_count,
         execution_time_ms,
+        partial: false,
+        incomplete_nodes: Vec::new(),
         truncated,
     }
 }
@@ -3693,6 +3841,7 @@ mod tests {
             execution_time_ms: 10,
             reranked: false,
             model: None,
+            incomplete_nodes: Vec::new(),
         };
 
         let peer = VectorSearchResponse {
@@ -3717,6 +3866,7 @@ mod tests {
             execution_time_ms: 15,
             reranked: false,
             model: None,
+            incomplete_nodes: Vec::new(),
         };
 
         let merged = merge_vector_responses(local, vec![peer], 10);
@@ -3750,6 +3900,7 @@ mod tests {
             execution_time_ms: 5,
             reranked: false,
             model: None,
+            incomplete_nodes: Vec::new(),
         };
 
         let peer = VectorSearchResponse {
@@ -3764,6 +3915,7 @@ mod tests {
             execution_time_ms: 8,
             reranked: false,
             model: None,
+            incomplete_nodes: Vec::new(),
         };
 
         let merged = merge_vector_responses(local, vec![peer], 2); // k=2
@@ -3789,6 +3941,7 @@ mod tests {
             execution_time_ms: 20,
             reranked: false,
             model: None,
+            incomplete_nodes: Vec::new(),
         };
 
         let peer = HybridSearchResponse {
@@ -3806,6 +3959,7 @@ mod tests {
             execution_time_ms: 25,
             reranked: false,
             model: None,
+            incomplete_nodes: Vec::new(),
         };
 
         let merged = merge_hybrid_responses(local, vec![peer], 10);
@@ -3828,6 +3982,8 @@ mod tests {
             row_count: 1,
             execution_time_ms: 10,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
 
         let peer = SqlResponse {
@@ -3841,6 +3997,8 @@ mod tests {
             row_count: 1,
             execution_time_ms: 12,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
 
         let merged = merge_sql_responses(local, vec![peer], 100, &MergePlan::default());
@@ -3868,6 +4026,8 @@ mod tests {
             row_count: 2,
             execution_time_ms: 5,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
 
         let peer = SqlResponse {
@@ -3880,6 +4040,8 @@ mod tests {
             row_count: 1,
             execution_time_ms: 8,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
 
         let merged = merge_sql_responses(local, vec![peer], 2, &MergePlan::default()); // limit=2
@@ -4291,7 +4453,7 @@ mod partition_ownership_tests {
     use super::*;
 
     /// A router with a known partition map and no peers to talk to.
-    fn router_with(self_node_id: u64, leaders: &[(&str, &[(u32, u64)])]) -> QueryRouter {
+    pub(super) fn router_with(self_node_id: u64, leaders: &[(&str, &[(u32, u64)])]) -> QueryRouter {
         let mut map = PartitionMap::default();
         for (topic, entries) in leaders {
             let per_topic: HashMap<u32, u64> = entries.iter().copied().collect();
@@ -4390,6 +4552,161 @@ mod partition_ownership_tests {
     }
 }
 
+/// Issue #57: a fan-out that lost peers reported only what came back, and the
+/// merge turned that into a confident wrong number.
+#[cfg(test)]
+mod fan_out_completeness_tests {
+    use super::*;
+
+    /// A fan-out with nothing missing is complete, and that is what lets a
+    /// merge be trusted.
+    #[test]
+    fn a_full_fan_out_is_complete() {
+        let fan_out: FanOut<u8> = FanOut { responses: vec![1, 2], failures: Vec::new() };
+        assert!(fan_out.is_complete());
+        assert_eq!(fan_out.failure_summary(), "");
+    }
+
+    /// The failure has to survive to the caller. Returning the responses alone
+    /// is what let `SELECT COUNT(*)` answer 0 for a topic holding 2.55M records.
+    #[test]
+    fn a_lost_peer_is_reported_not_dropped() {
+        let fan_out: FanOut<u8> = FanOut {
+            responses: vec![7],
+            failures: vec![
+                PeerFailure { node_id: 2, reason: "peer returned HTTP 503".into() },
+                PeerFailure {
+                    node_id: 3,
+                    reason: "peer did not answer within the query timeout".into(),
+                },
+            ],
+        };
+
+        assert!(
+            !fan_out.is_complete(),
+            "two peers did not answer, so this answer is not the cluster's"
+        );
+
+        let summary = fan_out.failure_summary();
+        assert!(summary.contains("node 2"), "{summary}");
+        assert!(summary.contains("node 3"), "{summary}");
+        assert!(
+            summary.contains("timeout"),
+            "the reason has to reach the operator, not just the count: {summary}"
+        );
+
+        // And the partial-answer path keeps one line per node.
+        let (responses, missing) = fan_out.into_parts();
+        assert_eq!(responses, vec![7]);
+        assert_eq!(missing.len(), 2);
+    }
+
+    /// An empty target list is not a failure: there was no one to ask.
+    #[test]
+    fn asking_nobody_is_complete() {
+        let fan_out: FanOut<u8> = FanOut::default();
+        assert!(fan_out.is_complete());
+        assert!(fan_out.responses.is_empty());
+    }
+
+    /// Which peers a query actually depends on. A node that leads none of the
+    /// queried partitions contributes nothing, so refusing a query because it
+    /// is down would take away an answer that is in fact complete — the shape
+    /// of a cluster deliberately running one node short, where leadership has
+    /// already failed over to the nodes that remain.
+    #[tokio::test]
+    async fn only_peers_leading_the_queried_data_are_load_bearing() {
+        // Node 3 is down and leads nothing; 1 and 2 share the partitions.
+        let router = super::partition_ownership_tests::router_with(
+            1,
+            &[("orders", &[(0, 1), (1, 2), (2, 2)][..])],
+        );
+
+        let needed = router
+            .peers_leading_any(&HashSet::from(["orders".to_string()]))
+            .await;
+        assert_eq!(
+            needed,
+            HashSet::from([2]),
+            "only node 2 leads data this node does not; node 3 leads nothing and \
+             this node itself answered locally"
+        );
+        assert!(
+            !needed.contains(&3),
+            "a node that leads no partition must not be able to refuse the query"
+        );
+        assert!(
+            !needed.contains(&1),
+            "the coordinator answers locally, so it is never its own peer"
+        );
+
+        // A topic the query does not touch must not drag its leaders in.
+        let other = router
+            .peers_leading_any(&HashSet::from(["unrelated".to_string()]))
+            .await;
+        assert!(other.is_empty());
+    }
+
+    /// And once a down node does lead part of the data, it becomes load-bearing
+    /// again — this is the case that must refuse.
+    #[tokio::test]
+    async fn a_peer_leading_queried_data_is_load_bearing() {
+        let router = super::partition_ownership_tests::router_with(
+            1,
+            &[("orders", &[(0, 1), (1, 2), (2, 3)][..])],
+        );
+        let needed = router
+            .peers_leading_any(&HashSet::from(["orders".to_string()]))
+            .await;
+        assert_eq!(needed, HashSet::from([2, 3]));
+    }
+
+    /// `_shards.failed` is how an Elasticsearch client learns an answer is
+    /// partial. `merge_search_responses` sums the shards of the nodes that
+    /// *replied*, so without this a search missing a whole node still claimed
+    /// every shard succeeded.
+    #[test]
+    fn unanswered_peers_show_up_in_the_shard_counters() {
+        fn resp(total: u32, successful: u32) -> chronik_search::api::SearchResponse {
+            chronik_search::api::SearchResponse {
+                took: 1,
+                timed_out: false,
+                _shards: chronik_search::api::ShardInfo {
+                    total,
+                    successful,
+                    skipped: 0,
+                    failed: 0,
+                },
+                hits: chronik_search::api::HitsInfo {
+                    total: chronik_search::api::TotalHits {
+                        value: 0,
+                        relation: "eq".to_string(),
+                    },
+                    max_score: None,
+                    hits: Vec::new(),
+                },
+                aggregations: None,
+            }
+        }
+
+        let mut complete = resp(3, 3);
+        note_unanswered_peers(&mut complete, 0);
+        assert_eq!(complete._shards.failed, 0);
+        assert_eq!(complete._shards.total, 3, "nothing missing, nothing added");
+
+        let mut partial = resp(2, 2);
+        note_unanswered_peers(&mut partial, 2);
+        assert_eq!(
+            partial._shards.failed, 2,
+            "a client checking _shards.failed must see the two nodes that went missing"
+        );
+        assert_eq!(
+            partial._shards.total, 4,
+            "and total must count the shards that were supposed to answer"
+        );
+    }
+}
+
 #[cfg(test)]
 mod sql_merge_tests {
     use super::*;
@@ -4408,6 +4725,8 @@ mod sql_merge_tests {
             rows,
             execution_time_ms: 1,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         }
     }
 
@@ -4545,6 +4864,8 @@ mod sql_merge_tests {
             row_count: 1,
             execution_time_ms: 0,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
         finish_derived(&mut merged, &post.derived);
         assert_eq!(merged.columns, vec!["avg_amount".to_string()]);
@@ -4570,6 +4891,8 @@ mod sql_merge_tests {
             row_count: 1,
             execution_time_ms: 0,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
         finish_derived(&mut merged, &derived);
         assert!(merged.rows[0]["a"].is_null());
@@ -4828,6 +5151,8 @@ mod sql_merge_tests {
             row_count: 0,
             execution_time_ms: 0,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
         let merged = merge_grouped_aggregate(
             as_resp(vec![of("a"), of("b")]),
@@ -4864,6 +5189,8 @@ mod sql_merge_tests {
             row_count: 0,
             execution_time_ms: 0,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
         // ann appears on day 1 from two nodes; day 2 has only bob.
         let merged = merge_grouped_aggregate(
@@ -5227,6 +5554,8 @@ mod sql_merge_tests {
             row_count: 0,
             execution_time_ms: 0,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
 
         // 30 over 3 rows here, 70 over 7 there: the true average is 10, while
@@ -5292,6 +5621,8 @@ mod sql_merge_tests {
             row_count: 0,
             execution_time_ms: 0,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
         let merged = merge_grouped_aggregate(
             as_resp(vec![bucket(1, 1), bucket(2, 1)]),
@@ -5429,6 +5760,8 @@ mod sql_merge_tests {
             row_count: 1,
             execution_time_ms: 0,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
 
         // 10 over 3 and 90 over 7: the true average is 10, and the mean of the
@@ -5466,6 +5799,8 @@ mod sql_merge_tests {
             row_count: 0,
             execution_time_ms: 0,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
 
         let merged = merge_grouped_aggregate(
@@ -5938,6 +6273,8 @@ mod finish_sql_tests {
             row_count: 1,
             execution_time_ms: 1,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
         finish_derived(&mut merged, &post.derived);
 
@@ -5993,6 +6330,8 @@ mod finish_sql_tests {
             row_count: 1,
             execution_time_ms: 1,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
         finish_derived(&mut merged, &post.derived);
 
@@ -6106,6 +6445,8 @@ mod ordering_merge_tests {
             row_count: 1,
             execution_time_ms: 1,
             truncated: false,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         };
         let peers = vec![
             SqlResponse {
@@ -6114,6 +6455,8 @@ mod ordering_merge_tests {
                 row_count: 1,
                 execution_time_ms: 1,
                 truncated: false,
+                partial: false,
+                incomplete_nodes: Vec::new(),
             },
             SqlResponse {
                 columns: vec!["k".to_string(), "m".to_string()],
@@ -6121,6 +6464,8 @@ mod ordering_merge_tests {
                 row_count: 1,
                 execution_time_ms: 1,
                 truncated: false,
+                partial: false,
+                incomplete_nodes: Vec::new(),
             },
         ];
         let merged = merge_grouped_aggregate(
@@ -6188,6 +6533,8 @@ mod top_k_tests {
             rows,
             execution_time_ms: 1,
             truncated,
+            partial: false,
+            incomplete_nodes: Vec::new(),
         }
     }
 

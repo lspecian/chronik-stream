@@ -129,6 +129,15 @@ pub struct VectorSearchResponse {
     /// VO-5: Model ID that was searched
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Nodes that were asked and did not answer, as `node N: reason`.
+    ///
+    /// A nearest-neighbour search is ranked and approximate, so a partial answer
+    /// is still useful — but only if the caller can tell that it is partial.
+    /// Issue #57: an unanswered peer was dropped silently, so a search missing a
+    /// third of the cluster looked exactly like one where those vectors did not
+    /// match. Present only when something went wrong.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_nodes: Vec<String>,
 }
 
 /// Single search result item
@@ -410,6 +419,7 @@ pub async fn search(
                 execution_time_ms,
                 reranked,
                 model: request.model.clone(),
+                incomplete_nodes: Vec::new(),
             };
 
             // Distributed fan-out: merge results from peer nodes
@@ -419,11 +429,23 @@ pub async fn search(
             let response = if needs_fan_out(&state, &headers, &topic).await {
                 let router = state.query_router.as_ref().unwrap();
                 let nodes = router.all_peers();
-                let peers: Vec<VectorSearchResponse> = router
-                    .fan_out_post(&format!("/_vector/{}/search", topic), &fan_out_request, &nodes)
-                    .await;
+                let (peers, missing) = router
+                    .fan_out_post::<_, VectorSearchResponse>(
+                        &format!("/_vector/{}/search", topic),
+                        &fan_out_request,
+                        &nodes,
+                    )
+                    .await
+                    .into_parts();
+                if !missing.is_empty() {
+                    tracing::warn!(topic = %topic, missing = %missing.join("; "),
+                          "Serving a partial vector search: some nodes did not answer");
+                }
                 debug!(topic = %topic, peer_count = peers.len(), "Merging vector search from peers");
-                super::query_router::merge_vector_responses(response, peers, fan_out_request.k)
+                let mut merged =
+                    super::query_router::merge_vector_responses(response, peers, fan_out_request.k);
+                merged.incomplete_nodes = missing;
+                merged
             } else {
                 response
             };
@@ -510,6 +532,7 @@ pub async fn search_by_vector(
                 execution_time_ms,
                 reranked: false,
                 model: request.model.clone(),
+                incomplete_nodes: Vec::new(),
             };
 
             // Distributed fan-out: merge results from peer nodes
@@ -517,11 +540,23 @@ pub async fn search_by_vector(
             let response = if needs_fan_out(&state, &headers, &topic).await {
                 let router = state.query_router.as_ref().unwrap();
                 let nodes = router.all_peers();
-                let peers: Vec<VectorSearchResponse> = router
-                    .fan_out_post(&format!("/_vector/{}/search_by_vector", topic), &fan_out_request, &nodes)
-                    .await;
+                let (peers, missing) = router
+                    .fan_out_post::<_, VectorSearchResponse>(
+                        &format!("/_vector/{}/search_by_vector", topic),
+                        &fan_out_request,
+                        &nodes,
+                    )
+                    .await
+                    .into_parts();
+                if !missing.is_empty() {
+                    tracing::warn!(topic = %topic, missing = %missing.join("; "),
+                          "Serving a partial vector search: some nodes did not answer");
+                }
                 debug!(topic = %topic, peer_count = peers.len(), "Merging vector-by-vector search from peers");
-                super::query_router::merge_vector_responses(response, peers, fan_out_request.k)
+                let mut merged =
+                    super::query_router::merge_vector_responses(response, peers, fan_out_request.k);
+                merged.incomplete_nodes = missing;
+                merged
             } else {
                 response
             };
@@ -786,6 +821,10 @@ pub struct HybridSearchResponse {
     /// VO-5: Model ID that was searched
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Nodes that were asked and did not answer, as `node N: reason`. See
+    /// [`VectorSearchResponse::incomplete_nodes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_nodes: Vec<String>,
 }
 
 /// Single hybrid search result item
@@ -1119,6 +1158,7 @@ pub async fn hybrid_search(
         execution_time_ms,
         reranked,
         model: request.model.clone(),
+        incomplete_nodes: Vec::new(),
     };
 
     // Distributed fan-out: merge results from peer nodes
@@ -1126,11 +1166,23 @@ pub async fn hybrid_search(
     let response = if needs_fan_out(&state, &headers, &topic).await {
         let router = state.query_router.as_ref().unwrap();
         let nodes = router.all_peers();
-        let peers: Vec<HybridSearchResponse> = router
-            .fan_out_post(&format!("/_vector/{}/hybrid", topic), &fan_out_request, &nodes)
-            .await;
+        let (peers, missing) = router
+            .fan_out_post::<_, HybridSearchResponse>(
+                &format!("/_vector/{}/hybrid", topic),
+                &fan_out_request,
+                &nodes,
+            )
+            .await
+            .into_parts();
+        if !missing.is_empty() {
+            tracing::warn!(topic = %topic, missing = %missing.join("; "),
+                  "Serving a partial hybrid search: some nodes did not answer");
+        }
         debug!(topic = %topic, peer_count = peers.len(), "Merging hybrid search from peers");
-        super::query_router::merge_hybrid_responses(response, peers, fan_out_request.k)
+        let mut merged =
+            super::query_router::merge_hybrid_responses(response, peers, fan_out_request.k);
+        merged.incomplete_nodes = missing;
+        merged
     } else {
         response
     };
