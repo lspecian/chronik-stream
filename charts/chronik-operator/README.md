@@ -40,6 +40,28 @@ $ kubectl get chronikcluster foo -o jsonpath='{.spec.fixDataOwnership}'
 Apply `crds/` before upgrading, and after upgrading confirm a newly added field
 survives a write.
 
+### 0.3.2 restarts every broker
+
+Upgrading to **0.3.2 rolls every Pod of every cluster this operator manages**,
+once per Pod, as the new operator takes leadership. Plan it like a cluster
+restart: brokers come back one boot later, and on a data-heavy cluster a boot can
+take minutes.
+
+The reason is the fix itself. Brokers gained a `startupProbe`, because the
+liveness probe was killing them while they were still starting — a broker holding
+~5,600 topics took 114s to open its Kafka port against a liveness budget of ~95s
+and was SIGKILLed 5 seconds after becoming ready, 710 times, never serving a
+request. A probe is not a field in the `ChronikCluster` spec, so the spec hash
+that decides whether a Pod is recreated would not have moved and the fix would
+have reached no existing broker. `POD_SHAPE_GENERATION` is mixed into that hash
+and bumped here to force it through.
+
+Every broker currently running carries the old probe and is one restart away from
+the same crash-loop, so the roll is the point rather than a side effect — but do
+it when you are watching.
+
+Later chart versions do not roll Pods unless their notes say so.
+
 ## Rolling a new operator version
 
 The operator decides whether to recreate a broker Pod by comparing a hash of
