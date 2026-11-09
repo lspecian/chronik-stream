@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.0] - 2026-11-09
+
 ### Fixed
 
 - **A cold search index could never be built for a topic once its segments grew
@@ -70,6 +72,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the whole set, and a build whose document count disagrees with the segment
   metadata is refused rather than published as an index that cannot answer for
   its own offset range.
+
+- **The operator's liveness probe killed brokers that were still starting
+  (operator chart 0.3.2).** A broker opens its Kafka port only at the end of
+  boot, after replaying the WAL, restoring watermarks and populating the
+  metadata catalog — so on a cluster with many topics the liveness probe raced
+  the boot and won. A broker holding ~5,600 topics took **114 seconds** to open
+  port 9092 against a liveness budget of ~95 seconds, and was SIGKILLed 5 seconds
+  after becoming ready. It never served a request in **710 restarts**, and the
+  cluster sat `Degraded` 2/3 for days. Both Pod shapes now carry a
+  `startupProbe`, which suspends liveness and readiness until the port opens, so
+  liveness goes back to meaning "this process hung *after* starting". Budget is
+  10 minutes, sized from the measurement rather than taste.
+
+  Because this is a Pod field the CRD says nothing about, the spec hash would not
+  have changed and the fix would have reached nobody — Pods are only recreated
+  when the hash moves. A `POD_SHAPE_GENERATION` counter is now mixed into both
+  the cluster and standalone hashes, bumped to 2 here, which makes this a
+  **rolling restart of every managed cluster on upgrade**. That is deliberate:
+  every broker already running carries the old probe and is one restart away from
+  the same crash-loop, so a supervised roll now is better than each cluster
+  discovering it later. Bumping that counter is from here on the documented way
+  to force an operator-side Pod change onto existing clusters.
 
 ### Changed
 
