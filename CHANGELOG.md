@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cold search index could never be built for a topic once its segments grew
+  past one Tantivy flush (#57).** Building a cold index committed the on-disk
+  index and then tarred its directory while the `IndexWriter` was still alive.
+  Tantivy merges on background threads, and a finished merge deletes the segment
+  files it merged away; tar lists a directory and *then* opens each entry, so a
+  file removed in between failed the whole archive with a bare
+  `Failed to add index to tar: No such file or directory (os error 2)`. The
+  trigger is size, not topic — a small topic on the identical binary indexed
+  fine, which is why the original report looked topic-specific. Reproduced with
+  120,000 records in one partition, where the released v2.15.1 fails every pass
+  and leaves the content unsearchable. The writer's merge threads are now joined
+  before anything reads the directory, the archive is rebuilt rather than
+  abandoned if a file does vanish under it, and a failure now names the directory
+  and what it holds instead of a bare errno. The gzip stream is also explicitly
+  finished: the previous code let the encoder flush on drop, which discards the
+  error, so a truncated archive would have surfaced later as a corrupt segment.
+
+- **A failed segment was re-indexed every pass forever, which starved
+  `acks=all` produce (#57).** A segment whose pass errored is deliberately not
+  recorded as indexed, so it is retried — correct for a transient failure, and
+  ruinous for a permanent one. One segment that could not build its index was
+  re-read, re-tokenized, re-uploaded and re-written every 30 seconds
+  indefinitely, and that I/O was enough to time out produce on the whole broker.
+  Retries now back off, doubling per consecutive failure, and a segment that
+  fails `MAX_SEGMENT_ATTEMPTS` times is quarantined with a log line that says so.
+  Nothing is deleted: the WAL copy is kept, so the records are still served and
+  still replicated — what stops is the pointless re-indexing. A restart clears
+  the state, because a new binary deserves a fresh attempt.
+
+- **A distributed query merged whatever came back and reported it as the
+  cluster's answer (#57).** The fan-out logged a peer that timed out, refused or
+  sent something unparseable, then dropped it, and the merge combined what was
+  left into a confident `200`. On a loaded cluster this returned
+  `SELECT COUNT(*)` totals short by whatever the missing nodes held, with
+  nothing in the response to say so — measured here at **20,425 of 30,000
+  records** against ground truth taken from Kafka's own end offsets. Every merge,
+  aggregate or row-wise, assumes it was given every node's contribution and
+  cannot tell a node that returned nothing from a node that never answered.
+  `/_sql` now refuses with `503 IncompleteClusterResult`, naming the nodes that
+  did not reply. Passing `"allow_partial": true` (or setting
+  `CHRONIK_SQL_ALLOW_PARTIAL`) still answers, with `partial: true` and the
+  missing nodes listed on the response — allowing a short answer is not the same
+  as hiding one. Only a peer that leads part of the queried data can refuse a
+  query: a node that is down but leads nothing contributes nothing, so a cluster
+  running deliberately short keeps working.
+
+- **A partial `/_search` claimed every shard succeeded.** `_shards` was summed
+  over the nodes that replied, so a node that never answered left `failed` at
+  zero. Unanswered peers are now counted in `_shards.total` and `_shards.failed`,
+  which is what an Elasticsearch client checks. `/_vector` and `/_vector/hybrid`
+  responses gained `incomplete_nodes` for the same reason: a ranked search can
+  honestly serve a partial answer, but only if the caller can tell it is partial.
+
+- **A cold index silently dropped everything past its first million documents,
+  and a range read everything past its first ten thousand.** The index build
+  copied documents through a scoring collector capped at 1,000,000, and
+  `query_by_offset_range` collected the "top" 10,000 — of documents that carry no
+  score to rank by, so the cap only decided how much to discard. Both now cover
+  the whole set, and a build whose document count disagrees with the segment
+  metadata is refused rather than published as an index that cannot answer for
+  its own offset range.
+
+### Changed
+
+- `tests/cluster/start.sh` honours `CHRONIK_BIN`, so a fix can be run against the
+  released artifact that still has the bug without overwriting the local build.
+
 ## [2.15.1] - 2026-11-07
 
 ### Fixed
