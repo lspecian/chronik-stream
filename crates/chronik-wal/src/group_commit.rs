@@ -335,6 +335,39 @@ impl GroupCommitConfig {
 }
 
 /// A pending write waiting for group commit
+/// The durability half of a write whose enqueue has already happened.
+///
+/// Returned by [`GroupCommitWal::append_enqueued`]. Dropping it without
+/// waiting is safe — the record is still committed by the background worker —
+/// it just means nobody hears about the fsync.
+#[must_use = "a CommitWait that is never awaited does not confirm the record is durable"]
+pub struct CommitWait {
+    /// `None` for acks=0, which asked not to be told.
+    rx: Option<oneshot::Receiver<Result<()>>>,
+    /// Held so a failed commit can clear the tail cache, as `append` always did.
+    queue: Option<Arc<PartitionCommitQueue>>,
+}
+
+impl CommitWait {
+    /// Wait until the record is fsynced (immediately `Ok` for acks=0).
+    pub async fn wait(self) -> Result<()> {
+        let Some(rx) = self.rx else {
+            return Ok(());
+        };
+        let result = rx
+            .await
+            .map_err(|_| WalError::CommitFailed("Response channel closed".into()))
+            .and_then(|r| r);
+        if result.is_err() {
+            // The log does not have this record, so neither may the cache.
+            if let Some(queue) = self.queue {
+                queue.tail.lock().await.clear();
+            }
+        }
+        result
+    }
+}
+
 struct PendingWrite {
     /// Pre-serialized WAL record data
     data: Bytes,
@@ -851,6 +884,30 @@ impl GroupCommitWal {
         record: WalRecord,
         acks: i16,
     ) -> Result<()> {
+        self.append_enqueued(topic, partition, record, acks)
+            .await?
+            .wait()
+            .await
+    }
+
+    /// Put a record in this partition's commit queue and return without waiting
+    /// for it to be fsynced; await the returned [`CommitWait`] for that.
+    ///
+    /// The queue is FIFO, so **the order in which callers return from this is
+    /// the order the records land in the file.** That is what a caller needs
+    /// when it hands out offsets: it can reserve an offset range and enqueue
+    /// the record under one lock, so file order matches offset order, and then
+    /// release the lock before waiting on the fsync — which keeps writers from
+    /// different requests sharing a group commit instead of queueing behind
+    /// each other's fsyncs. With `append`, reserving-then-enqueueing could only
+    /// be made atomic by holding the lock across the fsync.
+    pub async fn append_enqueued(
+        &self,
+        topic: String,
+        partition: i32,
+        record: WalRecord,
+        acks: i16,
+    ) -> Result<CommitWait> {
         // v2.2.10: Extract offset metadata from WalRecord before serialization (for async response callbacks)
         let (base_offset, last_offset) = match &record {
             WalRecord::V2 { base_offset, last_offset, .. } => (*base_offset, *last_offset),
@@ -877,9 +934,13 @@ impl GroupCommitWal {
 
         // Handle acks=0 (fire-and-forget)
         let result = if acks == 0 {
-            self.enqueue_nowait(Arc::clone(&queue), data.into(), base_offset, last_offset).await
+            self.enqueue_nowait(Arc::clone(&queue), data.into(), base_offset, last_offset)
+                .await
+                .map(|()| CommitWait { rx: None, queue: None })
         } else {
-            self.enqueue_and_wait(Arc::clone(&queue), data.into(), data_len, base_offset, last_offset).await
+            self.enqueue_with_receipt(Arc::clone(&queue), data.into(), data_len, base_offset, last_offset)
+                .await
+                .map(|rx| CommitWait { rx: Some(rx), queue: Some(Arc::clone(&queue)) })
         };
 
         if result.is_err() {
@@ -944,14 +1005,18 @@ impl GroupCommitWal {
     /// - Before: 4 separate lock acquisitions (backpressure check, enqueue, bytes update, commit check)
     /// - After: 1 lock acquisition combining all operations
     /// - Expected gain: 2-4x throughput at high concurrency
-    async fn enqueue_and_wait(
+    /// Enqueue a write that wants an fsync confirmation, and return the receiver
+    /// that will carry it. Waiting is the caller's business (see [`CommitWait`]),
+    /// so the enqueue itself is short and its position in the queue is fixed on
+    /// return.
+    async fn enqueue_with_receipt(
         &self,
         queue: Arc<PartitionCommitQueue>,
         data: Bytes,
         data_len: usize,
         base_offset: i64,  // v2.2.10: For async response callbacks
         last_offset: i64,  // v2.2.10: For async response callbacks
-    ) -> Result<()> {
+    ) -> Result<oneshot::Receiver<Result<()>>> {
         debug!("🟢 ENQUEUE_START: Enqueuing write with {} bytes", data_len);
 
         // Skip backpressure check for critical Raft topics
@@ -1004,12 +1069,7 @@ impl GroupCommitWal {
             info!("⚡ ENQUEUE_IMMEDIATE: Triggering immediate commit due to batch size");
         }
 
-        // Wait for commit confirmation
-        info!("⏳ ENQUEUE_WAIT: Waiting for fsync confirmation on oneshot channel...");
-        let result = rx.await
-            .map_err(|_| WalError::CommitFailed("Response channel closed".into()))?;
-        info!("✅ ENQUEUE_DONE: Fsync confirmed! Returning success to caller");
-        result
+        Ok(rx)
     }
 
     /// Get or create a partition queue

@@ -384,6 +384,9 @@ pub(crate) struct PartitionState {
     pending_batches: Arc<SegQueue<BufferedBatch>>,
     /// Last flush time
     last_flush: Arc<Mutex<Instant>>,
+    /// Held from offset reservation until the batch is in the WAL queue, so
+    /// the log holds batches in offset order. See `produce_to_partition`.
+    append_lock: Mutex<()>,
 }
 
 impl PartitionState {
@@ -1126,6 +1129,7 @@ impl ProduceHandler {
                 segment_size: AtomicU64::new(0),
                 pending_batches: Arc::new(SegQueue::new()),
                 last_flush: Arc::new(Mutex::new(Instant::now())),
+                append_lock: Mutex::new(()),
             };
 
             // Insert into partition_states (wrap in Arc)
@@ -1263,6 +1267,7 @@ impl ProduceHandler {
             segment_size: AtomicU64::new(0),
             pending_batches: Arc::new(SegQueue::new()),
             last_flush: Arc::new(Mutex::new(Instant::now())),
+            append_lock: Mutex::new(()),
         })
     }
     /// Create a new produce handler
@@ -2355,6 +2360,28 @@ impl ProduceHandler {
                 .await?;
         }
 
+        // From here until the batch is in the WAL queue, this request holds the
+        // partition's append lock, so batches enter the log in offset order.
+        //
+        // Without it, the offset range was reserved here and the WAL append
+        // happened several awaits later. With up to five requests in flight per
+        // partition (the Java producer's default), a later range could reach the
+        // WAL first, leaving the log holding e.g. 7552 before 7549..7551. Every
+        // reader walks the WAL in file order and serves the first batch at or
+        // past the requested offset, so a consumer asking for 7549 was handed
+        // 7552 and never saw 7549..7551 — records that were acknowledged, are on
+        // disk, and that SQL counts, unreachable through Fetch. Measured with a
+        // stock producer and no faults at all: max.in.flight=1 lost nothing,
+        // max.in.flight=5 lost a few records per 30,000, and whole 148-record
+        // batches when produce requests were timing out.
+        //
+        // Taken AFTER the sequence check, never before: that check can wait for
+        // an earlier in-flight batch of the same producer, which would need this
+        // lock to make progress. Released right after the enqueue (below), so
+        // the fsync and the acks=all ISR wait happen outside it and concurrent
+        // requests still share a group commit.
+        let append_guard = partition_state.append_lock.lock().await;
+
         // ATOMIC: Reserve offset range in ONE operation (prevents race conditions)
         let base_offset = partition_state.next_offset.fetch_add(record_count, Ordering::SeqCst);
 
@@ -2624,6 +2651,9 @@ impl ProduceHandler {
                                            topic, partition, e);
                                     return Err(Error::Internal(format!("WAL write failed: {}", e)));
                                 }
+                                // In the queue, so its place in the log is fixed:
+                                // let the next request reserve and enqueue.
+                                drop(append_guard);
 
                                 // Wait for async callback notification (non-blocking on WAL!)
                                 // The response_rx will be signaled when GroupCommitWal completes the batch fsync
@@ -2662,7 +2692,11 @@ impl ProduceHandler {
                                 // - acks=1/all: Blocks on fsync (fallback mode)
                                 debug!("📝 CALLING WAL (sync path): topic={} partition={} base_offset={} acks={}",
                                       topic, partition, base_offset, acks);
-                                if let Err(e) = wal_mgr.append_canonical_with_acks(
+                                // Enqueue under the append lock, then wait for the
+                                // fsync without it. Waiting while holding it would
+                                // make every acks=all request to this partition
+                                // fsync alone, one after another.
+                                let commit = match wal_mgr.append_canonical_enqueued(
                                     topic.to_string(),
                                     partition,
                                     serialized,
@@ -2671,7 +2705,16 @@ impl ProduceHandler {
                                     records.len() as i32,
                                     acks
                                 ).await {
-                                    error!("WAL WRITE FAILED (sync path): topic={} partition={} acks={} error={}",
+                                    Ok(commit) => commit,
+                                    Err(e) => {
+                                        error!("WAL WRITE FAILED (sync path): topic={} partition={} acks={} error={}",
+                                               topic, partition, acks, e);
+                                        return Err(Error::Internal(format!("WAL write failed: {}", e)));
+                                    }
+                                };
+                                drop(append_guard);
+                                if let Err(e) = commit.wait().await {
+                                    error!("WAL WRITE FAILED (sync path, commit): topic={} partition={} acks={} error={}",
                                            topic, partition, acks, e);
                                     return Err(Error::Internal(format!("WAL write failed: {}", e)));
                                 }
@@ -3192,6 +3235,7 @@ impl ProduceHandler {
             segment_size: AtomicU64::new(0),
             pending_batches: Arc::new(SegQueue::new()),
             last_flush: Arc::new(Mutex::new(Instant::now())),
+            append_lock: Mutex::new(()),
         });
 
         self.partition_states.insert(key, Arc::clone(&state));

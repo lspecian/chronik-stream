@@ -221,6 +221,38 @@ impl WalManager {
         Ok(())
     }
 
+    /// [`Self::append_canonical_with_acks`] split in two: enqueue now, and
+    /// return the fsync wait to the caller.
+    ///
+    /// For a producer that assigns offsets: reserve the range and call this
+    /// under one per-partition lock, so the WAL holds batches in offset order,
+    /// then release the lock and await the returned wait. Readers walk the WAL
+    /// in file order and hand out the first batch at or past the requested
+    /// offset, so a batch appended *after* a higher-offset one is skipped by
+    /// every consumer — it is in the log and unreachable.
+    pub async fn append_canonical_enqueued(
+        &self,
+        topic: String,
+        partition: i32,
+        canonical_data: Vec<u8>,
+        base_offset: i64,
+        last_offset: i64,
+        record_count: i32,
+        acks: i16,
+    ) -> Result<crate::group_commit::CommitWait> {
+        let wal_record = WalRecord::new_v2(
+            topic.clone(),
+            partition,
+            canonical_data,
+            base_offset,
+            last_offset,
+            record_count,
+        );
+        self.group_commit_wal
+            .append_enqueued(topic, partition, wal_record, acks)
+            .await
+    }
+
 
     /// One past the highest offset this partition has fsynced.
     ///
