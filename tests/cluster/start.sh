@@ -6,7 +6,11 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BINARY="$PROJECT_ROOT/target/release/chronik-server"
+# Normally the release build from this tree. `CHRONIK_BIN` points it at another
+# binary instead, which is how a fix gets compared against the released artifact
+# that still has the bug: a pre/post run needs both, and overwriting
+# target/release to get the old one loses the new one.
+BINARY="${CHRONIK_BIN:-$PROJECT_ROOT/target/release/chronik-server}"
 
 # Colors
 RED='\033[0;31m'

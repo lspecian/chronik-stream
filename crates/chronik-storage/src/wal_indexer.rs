@@ -153,6 +153,42 @@ impl Default for WalIndexerConfig {
     }
 }
 
+/// Backoff state for a segment whose indexing pass failed.
+///
+/// See `WalIndexer::segment_failures` for why this exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentRetry {
+    /// Consecutive failed passes.
+    pub attempts: u32,
+    /// Passes still to skip before trying again. Decremented once per run, so
+    /// the backoff is measured in indexing cycles rather than wall-clock —
+    /// the indexer only wakes on its own interval, so a deadline in seconds
+    /// would round to the same thing while being harder to test.
+    pub skip_passes: u32,
+}
+
+/// Failed passes after which a segment stops being retried automatically.
+///
+/// Reached only by a segment that fails for a reason that re-running cannot fix.
+/// Its WAL copy is kept (nothing here deletes data), so the records are still
+/// served from the WAL and still replicated — what stops is the pointless
+/// re-indexing. Restarting the broker clears this.
+const MAX_SEGMENT_ATTEMPTS: u32 = 6;
+
+/// Cap on how many passes a segment may be made to wait, so an exponential
+/// backoff cannot park a recoverable segment for hours.
+const MAX_SKIP_PASSES: u32 = 32;
+
+/// How long to wait after `attempts` consecutive failures, in indexing passes:
+/// 1, 2, 4, 8 … capped. Doubling is what turns a hot loop into a trickle; the
+/// cap is what keeps a transient failure from being punished like a permanent
+/// one.
+fn backoff_passes(attempts: u32) -> u32 {
+    1u32.checked_shl(attempts.saturating_sub(1))
+        .unwrap_or(MAX_SKIP_PASSES)
+        .min(MAX_SKIP_PASSES)
+}
+
 /// Statistics from an indexing run
 #[derive(Debug, Default, Clone)]
 pub struct IndexingStats {
@@ -262,6 +298,23 @@ pub struct WalIndexer {
     /// re-indexed. In-memory only: after a restart each segment is indexed once
     /// more, which is harmless because the output is deterministic.
     indexed_segments: Arc<RwLock<HashMap<String, u64>>>,
+
+    /// Segments whose last pass failed, with how many times and when they may be
+    /// tried again (`segment_id → SegmentRetry`).
+    ///
+    /// Issue #57: a segment that fails is deliberately *not* recorded in
+    /// `indexed_segments`, so it is picked up again on the next run — which is
+    /// right for a transient failure and ruinous for a permanent one. One
+    /// segment that could not build its Tantivy index was re-read, re-tokenized,
+    /// re-uploaded and re-written every 30s indefinitely, and the CPU and I/O
+    /// that burned was enough to make `acks=all` produce time out. Retrying is
+    /// correct; retrying at full speed forever is what took the cluster down
+    /// with it.
+    ///
+    /// In-memory only. A restart clears the backoff, which is the behaviour we
+    /// want: a new binary deserves a fresh attempt at a segment the old one
+    /// could not index.
+    segment_failures: Arc<RwLock<HashMap<String, SegmentRetry>>>,
 
     /// Statistics from last indexing run
     last_stats: Arc<RwLock<IndexingStats>>,
@@ -428,6 +481,7 @@ impl WalIndexer {
             metadata_store,
             indexing_in_progress: Arc::new(RwLock::new(HashSet::new())),
             indexed_segments: Arc::new(RwLock::new(HashMap::new())),
+            segment_failures: Arc::new(RwLock::new(HashMap::new())),
             last_stats: Arc::new(RwLock::new(IndexingStats::default())),
             running: Arc::new(RwLock::new(false)),
             runtime: Arc::new(BackgroundRuntime::new(runtime)),
@@ -684,6 +738,7 @@ impl WalIndexer {
         let metadata_store = Arc::clone(&self.metadata_store);
         let indexing_in_progress = Arc::clone(&self.indexing_in_progress);
         let indexed_segments = Arc::clone(&self.indexed_segments);
+        let segment_failures = Arc::clone(&self.segment_failures);
         let last_stats = Arc::clone(&self.last_stats);
         let running = Arc::clone(&self.running);
         let runtime = Arc::clone(&self.runtime);
@@ -760,6 +815,7 @@ impl WalIndexer {
                     &metadata_store,
                     &indexing_in_progress,
                     &indexed_segments,
+                    &segment_failures,
                     &vector_index_manager,
                     &is_leader,
                     &hot_buffer,
@@ -818,6 +874,7 @@ impl WalIndexer {
             &self.metadata_store,
             &self.indexing_in_progress,
             &self.indexed_segments,
+            &self.segment_failures,
             &self.vector_index_manager,
             &self.is_leader,
             &self.hot_buffer,
@@ -829,7 +886,7 @@ impl WalIndexer {
     }
 
     /// Index sealed segments (internal implementation)
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, indexed_segments, vector_index_manager, is_leader, hot_buffer, replication_progress, cold_flush_listener, hot_vector_index))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, indexed_segments, segment_failures, vector_index_manager, is_leader, hot_buffer, replication_progress, cold_flush_listener, hot_vector_index))]
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -838,6 +895,7 @@ impl WalIndexer {
         metadata_store: &Arc<dyn MetadataStore>,
         indexing_in_progress: &Arc<RwLock<HashSet<String>>>,
         indexed_segments: &Arc<RwLock<HashMap<String, u64>>>,
+        segment_failures: &Arc<RwLock<HashMap<String, SegmentRetry>>>,
         vector_index_manager: &Arc<VectorIndexManager>,
         is_leader: &Arc<AtomicBool>,
         hot_buffer: &Arc<RwLock<Option<Arc<HotDataBuffer>>>>,
@@ -887,6 +945,43 @@ impl WalIndexer {
                 segment_sizes.insert(segment.clone(), size);
                 segments_to_index.push(segment);
             }
+        }
+
+        // Hold back segments that are serving a backoff, and drop the ones that
+        // have exhausted their attempts (issue #57). Without this a segment that
+        // cannot be indexed is retried at full speed every pass forever, and the
+        // I/O that costs is enough to time out `acks=all` produce on the whole
+        // broker.
+        let (held_back, quarantined) = {
+            let mut failures = segment_failures.write().await;
+            let before = segments_to_index.len();
+            let mut quarantined = 0usize;
+
+            segments_to_index.retain(|segment| match failures.get_mut(segment) {
+                None => true,
+                Some(retry) if retry.attempts >= MAX_SEGMENT_ATTEMPTS => {
+                    quarantined += 1;
+                    false
+                }
+                Some(retry) if retry.skip_passes > 0 => {
+                    retry.skip_passes -= 1;
+                    false
+                }
+                Some(_) => true,
+            });
+
+            (before - segments_to_index.len() - quarantined, quarantined)
+        };
+
+        if held_back > 0 || quarantined > 0 {
+            warn!(
+                backing_off = held_back,
+                quarantined,
+                max_attempts = MAX_SEGMENT_ATTEMPTS,
+                "Some WAL segments were not indexed this pass (previous failures). Their WAL \
+                 copies are kept, so their records are still served and replicated; a restart \
+                 retries them."
+            );
         }
 
         if segments_to_index.is_empty() {
@@ -1018,11 +1113,18 @@ impl WalIndexer {
                                 .await
                                 .insert(segment_id.clone(), *size);
                         }
+                        // A clean pass clears the backoff. The next failure
+                        // starts from one attempt again, so a segment that
+                        // occasionally fails is never slowly starved.
+                        segment_failures.write().await.remove(segment_id);
+                    } else {
+                        Self::record_segment_failure(segment_failures, segment_id).await;
                     }
                 }
                 Err(e) => {
                     error!(segment = %segment_id, error = %e, "Failed to index segment");
                     stats.errors += 1;
+                    Self::record_segment_failure(segment_failures, segment_id).await;
                 }
             }
         }
@@ -1037,6 +1139,41 @@ impl WalIndexer {
 
         stats.duration_ms = start_time.elapsed().as_millis() as u64;
         Ok(stats)
+    }
+
+    /// Note a failed pass for `segment_id` and set how long it waits.
+    ///
+    /// The backoff doubles per consecutive failure and is announced at the point
+    /// it starts mattering, so an operator reading the log sees the indexer
+    /// deciding to slow down rather than a stream of identical errors.
+    async fn record_segment_failure(
+        segment_failures: &Arc<RwLock<HashMap<String, SegmentRetry>>>,
+        segment_id: &str,
+    ) {
+        let mut failures = segment_failures.write().await;
+        let entry = failures
+            .entry(segment_id.to_string())
+            .or_insert(SegmentRetry { attempts: 0, skip_passes: 0 });
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.skip_passes = backoff_passes(entry.attempts);
+
+        if entry.attempts >= MAX_SEGMENT_ATTEMPTS {
+            error!(
+                segment = %segment_id,
+                attempts = entry.attempts,
+                "WAL segment has failed indexing on every attempt — quarantining it. Its WAL \
+                 copy is KEPT, so no records are lost and consumers still read them; what stops \
+                 is re-indexing it every pass. Search and SQL will not see this segment's range \
+                 until the cause is fixed and the broker restarted."
+            );
+        } else {
+            warn!(
+                segment = %segment_id,
+                attempts = entry.attempts,
+                skip_passes = entry.skip_passes,
+                "WAL segment failed indexing — backing off before the next attempt"
+            );
+        }
     }
 
     /// Whether `index_segment` may delete the source WAL segment after a pass.
@@ -2747,6 +2884,77 @@ mod tests {
         // Deletion disabled -> never delete, regardless of errors.
         assert!(!WalIndexer::may_delete_wal_segment(false, 5, 5));
         assert!(!WalIndexer::may_delete_wal_segment(false, 5, 6));
+    }
+
+    /// Issue #57: the retry had no bound, so one segment that could not be
+    /// indexed re-ran every 30s forever and the I/O starved `acks=all` produce.
+    #[test]
+    fn the_retry_backoff_doubles_and_is_capped() {
+        assert_eq!(backoff_passes(1), 1, "the first retry is the next pass");
+        assert_eq!(backoff_passes(2), 2);
+        assert_eq!(backoff_passes(3), 4);
+        assert_eq!(backoff_passes(4), 8);
+
+        // Capped, so a segment that recovers is not parked for hours.
+        assert_eq!(backoff_passes(20), MAX_SKIP_PASSES);
+        // And no shift overflow at the extreme.
+        assert_eq!(backoff_passes(u32::MAX), MAX_SKIP_PASSES);
+        assert_eq!(
+            backoff_passes(0),
+            1,
+            "a zero-attempt entry must still wait a pass rather than spin"
+        );
+    }
+
+    /// A failure must set a wait, a further failure must lengthen it, and a
+    /// clean pass must clear it — otherwise a segment that fails once is slowly
+    /// starved for the rest of the process's life.
+    #[tokio::test]
+    async fn a_failure_backs_off_and_a_clean_pass_clears_it() {
+        let failures: Arc<RwLock<HashMap<String, SegmentRetry>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let seg = "default-logs:0:4";
+
+        WalIndexer::record_segment_failure(&failures, seg).await;
+        assert_eq!(
+            failures.read().await.get(seg),
+            Some(&SegmentRetry { attempts: 1, skip_passes: 1 })
+        );
+
+        WalIndexer::record_segment_failure(&failures, seg).await;
+        WalIndexer::record_segment_failure(&failures, seg).await;
+        let after_three = failures.read().await.get(seg).cloned().unwrap();
+        assert_eq!(after_three.attempts, 3);
+        assert_eq!(
+            after_three.skip_passes, 4,
+            "the wait must grow with consecutive failures"
+        );
+
+        // What the clean-pass branch does.
+        failures.write().await.remove(seg);
+        assert!(failures.read().await.get(seg).is_none());
+
+        // A fresh failure starts over rather than resuming the old backoff.
+        WalIndexer::record_segment_failure(&failures, seg).await;
+        assert_eq!(failures.read().await.get(seg).unwrap().attempts, 1);
+    }
+
+    /// The quarantine threshold has to be reachable by repeated failure, and it
+    /// must not be so low that a couple of transient object-store errors stop a
+    /// segment being indexed at all.
+    #[test]
+    fn quarantine_is_reachable_but_not_hair_trigger() {
+        assert!(
+            MAX_SEGMENT_ATTEMPTS >= 4,
+            "a transient failure must get several attempts"
+        );
+        // The passes a segment waits before its final attempt, summed, is the
+        // grace period an operator gets to notice the warnings.
+        let total_waited: u32 = (1..MAX_SEGMENT_ATTEMPTS).map(backoff_passes).sum();
+        assert!(
+            total_waited >= 15,
+            "quarantine must take many passes to reach, got {total_waited}"
+        );
     }
 
     #[test]

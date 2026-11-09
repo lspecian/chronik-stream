@@ -10,6 +10,13 @@ use tantivy::{
     DateTime as TantivyDateTime, TantivyDocument,
 };
 use serde::{Serialize, Deserialize};
+
+/// Document-store blocks kept decompressed while copying an index.
+///
+/// The copy reads documents in store order, so a handful of blocks is enough to
+/// stop consecutive documents re-decompressing the block they share. Zero would
+/// make the copy decompress once per document.
+const STORE_BLOCK_CACHE: usize = 16;
 use std::path::{Path, PathBuf};
 use std::fs::{self, File};
 use std::io::{Write, Read};
@@ -232,21 +239,69 @@ impl TantivySegmentWriter {
             .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
         let searcher = reader.searcher();
 
-        // Get all documents by searching for all offsets
+        // Copy every document to the disk index by walking the segments
+        // directly.
+        //
+        // This used to run `AllQuery` through `TopDocs::with_limit(1_000_000)`,
+        // which silently wrote only the first million documents: a WAL segment
+        // holding more than that produced a cold index missing the rest, with no
+        // error and a record_count in the metadata that disagreed with what the
+        // index could answer. A scoring collector is also the wrong instrument
+        // for "every document" — it heap-sorts by a score none of these
+        // documents have. Walking `segment_readers()` is exact, unbounded, and
+        // cheaper.
         let offset_field = self.schema_fields.offset;
-        let all_docs_query = tantivy::query::AllQuery;
-        let top_docs = searcher.search(&all_docs_query, &tantivy::collector::TopDocs::with_limit(1000000))
-            .map_err(|e| Error::Internal(format!("Failed to search all docs: {}", e)))?;
+        let mut copied: usize = 0;
+        for segment_reader in searcher.segment_readers() {
+            let store = segment_reader
+                .get_store_reader(STORE_BLOCK_CACHE)
+                .map_err(|e| Error::Internal(format!("Failed to open document store: {}", e)))?;
+            // Passing the alive bitset skips deleted documents. Nothing deletes
+            // from these indexes today, but a copy that ignored it would
+            // resurrect anything that ever did.
+            for doc in store.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
+                let doc = doc
+                    .map_err(|e| Error::Internal(format!("Failed to retrieve doc: {}", e)))?;
+                disk_writer.add_document(doc)
+                    .map_err(|e| Error::Internal(format!("Failed to add doc to disk index: {}", e)))?;
+                copied += 1;
+            }
+        }
 
-        for (_score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)
-                .map_err(|e| Error::Internal(format!("Failed to retrieve doc: {}", e)))?;
-            disk_writer.add_document(doc)
-                .map_err(|e| Error::Internal(format!("Failed to add doc to disk index: {}", e)))?;
+        // The metadata we are about to ship says how many records this segment
+        // holds. If the index does not hold that many, the segment would serve
+        // confident partial answers forever.
+        if copied != self.metadata.record_count {
+            return Err(Error::Internal(format!(
+                "Tantivy index for {}:{} holds {} documents but the segment metadata says {} — \
+                 refusing to publish an index that cannot answer for its own offset range",
+                self.metadata.topic, self.metadata.partition, copied, self.metadata.record_count
+            )));
         }
 
         disk_writer.commit()
             .map_err(|e| Error::Internal(format!("Failed to commit disk index: {}", e)))?;
+
+        // Join Tantivy's background merge threads before anything reads the
+        // directory.
+        //
+        // Issue #57: `commit()` returning does NOT mean the index directory has
+        // stopped changing. Tantivy merges on background threads, and when a
+        // merge finishes it deletes the segment files it merged away (the
+        // garbage collector then removes whatever else became unreferenced).
+        // The tar below lists the directory and *then* opens each entry, so a
+        // file deleted in between surfaced as a bare
+        //   Failed to add index to tar: No such file or directory (os error 2)
+        // failing the whole index upload — every run, for whichever topic's
+        // segments were large enough to trigger a merge, while a smaller topic
+        // on the identical binary indexed fine. That looked topic-specific and
+        // was really size-specific.
+        //
+        // Consuming the writer joins those threads and drops the write lock, so
+        // from here the directory is stable. This is the fix; the retry inside
+        // `write_tar_gz` is belt-and-braces, not the cure.
+        disk_writer.wait_merging_threads()
+            .map_err(|e| Error::Internal(format!("Failed to join Tantivy merge threads: {}", e)))?;
 
         // Write metadata.json
         let metadata_path = temp_dir.path().join("metadata.json");
@@ -263,25 +318,115 @@ impl TantivySegmentWriter {
             self.metadata.topic, self.metadata.partition, self.metadata.base_offset, self.metadata.last_offset);
         let output_path = output_dir.join(&segment_filename);
 
-        let tar_file = File::create(&output_path)
-            .map_err(|e| Error::Internal(format!("Failed to create tar file: {}", e)))?;
+        Self::write_tar_gz(&output_path, &index_dir, &metadata_path)?;
+
+        Ok((output_path, self.metadata))
+    }
+
+    /// How many times the archive is rebuilt when a file vanishes under it.
+    const TAR_ATTEMPTS: u32 = 3;
+
+    /// Pack the committed index directory and its metadata into `output_path`.
+    ///
+    /// Retried when, and only when, the archive fails because a file was not
+    /// found. Tar lists a directory and then opens each entry, so anything that
+    /// removes a file in between fails the whole archive (see the merge-thread
+    /// note in `commit_and_serialize`). Each attempt re-lists the directory, so
+    /// a retry over a settled directory succeeds — the alternative is a segment
+    /// that is never indexed, retried forever, which is what issue #57 reported.
+    ///
+    /// Any other error is returned immediately: retrying a full disk or a
+    /// permission problem just burns I/O on the indexer's thread.
+    fn write_tar_gz(output_path: &Path, index_dir: &Path, metadata_path: &Path) -> Result<()> {
+        let mut last: Option<std::io::Error> = None;
+
+        for attempt in 1..=Self::TAR_ATTEMPTS {
+            match Self::try_write_tar_gz(output_path, index_dir, metadata_path) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = Self::TAR_ATTEMPTS,
+                        index_dir = %index_dir.display(),
+                        error = %e,
+                        "A file disappeared while archiving the Tantivy index — rebuilding the archive"
+                    );
+                    last = Some(e);
+                }
+                Err(e) => {
+                    return Err(Error::Internal(format!(
+                        "Failed to archive Tantivy index at {}: {}",
+                        index_dir.display(),
+                        e
+                    )));
+                }
+            }
+        }
+
+        // Name the directory and its contents. The bare `No such file or
+        // directory (os error 2)` this replaces gave the reader nothing to go
+        // on: not which file, not which directory, not whether the index had
+        // been written at all.
+        Err(Error::Internal(format!(
+            "Failed to archive Tantivy index at {} after {} attempts: {}. A file listed in \
+             the index directory was gone by the time it was read. The directory now holds: \
+             [{}]",
+            index_dir.display(),
+            Self::TAR_ATTEMPTS,
+            last.map(|e| e.to_string())
+                .unwrap_or_else(|| "no error recorded".to_string()),
+            Self::describe_dir(index_dir),
+        )))
+    }
+
+    /// One attempt at the archive. Returns the raw `io::Error` so the caller can
+    /// tell a vanished file from a full disk.
+    fn try_write_tar_gz(
+        output_path: &Path,
+        index_dir: &Path,
+        metadata_path: &Path,
+    ) -> std::io::Result<()> {
+        let tar_file = File::create(output_path)?;
         let enc = GzEncoder::new(tar_file, Compression::default());
         let mut tar = tar::Builder::new(enc);
 
-        // Add index directory
-        tar.append_dir_all("index", &index_dir)
-            .map_err(|e| Error::Internal(format!("Failed to add index to tar: {}", e)))?;
+        tar.append_dir_all("index", index_dir)?;
 
-        // Add metadata
-        let mut metadata_file = File::open(&metadata_path)
-            .map_err(|e| Error::Internal(format!("Failed to open metadata: {}", e)))?;
-        tar.append_file("metadata.json", &mut metadata_file)
-            .map_err(|e| Error::Internal(format!("Failed to add metadata to tar: {}", e)))?;
+        let mut metadata_file = File::open(metadata_path)?;
+        tar.append_file("metadata.json", &mut metadata_file)?;
 
-        tar.finish()
-            .map_err(|e| Error::Internal(format!("Failed to finish tar: {}", e)))?;
+        // Finish the tar trailer AND the gzip stream. The previous code called
+        // `tar.finish()` and let the encoder drop, which flushes on a
+        // best-effort basis and swallows the error — a truncated archive would
+        // only surface later, as a corrupt segment on read.
+        let enc = tar.into_inner()?;
+        enc.finish()?;
 
-        Ok((output_path, self.metadata))
+        Ok(())
+    }
+
+    /// Directory contents for an error message, truncated so a wide index does
+    /// not produce an unreadable log line.
+    fn describe_dir(dir: &Path) -> String {
+        match fs::read_dir(dir) {
+            Err(e) => format!("unreadable: {}", e),
+            Ok(entries) => {
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                let total = names.len();
+                names.truncate(20);
+                if total > names.len() {
+                    format!("{}, … {} more", names.join(", "), total - names.len())
+                } else if total == 0 {
+                    "empty".to_string()
+                } else {
+                    names.join(", ")
+                }
+            }
+        }
     }
 
     /// Commit, serialize, and upload to object store
@@ -523,11 +668,21 @@ impl TantivySegmentReader {
             std::ops::Bound::Excluded(end_term),
         );
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(10000))
+        // Collect every document in the range, not the top 10,000 of them.
+        //
+        // `TopDocs::with_limit(10_000)` silently capped this: a segment holding
+        // more than 10,000 records in the requested range returned 10,000 and
+        // reported no truncation, so a caller reading a range back got a short
+        // answer indistinguishable from a complete one. These documents carry no
+        // score to rank by, so there was never a meaningful "top" — the cap only
+        // decided how much to drop. `DocSetCollector` returns the whole matching
+        // set.
+        let doc_addresses = searcher
+            .search(&query, &tantivy::collector::DocSetCollector)
             .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
 
-        let mut records = Vec::new();
-        for (_score, doc_address) in top_docs {
+        let mut records = Vec::with_capacity(doc_addresses.len());
+        for doc_address in doc_addresses {
             let doc = searcher.doc(doc_address)
                 .map_err(|e| Error::Internal(format!("Failed to retrieve doc: {}", e)))?;
             records.push(self.doc_to_record(&doc)?);
@@ -573,7 +728,7 @@ impl TantivySegmentReader {
 mod tests {
     use super::*;
 
-    fn create_test_canonical_record(base_offset: i64, num_records: usize) -> CanonicalRecord {
+    pub(super) fn create_test_canonical_record(base_offset: i64, num_records: usize) -> CanonicalRecord {
         let mut records = Vec::new();
         for i in 0..num_records {
             records.push(CanonicalRecordEntry {
@@ -1031,5 +1186,148 @@ mod tests {
             assert_eq!(record.headers.len(), 1);
             assert_eq!(record.headers[0].key, "header1");
         }
+    }
+}
+
+/// Issue #57: archiving the committed index raced Tantivy's background merge
+/// threads, and when it lost, the only thing the operator saw was
+/// `Failed to add index to tar: No such file or directory (os error 2)`.
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+
+    fn metadata_file(dir: &Path) -> PathBuf {
+        let path = dir.join("metadata.json");
+        fs::write(&path, b"{}").unwrap();
+        path
+    }
+
+    /// The failure an operator actually has to diagnose. A bare ENOENT names
+    /// neither the file nor the directory nor whether an index was written at
+    /// all, so it reads as "the image is missing tar" — which is where issue
+    /// #57's analysis went. The message must say where it was looking and what
+    /// it found there.
+    #[test]
+    fn a_failed_archive_names_the_directory_and_its_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata_path = metadata_file(temp.path());
+        let missing = temp.path().join("index-that-was-never-created");
+
+        let err = TantivySegmentWriter::write_tar_gz(
+            &temp.path().join("out.tar.gz"),
+            &missing,
+            &metadata_path,
+        )
+        .expect_err("archiving a directory that does not exist must fail");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("index-that-was-never-created"),
+            "the error must name the directory it could not archive: {msg}"
+        );
+        assert!(
+            msg.contains("attempts"),
+            "the error must say the archive was retried, not that it failed once: {msg}"
+        );
+        assert!(
+            msg.contains("unreadable") || msg.contains("empty"),
+            "the error must report what the directory held: {msg}"
+        );
+    }
+
+    /// An empty-but-present index directory is a different fault from a missing
+    /// one, and the message has to distinguish them — this is the shape a
+    /// half-written index leaves behind.
+    #[test]
+    fn an_empty_index_directory_is_reported_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty = temp.path().join("index");
+        fs::create_dir_all(&empty).unwrap();
+
+        // `append_dir_all` over an existing empty directory succeeds, so this
+        // asserts the diagnostic helper rather than the archive.
+        assert_eq!(TantivySegmentWriter::describe_dir(&empty), "empty");
+        assert!(TantivySegmentWriter::describe_dir(&temp.path().join("gone"))
+            .starts_with("unreadable"));
+    }
+
+    /// The archive must be a complete, independently readable gzip stream. The
+    /// previous code called `tar.finish()` and let the `GzEncoder` drop, which
+    /// flushes best-effort and discards the error, so a truncated archive would
+    /// have surfaced later as a corrupt cold segment rather than here.
+    #[test]
+    fn the_archive_is_a_complete_gzip_stream_holding_the_whole_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("segments");
+
+        let mut writer = TantivySegmentWriter::new("logs".to_string(), 3, 0).unwrap();
+        writer
+            .write_batch(&tests::create_test_canonical_record(0, 250))
+            .unwrap();
+        let (tar_gz_path, metadata) = writer.commit_and_serialize(&output_dir).unwrap();
+
+        // Decompress the whole stream and list it. A stream cut short by an
+        // unfinished encoder fails here.
+        let file = File::open(&tar_gz_path).unwrap();
+        let mut archive = tar::Archive::new(GzDecoder::new(file));
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            entries.iter().any(|p| p == "metadata.json"),
+            "metadata.json must be in the archive, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|p| p.contains("meta.json")),
+            "the Tantivy index's own meta.json must be in the archive, got {entries:?}"
+        );
+
+        // And the index must still open and answer from the archive, which is
+        // what the cold read path does.
+        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        assert_eq!(reader.metadata().record_count, 250);
+        assert_eq!(metadata.record_count, 250);
+        assert_eq!(reader.query_by_offset_range(0, 250).unwrap().len(), 250);
+    }
+
+    /// The same path driven through enough batches to make Tantivy flush more
+    /// than one in-index segment, so `commit()` has real merge work pending when
+    /// the archive starts. This is the production shape that failed: a topic
+    /// whose segments were large enough to trigger a merge, while a smaller
+    /// topic on the identical binary archived fine.
+    #[test]
+    fn an_index_with_merge_work_pending_still_archives() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_dir = temp.path().join("segments");
+
+        let mut writer = TantivySegmentWriter::new("logs".to_string(), 0, 0).unwrap();
+        let per_batch = 2_000;
+        let batches = 12;
+        for b in 0..batches {
+            writer
+                .write_batch(&tests::create_test_canonical_record(
+                    (b * per_batch) as i64,
+                    per_batch,
+                ))
+                .unwrap();
+        }
+
+        let (tar_gz_path, metadata) = writer
+            .commit_and_serialize(&output_dir)
+            .expect("an index with pending merges must archive, not fail with ENOENT");
+
+        assert_eq!(metadata.record_count, batches * per_batch);
+
+        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        assert_eq!(
+            reader
+                .query_by_offset_range(0, (batches * per_batch) as i64)
+                .unwrap()
+                .len(),
+            batches * per_batch
+        );
     }
 }
