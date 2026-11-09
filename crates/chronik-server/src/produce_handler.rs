@@ -2325,6 +2325,36 @@ impl ProduceHandler {
             .map_err(|e| Error::Protocol(format!("Failed to decode record batch: {}", e)))?;
         let record_count = temp_batch.records.len() as u64;
 
+        // Idempotence check BEFORE any offsets are reserved.
+        //
+        // This used to run after the `fetch_add` below. A producer retrying a
+        // batch whose response it never got — `REQUEST_TIMED_OUT` under load —
+        // had the retry correctly rejected as a duplicate, but only once its
+        // offsets were already taken, and nothing gives a reservation back. Each
+        // retry left a permanent hole the size of a batch: on a live cluster four
+        // retries put a partition 3,405 offsets past the 30,000 records actually
+        // produced, so every offset-derived number (end offsets, lag, "records
+        // in topic") was wrong while the data itself was fine. Kafka validates
+        // producer state before assigning offsets for exactly this reason.
+        //
+        // Only header fields are read here (producer id/epoch, base sequence,
+        // record count), and the base-offset rewrite below changes none of them,
+        // so validating the decoded-as-received batch is equivalent to
+        // validating the re-encoded one.
+        //
+        // Control batches (COMMIT/ABORT end-transaction markers) carry the
+        // transaction's producer id/epoch but are NOT part of the data sequence
+        // space, so they skip it — otherwise a marker's base_sequence would be
+        // rejected as a duplicate. The check also advances the tracked sequence in
+        // the same lock, and that advance must precede the acks=1/all async
+        // early return: an advance placed after the WAL write never runs on that
+        // path, and the producer's next batch would be rejected as out of order.
+        let is_control_batch = (temp_batch.header.attributes & 0x20) != 0;
+        if temp_batch.header.producer_id >= 0 && !is_control_batch {
+            self.validate_producer_sequence(&temp_batch, topic, partition, transactional_id)
+                .await?;
+        }
+
         // ATOMIC: Reserve offset range in ONE operation (prevents race conditions)
         let base_offset = partition_state.next_offset.fetch_add(record_count, Ordering::SeqCst);
 
@@ -2385,24 +2415,7 @@ impl ProduceHandler {
             .stamp_and_record_leader_epoch(topic, partition, base_offset as i64, re_encoded_bytes)
             .await;
 
-        // Validate producer info for idempotence. Control batches (COMMIT/ABORT
-        // end-transaction markers) carry the transaction's producer id/epoch but are
-        // NOT part of the data sequence space, so they must skip sequence validation
-        // — otherwise the marker's base_sequence would be rejected as a duplicate.
-        let is_control_batch = (kafka_batch.header.attributes & 0x20) != 0;
-        if kafka_batch.header.producer_id >= 0 && !is_control_batch {
-            // validate_producer_sequence both checks AND advances the producer's
-            // tracked sequence atomically (one write-lock acquisition). The advance
-            // must happen here, before the acks=1/all async-response early return —
-            // an advance placed after the WAL write never runs on that path, so the
-            // producer's next batch would be wrongly rejected as OutOfOrderSequence.
-            self.validate_producer_sequence(
-                &kafka_batch,
-                topic,
-                partition,
-                transactional_id,
-            ).await?;
-        }
+        // (Idempotence was validated above, before the offsets were reserved.)
 
         // EOS layer 6 (log-derived): update the per-partition transaction index from
         // this batch as it lands in the local log — a transactional data batch opens a
@@ -4334,11 +4347,58 @@ mod tests {
         // Check duplicate metrics
         assert_eq!(handler.metrics.duplicate_records.load(Ordering::Relaxed), 1);
     }
-    
+
+    /// A retried idempotent batch must not cost the partition any offsets.
+    ///
+    /// Observed on a live cluster: four produce requests timed out
+    /// (`REQUEST_TIMED_OUT`), the idempotent Java producer retried them, and the
+    /// partition ended 3,405 offsets past the 30,000 records produced — about
+    /// one ~850-record batch per retry. The retries were correctly recognised as
+    /// duplicates, but the offsets for them had already been reserved by then.
+    #[tokio::test]
+    async fn a_rejected_duplicate_does_not_consume_offsets() {
+        let (handler, _temp) = create_test_handler().await;
+
+        let produce = |records: Vec<u8>| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        };
+
+        let batch_a = create_test_record_batch(77, 0, vec![("a", "1"), ("b", "2"), ("c", "3")]);
+        let batch_b = create_test_record_batch(77, 3, vec![("d", "4"), ("e", "5"), ("f", "6")]);
+
+        let first = handler.handle_produce(produce(batch_a.clone()), 1).await.unwrap();
+        assert_eq!(first.topics[0].partitions[0].error_code, 0);
+        assert_eq!(first.topics[0].partitions[0].base_offset, 0);
+
+        // The producer's retry of A: same producer, same sequence.
+        let retry = handler.handle_produce(produce(batch_a), 2).await.unwrap();
+        assert_eq!(
+            retry.topics[0].partitions[0].error_code,
+            ErrorCode::DuplicateSequenceNumber.code(),
+            "the retry must be recognised as a duplicate"
+        );
+
+        // B is the next three records. If the rejected retry reserved offsets,
+        // B lands at 6 and offsets 3..6 exist in the log for no record at all.
+        let second = handler.handle_produce(produce(batch_b), 3).await.unwrap();
+        assert_eq!(second.topics[0].partitions[0].error_code, 0);
+        assert_eq!(
+            second.topics[0].partitions[0].base_offset, 3,
+            "a rejected duplicate consumed offsets: the next batch landed at {} instead of 3",
+            second.topics[0].partitions[0].base_offset
+        );
+    }
+
     #[tokio::test]
     async fn test_out_of_order_sequence() {
         let (handler, _temp) = create_test_handler().await;
-        
+
         // First batch with sequence 0
         let records_data1 = create_test_record_batch(
             1234,
