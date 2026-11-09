@@ -310,6 +310,13 @@ fn compute_standalone_spec_hash(spec: &crate::crds::standalone::ChronikStandalon
         format!("{:?}", sc).hash(&mut hasher);
     }
 
+    // The standalone Pod gained the same startup probe, so it needs the same
+    // escape hatch — see `POD_SHAPE_GENERATION` in `cluster_controller`. Shared
+    // rather than duplicated, so the two cannot drift: a Pod-shape fix that
+    // reaches cluster brokers but not standalone ones is the kind of gap that
+    // only shows up on the one deployment nobody tested.
+    crate::controllers::cluster_controller::POD_SHAPE_GENERATION.hash(&mut hasher);
+
     format!("{:016x}", hasher.finish())
 }
 

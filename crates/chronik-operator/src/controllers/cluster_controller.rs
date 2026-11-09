@@ -539,8 +539,32 @@ fn compute_cluster_spec_hash(spec: &ChronikClusterSpec) -> String {
         format!("{:?}", sc).hash(&mut hasher);
     }
 
+    // The shape of the Pod this operator builds, independent of the spec.
+    //
+    // Everything above is a user-set field: the hash changes when the user
+    // changes something. But the operator also decides parts of the Pod the
+    // spec says nothing about, and when one of those is *wrong* a fix to it
+    // reaches nobody — the hash is unchanged, so no Pod is recreated, and the
+    // fix lands only if some unrelated edit happens to rebuild the Pod.
+    //
+    // Bumping this is the deliberate way to say "the Pod I build has changed in
+    // a way existing Pods must pick up", and it costs a rolling restart of every
+    // managed cluster. Do not bump it for cosmetics.
+    POD_SHAPE_GENERATION.hash(&mut hasher);
+
     format!("{:016x}", hasher.finish())
 }
+
+/// Generation of the operator-decided Pod shape. See `compute_cluster_spec_hash`.
+///
+/// 2: added a startup probe. Boot opens the Kafka port only after replaying the
+///    WAL and metadata catalog, so on a cluster with many topics the liveness
+///    probe raced the boot and won — a broker holding ~5,600 topics took 114s to
+///    open 9092 against a ~95s liveness budget and was SIGKILLed 5s after
+///    becoming ready, 701 times, never serving a request. Brokers already
+///    running carry the old probe and are one restart away from the same thing,
+///    which is why this has to reach them rather than wait for a future edit.
+pub(crate) const POD_SHAPE_GENERATION: u32 = 2;
 
 /// Check if a cluster node Pod needs recreation by comparing spec hash annotation.
 fn cluster_pod_needs_update(pod: &Pod, spec: &ChronikClusterSpec) -> bool {
@@ -819,9 +843,36 @@ mod tests {
         let spec: ChronikClusterSpec = serde_json::from_str("{}").unwrap();
         assert_eq!(
             compute_cluster_spec_hash(&spec),
-            "4a01ffeff1524553",
+            // Changed once, deliberately, for POD_SHAPE_GENERATION = 2 (the
+            // startup probe). The old probe left a data-heavy broker unable to
+            // ever finish starting, and brokers already running carry it, so the
+            // fix had to reach them: a supervised rolling restart now is better
+            // than each cluster discovering the crash-loop at its next restart.
+            // Was "4a01ffeff1524553" at generation 1.
+            "a754f5cb9f9a4558",
             "the hash of a default spec changed — every broker Pod under this \
              operator would be recreated on upgrade"
+        );
+    }
+
+    /// The escape hatch has to actually work: bumping the generation must move
+    /// the hash, or a future operator-side Pod fix will silently reach nobody.
+    #[test]
+    fn the_pod_shape_generation_is_mixed_into_the_hash() {
+        let spec: ChronikClusterSpec = serde_json::from_str("{}").unwrap();
+        let mut with_other_generation = std::collections::hash_map::DefaultHasher::new();
+        // Recompute by hand with a different generation and nothing else changed.
+        let real = compute_cluster_spec_hash(&spec);
+        (POD_SHAPE_GENERATION + 1).hash(&mut with_other_generation);
+        assert_ne!(
+            real,
+            format!("{:016x}", with_other_generation.finish()),
+            "the generation must participate in the hash"
+        );
+        assert!(
+            POD_SHAPE_GENERATION >= 2,
+            "generation 2 carries the startup probe; going back would reintroduce \
+             the boot crash-loop"
         );
     }
 

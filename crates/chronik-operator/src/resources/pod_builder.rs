@@ -20,6 +20,20 @@ use crate::crds::standalone::ChronikStandaloneSpec;
 /// GCE-PD, AzureDisk, NFS-CSI, …). See chronik-stream issue #3.
 const CHRONIK_IMAGE_UID: i64 = 1001;
 
+/// How often the startup probe checks whether the Kafka port is open.
+const STARTUP_PROBE_PERIOD_SECONDS: i32 = 10;
+
+/// How many startup checks may fail before the broker is restarted.
+///
+/// With the period above this is a 10-minute boot budget. It is sized from
+/// measurement, not taste: a broker holding ~5,600 topics took **114 seconds**
+/// to open its Kafka port, against a liveness budget of ~95 seconds, and so was
+/// killed moments after becoming ready — 701 times. Boot cost scales with the
+/// WAL and catalog on disk, so the budget has to leave room for a cluster far
+/// larger than the one that exposed this, and the downside of being generous is
+/// only that a genuinely wedged boot is caught later.
+const STARTUP_PROBE_FAILURE_THRESHOLD: i32 = 60;
+
 /// Build the init container that normalises ownership of the data volume.
 ///
 /// `fsGroup` is the documented way to do this and it is **not enough**: the
@@ -298,12 +312,26 @@ pub fn build_standalone_pod(
         k8s_resources
     });
 
+    // See the startup-probe note in `build_cluster_node_pod`: boot opens the Kafka
+    // port last, so without this the liveness probe races a broker that is
+    // replaying a large WAL and catalog.
+    let startup_probe = Probe {
+        tcp_socket: Some(TCPSocketAction {
+            port: IntOrString::Int(spec.kafka_port),
+            ..Default::default()
+        }),
+        initial_delay_seconds: Some(5),
+        period_seconds: Some(STARTUP_PROBE_PERIOD_SECONDS),
+        timeout_seconds: Some(3),
+        failure_threshold: Some(STARTUP_PROBE_FAILURE_THRESHOLD),
+        ..Default::default()
+    };
+
     let liveness_probe = Probe {
         tcp_socket: Some(TCPSocketAction {
             port: IntOrString::Int(spec.kafka_port),
             ..Default::default()
         }),
-        initial_delay_seconds: Some(15),
         period_seconds: Some(10),
         timeout_seconds: Some(5),
         failure_threshold: Some(3),
@@ -315,7 +343,6 @@ pub fn build_standalone_pod(
             port: IntOrString::Int(spec.kafka_port),
             ..Default::default()
         }),
-        initial_delay_seconds: Some(10),
         period_seconds: Some(5),
         timeout_seconds: Some(3),
         failure_threshold: Some(3),
@@ -335,6 +362,7 @@ pub fn build_standalone_pod(
         ports: Some(ports),
         env: Some(env_vars),
         resources,
+        startup_probe: Some(startup_probe),
         liveness_probe: Some(liveness_probe),
         readiness_probe: Some(readiness_probe),
         volume_mounts: Some(vec![VolumeMount {
@@ -650,12 +678,44 @@ pub fn build_cluster_node_pod(
         k8s_resources
     });
 
+    // A broker must be allowed to finish starting before anything judges it
+    // alive. Boot replays the WAL, restores watermarks and populates the
+    // metadata catalog, and the Kafka port opens only at the end of that — so
+    // on a cluster with a lot of topics the liveness probe was racing the boot
+    // and winning. One broker here took 114s to open 9092 and was SIGKILLed 5
+    // seconds later, because liveness had already spent its 30s + 6×10s budget
+    // at ~95s. It never served a single request in 701 restarts: the probe
+    // killed it moments after it became ready, every time.
+    //
+    // A startup probe is the mechanism for exactly this. Kubernetes suspends
+    // BOTH liveness and readiness until it first succeeds, so the budget below
+    // replaces the liveness budget during boot and liveness goes back to being
+    // what it should be — a check for a process that has hung *after* starting.
+    let startup_probe = Probe {
+        tcp_socket: Some(TCPSocketAction {
+            port: IntOrString::Int(kafka_port),
+            ..Default::default()
+        }),
+        // Start checking quickly; a fast broker is then ready almost at once.
+        initial_delay_seconds: Some(5),
+        period_seconds: Some(STARTUP_PROBE_PERIOD_SECONDS),
+        timeout_seconds: Some(3),
+        // The budget is period × threshold. Generous on purpose: being killed
+        // mid-boot costs a restart that makes the next boot no faster, and a
+        // process that is genuinely wedged at startup is still caught, just
+        // later. A crash-looping broker is far more expensive than a slow one.
+        failure_threshold: Some(STARTUP_PROBE_FAILURE_THRESHOLD),
+        ..Default::default()
+    };
+
     let liveness_probe = Probe {
         tcp_socket: Some(TCPSocketAction {
             port: IntOrString::Int(kafka_port),
             ..Default::default()
         }),
-        initial_delay_seconds: Some(30),
+        // No initial delay needed: the startup probe above gates this one, and
+        // leaving a delay here would only add to the time a hung broker is left
+        // running after it has started.
         period_seconds: Some(10),
         timeout_seconds: Some(5),
         failure_threshold: Some(6),
@@ -667,7 +727,6 @@ pub fn build_cluster_node_pod(
             port: IntOrString::Int(kafka_port),
             ..Default::default()
         }),
-        initial_delay_seconds: Some(15),
         period_seconds: Some(5),
         timeout_seconds: Some(3),
         failure_threshold: Some(3),
@@ -687,6 +746,7 @@ pub fn build_cluster_node_pod(
         ports: Some(ports),
         env: Some(env_vars),
         resources,
+        startup_probe: Some(startup_probe),
         liveness_probe: Some(liveness_probe),
         readiness_probe: Some(readiness_probe),
         volume_mounts: Some(vec![
@@ -987,11 +1047,67 @@ mod tests {
 
         let container = &pod.spec.as_ref().unwrap().containers[0];
         let liveness = container.liveness_probe.as_ref().unwrap();
-        assert_eq!(liveness.initial_delay_seconds, Some(15));
         assert!(liveness.tcp_socket.is_some());
 
-        let readiness = container.readiness_probe.as_ref().unwrap();
-        assert_eq!(readiness.initial_delay_seconds, Some(10));
+        assert!(container.readiness_probe.is_some());
+    }
+
+    /// A broker opens its Kafka port only at the end of boot, after replaying
+    /// the WAL and the metadata catalog. Without a startup probe the liveness
+    /// probe races that boot: one broker holding ~5,600 topics took 114s and was
+    /// killed 5s after becoming ready, 701 times over.
+    ///
+    /// Asserted on the BUILT Pod, both shapes, because that is the object the
+    /// kubelet acts on — a helper that returns the right probe proves nothing if
+    /// the container does not carry it (the lesson from issue #51).
+    #[test]
+    fn every_pod_shape_gates_liveness_behind_a_startup_probe() {
+        let standalone: ChronikStandaloneSpec = serde_json::from_str("{}").unwrap();
+        let standalone_pod =
+            build_standalone_pod("test", "ns", &standalone, test_owner_ref(), None);
+
+        let cluster: crate::crds::cluster::ChronikClusterSpec =
+            serde_json::from_str(r#"{"replicas": 3}"#).unwrap();
+        let cluster_pod =
+            build_cluster_node_pod("test", "ns", 1, &cluster, test_owner_ref(), None);
+
+        for (what, pod) in [("standalone", &standalone_pod), ("cluster", &cluster_pod)] {
+            let container = &pod.spec.as_ref().unwrap().containers[0];
+
+            let startup = container
+                .startup_probe
+                .as_ref()
+                .unwrap_or_else(|| panic!("{what} pod has no startup probe"));
+
+            assert!(
+                startup.tcp_socket.is_some(),
+                "{what}: the startup probe must watch the Kafka port"
+            );
+
+            let budget = startup.period_seconds.unwrap() * startup.failure_threshold.unwrap();
+            assert!(
+                budget >= 300,
+                "{what}: a boot budget of {budget}s is not enough — a measured boot took 114s \
+                 and boot cost grows with the WAL and catalog on disk"
+            );
+
+            // The point of the startup probe is that liveness no longer carries
+            // the boot budget. A lingering initial delay here would only extend
+            // how long a broker that hangs *after* starting is left running.
+            let liveness = container.liveness_probe.as_ref().unwrap();
+            assert_eq!(
+                liveness.initial_delay_seconds, None,
+                "{what}: liveness should not re-delay once a startup probe gates it"
+            );
+
+            // And both must watch the same port, or the startup probe would
+            // hand over to a liveness check of something else entirely.
+            assert_eq!(
+                startup.tcp_socket.as_ref().unwrap().port,
+                liveness.tcp_socket.as_ref().unwrap().port,
+                "{what}: startup and liveness must probe the same port"
+            );
+        }
     }
 
     #[test]
