@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Kafka consumers could silently never receive records the broker had
+  acknowledged.** The produce path reserved an offset range and appended to the
+  WAL several awaits later, so with more than one request in flight per
+  partition — the Java producer's default is five — a later range could reach
+  the WAL first. Fetch walks the WAL in file order and serves the first batch at
+  or past the requested offset, so a consumer asking for an offset in the late
+  batch was handed the batch after it and never saw the records in between.
+  They were on disk, replicated, and counted by SQL; no consumer could read
+  them. No fault was needed: with a stock producer, released v2.16.0 left 304 of
+  60,000 records unreachable, and whole batches when produce requests were also
+  timing out. Batches now enter the WAL in offset order, under a per-partition
+  lock held from offset reservation until the batch is queued. The fsync and the
+  `acks=all` ISR wait happen after the lock is released, so concurrent requests
+  still share a group commit. Throughput on a local 3-node cluster: `acks=1`
+  −8.8%, `acks=all` +11.9%.
+
+- **A retried idempotent produce left a permanent hole in the offsets.** A
+  producer retrying after `REQUEST_TIMED_OUT` had the retry correctly rejected as
+  a duplicate — nothing was stored twice — but only after offsets had been
+  reserved for it. Each retry left an empty batch-sized range, so end offsets,
+  consumer lag and record counts derived from offsets all ran high (a partition
+  ended 3,405 offsets past the 30,000 records produced), and transactional
+  readers stalled: with retries forced mid-transaction, v2.16.0 served
+  `read_committed` 6,471 of 30,000 records. The idempotence check now runs
+  before offsets are reserved, as Kafka does.
+
 ## [2.16.0] - 2026-11-09
 
 ### Fixed
