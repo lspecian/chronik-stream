@@ -36,7 +36,7 @@ use chronik_embeddings::{VectorSearchConfig, create_provider};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::{info, warn, error, debug, instrument};
 use std::collections::{HashMap, HashSet};
 
@@ -62,6 +62,13 @@ pub struct WalIndexerConfig {
 
     /// Maximum number of segments to index per run
     pub max_segments_per_run: usize,
+
+    /// Pause between segments within one run, in milliseconds. Zero (the
+    /// default) indexes a backlog back to back; constrained disks can trade
+    /// drain speed for headroom with `CHRONIK_WAL_INDEXER_SEGMENT_PAUSE_MS`.
+    /// Runs themselves are always separated by a full `interval_secs` of idle.
+    #[serde(default)]
+    pub segment_pause_ms: u64,
 
     /// Whether to delete WAL segments after successful indexing
     pub delete_after_index: bool,
@@ -134,6 +141,7 @@ impl Default for WalIndexerConfig {
             interval_secs: 30,
             min_segment_age_secs: 10,
             max_segments_per_run: 100,
+            segment_pause_ms: 0,
             delete_after_index: true,
             object_store: ObjectStoreConfig::default(),
             index_base_path: "./data/indexes".to_string(),
@@ -792,10 +800,28 @@ impl WalIndexer {
             );
 
             // === Periodic indexing loop ===
-            let mut interval_timer = interval(Duration::from_secs(config.interval_secs));
+            //
+            // A full interval of idle AFTER each run, not a fixed-rate tick.
+            //
+            // This was `interval().tick()`, whose default missed-tick behaviour
+            // is Burst: a run that outlasts the period (a backlog of 100
+            // segments takes 15–75 s against a 30 s period) leaves ticks owed,
+            // and they fire immediately, one after another. So exactly when a
+            // node had the most to catch up on, the indexer ran back to back
+            // with no gap at all — reported on a homelab cluster draining a
+            // 587 MB backlog after an upgrade, where it held the disk long
+            // enough to starve Raft. Sleeping after the run guarantees the rest
+            // of the node `interval_secs` of headroom between runs however long
+            // a run takes; in steady state a run lasts milliseconds, so
+            // freshness is unchanged.
+            let idle_between_runs = Duration::from_secs(config.interval_secs);
+            let mut first_run = true;
 
             loop {
-                interval_timer.tick().await;
+                if !first_run {
+                    tokio::time::sleep(idle_between_runs).await;
+                }
+                first_run = false;
 
                 // Check if still running
                 let is_running = *running.read().await;
@@ -1085,7 +1111,10 @@ impl WalIndexer {
         }
 
         // Process each segment
-        for segment_id in &segments_to_index {
+        for (n, segment_id) in segments_to_index.iter().enumerate() {
+            if n > 0 && config.segment_pause_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(config.segment_pause_ms)).await;
+            }
             let errors_before = stats.errors;
             match Self::index_segment(
                 config,

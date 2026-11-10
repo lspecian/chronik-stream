@@ -30,6 +30,40 @@ use parking_lot::Mutex;
 use dashmap::DashMap;
 
 use raft::{prelude::*, storage::MemStorage};
+
+/// The runtime Raft runs on: its tick/ready loop, the outbound message
+/// sender, the gRPC server, and the peer connections those create.
+///
+/// Raft used to share the main runtime with every Kafka request handler, the
+/// WAL group commit, and whatever else was busy. Liveness in Raft is a
+/// deadline — a follower that hears nothing for `election_tick` (about two
+/// seconds) starts an election — so any stall on the shared runtime became an
+/// election. Reported on a homelab cluster draining an indexing backlog: heartbeat
+/// RPCs failing with "Timeout expired" against a 10 s RPC deadline, although
+/// the receiving handler does nothing but enqueue, which only happens when the
+/// receiving task cannot be scheduled at all; then hundreds of term bumps an hour.
+/// Raft's work is small and latency-critical, so it gets threads nobody else
+/// can occupy.
+///
+/// Static, never dropped: dropping a runtime from inside async context panics,
+/// and Raft lives for the whole process.
+static RAFT_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// Threads for [`RAFT_RUNTIME`]: the loop, the sender, the server, and a spare.
+const RAFT_RUNTIME_THREADS: usize = 4;
+
+pub(crate) fn raft_runtime() -> &'static tokio::runtime::Handle {
+    RAFT_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(RAFT_RUNTIME_THREADS)
+                .thread_name("raft")
+                .enable_all()
+                .build()
+                .expect("failed to create the Raft runtime")
+        })
+        .handle()
+}
 use slog::Drain;
 use chronik_wal::{RaftWalStorage, GroupCommitWal, GroupCommitConfig};
 use std::path::PathBuf;
@@ -338,7 +372,7 @@ impl RaftCluster {
         // v2.2.8 FIX: Spawn concurrent tasks per message to prevent head-of-line blocking
         // Previously, retries for one peer would block messages to ALL peers
         let transport_for_sender = transport.clone();
-        tokio::spawn(async move {
+        raft_runtime().spawn(async move {
             while let Some((peer_id, msg)) = message_receiver.recv().await {
                 let msg_type = msg.msg_type;
                 tracing::debug!("Message sender: sending {:?} to peer {}", msg_type, peer_id);
@@ -2188,7 +2222,7 @@ impl RaftCluster {
             .add_service(raft_service_server::RaftServiceServer::new(service))
             .serve(addr);
 
-        let handle = tokio::spawn(async move {
+        let handle = raft_runtime().spawn(async move {
             if let Err(e) = server.await {
                 tracing::error!("Raft gRPC server error: {}", e);
             }
@@ -2269,7 +2303,7 @@ impl RaftCluster {
             tracing::info!("Multi-node mode: starting Raft message processing loop");
         }
 
-        tokio::spawn(async move {
+        raft_runtime().spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
 
             // v2.2.7 Phase 2: Track previous leader for change detection
@@ -2954,7 +2988,7 @@ pub async fn run_raft_cluster(config: RaftClusterConfig) -> Result<()> {
     // This prevents chicken-and-egg problem during cluster startup
     // Spawn in background so it doesn't block
     let cluster_for_prewarm = raft_cluster.clone();
-    tokio::spawn(async move {
+    raft_runtime().spawn(async move {
         cluster_for_prewarm.pre_warm_connections().await;
     });
 

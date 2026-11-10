@@ -52,7 +52,10 @@ pub async fn start_raft_grpc_server(
     // Spawn in background so it doesn't block message loop startup
     info!("Pre-warming Raft connections in background...");
     let cluster_for_prewarm = raft_cluster.clone();
-    tokio::spawn(async move {
+    // On the Raft runtime: a client connection's I/O task runs on whichever
+    // runtime created it, so warming it anywhere else would put Raft's outbound
+    // traffic back on the shared runtime.
+    crate::raft_cluster::raft_runtime().spawn(async move {
         cluster_for_prewarm.pre_warm_connections().await;
     });
 

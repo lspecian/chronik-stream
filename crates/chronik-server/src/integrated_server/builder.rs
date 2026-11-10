@@ -1747,6 +1747,10 @@ impl IntegratedKafkaServerBuilder {
             interval_secs: self.config.wal_indexing_interval_secs,
             min_segment_age_secs: 10,
             max_segments_per_run: 100,
+            segment_pause_ms: std::env::var("CHRONIK_WAL_INDEXER_SEGMENT_PAUSE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0),
             // Reclaiming WAL space after indexing. Off by env for tests that
             // need the WAL to stay put — RP-3.3's divergence test cannot observe
             // a truncation of records the indexer has already archived away.

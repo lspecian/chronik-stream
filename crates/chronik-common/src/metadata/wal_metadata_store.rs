@@ -2993,6 +2993,49 @@ mod topic_provenance_tests {
         );
     }
 
+    /// A re-broadcast `TopicCreated` for a topic that already holds data must
+    /// leave its partitions exactly as they are.
+    ///
+    /// Issue #58 attributed lost records to followers "re-initializing" every
+    /// partition on `TopicCreated ... at offset 0`. Those lines are the routine
+    /// catalog re-broadcast — every one carries offset 0 — and arrive on every
+    /// leadership change and anti-entropy round. If replaying one reset a
+    /// partition, every cluster would lose data on every round; this pins that
+    /// it does not, for both a newer and an older replayed config.
+    #[tokio::test]
+    async fn replaying_topic_created_never_resets_a_partition_with_data() {
+        let store = store();
+        store.create_topic("default-logs", config_with(3)).await.unwrap();
+        for (p, hw) in [(0, 841_582), (1, 858_589), (2, 853_596)] {
+            store.update_partition_offset("default-logs", p, hw, 0).await.unwrap();
+        }
+        for (p, hw) in [(0, 841_582), (1, 858_589), (2, 853_596)] {
+            assert_eq!(store.get_partition_offset("default-logs", p).await.unwrap(), Some((hw, 0)));
+        }
+
+        for (age, auto_created) in [(1i64, false), (-1, false), (1, true)] {
+            let mut replay = MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicCreated {
+                    name: "default-logs".to_string(),
+                    config: config_with(3),
+                    auto_created,
+                },
+                2,
+            );
+            replay.timestamp = replay.timestamp + chrono::Duration::days(age);
+            store.apply_replicated_event(replay).await.unwrap();
+
+            for (p, hw) in [(0, 841_582), (1, 858_589), (2, 853_596)] {
+                assert_eq!(
+                    store.get_partition_offset("default-logs", p).await.unwrap(),
+                    Some((hw, 0)),
+                    "replaying TopicCreated (age {age:+}d, auto_created {auto_created}) reset partition {p}"
+                );
+            }
+            assert_eq!(partitions_of(&store, "default-logs").await, 3);
+        }
+    }
+
     /// The other direction: an explicit create replaces an auto-created config
     /// even when it has FEWER partitions. Provenance decides, not size.
     #[tokio::test]

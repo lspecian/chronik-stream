@@ -223,8 +223,15 @@ impl raft_service_server::RaftService for RaftServiceImpl {
         let handler = self.write_handler.as_ref()
             .ok_or_else(|| Status::unimplemented("Write handler not configured"))?;
 
-        // Forward write via handler
-        match handler(req.command_data) {
+        // On a blocking thread. The handler waits — synchronously, for up to
+        // 10 s — for the Raft loop to commit the write. Called inline it held an
+        // async worker that long for every forwarded metadata write, and the
+        // threads it held are the ones that must stay free to answer heartbeats.
+        let handler = Arc::clone(handler);
+        let outcome = tokio::task::spawn_blocking(move || handler(req.command_data))
+            .await
+            .map_err(|e| Status::internal(format!("forward-write task failed: {}", e)))?;
+        match outcome {
             Ok(()) => Ok(Response::new(ForwardWriteResponse {
                 success: true,
                 error: String::new(),
