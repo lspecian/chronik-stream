@@ -2581,8 +2581,20 @@ impl KafkaProtocolHandler {
                     .as_millis() as i64 - 86400000) // 1 day ago
             }
             ts if ts >= 0 => {
-                // Return offset for specific timestamp (dummy implementation)
-                (500, ts)
+                let log_start = self.produce_handler
+                    .get_log_start_offset(topic_name, partition_index)
+                    .await;
+                let high_watermark = self.produce_handler
+                    .get_partition_high_watermark(topic_name, partition_index)
+                    .await;
+                match self.fetch_handler
+                    .offset_for_timestamp(topic_name, partition_index, ts, log_start, high_watermark)
+                    .await?
+                {
+                    Some((offset, found_ts)) => (offset, found_ts),
+                    // Kafka's answer when no record is at or after the time.
+                    None => (-1, -1),
+                }
             }
             _ => {
                 // Invalid timestamp

@@ -2766,6 +2766,75 @@ impl FetchHandler {
         Ok((high_watermark, log_start_offset))
     }
     
+    /// ListOffsets by timestamp: the earliest offset whose record timestamp is
+    /// at or after `target_ms`, with that record's timestamp, or `None` when no
+    /// record is that recent (Kafka answers offset -1).
+    ///
+    /// This used to be a placeholder answering offset 500 for every timestamp,
+    /// so `offsetsForTimes`, `--reset-offsets --to-datetime`, and every
+    /// "start from time T" consumer silently began at an arbitrary record —
+    /// past the end of a small partition, deep inside a large one.
+    ///
+    /// Binary search over offsets, probing the first record at each midpoint,
+    /// finds the boundary in O(log n) reads when timestamps rise with offsets —
+    /// the normal case, and the case in which this equals Kafka's answer
+    /// exactly. Producer-assigned CreateTime need not be monotonic, so a final
+    /// forward scan starts `TIMESTAMP_SCAN_BACK` records before the boundary
+    /// and returns the earliest qualifying record it meets. Kafka's own answer
+    /// is approximate in the same way: its time index records the running
+    /// maximum, not every record.
+    pub async fn offset_for_timestamp(
+        &self,
+        topic: &str,
+        partition: i32,
+        target_ms: i64,
+        log_start: i64,
+        high_watermark: i64,
+    ) -> Result<Option<(i64, i64)>> {
+        const PROBE_BYTES: i32 = 64 * 1024;
+        const SCAN_BYTES: i32 = 1024 * 1024;
+        const TIMESTAMP_SCAN_BACK: i64 = 1000;
+
+        if log_start >= high_watermark {
+            return Ok(None);
+        }
+
+        let (mut lo, mut hi) = (log_start, high_watermark);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let first = self
+                .fetch_records(topic, partition, mid, high_watermark, PROBE_BYTES)
+                .await?
+                .into_iter()
+                .filter(|r| r.offset >= mid)
+                .min_by_key(|r| r.offset);
+            match first {
+                Some(r) if r.timestamp >= target_ms => hi = mid,
+                // Step past holes too: the first record at or after `mid` is
+                // the one that answered, wherever it sits.
+                Some(r) => lo = (r.offset + 1).max(mid + 1),
+                None => hi = mid,
+            }
+        }
+
+        let mut cursor = lo.saturating_sub(TIMESTAMP_SCAN_BACK).max(log_start);
+        while cursor < high_watermark {
+            let mut records = self
+                .fetch_records(topic, partition, cursor, high_watermark, SCAN_BYTES)
+                .await?;
+            records.retain(|r| r.offset >= cursor);
+            if records.is_empty() {
+                break;
+            }
+            records.sort_by_key(|r| r.offset);
+            if let Some(hit) = records.iter().find(|r| r.timestamp >= target_ms) {
+                return Ok(Some((hit.offset, hit.timestamp)));
+            }
+            cursor = records.last().map(|r| r.offset + 1).unwrap_or(high_watermark);
+        }
+        Ok(None)
+    }
+
     /// Update in-memory buffer with raw Kafka batch bytes (v1.3.32 FIX)
     /// CRITICAL: Stores original wire-format bytes to preserve CRC
     pub async fn update_buffer_with_raw_batch(

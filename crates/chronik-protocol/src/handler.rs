@@ -4356,8 +4356,13 @@ impl ProtocolHandler {
                             .as_millis() as i64 - 86400000) // 1 day ago
                     }
                     ts if ts >= 0 => {
-                        // Return offset for specific timestamp (dummy implementation)
-                        (500, ts)
+                        // This handler has no access to records, so it cannot
+                        // look a timestamp up; the server answers ListOffsets
+                        // itself (`kafka_handler`). Say "not found" rather than
+                        // invent an offset — this used to answer 500 for every
+                        // timestamp.
+                        let _ = ts;
+                        (-1, -1)
                     }
                     _ => {
                         // Invalid timestamp
