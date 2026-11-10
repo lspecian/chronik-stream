@@ -81,10 +81,13 @@ impl LeaderStatus {
 /// Run the leader election loop. This function never returns normally.
 pub async fn run(client: Client, config: LeaderElectionConfig, status: LeaderStatus) {
     let api: Api<Lease> = Api::namespaced(client, &config.namespace);
+    let mut last_renewed: Option<std::time::Instant> = None;
 
     loop {
+        let mut retry_soon = false;
         match try_acquire_or_renew(&api, &config).await {
             Ok(acquired) => {
+                last_renewed = acquired.then(std::time::Instant::now);
                 if acquired && !status.is_leader() {
                     info!(
                         holder = %config.holder_id,
@@ -100,13 +103,46 @@ pub async fn run(client: Client, config: LeaderElectionConfig, status: LeaderSta
                 status.set_leader(acquired);
             }
             Err(e) => {
-                error!("Leader election error: {e}");
-                status.set_leader(false);
+                if status.is_leader() && within_renew_deadline(last_renewed, &config) {
+                    // One failed call is not a lost lease. Measured on microk8s:
+                    // a single `500 database is locked` from the API server
+                    // made the operator give up leadership and restart while
+                    // the lease it had just renewed still had 15 s to run — 11
+                    // restarts in a day, each one a reconcile gap. Keep
+                    // retrying until the renew deadline, which ends before the
+                    // lease does, so no rival can have acquired it meanwhile.
+                    warn!("Leader election error, still within the lease — retrying: {e}");
+                    retry_soon = true;
+                } else {
+                    error!("Leader election error: {e}");
+                    status.set_leader(false);
+                }
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(config.renew_interval_secs)).await;
+        let pause = if retry_soon {
+            1
+        } else {
+            config.renew_interval_secs
+        };
+        tokio::time::sleep(Duration::from_secs(pause)).await;
     }
+}
+
+/// Whether a leader that failed to renew may keep acting as leader.
+///
+/// The deadline is the lease minus one renew interval: after it, a rival might
+/// acquire the lease the moment it expires, and two operators reconciling the
+/// same clusters is worse than a restart. Kubernetes' client-go draws the same
+/// line (`renewDeadline` < `leaseDuration`).
+fn within_renew_deadline(
+    last_renewed: Option<std::time::Instant>,
+    config: &LeaderElectionConfig,
+) -> bool {
+    let deadline = Duration::from_secs(
+        (config.lease_duration_secs.max(0) as u64).saturating_sub(config.renew_interval_secs),
+    );
+    last_renewed.is_some_and(|t| t.elapsed() < deadline)
 }
 
 /// Gracefully step down from leadership on shutdown.
@@ -297,5 +333,27 @@ mod tests {
     #[test]
     fn test_epoch_secs_nonzero() {
         assert!(epoch_secs() > 0);
+    }
+
+    /// A leader that just renewed survives one failed call...
+    #[test]
+    fn a_fresh_lease_survives_a_failed_renewal() {
+        let config = LeaderElectionConfig::default();
+        assert!(within_renew_deadline(
+            Some(std::time::Instant::now()),
+            &config
+        ));
+    }
+
+    /// ...but not once a rival could hold the lease.
+    #[test]
+    fn leadership_ends_at_the_renew_deadline() {
+        let config = LeaderElectionConfig::default(); // 15 s lease, 5 s interval
+        let renewed = std::time::Instant::now() - Duration::from_secs(10);
+        assert!(!within_renew_deadline(Some(renewed), &config));
+        assert!(
+            !within_renew_deadline(None, &config),
+            "never renewed is never within"
+        );
     }
 }
