@@ -56,6 +56,27 @@ const DEFAULT_TICK: Duration = Duration::from_secs(2);
 /// range for the same reason.
 const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(30);
 
+/// How often leadership is returned to preferred replicas. Kafka's
+/// `leader.imbalance.check.interval.seconds` default.
+const DEFAULT_REBALANCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Preferred-leader moves per pass. Each one bumps a leader epoch and sends
+/// that partition's producers and followers through a leader change, so a
+/// large catalog is rebalanced in steps, one interval apart.
+const DEFAULT_REBALANCE_MAX_MOVES: usize = 50;
+
+/// `CHRONIK_AUTO_LEADER_REBALANCE` (default on) and
+/// `CHRONIK_LEADER_REBALANCE_INTERVAL_SECS` (default 300).
+fn rebalance_interval_from_env() -> Option<Duration> {
+    let enabled = std::env::var("CHRONIK_AUTO_LEADER_REBALANCE")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no"))
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    Some(env_secs("CHRONIK_LEADER_REBALANCE_INTERVAL_SECS").unwrap_or(DEFAULT_REBALANCE_INTERVAL))
+}
+
 /// One partition that must change leader, and to whom.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failover {
@@ -79,6 +100,13 @@ pub struct Failover {
     pub replicas: Vec<u64>,
     /// Replicas currently alive. Reported, not written — diagnostics only.
     pub live_replicas: Vec<u64>,
+}
+
+/// Why a leadership change is being made — for the log and the counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveReason {
+    LeaderUnreachable,
+    PreferredReplicaInSync,
 }
 
 /// A partition whose leader is gone and which has no live replica to move to.
@@ -185,6 +213,74 @@ pub fn plan_failover(
     plan
 }
 
+/// Partitions whose leadership should go back to their preferred replica.
+///
+/// Failover is one-way: it moves a partition off a dead leader and nothing
+/// ever moved it back. So every transient failure permanently skewed
+/// leadership, and worse, could leave a partition led by a replica that holds
+/// only part of its history. Measured on a live cluster: two partitions failed
+/// over in August to replicas that the replication of that era had marked in
+/// sync while they held nothing. The new leaders began at the high watermark,
+/// every read below it jumped to ~858,000, and the full ~590 MB history sat on
+/// the preferred replica — still in the in-sync set, still replicating — for
+/// three months, unread. Kafka avoids this with `auto.leader.rebalance.enable`
+/// (default on); this is that.
+///
+/// Rules, all conservative because nothing is broken when this runs:
+///
+/// - the current leader must be alive — a dead leader is `plan_failover`'s
+///   job, and acting on both at once would fight;
+/// - the preferred replica (`replicas[0]`) must be alive AND in the leader's
+///   **published** in-sync set. An empty set means "not reported", and with no
+///   failure to repair there is no reason to move on no evidence;
+/// - internal (`__`) topics are skipped, as in failover;
+/// - at most `max_moves` per pass, so an upgrade that suddenly enables this on
+///   a large catalog moves leadership in bounded steps rather than all at once.
+pub fn plan_preferred_leaders(
+    assignments: &[PartitionAssignment],
+    live: &HashSet<u64>,
+    max_moves: usize,
+) -> Vec<Failover> {
+    let mut moves = Vec::new();
+
+    for assignment in assignments {
+        if moves.len() >= max_moves {
+            break;
+        }
+        if assignment.topic.starts_with("__") {
+            continue;
+        }
+        let Some(&preferred) = assignment.replicas.first() else {
+            continue;
+        };
+        if assignment.leader_id == preferred {
+            continue;
+        }
+        if !live.contains(&assignment.leader_id) || !live.contains(&preferred) {
+            continue;
+        }
+        if !assignment.isr.contains(&preferred) {
+            continue;
+        }
+
+        moves.push(Failover {
+            topic: assignment.topic.clone(),
+            partition: assignment.partition,
+            from: assignment.leader_id,
+            to: preferred,
+            replicas: assignment.replicas.clone(),
+            live_replicas: assignment
+                .replicas
+                .iter()
+                .copied()
+                .filter(|id| live.contains(id))
+                .collect(),
+        });
+    }
+
+    moves
+}
+
 /// Nodes present now that were absent before — the ones that just came back.
 ///
 /// `previous` is `None` on the first observation after becoming Raft leader.
@@ -228,6 +324,18 @@ pub struct PartitionFailoverController {
     liveness_window: Duration,
     shutdown: Arc<AtomicBool>,
     failovers_performed: Arc<AtomicU64>,
+    /// How often leadership is returned to preferred replicas; `None` disables
+    /// it (`CHRONIK_AUTO_LEADER_REBALANCE=false`).
+    rebalance_interval: Option<Duration>,
+    /// Cap on preferred-leader moves per pass.
+    rebalance_max_moves: usize,
+    /// Last leadership change this controller made, of either kind. A
+    /// preferred-leader pass waits a full interval after it, so a flapping node
+    /// is not handed leadership back the moment it reappears.
+    last_leadership_change: parking_lot::Mutex<Option<Instant>>,
+    /// When the last preferred-leader pass ran.
+    last_rebalance_pass: parking_lot::Mutex<Option<Instant>>,
+    rebalances_performed: Arc<AtomicU64>,
 }
 
 impl PartitionFailoverController {
@@ -251,6 +359,15 @@ impl PartitionFailoverController {
                 .unwrap_or(DEFAULT_LIVENESS_WINDOW),
             shutdown: Arc::new(AtomicBool::new(false)),
             failovers_performed: Arc::new(AtomicU64::new(0)),
+            rebalance_interval: rebalance_interval_from_env(),
+            rebalance_max_moves: std::env::var("CHRONIK_LEADER_REBALANCE_MAX_PER_PASS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(DEFAULT_REBALANCE_MAX_MOVES),
+            last_leadership_change: parking_lot::Mutex::new(None),
+            last_rebalance_pass: parking_lot::Mutex::new(None),
+            rebalances_performed: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -416,10 +533,50 @@ impl PartitionFailoverController {
         }
 
         for failover in &plan.failovers {
-            self.apply(failover).await;
+            self.apply(failover, MoveReason::LeaderUnreachable).await;
+        }
+        if !plan.failovers.is_empty() {
+            *self.last_leadership_change.lock() = Some(now);
+            // Never rebalance in a pass that failed something over.
+            return Ok(());
+        }
+
+        if self.rebalance_due(now) {
+            let moves = plan_preferred_leaders(&assignments, &live, self.rebalance_max_moves);
+            for m in &moves {
+                self.apply(m, MoveReason::PreferredReplicaInSync).await;
+            }
+            if !moves.is_empty() {
+                *self.last_leadership_change.lock() = Some(now);
+            }
         }
 
         Ok(())
+    }
+
+    /// Whether a preferred-leader pass should run now: enabled, a full interval
+    /// since the last pass, and a full interval since the last leadership
+    /// change of either kind — so a node that just failed is not handed
+    /// leadership back the moment it reappears, only once it has stayed.
+    fn rebalance_due(&self, now: Instant) -> bool {
+        let Some(interval) = self.rebalance_interval else {
+            return false;
+        };
+        let elapsed = |t: Option<Instant>| t.map_or(true, |t| now.duration_since(t) >= interval);
+
+        if !elapsed(*self.last_leadership_change.lock()) {
+            return false;
+        }
+        let mut last_pass = self.last_rebalance_pass.lock();
+        if !elapsed(*last_pass) {
+            return false;
+        }
+        *last_pass = Some(now);
+        true
+    }
+
+    pub fn rebalances_performed(&self) -> u64 {
+        self.rebalances_performed.load(Ordering::Relaxed)
     }
 
     /// Move one partition to its new leader.
@@ -428,7 +585,7 @@ impl PartitionFailoverController {
     /// derives the leader epoch, so a genuine leader change bumps it exactly
     /// once. That bump is what tells followers to re-run the RP-3.3 epoch
     /// handshake and truncate anything the old leader never committed.
-    async fn apply(&self, failover: &Failover) {
+    async fn apply(&self, failover: &Failover, reason: MoveReason) {
         let assignment = PartitionAssignment {
             topic: failover.topic.clone(),
             partition: failover.partition,
@@ -448,20 +605,29 @@ impl PartitionFailoverController {
         };
 
         match self.metadata_store.assign_partition(assignment).await {
-            Ok(()) => {
-                self.failovers_performed.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    "{}-{}: leader {} is unreachable — failed over to {} (live replicas {:?})",
-                    failover.topic,
-                    failover.partition,
-                    failover.from,
-                    failover.to,
-                    failover.live_replicas
-                );
-            }
+            Ok(()) => match reason {
+                MoveReason::LeaderUnreachable => {
+                    self.failovers_performed.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "{}-{}: leader {} is unreachable — failed over to {} (live replicas {:?})",
+                        failover.topic,
+                        failover.partition,
+                        failover.from,
+                        failover.to,
+                        failover.live_replicas
+                    );
+                }
+                MoveReason::PreferredReplicaInSync => {
+                    self.rebalances_performed.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        "{}-{}: preferred replica {} is in sync — leadership returned to it from {}",
+                        failover.topic, failover.partition, failover.to, failover.from
+                    );
+                }
+            },
             Err(e) => error!(
-                "{}-{}: could not fail over from unreachable leader {} to {}: {}",
-                failover.topic, failover.partition, failover.from, failover.to, e
+                "{}-{}: could not move leadership from {} to {} ({:?}): {}",
+                failover.topic, failover.partition, failover.from, failover.to, reason, e
             ),
         }
     }
@@ -857,5 +1023,86 @@ mod tests {
         let plan = plan_failover(&assignments, &live(&[3]));
 
         assert_eq!(plan.failovers[0].replicas, vec![1, 2, 3]);
+    }
+
+    // ---- preferred-leader return -------------------------------------------
+
+    /// The live-cluster case this exists for: leadership failed over to a
+    /// replica, the preferred replica came back and caught up, and nothing ever
+    /// moved leadership back. Shape taken from the cluster where it happened.
+    #[test]
+    fn leadership_returns_to_an_in_sync_preferred_replica() {
+        let assignments = vec![
+            assignment_with_isr("default-logs", 0, 1, &[1, 2, 3], &[1, 2, 3]),
+            assignment_with_isr("default-logs", 1, 3, &[2, 3, 1], &[2, 3]),
+            assignment_with_isr("default-logs", 2, 1, &[3, 1, 2], &[3, 1, 2]),
+        ];
+
+        let moves = plan_preferred_leaders(&assignments, &live(&[1, 2, 3]), 50);
+
+        let got: Vec<(u32, u64, u64)> = moves.iter().map(|m| (m.partition, m.from, m.to)).collect();
+        assert_eq!(got, vec![(1, 3, 2), (2, 1, 3)]);
+        // A leadership move, never a reassignment.
+        assert_eq!(moves[0].replicas, vec![2, 3, 1]);
+        assert_eq!(moves[1].replicas, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn a_preferred_leader_already_leading_is_left_alone() {
+        let assignments = vec![assignment_with_isr("t", 0, 1, &[1, 2, 3], &[1, 2, 3])];
+        assert!(plan_preferred_leaders(&assignments, &live(&[1, 2, 3]), 50).is_empty());
+    }
+
+    /// Not in sync means it may lack acknowledged records; handing it
+    /// leadership would truncate them away on every other replica.
+    #[test]
+    fn a_preferred_replica_that_is_not_in_sync_does_not_take_over() {
+        let assignments = vec![assignment_with_isr("t", 0, 3, &[2, 3, 1], &[3, 1])];
+        assert!(plan_preferred_leaders(&assignments, &live(&[1, 2, 3]), 50).is_empty());
+    }
+
+    /// An unpublished set is "unknown". Failover falls back to the replica set
+    /// because something is broken; a rebalance repairs nothing, so it waits.
+    #[test]
+    fn an_unpublished_isr_moves_nothing() {
+        let assignments = vec![assignment("t", 0, 3, &[2, 3, 1])];
+        assert!(plan_preferred_leaders(&assignments, &live(&[1, 2, 3]), 50).is_empty());
+    }
+
+    #[test]
+    fn a_dead_preferred_replica_does_not_take_over() {
+        let assignments = vec![assignment_with_isr("t", 0, 3, &[2, 3, 1], &[2, 3, 1])];
+        assert!(plan_preferred_leaders(&assignments, &live(&[1, 3]), 50).is_empty());
+    }
+
+    /// A dead leader belongs to failover; both acting on it would fight.
+    #[test]
+    fn a_dead_current_leader_is_left_to_failover() {
+        let assignments = vec![assignment_with_isr("t", 0, 3, &[2, 3, 1], &[2, 3, 1])];
+        assert!(plan_preferred_leaders(&assignments, &live(&[1, 2]), 50).is_empty());
+    }
+
+    #[test]
+    fn internal_topics_are_never_rebalanced() {
+        let assignments = vec![assignment_with_isr("__meta", 0, 3, &[2, 3, 1], &[2, 3, 1])];
+        assert!(plan_preferred_leaders(&assignments, &live(&[1, 2, 3]), 50).is_empty());
+    }
+
+    /// Enabling this on a large, skewed catalog must not move everything at once.
+    #[test]
+    fn moves_per_pass_are_capped() {
+        let assignments: Vec<_> = (0..10)
+            .map(|p| assignment_with_isr("t", p, 3, &[2, 3, 1], &[2, 3, 1]))
+            .collect();
+        assert_eq!(plan_preferred_leaders(&assignments, &live(&[1, 2, 3]), 4).len(), 4);
+    }
+
+    /// After one pass is applied, the next plans nothing — no epoch churn.
+    #[test]
+    fn rebalancing_converges() {
+        let mut assignments = vec![assignment_with_isr("t", 0, 3, &[2, 3, 1], &[2, 3, 1])];
+        let moves = plan_preferred_leaders(&assignments, &live(&[1, 2, 3]), 50);
+        assignments[0].leader_id = moves[0].to;
+        assert!(plan_preferred_leaders(&assignments, &live(&[1, 2, 3]), 50).is_empty());
     }
 }
