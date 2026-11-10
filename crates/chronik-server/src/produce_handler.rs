@@ -331,6 +331,15 @@ impl ProduceFlushProfile {
     }
 }
 
+/// How `validate_producer_sequence` treats a batch that is next in sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceCheck {
+    /// Wait (bounded) for earlier in-flight batches; record nothing.
+    WaitForTurn,
+    /// Record the sequence now; never wait — the caller holds the append lock.
+    AdvanceNow,
+}
+
 /// Producer information for idempotence tracking
 #[derive(Debug, Clone)]
 struct ProducerInfo {
@@ -2355,9 +2364,15 @@ impl ProduceHandler {
         // early return: an advance placed after the WAL write never runs on that
         // path, and the producer's next batch would be rejected as out of order.
         let is_control_batch = (temp_batch.header.attributes & 0x20) != 0;
-        if temp_batch.header.producer_id >= 0 && !is_control_batch {
-            self.validate_producer_sequence(&temp_batch, topic, partition, transactional_id)
-                .await?;
+        let sequenced = temp_batch.header.producer_id >= 0 && !is_control_batch;
+        if sequenced {
+            // Phase 1, outside the append lock: wait until this batch is next
+            // in its producer's sequence. Duplicates are rejected here, so a
+            // retry never reserves offsets.
+            self.validate_producer_sequence(
+                &temp_batch, topic, partition, transactional_id, SequenceCheck::WaitForTurn,
+            )
+            .await?;
         }
 
         // From here until the batch is in the WAL queue, this request holds the
@@ -2375,12 +2390,32 @@ impl ProduceHandler {
         // max.in.flight=5 lost a few records per 30,000, and whole 148-record
         // batches when produce requests were timing out.
         //
-        // Taken AFTER the sequence check, never before: that check can wait for
-        // an earlier in-flight batch of the same producer, which would need this
+        // Taken AFTER the phase-1 sequence wait, never before: that wait is for
+        // an earlier in-flight batch of the same producer, which needs this
         // lock to make progress. Released right after the enqueue (below), so
         // the fsync and the acks=all ISR wait happen outside it and concurrent
         // requests still share a group commit.
+        #[cfg(test)]
+        tests::pause_before_append_lock(temp_batch.header.producer_id, temp_batch.header.base_sequence).await;
+
         let append_guard = partition_state.append_lock.lock().await;
+
+        // Phase 2, under the append lock: record the sequence and, right below,
+        // reserve the offsets — together, so a producer's batches take offsets
+        // in sequence order.
+        //
+        // Phase 1 alone only ordered the *checks*. Batch N and N+1 of one
+        // producer could both pass it and then race for this lock, and when
+        // N+1 won it took the lower offsets: the producer's records stored out
+        // of order, which idempotence promises cannot happen. Advancing here
+        // closes that, and cannot deadlock — N+1 waited in phase 1 holding
+        // nothing, and N advances while holding this lock.
+        if sequenced {
+            self.validate_producer_sequence(
+                &temp_batch, topic, partition, transactional_id, SequenceCheck::AdvanceNow,
+            )
+            .await?;
+        }
 
         // ATOMIC: Reserve offset range in ONE operation (prevents race conditions)
         let base_offset = partition_state.next_offset.fetch_add(record_count, Ordering::SeqCst);
@@ -3249,6 +3284,7 @@ impl ProduceHandler {
         topic: &str,
         partition: i32,
         transactional_id: Option<&str>,
+        mode: SequenceCheck,
     ) -> Result<()> {
         if !self.config.enable_idempotence {
             return Ok(());
@@ -3322,6 +3358,11 @@ impl ProduceHandler {
                     self.metrics.duplicate_records.fetch_add(batch.records.len() as u64, Ordering::Relaxed);
                     return Err(Error::DuplicateSequenceNumber(format!("Duplicate sequence: {}", batch.header.base_sequence)));
                 } else if batch.header.base_sequence == expected_sequence {
+                    if mode == SequenceCheck::WaitForTurn {
+                        // Our turn — but only record it under the append lock,
+                        // together with the offsets, so the two orders agree.
+                        return Ok(());
+                    }
                     // In order — advance the tracked sequence atomically (same lock).
                     let last_sequence = batch.header.base_sequence + batch.records.len() as i32 - 1;
                     producer_info.sequence_numbers.insert(key, last_sequence);
@@ -3330,6 +3371,15 @@ impl ProduceHandler {
                 }
                 // base_sequence > expected_sequence: an earlier batch is still in
                 // flight. Release the lock (end of scope) and wait for it.
+            }
+
+            if mode == SequenceCheck::AdvanceNow {
+                // Never wait here: the caller holds the partition's append lock,
+                // which is exactly what the earlier batch needs to advance.
+                return Err(Error::OutOfOrderSequenceNumber(format!(
+                    "Out of order sequence: producer={}, topic={}, partition={}, got={}",
+                    batch.header.producer_id, topic, partition, batch.header.base_sequence
+                )));
             }
 
             if Instant::now() >= deadline {
@@ -4436,6 +4486,65 @@ mod tests {
             second.topics[0].partitions[0].base_offset, 3,
             "a rejected duplicate consumed offsets: the next batch landed at {} instead of 3",
             second.topics[0].partitions[0].base_offset
+        );
+    }
+
+    /// `(producer_id, base_sequence)` to hold just before it takes the append
+    /// lock — the window in which, before the fix, a batch had recorded its
+    /// sequence but not yet reserved its offsets. Production never pauses.
+    static PAUSE_BEFORE_LOCK: std::sync::Mutex<Option<(i64, i32)>> = std::sync::Mutex::new(None);
+
+    pub(super) async fn pause_before_append_lock(producer_id: i64, base_sequence: i32) {
+        let hit = *PAUSE_BEFORE_LOCK.lock().unwrap() == Some((producer_id, base_sequence));
+        if hit {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// A producer's batches take offsets in sequence order.
+    ///
+    /// Idempotence promises the log holds a producer's records in the order it
+    /// sent them. When the sequence was recorded in one step and the offsets
+    /// reserved in a later one, batch N could record its sequence, be delayed —
+    /// descheduled under load — and batch N+1 would then pass its own check and
+    /// reserve the LOWER offsets. The hook holds N in exactly that window, so
+    /// this fails deterministically against the old ordering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_producers_batches_take_offsets_in_sequence_order() {
+        let (handler, _temp) = create_test_handler().await;
+        let handler = Arc::new(handler);
+
+        let produce = |records: Vec<u8>| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        };
+
+        let pid = 4242;
+        *PAUSE_BEFORE_LOCK.lock().unwrap() = Some((pid, 0));
+        let first = create_test_record_batch(pid, 0, vec![("a", "1"), ("b", "2"), ("c", "3")]);
+        let second = create_test_record_batch(pid, 3, vec![("d", "4"), ("e", "5")]);
+
+        let h = Arc::clone(&handler);
+        let req = produce(first);
+        let early = tokio::spawn(async move { h.handle_produce(req, 1).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let late = handler.handle_produce(produce(second), 2).await.unwrap();
+        let early = early.await.unwrap().unwrap();
+        *PAUSE_BEFORE_LOCK.lock().unwrap() = None;
+
+        let (e, l) = (&early.topics[0].partitions[0], &late.topics[0].partitions[0]);
+        assert_eq!((e.error_code, l.error_code), (0, 0));
+        assert_eq!(
+            (e.base_offset, l.base_offset),
+            (0, 3),
+            "sequence 0 must take the lower offsets; got seq0@{} seq3@{}",
+            e.base_offset,
+            l.base_offset
         );
     }
 
