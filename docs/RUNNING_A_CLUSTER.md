@@ -316,6 +316,42 @@ S3_BUCKET=chronik-prod-backups
 S3_REGION=us-west-2
 ```
 
+### Leadership and Durability
+
+**Replication factor 1 means one copy.** A topic created with
+`replication_factor = 1` (or `--replication-factor 1`) keeps each partition on a
+single node. Losing that node's disk loses the partition, and while the node is
+down the partition is unavailable — there is no other replica to fail over to.
+Use RF ≥ 2 for anything you cannot afford to lose, and RF = 3 with
+`min_insync_replicas = 2` for production.
+
+**Failover and return.** When a partition's leader stops answering for
+`CHRONIK_FAILOVER_LIVENESS_SECS` (default 30), the Raft leader moves leadership
+to the first replica in the partition's in-sync set. It never promotes a replica
+that is merely reachable: one that is not in sync may lack acknowledged
+records, and promoting it would truncate them away everywhere else. Once the
+preferred replica (the first in the replica list) is back and in sync,
+leadership returns to it — Kafka's `auto.leader.rebalance.enable`:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CHRONIK_AUTO_LEADER_REBALANCE` | `true` | Return leadership to in-sync preferred replicas. |
+| `CHRONIK_LEADER_REBALANCE_INTERVAL_SECS` | `300` | How often to check, and how long after any leadership change to wait first — a node that just failed is not handed leadership back the moment it reappears. |
+| `CHRONIK_LEADER_REBALANCE_MAX_PER_PASS` | `50` | Moves per check, so a large skewed catalog is rebalanced in steps. |
+
+Before v2.16.2 failover was one-way, so a cluster that had ever failed over
+kept the skew forever. Upgrading moves those partitions back within a few
+intervals — expect leader changes (and producers refreshing metadata) for that
+long after the roll.
+
+**Background indexing on constrained disks.** The WAL indexer sleeps a full
+`wal_indexing_interval_secs` after every run, so a backlog never runs back to
+back. On disks shared with everything else, `CHRONIK_WAL_INDEXER_SEGMENT_PAUSE_MS`
+(default `0`) adds a pause between segments within a run, trading backlog drain
+speed for headroom. Raft runs on its own threads and does not compete with
+indexing or request handling for them; it still shares the disk, so a disk that
+stalls fsync for seconds can still delay Raft.
+
 ### Port Reference
 
 | Port | Purpose | Clients |

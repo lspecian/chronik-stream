@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Partition leadership never returned to the preferred replica.** Failover
+  was one-way: a partition whose leader went away moved to another replica and
+  stayed there forever. On a live cluster this left two partitions led since
+  August by replicas holding only part of their history; reads below ~858,000
+  jumped straight past the missing range while the full ~590 MB history sat on
+  the preferred replica, in sync and replicating, unread. Leadership now
+  returns to an alive, in-sync preferred replica — Kafka's
+  `auto.leader.rebalance.enable` — checked every 300 s, never within an interval
+  of a failover, at most 50 moves per pass (`CHRONIK_AUTO_LEADER_REBALANCE`,
+  `CHRONIK_LEADER_REBALANCE_INTERVAL_SECS`, `CHRONIK_LEADER_REBALANCE_MAX_PER_PASS`).
+  Expect leader changes for a few intervals after upgrading a cluster that has
+  ever failed over.
+
+- **Topics written in the legacy (v0/v1) message format were never
+  replicated.** Followers refused anything but v2 batches, and the refusal was
+  not a backoff: the follower fetched the same offset again at once, forever,
+  while the leader re-read the data and logged every message. Measured on a live
+  cluster at 3.5–5 cores per node, and the affected partitions had a real
+  replication factor of one. Followers now replicate uncompressed legacy message
+  sets byte-for-byte, and any partition whose fetched records cannot be applied
+  backs off (1 s doubling to 60 s) instead of spinning.
+
+- **Legacy message sets decoded with shifted offsets when the first message sat
+  at offset 0** — the normal case for a producer-built set. The base offset was
+  taken from the second message, so the deltas after it shifted and collided.
+
+- **The fetch and produce paths printed a line per message** (`V1→OFFSET_UPDATE`,
+  `V1→PRESERVED`, `V2→DETECTED`, `CANONICAL_RECORD→DEBUG`) with unconditional
+  `eprintln!`, about 29,000 lines/s on a busy node, crowding every other log line
+  out of the retained window. Now at `trace` level.
+
+- **ListOffsets by timestamp answered offset 500 for every timestamp.**
+  `offsetsForTimes`, `kafka-consumer-groups --reset-offsets --to-datetime`, and
+  every "start from time T" consumer began at an arbitrary record. It now returns
+  the first offset whose timestamp is at or after the time, or -1 when no record
+  is that recent.
+
+- **A producer's batches could take offsets out of sequence order.** The
+  sequence was recorded before the partition's append lock was taken, so a batch
+  delayed between the two let the next batch of the same producer reserve the
+  lower offsets. The sequence is now recorded under the append lock, together
+  with the offset reservation.
+
+- **Raft shared its threads with everything else.** Heartbeat handling ran on
+  the main runtime beside every request handler, and each forwarded metadata
+  write blocked a worker for up to 10 s, so a busy node could miss Raft's ~2 s
+  election deadline — reported (#58) as election storms while an indexing
+  backlog drained. Raft's loop, gRPC server, outbound sender and peer connections
+  now run on a dedicated runtime, and forwarded writes wait on a blocking thread.
+
+- **The WAL indexer ran a backlog back to back.** Its fixed-rate timer fired
+  owed ticks immediately when a run outlasted the 30 s period, so a 15–75 s run
+  was followed by another at once (#58). A full interval of idle now follows
+  every run; `CHRONIK_WAL_INDEXER_SEGMENT_PAUSE_MS` adds a pause between segments
+  within a run for constrained disks.
+
+- **The operator restarted on a single failed Lease renewal.** One
+  `500 database is locked` from the API server dropped leadership while the
+  lease had 15 s left (11 restarts in a day on microk8s). It now keeps retrying
+  until the renew deadline (lease minus one renew interval), as client-go does.
+
+### Documentation
+
+- `docs/RUNNING_A_CLUSTER.md`: what replication factor 1 means, failover and
+  preferred-leader return, and indexing on constrained disks (#58). Issue #58's
+  "metadata log replayed from offset 0" was the routine catalog re-broadcast,
+  which always carries offset 0; replaying it never resets a partition, now
+  pinned by a test.
+
 ## [2.16.1] - 2026-11-10
 
 ### Fixed
