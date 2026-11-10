@@ -101,6 +101,31 @@ pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<V
     let len = bytes.len();
 
     while pos < len {
+        // Both a v2 batch and a legacy (v0/v1) message keep their magic byte
+        // at position 16, so the format is known before anything else is read.
+        if len - pos <= MAGIC_OFFSET {
+            break;
+        }
+        let leading_magic = bytes[pos + MAGIC_OFFSET] as i8;
+        if leading_magic == 0 || leading_magic == 1 {
+            match legacy_run(bytes, pos, cursor)? {
+                LegacyRun::Partial => break,
+                LegacyRun::AlreadyHave { end } => {
+                    pos = end;
+                    continue;
+                }
+                LegacyRun::Run(frame) => {
+                    if frame.base_offset != cursor {
+                        return Err(ApplyRefusal::Gap { expected: cursor, found: frame.base_offset });
+                    }
+                    cursor = frame.next_offset();
+                    pos = frame.end;
+                    actions.push(BatchAction::Apply(frame));
+                    continue;
+                }
+            }
+        }
+
         // A trailing partial batch is normal: the leader truncates the blob at
         // its byte budget. Stop cleanly and let the next fetch pick it up.
         if len - pos < MIN_BATCH_HEADER {
@@ -166,6 +191,98 @@ pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<V
     }
 
     Ok(actions)
+}
+
+/// A legacy message: offset(8) size(4) crc(4) magic(1) attributes(1), then a
+/// key and a value of at least a length field each.
+const LEGACY_MIN_MESSAGE: i32 = 4 + 1 + 1 + 4 + 4;
+const LEGACY_ATTRIBUTES_OFFSET: usize = 17;
+
+/// What one stretch of legacy (v0/v1) messages contributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyRun {
+    /// Not even one whole message is available yet.
+    Partial,
+    /// Every whole message here is below the follower's log end.
+    AlreadyHave { end: usize },
+    /// Consecutive messages starting at or after the log end.
+    Run(BatchFrame),
+}
+
+/// Frame a run of consecutive legacy messages starting at `start`.
+///
+/// A topic written by an old client (v0/v1 message format) is stored and served
+/// in that format — the leader returns the producer's original message set with
+/// offsets rewritten, since the legacy CRC does not cover the offset field. This
+/// used to be refused outright ("only v2 batches can be replicated"), and the
+/// refusal was not a backoff: the follower fetched the same offset again at
+/// once, forever. Measured on a live cluster: two followers re-reading a
+/// handful of such partitions continuously, the leader logging every message
+/// of every re-read, 3.5–5 cores per node burnt on it — and those partitions
+/// had never been replicated at all, so their replication factor was one.
+///
+/// Each legacy message is an independent unit with its own CRC, so unlike a v2
+/// batch a run may be cut anywhere: messages below `cursor` are dropped rather
+/// than treated as divergence, and a gap in offsets ends the run.
+fn legacy_run(bytes: &[u8], start: usize, cursor: i64) -> std::result::Result<LegacyRun, ApplyRefusal> {
+    let len = bytes.len();
+    let mut pos = start;
+    let mut first: Option<(usize, i64)> = None;
+    let mut last_offset = 0i64;
+    let mut count = 0i32;
+
+    while len - pos > LEGACY_ATTRIBUTES_OFFSET {
+        let magic = bytes[pos + MAGIC_OFFSET] as i8;
+        if magic != 0 && magic != 1 {
+            break; // a v2 batch follows; the caller frames it
+        }
+        let size = read_i32(bytes, pos + 8);
+        if size < LEGACY_MIN_MESSAGE {
+            return Err(ApplyRefusal::Malformed(format!(
+                "legacy message at byte {pos} declared size {size}"
+            )));
+        }
+        let end = pos + 12 + size as usize;
+        if end > len {
+            break; // partial trailing message
+        }
+        if bytes[pos + LEGACY_ATTRIBUTES_OFFSET] & 0x07 != 0 {
+            // A compressed wrapper holds many records under one offset; the
+            // leader's own offset rewrite assumes one record per message, so
+            // there is no consistent answer to copy here.
+            return Err(ApplyRefusal::Malformed(format!(
+                "compressed legacy message at byte {pos} cannot be replicated"
+            )));
+        }
+
+        let offset = read_i64(bytes, pos);
+        match first {
+            None if offset < cursor => {} // already in the local log
+            None => {
+                first = Some((pos, offset));
+                last_offset = offset;
+                count = 1;
+            }
+            Some(_) if offset == last_offset + 1 => {
+                last_offset = offset;
+                count += 1;
+            }
+            Some(_) => break, // not consecutive — let the caller judge it
+        }
+        pos = end;
+    }
+
+    Ok(match first {
+        Some((run_start, base_offset)) => LegacyRun::Run(BatchFrame {
+            start: run_start,
+            end: pos,
+            base_offset,
+            last_offset,
+            record_count: count,
+        }),
+        None if pos > start => LegacyRun::AlreadyHave { end: pos },
+        None => LegacyRun::Partial,
+    })
 }
 
 /// Append one batch to the follower's local log, with the same side effects the
@@ -328,6 +445,21 @@ pub async fn apply_fetched_records(
                 frame.base_offset
             ))
         })?;
+        // The plan read only headers; the decode read everything. If they
+        // disagree about where this lands, appending would put records at
+        // offsets the leader does not have them at.
+        if canonical.base_offset != frame.base_offset
+            || canonical.records.len() as i32 != frame.record_count
+        {
+            return Err(ApplyRefusal::Malformed(format!(
+                "batch {topic}-{partition} planned as [{}, {}] ({} records) decoded as base {} with {} records",
+                frame.base_offset,
+                frame.last_offset,
+                frame.record_count,
+                canonical.base_offset,
+                canonical.records.len()
+            )));
+        }
 
         match apply_canonical_batch(
             wal_manager,
@@ -512,13 +644,110 @@ mod tests {
         assert!(actions.is_empty());
     }
 
-    #[test]
-    fn a_non_v2_batch_is_rejected() {
-        let mut bytes = batch(0, 5, 0);
-        bytes[MAGIC_OFFSET] = 1; // magic v1
+    /// One v1 (magic 1) legacy message, uncompressed unless `attributes` says.
+    fn legacy_message(offset: i64, value: &[u8], attributes: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_be_bytes()); // crc (not checked on this path)
+        body.push(1); // magic v1
+        body.push(attributes);
+        body.extend_from_slice(&1_700_000_000_000i64.to_be_bytes()); // timestamp
+        body.extend_from_slice(&(-1i32).to_be_bytes()); // null key
+        body.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        body.extend_from_slice(value);
 
-        let err = plan_batches(&bytes, 0).expect_err("only v2 batches replicate");
+        let mut m = Vec::new();
+        m.extend_from_slice(&offset.to_be_bytes());
+        m.extend_from_slice(&(body.len() as i32).to_be_bytes());
+        m.extend(body);
+        m
+    }
+
+    fn legacy_set(offsets: std::ops::Range<i64>) -> Vec<u8> {
+        offsets
+            .flat_map(|o| legacy_message(o, format!("v{o}").as_bytes(), 0))
+            .collect()
+    }
+
+    /// The live-cluster case: a topic written by an old client could never be
+    /// replicated, and the refusal made the follower re-fetch forever.
+    #[test]
+    fn a_legacy_message_set_is_applied_as_one_run() {
+        let bytes = legacy_set(10..13);
+        let actions = plan_batches(&bytes, 10).expect("legacy messages replicate");
+        assert_eq!(
+            actions,
+            vec![BatchAction::Apply(BatchFrame {
+                start: 0,
+                end: bytes.len(),
+                base_offset: 10,
+                last_offset: 12,
+                record_count: 3,
+            })]
+        );
+    }
+
+    /// Legacy messages stand alone, so a run is cut at the log end rather than
+    /// treated as divergence.
+    #[test]
+    fn a_legacy_run_is_trimmed_to_the_log_end() {
+        let bytes = legacy_set(10..13);
+        let skip = legacy_message(10, b"v10", 0).len();
+        let actions = plan_batches(&bytes, 11).unwrap();
+        assert_eq!(
+            actions,
+            vec![BatchAction::Apply(BatchFrame {
+                start: skip,
+                end: bytes.len(),
+                base_offset: 11,
+                last_offset: 12,
+                record_count: 2,
+            })]
+        );
+    }
+
+    #[test]
+    fn legacy_messages_already_present_are_skipped() {
+        let bytes = legacy_set(10..13);
+        assert!(plan_batches(&bytes, 13).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_legacy_gap_is_refused() {
+        let err = plan_batches(&legacy_set(15..17), 10).expect_err("a hole must not be appended");
+        assert_eq!(err, ApplyRefusal::Gap { expected: 10, found: 15 });
+    }
+
+    #[test]
+    fn a_compressed_legacy_message_is_refused() {
+        let bytes = legacy_message(10, b"compressed", 0x01);
+        let err = plan_batches(&bytes, 10).expect_err("compressed legacy is not copyable");
         assert!(matches!(err, ApplyRefusal::Malformed(_)));
+    }
+
+    /// A topic can switch format mid-log when its producer is upgraded.
+    #[test]
+    fn a_v2_batch_after_a_legacy_run_is_framed_too() {
+        let mut bytes = legacy_set(0..2);
+        let legacy_len = bytes.len();
+        bytes.extend(batch(2, 3, 0));
+        let actions = plan_batches(&bytes, 0).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions[0], BatchAction::Apply(f) if f.base_offset == 0 && f.record_count == 2));
+        assert!(matches!(actions[1], BatchAction::Apply(f) if f.start == legacy_len && f.base_offset == 2));
+    }
+
+    /// The frame and the decode must agree, or records land at the wrong
+    /// offsets — and the decoder took its base from the SECOND message whenever
+    /// the first sat at offset 0.
+    #[test]
+    fn a_legacy_run_decodes_to_the_planned_offsets() {
+        for range in [10..13, 0..3] {
+            let bytes = legacy_set(range.clone());
+            let canonical = CanonicalRecord::from_kafka_batch(&bytes).expect("decodes");
+            let offsets: Vec<i64> = canonical.records.iter().map(|r| r.offset).collect();
+            assert_eq!(canonical.base_offset, range.start, "range {range:?}");
+            assert_eq!(offsets, range.clone().collect::<Vec<_>>(), "range {range:?}");
+        }
     }
 
     #[test]

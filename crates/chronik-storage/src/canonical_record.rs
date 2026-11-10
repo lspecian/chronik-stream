@@ -352,11 +352,11 @@ impl CanonicalRecord {
         // For v1: preserve entire MessageSet (already had this)
         // For v2: preserve entire RecordBatch (NEW - fixes Java client CRC validation)
         if is_v1_format {
-            eprintln!("V1→DETECTED: Preserving {} bytes of original v1 MessageSet wire format", bytes_consumed);
+            tracing::trace!("V1→DETECTED: Preserving {} bytes of original v1 MessageSet wire format", bytes_consumed);
             canonical.original_v1_wire_format = Some(wire_bytes[..bytes_consumed].to_vec());
         } else {
             // v2 RecordBatch - preserve FULL batch (header + compressed payload)
-            eprintln!("V2→DETECTED: Preserving {} bytes of original v2 RecordBatch wire format", bytes_consumed);
+            tracing::trace!("V2→DETECTED: Preserving {} bytes of original v2 RecordBatch wire format", bytes_consumed);
             canonical.original_v2_wire_format = Some(wire_bytes[..bytes_consumed].to_vec());
         }
 
@@ -390,13 +390,13 @@ impl CanonicalRecord {
         // CRITICAL: Preserve original records bytes for ALL batches (compressed or not)
         // CRC validation covers the records section regardless of compression
         // This is stored in KafkaRecordBatch.compressed_records_data after decoding
-        eprintln!("CANONICAL_RECORD→DEBUG: batch.compressed_records_data is_some={}, len={}",
+        tracing::trace!("CANONICAL_RECORD→DEBUG: batch.compressed_records_data is_some={}, len={}",
                   batch.compressed_records_data.is_some(),
                   batch.compressed_records_data.as_ref().map(|b| b.len()).unwrap_or(0));
 
         let compressed_records_wire_bytes = batch.compressed_records_data.map(|bytes| bytes.to_vec());
 
-        eprintln!("CANONICAL_RECORD→DEBUG: After .map(), compressed_records_wire_bytes is_some={}, len={}",
+        tracing::trace!("CANONICAL_RECORD→DEBUG: After .map(), compressed_records_wire_bytes is_some={}, len={}",
                   compressed_records_wire_bytes.is_some(),
                   compressed_records_wire_bytes.as_ref().map(|b| b.len()).unwrap_or(0));
 
@@ -560,7 +560,7 @@ impl CanonicalRecord {
         // So we can update the offset field without invalidating the CRC.
         if let Some(ref v1_bytes) = self.original_v1_wire_format {
             let updated_v1 = self.update_v1_messageset_offsets(v1_bytes)?;
-            eprintln!("V1→PRESERVED: Returning v1 MessageSet with updated offsets ({} bytes, {} records)",
+            tracing::trace!("V1→PRESERVED: Returning v1 MessageSet with updated offsets ({} bytes, {} records)",
                 updated_v1.len(), self.records.len());
             return Ok(Bytes::from(updated_v1));
         }
@@ -860,7 +860,7 @@ impl CanonicalRecord {
             let offset_bytes = new_offset.to_be_bytes();
             updated[cursor_pos..cursor_pos + 8].copy_from_slice(&offset_bytes);
 
-            eprintln!("V1→OFFSET_UPDATE: Message {} at pos {} updated to offset {}",
+            tracing::trace!("V1→OFFSET_UPDATE: Message {} at pos {} updated to offset {}",
                 record_index, cursor_pos, new_offset);
 
             // Move to next message: current position + 12 (offset + size fields) + message_size
@@ -869,7 +869,7 @@ impl CanonicalRecord {
         }
 
         if record_index != self.records.len() {
-            eprintln!("V1→WARNING: Expected {} records but updated {} offsets",
+            tracing::trace!("V1→WARNING: Expected {} records but updated {} offsets",
                 self.records.len(), record_index);
         }
 

@@ -304,6 +304,9 @@ pub struct ReplicaFetcher {
     metadata_events: Option<Arc<crate::metadata_events::MetadataEventBus>>,
     /// Follower LEO per partition, the offset the next fetch asks from.
     positions: Arc<DashMap<(String, i32), i64>>,
+    /// Partitions whose fetched records could not be applied, and when they
+    /// may be asked for again. See `REFUSAL_BACKOFF_MAX`.
+    refused: Arc<DashMap<(String, i32), Refusal>>,
     shutdown: Arc<AtomicBool>,
     batches_applied: Arc<AtomicU64>,
     fetch_errors: Arc<AtomicU64>,
@@ -327,6 +330,7 @@ impl ReplicaFetcher {
             peers,
             metadata_events: None,
             positions: Arc::new(DashMap::new()),
+            refused: Arc::new(DashMap::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             batches_applied: Arc::new(AtomicU64::new(0)),
             fetch_errors: Arc::new(AtomicU64::new(0)),
@@ -934,6 +938,9 @@ impl ReplicaFetcher {
         let mut by_topic: BTreeMap<String, Vec<FetchPartitionRequest>> = BTreeMap::new();
 
         for followed in partitions {
+            if self.backing_off(&followed.topic, followed.partition) {
+                continue;
+            }
             let offset = self
                 .position_of(&followed.topic, followed.partition)
                 .await;
@@ -1049,6 +1056,7 @@ impl ReplicaFetcher {
         .await
         {
             Ok(leo) => {
+                self.refused.remove(&(topic.to_string(), index));
                 if leo != expected {
                     self.positions.insert((topic.to_string(), index), leo);
                     self.batches_applied.fetch_add(1, Ordering::Relaxed);
@@ -1086,7 +1094,11 @@ impl ReplicaFetcher {
             }
             Err(refusal) => {
                 self.fetch_errors.fetch_add(1, Ordering::Relaxed);
-                warn!("{}-{}: could not apply fetched records — {}", topic, index, refusal);
+                let wait = self.note_refusal(topic, index);
+                warn!(
+                    "{}-{}: could not apply fetched records — {}. Not fetching this partition for {:?}.",
+                    topic, index, refusal, wait
+                );
                 PartitionOutcome::Fine
             }
         }
@@ -1177,6 +1189,46 @@ pub fn plan_reconciliation(error_code: i16, end_offset: i64, local_log_end: i64)
     }
 
     ReconcileAction::Truncate { to: end_offset }
+}
+
+/// First wait after a partition's fetched records are refused; doubles per
+/// consecutive refusal up to [`REFUSAL_BACKOFF_MAX`].
+const REFUSAL_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A refusal used to cost nothing: the partition was asked for again on the
+/// very next fetch, the leader re-read and re-sent the same records, and the
+/// follower refused them again — at network speed, for months, on every
+/// partition whose data this follower could not parse. Whatever the cause, a
+/// refusal that repeats will repeat; waiting turns a hot loop into one request
+/// a minute.
+const REFUSAL_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy)]
+struct Refusal {
+    strikes: u32,
+    until: std::time::Instant,
+}
+
+impl ReplicaFetcher {
+    fn backing_off(&self, topic: &str, partition: i32) -> bool {
+        self.refused
+            .get(&(topic.to_string(), partition))
+            .is_some_and(|r| std::time::Instant::now() < r.until)
+    }
+
+    /// Record a refusal; returns how long the partition is now left alone.
+    fn note_refusal(&self, topic: &str, partition: i32) -> std::time::Duration {
+        let mut entry = self
+            .refused
+            .entry((topic.to_string(), partition))
+            .or_insert(Refusal { strikes: 0, until: std::time::Instant::now() });
+        entry.strikes = entry.strikes.saturating_add(1);
+        let wait = REFUSAL_BACKOFF_MIN
+            .saturating_mul(1u32 << (entry.strikes - 1).min(6))
+            .min(REFUSAL_BACKOFF_MAX);
+        entry.until = std::time::Instant::now() + wait;
+        wait
+    }
 }
 
 /// What one partition's slice of a fetch response means for the loop.

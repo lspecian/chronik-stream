@@ -462,7 +462,7 @@ impl KafkaRecordBatch {
         let compressed_records_data = Some(Bytes::from(compressed_buf.clone()));
 
         // DEBUG: Verify this is being set
-        eprintln!("KAFKA_RECORDS→DEBUG: Setting compressed_records_data, len={}, compression={:?}",
+        tracing::trace!("KAFKA_RECORDS→DEBUG: Setting compressed_records_data, len={}, compression={:?}",
                   compressed_buf.len(), compression);
 
         // Decompress if needed
@@ -546,6 +546,7 @@ impl KafkaRecordBatch {
         let mut base_offset = 0i64;
         let mut base_timestamp = 0i64;
         let mut max_timestamp = 0i64;
+        let mut first_message = true;
 
         // Parse MessageSet format (series of offset + message_size + message)
         while cursor.position() < data.len() as u64 {
@@ -557,8 +558,13 @@ impl KafkaRecordBatch {
 
             // Read offset
             let offset = read_i64(&mut cursor)?;
-            if base_offset == 0 {
+            // The first message sets the base. Testing `base_offset == 0` for
+            // "unset" broke the ordinary case of a set whose first offset IS 0
+            // — every producer-built set: the second message then overwrote
+            // the base and the deltas below it shifted and collided.
+            if first_message {
                 base_offset = offset;
+                first_message = false;
             }
 
             // Read message size
@@ -720,6 +726,15 @@ impl KafkaRecordBatch {
             }
         }
         
+        // Offset deltas by position. A legacy set is a run of consecutive
+        // offsets, but the offsets written into it are not reliable: producers
+        // send 0..n-1 or all zeros, and a compressed wrapper carries the offset
+        // of its LAST inner message while its inner messages are relative.
+        // Position is the one ordering every case agrees on.
+        for (index, record) in records.iter_mut().enumerate() {
+            record.offset_delta = index as i32;
+        }
+
         // Create a v2 RecordBatch header with converted data
         let header = RecordBatchHeader {
             base_offset,
@@ -744,7 +759,7 @@ impl KafkaRecordBatch {
         // Legacy messages must be converted to v2 RecordBatch format for consumers.
         // Preserving v1 bytes would create a hybrid message (v2 header + v1 records = invalid CRC).
         // Instead, let to_kafka_batch() re-encode everything properly as v2.
-        eprintln!("LEGACY_DECODE→DEBUG: Parsed {} records from legacy MessageSet, will re-encode as v2", records.len());
+        tracing::trace!("LEGACY_DECODE→DEBUG: Parsed {} records from legacy MessageSet, will re-encode as v2", records.len());
 
         Ok((Self { header, records, compressed_records_data: None }, bytes_consumed))
     }
