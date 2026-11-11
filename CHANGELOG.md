@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.3] - 2026-11-11
+
+### Fixed
+
+- **The v2.16.2 amd64 image and `linux-amd64-gnu` binary could not start**
+  (`GLIBC_2.43 not found`). GitHub moved `ubuntu-latest` to Ubuntu 26.04 that
+  day; the glibc build was linked against glibc 2.43 while the image runs it on
+  `ubuntu:24.04` (2.39). The glibc and Docker jobs are now pinned to
+  `ubuntu-24.04`, and the release runs `chronik-server version` inside the built
+  image for each architecture before anything is pushed. v2.16.3 carries the
+  same code as v2.16.2; the static musl binaries, arm64, and macOS builds of
+  v2.16.2 were unaffected.
+
 ## [2.16.2] - 2026-11-11
 
 ### Fixed

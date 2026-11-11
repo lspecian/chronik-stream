@@ -55,7 +55,13 @@ jobs:
           # so these must opt in explicitly to keep /memory/v1/* in the image. The
           # bare `cargo build` default is clean core; only the shipped Docker image
           # carries memory, and only on glibc.
-          - os: ubuntu-latest
+          # Pinned, never ubuntu-latest: a glibc binary runs only where glibc is
+          # at least as new as the one it was linked against, and the image runs
+          # it on ubuntu:24.04. ubuntu-latest moved to 26.04 (glibc 2.43) on
+          # 2026-11-11 and v2.16.2 shipped an amd64 image whose binary could not
+          # start ("GLIBC_2.43 not found"). Move this only together with the
+          # base image in Dockerfile.binary.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: chronik-server-linux-amd64-gnu
             use_cross: false
@@ -194,7 +200,7 @@ jobs:
   docker:
     name: Build and Push Docker Images
     needs: build-binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -262,6 +268,20 @@ jobs:
             # (see build-push step), so branch/PR builds never move :latest.
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
       
+      # Run the binary INSIDE the image, per architecture, before anything is
+      # pushed. Every earlier check looked at the artifact on the build host;
+      # v2.16.2 passed them all and published an image that could not start.
+      - name: Smoke-test the image on each architecture
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            docker buildx build --platform linux/$arch --load -t chronik-smoke:$arch \
+              -f Dockerfile.binary --build-arg VERSION=${{ github.ref_name }} .
+            out=$(docker run --rm --platform linux/$arch --entrypoint chronik-server chronik-smoke:$arch version 2>&1)
+            echo "$arch: $out" | head -3
+            echo "$out" | grep -q "Chronik Server v" || { echo "::error::$arch image cannot run chronik-server"; exit 1; }
+          done
+
       - name: Build and push Docker image (optimized)
         uses: docker/build-push-action@v5
         with:
