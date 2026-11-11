@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **About 1.2% of older records were unreadable through Fetch.** Until v2.16.1,
+  concurrent produce requests appended batches out of offset order, and that
+  data is still on disk. The WAL reader returned batches in file order and its
+  seek index assumed offsets only increase, so a consumer was served e.g.
+  857768..857873 and then 858245, and never saw the batches stored after it.
+  Measured on a live cluster: 10,583 of 842,237 records on one partition, 10,198
+  of 859,443 on another, in hundreds of small gaps — on disk, replicated, counted
+  by SQL. The reader now orders batches by offset, serves only a contiguous run,
+  and its seek index keys on the running maximum offset, so a misplaced batch is
+  never jumped over. Verified on that partition's actual WAL: v2.16.3 reads
+  848,613 of 858,811 records (384 gaps); this reads all 858,811.
+
 ## [2.16.3] - 2026-11-11
 
 ### Fixed

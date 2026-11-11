@@ -175,10 +175,19 @@ struct SegmentMarks {
     /// Bytes already scanned. Everything below this is described by the fields
     /// here; everything above has yet to be read.
     indexed_len: u64,
-    first_offset: Option<i64>,
-    last_offset: Option<i64>,
-    /// (base offset of a record, byte position of that record's first byte),
-    /// ascending, roughly one per `MARK_INTERVAL`.
+    /// Highest `last_offset` of any record in the file — the maximum, not the
+    /// last record's, because batches are not always stored in offset order.
+    max_last_offset: Option<i64>,
+    /// (highest `last_offset` of every record BEFORE this position, byte
+    /// position of a record's first byte), roughly one per `MARK_INTERVAL`.
+    ///
+    /// The running maximum, not the record's own base offset. Concurrent
+    /// produce requests appended batches out of offset order until v2.16.1 —
+    /// measured on a live partition as 857821, 857768, 858245, 858086, … in
+    /// file order — and that data is still on disk. Keyed by base offset, a
+    /// seek could start past a batch that holds the wanted offset; keyed by
+    /// the running maximum, everything before the chosen mark provably ends
+    /// below the offset. Non-decreasing, so it still binary-searches.
     marks: Vec<(i64, u64)>,
 }
 
@@ -187,16 +196,14 @@ impl SegmentMarks {
         Self {
             path,
             indexed_len: 0,
-            first_offset: None,
-            last_offset: None,
+            max_last_offset: None,
             marks: Vec::new(),
         }
     }
 
     fn reset(&mut self) {
         self.indexed_len = 0;
-        self.first_offset = None;
-        self.last_offset = None;
+        self.max_last_offset = None;
         self.marks.clear();
     }
 
@@ -240,12 +247,11 @@ impl SegmentMarks {
                         Some((_, last_pos)) => position - last_pos >= MARK_INTERVAL,
                     };
                     if want_mark {
-                        self.marks.push((layout.base_offset, position));
+                        self.marks.push((self.max_last_offset.unwrap_or(i64::MIN), position));
                     }
-                    if self.first_offset.is_none() {
-                        self.first_offset = Some(layout.base_offset);
-                    }
-                    self.last_offset = Some(layout.last_offset);
+                    self.max_last_offset = Some(
+                        self.max_last_offset.map_or(layout.last_offset, |m| m.max(layout.last_offset)),
+                    );
                     cursor += layout.total_len;
                 }
                 // Stop at the first incomplete or torn record and leave
@@ -262,15 +268,14 @@ impl SegmentMarks {
     /// Byte position to start reading from to reach `offset`, or `None` if this
     /// segment cannot contain it.
     fn seek_to(&self, offset: i64) -> Option<u64> {
-        if self.last_offset? < offset {
+        if self.max_last_offset? < offset {
             return None;
         }
-        // The last mark at or below the offset. Records between it and the
-        // offset are skipped by the reader, which costs at most MARK_INTERVAL.
-        match self.marks.binary_search_by(|(base, _)| base.cmp(&offset)) {
-            Ok(i) => Some(self.marks[i].1),
-            Err(0) => self.marks.first().map(|(_, p)| *p),
-            Err(i) => Some(self.marks[i - 1].1),
+        // The last mark before which every record ends below the offset.
+        let after = self.marks.partition_point(|(max_before, _)| *max_before < offset);
+        match after {
+            0 => self.marks.first().map(|(_, p)| *p),
+            i => Some(self.marks[i - 1].1),
         }
     }
 }
@@ -338,9 +343,47 @@ impl PartitionIndex {
     pub async fn read_from(&mut self, offset: i64, max_records: usize) -> Result<Vec<WalRecord>> {
         self.refresh().await?;
 
+        // Batches are not always stored in offset order (see `SegmentMarks::
+        // marks`). Returning them in FILE order let a reader serve 857768..
+        // 857873 and then 858245, so the consumer's next fetch began at 858268
+        // and never saw the batches stored after it: measured on a live
+        // cluster as ~1.2% of every partition — 10,583 of 842,237 records on
+        // one — on disk, replicated, counted by SQL, unreachable through Fetch.
+        //
+        // So: collect a little past the limit, order by offset, and return
+        // only a contiguous run. A batch stored further away than the slack is
+        // found by the next fetch, which asks for exactly the offset it starts
+        // at — nothing is skipped, at worst a fetch returns less.
+        let window = max_records.saturating_mul(2).max(max_records.saturating_add(READ_SLACK_MESSAGES));
         let mut out = Vec::new();
-        let mut messages = 0usize;
+        let truncated = self.collect(offset, window, |_| true, &mut out).await?;
+        out.sort_by_key(|r| r.get_base_offset());
 
+        // The run must start with the batch holding `offset` if one exists.
+        // When the window filled before reaching it, look for anything below
+        // what was found — once, unbounded, but keeping only those records.
+        let first_base = out.first().map(|r| r.get_base_offset()).unwrap_or(i64::MAX);
+        if truncated && first_base > offset {
+            let mut earlier = Vec::new();
+            self.collect(offset, usize::MAX, |l| l.base_offset < first_base, &mut earlier).await?;
+            out.extend(earlier);
+            out.sort_by_key(|r| r.get_base_offset());
+        }
+
+        Ok(contiguous_run(out, max_records))
+    }
+
+    /// Records with `last_offset >= offset` that `accept` keeps, from every
+    /// segment that can hold them, until `limit` messages. Returns whether the
+    /// limit cut the scan short.
+    async fn collect(
+        &self,
+        offset: i64,
+        limit: usize,
+        accept: impl Fn(&RecordLayout) -> bool + Copy,
+        out: &mut Vec<WalRecord>,
+    ) -> Result<bool> {
+        let mut messages = 0usize;
         // BTreeMap iterates by segment id, which is log order.
         let plan: Vec<(PathBuf, u64)> = self
             .segments
@@ -349,22 +392,23 @@ impl PartitionIndex {
             .collect();
 
         for (path, start) in plan {
-            if messages >= max_records {
-                break;
+            if messages >= limit {
+                return Ok(true);
             }
-            self.read_segment_from(&path, start, offset, max_records, &mut messages, &mut out)
+            self.read_segment_from(&path, start, offset, limit, accept, &mut messages, out)
                 .await?;
         }
-
-        Ok(out)
+        Ok(messages >= limit)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn read_segment_from(
         &self,
         path: &Path,
         start: u64,
         offset: i64,
         max_records: usize,
+        accept: impl Fn(&RecordLayout) -> bool,
         messages: &mut usize,
         out: &mut Vec<WalRecord>,
     ) -> Result<()> {
@@ -388,7 +432,7 @@ impl PartitionIndex {
             loop {
                 match parse_record(&buf[cursor..]) {
                     Parsed::Record(layout) => {
-                        if layout.last_offset >= offset && *messages < max_records {
+                        if layout.last_offset >= offset && *messages < max_records && accept(&layout) {
                             if let Some(record) = layout.to_record(&buf[cursor..]) {
                                 *messages += layout.record_count.max(1) as usize;
                                 out.push(record);
@@ -416,6 +460,43 @@ impl PartitionIndex {
 
         Ok(())
     }
+}
+
+/// Messages read past `max_records` so that batches stored slightly out of
+/// order can still be returned in order.
+const READ_SLACK_MESSAGES: usize = 1000;
+
+/// From batches sorted by base offset, the longest run without a gap, up to
+/// `max_records` messages.
+///
+/// A batch wholly covered by what is already in the run is a second copy of
+/// those offsets (they exist on disk from before v2.16.1) and is dropped; the
+/// first copy in log order is kept. A gap ends the run — the next fetch asks
+/// for the gap's first offset, and finds the batch if it exists. The run may
+/// begin above the requested offset: that is a genuine hole, and consumers
+/// step over it as Kafka's do.
+fn contiguous_run(sorted: Vec<WalRecord>, max_records: usize) -> Vec<WalRecord> {
+    let mut run = Vec::new();
+    let mut next: Option<i64> = None;
+    let mut messages = 0usize;
+    for record in sorted {
+        let (base, last) = (record.get_base_offset(), record.get_last_offset());
+        if let Some(n) = next {
+            if last < n {
+                continue;
+            }
+            if base > n {
+                break;
+            }
+        }
+        next = Some(last + 1);
+        messages += record.get_record_count().max(1) as usize;
+        run.push(record);
+        if messages >= max_records {
+            break;
+        }
+    }
+    run
 }
 
 #[cfg(test)]
@@ -590,5 +671,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut index = PartitionIndex::new(dir.path().join("nope"), 0);
         assert!(index.read_from(0, 10).await.is_err());
+    }
+
+    fn bases(got: &[WalRecord]) -> Vec<i64> {
+        got.iter().map(|r| r.get_base_offset()).collect()
+    }
+
+    /// Batches stored out of offset order — as concurrent produce requests
+    /// left them until v2.16.1 — come back in offset order.
+    #[tokio::test]
+    async fn batches_stored_out_of_order_are_returned_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 0, 0, &[(10, 19), (0, 9), (30, 39), (20, 29)]).await;
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        assert_eq!(bases(&index.read_from(0, 1000).await.unwrap()), vec![0, 10, 20, 30]);
+    }
+
+    /// The live-cluster failure: with a limit, file order served 0..9 and then
+    /// 20..29, the consumer's next fetch began at 30, and 10..19 was never read.
+    #[tokio::test]
+    async fn a_batch_stored_late_is_not_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 0, 0, &[(0, 9), (20, 29), (10, 19)]).await;
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        let got = index.read_from(0, 15).await.unwrap();
+        assert_eq!(bases(&got), vec![0, 10], "the run must be contiguous");
+    }
+
+    #[tokio::test]
+    async fn a_second_copy_of_the_same_offsets_is_served_once() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 0, 0, &[(0, 9), (10, 10), (10, 10), (11, 11)]).await;
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        assert_eq!(bases(&index.read_from(0, 1000).await.unwrap()), vec![0, 10, 11]);
+    }
+
+    /// A genuine hole is stepped over, as Kafka consumers expect; it must not
+    /// stall the reader.
+    #[tokio::test]
+    async fn a_genuine_hole_is_stepped_over() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 0, 0, &[(0, 9), (20, 29)]).await;
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        assert_eq!(bases(&index.read_from(10, 1000).await.unwrap()), vec![20]);
+    }
+
+    /// A seek must not start past a misplaced batch. Marks keyed by base
+    /// offset sent a read for 500 to a mark near 990's position, beyond where
+    /// batch 500 was actually stored.
+    #[tokio::test]
+    async fn a_seek_does_not_jump_past_a_misplaced_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1,000 single-record batches (~300 bytes each, several marks), with
+        // batch 500 stored near the end.
+        let mut order: Vec<(i64, i64)> = (0..1000).filter(|o| *o != 500).map(|o| (o, o)).collect();
+        order.insert(990, (500, 500));
+        write_segment(dir.path(), 0, 0, &order).await;
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        let got = index.read_from(500, 5).await.unwrap();
+        assert_eq!(bases(&got), vec![500, 501, 502, 503, 504]);
+    }
+
+    /// Several reads in a row see every offset exactly once — what a consumer
+    /// does — even across scattered disorder.
+    #[tokio::test]
+    async fn successive_reads_cover_every_offset_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut order: Vec<(i64, i64)> = (0..200).map(|b| (b * 5, b * 5 + 4)).collect();
+        for i in (0..order.len() - 3).step_by(7) {
+            order.swap(i, i + 3);
+        }
+        write_segment(dir.path(), 0, 0, &order).await;
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        let mut next = 0i64;
+        let mut seen = Vec::new();
+        while next < 1000 {
+            let got = index.read_from(next, 12).await.unwrap();
+            assert!(!got.is_empty(), "stalled at {next}");
+            for r in &got {
+                seen.push(r.get_base_offset());
+                next = r.get_last_offset() + 1;
+            }
+        }
+        assert_eq!(seen, (0..200).map(|b| b * 5).collect::<Vec<_>>());
     }
 }
