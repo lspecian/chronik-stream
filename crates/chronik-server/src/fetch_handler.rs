@@ -758,7 +758,7 @@ impl FetchHandler {
         if high_watermark == 0 {
             if let Ok(Some((meta_hwm, _log_start))) = self.metadata_store.get_partition_offset(topic, partition as u32).await {
                 if meta_hwm > 0 {
-                    tracing::info!(
+                    tracing::debug!(
                         "📊 WATERMARK FALLBACK: Using metadata_store for {}-{}: {} (ProduceHandler returned 0)",
                         topic, partition, meta_hwm
                     );
@@ -1056,7 +1056,7 @@ impl FetchHandler {
 
         // v2.2.7.2: Log successful fetch completion
         let fetch_elapsed = fetch_start.elapsed();
-        info!(
+        debug!(
             "✅ FETCH SUCCESS: topic={}, partition={}, offset={}, bytes={}, elapsed={:?}",
             topic, partition, fetch_offset, records_bytes.len(), fetch_elapsed
         );
@@ -1398,7 +1398,7 @@ impl FetchHandler {
                     let batch_bytes = &segment.raw_kafka_batches[batch_start..batch_start + total_batch_size];
                     combined_bytes.extend_from_slice(batch_bytes);
 
-                    tracing::info!(
+                    tracing::debug!(
                         "RAW→BATCH: Including {} bytes from batch {}-{}",
                         total_batch_size, base_offset, last_offset
                     );
@@ -1415,7 +1415,7 @@ impl FetchHandler {
         }
 
         if !combined_bytes.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 "RAW→SEGMENTS: Returning {} bytes of raw Kafka data from {} segments",
                 combined_bytes.len(), segments.len()
             );
@@ -1438,7 +1438,7 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Option<Vec<u8>>> {
-        tracing::info!("RAW→WAL: Buffer empty or no match, trying WAL");
+        tracing::debug!("RAW→WAL: Buffer empty or no match, trying WAL");
 
         if let Some(wal_manager) = self.wal_manager.as_ref() {
             let raw_bytes_from_wal = self.fetch_raw_bytes_from_wal(
@@ -1451,13 +1451,13 @@ impl FetchHandler {
             ).await?;
 
             if let Some(bytes) = raw_bytes_from_wal {
-                tracing::info!(
+                tracing::debug!(
                     "RAW→WAL: Returning {} bytes of raw Kafka data from WAL",
                     bytes.len()
                 );
                 return Ok(Some(bytes));
             }
-            tracing::info!("RAW→WAL: No raw bytes found in WAL");
+            tracing::debug!("RAW→WAL: No raw bytes found in WAL");
         }
 
         Ok(None)
@@ -1479,7 +1479,7 @@ impl FetchHandler {
         let state = self.state.read().await;
         let buffer = state.buffers.get(&(topic.to_string(), partition))?;
 
-        tracing::info!(
+        tracing::debug!(
             "RAW→BUFFER: Checking buffer for {}-{}, buffer has {} batches",
             topic, partition, buffer.batch_metadata.len()
         );
@@ -1494,7 +1494,7 @@ impl FetchHandler {
                     break;
                 }
 
-                tracing::info!(
+                tracing::debug!(
                     "RAW→BUFFER: Adding {} bytes from batch at offsets {}-{}",
                     raw_batch.len(), metadata.base_offset, metadata.last_offset
                 );
@@ -1503,7 +1503,7 @@ impl FetchHandler {
         }
 
         if !combined_bytes.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 "RAW→BUFFER: Returning {} bytes of raw Kafka data from buffer",
                 combined_bytes.len()
             );
@@ -1531,7 +1531,7 @@ impl FetchHandler {
             return Ok(records);
         }
 
-        info!(
+        debug!(
             "FETCH→TANTIVY: Trying Tantivy archives for {}-{} (have {} records so far)",
             topic, partition, records.len()
         );
@@ -1546,7 +1546,7 @@ impl FetchHandler {
             max_bytes
         ).await {
             Ok(tantivy_records) if !tantivy_records.is_empty() => {
-                info!(
+                debug!(
                     "FETCH→TANTIVY: Successfully fetched {} records from Tantivy archives for {}-{}",
                     tantivy_records.len(), topic, partition
                 );
@@ -1592,7 +1592,7 @@ impl FetchHandler {
         max_bytes: i32,
         mut records: Vec<chronik_storage::Record>,
     ) -> Result<Vec<chronik_storage::Record>> {
-        info!(
+        debug!(
             "FETCH→S3_RAW_SEGMENTS: Trying to download raw segment from S3 for {}-{} (have {} records so far)",
             topic, partition, records.len()
         );
@@ -1605,7 +1605,7 @@ impl FetchHandler {
             max_bytes
         ).await {
             Ok(s3_records) if !s3_records.is_empty() => {
-                info!(
+                debug!(
                     "FETCH→S3_RAW_SEGMENTS: Successfully fetched {} records from S3 for {}-{}",
                     s3_records.len(), topic, partition
                 );
@@ -1671,7 +1671,7 @@ impl FetchHandler {
 
             if should_try_wal {
                 if fetch_in_trimmed_region {
-                    info!(
+                    debug!(
                         "FETCH→WAL_FALLBACK: fetch_offset={} is before buffer min_offset={} (trimmed), reading from WAL",
                         fetch_offset, buffer_min_offset
                     );
@@ -1679,7 +1679,7 @@ impl FetchHandler {
                 match self.fetch_from_wal(wal_manager, topic, partition, fetch_offset, max_bytes).await {
                     Ok(wal_records) => {
                         if !wal_records.is_empty() {
-                            info!(
+                            debug!(
                                 "FETCH→WAL: Successfully fetched {} records from WAL for {}-{}",
                                 wal_records.len(), topic, partition
                             );
@@ -1699,10 +1699,22 @@ impl FetchHandler {
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "FETCH→WAL: Failed to fetch from WAL for {}-{}: {} - will try segments",
-                            topic, partition, e
-                        );
+                        // The indexer deletes a WAL segment once it is in the segment
+                        // tier, so a missing segment is the normal hand-off to the
+                        // next tier, on every fetch of older data. Anything else is a
+                        // real read failure.
+                        let msg = e.to_string();
+                        if msg.contains("Segment not found") {
+                            debug!(
+                                "FETCH→WAL: WAL segment gone for {}-{} ({}), trying segments",
+                                topic, partition, msg
+                            );
+                        } else {
+                            warn!(
+                                "FETCH→WAL: Failed to fetch from WAL for {}-{}: {} - will try segments",
+                                topic, partition, msg
+                            );
+                        }
                     }
                 }
             }
@@ -1730,7 +1742,7 @@ impl FetchHandler {
             None => return Ok((vec![], 0, -1, -1)),
         };
 
-        info!(
+        debug!(
             "FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches, min_offset={}",
             topic, partition, buffer.batch_metadata.len(), buffer.min_offset_in_buffer
         );
@@ -1773,7 +1785,7 @@ impl FetchHandler {
         }
 
         if !records.is_empty() {
-            info!(
+            debug!(
                 "FETCH→BUFFER: Fetched {} records from buffer for {}-{}, highest offset: {}",
                 records.len(), topic, partition, buffer_max_offset
             );
@@ -1791,7 +1803,7 @@ impl FetchHandler {
         high_watermark: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
-        info!(
+        debug!(
             "fetch_records called - topic: {}, partition: {}, fetch_offset: {}, high_watermark: {}",
             topic, partition, fetch_offset, high_watermark
         );
@@ -1934,7 +1946,7 @@ impl FetchHandler {
         use chronik_storage::canonical_record::CanonicalRecord;
 
         // Use metadata store to find segments instead of parsing filenames
-        info!(
+        debug!(
             "METADATA→LIST: Looking for segments for {}-{}",
             topic, partition
         );
@@ -1949,11 +1961,11 @@ impl FetchHandler {
         };
 
         if all_segments.is_empty() {
-            info!("METADATA→LIST: No segments found for {}-{}", topic, partition);
+            debug!("METADATA→LIST: No segments found for {}-{}", topic, partition);
             return Ok(vec![]);
         }
 
-        info!(
+        debug!(
             "METADATA→LIST: Found {} segment(s) for {}-{}",
             all_segments.len(), topic, partition
         );
@@ -1966,7 +1978,7 @@ impl FetchHandler {
 
             // Check if this segment overlaps with [fetch_offset, high_watermark)
             if max_offset >= fetch_offset && min_offset < high_watermark {
-                info!(
+                debug!(
                     "METADATA→MATCH: Segment {} covers offsets {}-{}, overlaps with fetch range {}-{}",
                     seg_meta.path, min_offset, max_offset, fetch_offset, high_watermark
                 );
@@ -1975,7 +1987,7 @@ impl FetchHandler {
         }
 
         if matching_segments.is_empty() {
-            info!(
+            debug!(
                 "S3→NO_MATCH: No segments overlap with fetch range {}-{} for {}-{}",
                 fetch_offset, high_watermark, topic, partition
             );
@@ -1993,7 +2005,7 @@ impl FetchHandler {
                 break;
             }
 
-            info!(
+            debug!(
                 "S3→DOWNLOAD: Downloading raw segment {} (offsets {}-{})",
                 object_key, segment_min, segment_max
             );
@@ -2010,7 +2022,7 @@ impl FetchHandler {
                 }
             };
 
-            info!(
+            debug!(
                 "S3→DOWNLOAD: Downloaded {} bytes from {}",
                 segment_data.len(), object_key
             );
@@ -2028,7 +2040,7 @@ impl FetchHandler {
                 }
             };
 
-            info!(
+            debug!(
                 "S3→DESERIALIZE: Segment {} contains {} canonical record batches",
                 object_key, canonical_records.len()
             );
@@ -2063,7 +2075,7 @@ impl FetchHandler {
             }
         }
 
-        info!(
+        debug!(
             "S3→COMPLETE: Fetched {} records ({} bytes) from S3 raw segments for {}-{}",
             all_records.len(), bytes_fetched, topic, partition
         );
@@ -2201,7 +2213,7 @@ impl FetchHandler {
             .max()
             .unwrap_or(-1);
         
-        tracing::info!("Max segment offset: {}, fetch_offset: {}", max_segment_offset, fetch_offset);
+        tracing::debug!("Max segment offset: {}, fetch_offset: {}", max_segment_offset, fetch_offset);
         
         // PHASE 1: Fetch from segments if needed
         if fetch_offset <= max_segment_offset {
@@ -2250,7 +2262,7 @@ impl FetchHandler {
         if current_offset < high_watermark && bytes_fetched < max_bytes as usize {
             let state = self.state.read().await;
             if let Some(buffer) = state.buffers.get(&(topic.to_string(), partition)) {
-                tracing::info!("FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches, current_offset={}, max_segment_offset={}, high_watermark={}",
+                tracing::debug!("FETCH→BUFFER: Checking buffer for {}-{}, buffer has {} batches, current_offset={}, max_segment_offset={}, high_watermark={}",
                     topic, partition, buffer.batch_metadata.len(), current_offset, max_segment_offset, high_watermark);
 
                 // Iterate through batches and decode records from raw bytes
@@ -2268,7 +2280,7 @@ impl FetchHandler {
                         let raw_batch = &buffer.raw_batches[batch_idx];
                         match self.decode_records_from_raw_batch(raw_batch, current_offset, high_watermark) {
                             Ok(batch_records) => {
-                                tracing::info!(
+                                tracing::debug!(
                                     "FETCH from buffer: partition={} batch_base={} decoded {} records",
                                     partition, metadata.base_offset, batch_records.len()
                                 );
@@ -2288,7 +2300,7 @@ impl FetchHandler {
                     }
                 }
             } else {
-                tracing::info!("FETCH→NO_BUFFER: No buffer found for {}-{}", topic, partition);
+                tracing::debug!("FETCH→NO_BUFFER: No buffer found for {}-{}", topic, partition);
             }
         }
         
@@ -2362,7 +2374,7 @@ impl FetchHandler {
             return Ok(vec![]);
         }
 
-        info!(
+        debug!(
             "Found {} Tantivy segments for {}-{} range {}-{}, downloading and reading",
             tantivy_segments.len(), topic, partition, fetch_offset, high_watermark
         );
@@ -2416,7 +2428,7 @@ impl FetchHandler {
         }
 
         if all_entries.is_empty() {
-            info!("No entries found in Tantivy segments for {}-{} range {}-{}",
+            debug!("No entries found in Tantivy segments for {}-{} range {}-{}",
                 topic, partition, fetch_offset, high_watermark);
             return Ok(vec![]);
         }
@@ -2437,7 +2449,7 @@ impl FetchHandler {
             })
             .collect();
 
-        info!(
+        debug!(
             "Returning {} records from Tantivy segments for {}-{} range {}-{}",
             records.len(), topic, partition, fetch_offset, high_watermark
         );
@@ -2471,7 +2483,7 @@ impl FetchHandler {
             return Ok(None);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Found {} Tantivy segments for {}-{} range {}-{}, downloading and reading",
             tantivy_segments.len(), topic, partition, fetch_offset, high_watermark
         );
@@ -2525,7 +2537,7 @@ impl FetchHandler {
         }
 
         if all_entries.is_empty() {
-            tracing::info!("No entries found in Tantivy segments for {}-{} range {}-{}",
+            tracing::debug!("No entries found in Tantivy segments for {}-{} range {}-{}",
                 topic, partition, fetch_offset, high_watermark);
             return Ok(None);
         }
@@ -2544,7 +2556,7 @@ impl FetchHandler {
         // Convert to Kafka wire format
         let kafka_batch = canonical_record.to_kafka_batch()?;
 
-        tracing::info!(
+        tracing::debug!(
             "Returning {} bytes from Tantivy segments for {}-{} range {}-{}",
             kafka_batch.len(), topic, partition, fetch_offset, high_watermark
         );
@@ -2560,7 +2572,7 @@ impl FetchHandler {
         start_offset: i64,
         end_offset: i64,
     ) -> Result<Vec<SegmentInfo>> {
-        tracing::info!(
+        tracing::debug!(
             "get_segments_for_range - topic: {}, partition: {}, range: {}-{}",
             topic, partition, start_offset, end_offset
         );
@@ -2580,10 +2592,10 @@ impl FetchHandler {
         }
         
         // Query metadata store
-        tracing::warn!("SEGMENT→QUERY: Requesting segments from metadata store for {}-{}", topic, partition);
+        tracing::debug!("SEGMENT→QUERY: Requesting segments from metadata store for {}-{}", topic, partition);
         let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
         
-        tracing::warn!(
+        tracing::debug!(
             "SEGMENT→QUERY: Retrieved {} total segments from metadata store for {}-{}",
             segments.len(), topic, partition
         );
@@ -2600,7 +2612,7 @@ impl FetchHandler {
                 // A segment is relevant if it overlaps with our range
                 let overlaps = s.end_offset >= start_offset && s.start_offset < end_offset;
                 if overlaps {
-                    tracing::info!(
+                    tracing::debug!(
                         "  Including segment {} (offsets {}-{}) for range {}-{}",
                         s.segment_id, s.start_offset, s.end_offset, start_offset, end_offset
                     );
@@ -2615,7 +2627,7 @@ impl FetchHandler {
             })
             .collect();
         
-        tracing::info!(
+        tracing::debug!(
             "Filtered to {} segments for offset range {}-{}",
             segment_infos.len(), start_offset, end_offset
         );
@@ -2637,7 +2649,7 @@ impl FetchHandler {
         end_offset: i64,
         max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
-        tracing::info!("Fetching from segment {} (offsets {}-{}) with key: {}",
+        tracing::debug!("Fetching from segment {} (offsets {}-{}) with key: {}",
             segment_info.segment_id, start_offset, end_offset, segment_info.object_key);
 
         // Phase 1: Read and parse segment from object store (complexity < 10)
@@ -2669,7 +2681,7 @@ impl FetchHandler {
         start_offset: i64,
         end_offset: i64,
     ) -> Result<Vec<u8>> {
-        tracing::info!("Fetching raw Kafka batch from segment {} (offsets {}-{})", 
+        tracing::debug!("Fetching raw Kafka batch from segment {} (offsets {}-{})", 
             segment_info.segment_id, start_offset, end_offset);
         
         // Read segment from storage
@@ -2712,7 +2724,7 @@ impl FetchHandler {
         let num_segments = segments.len();
         
         for segment in segments {
-            tracing::info!("Fetching raw Kafka batch from segment {} (offsets {}-{})", 
+            tracing::debug!("Fetching raw Kafka batch from segment {} (offsets {}-{})", 
                 segment.segment_id, segment.base_offset, segment.last_offset);
             
             // Fetch raw batch for this segment
@@ -2720,7 +2732,7 @@ impl FetchHandler {
                 start_offset.max(segment.base_offset), 
                 end_offset.min(segment.last_offset + 1)).await {
                 Ok(raw_bytes) if !raw_bytes.is_empty() => {
-                    tracing::info!("Got {} bytes of raw Kafka data from segment {}", 
+                    tracing::debug!("Got {} bytes of raw Kafka data from segment {}", 
                         raw_bytes.len(), segment.segment_id);
                     combined_bytes.extend_from_slice(&raw_bytes);
                 }
@@ -2736,7 +2748,7 @@ impl FetchHandler {
             }
         }
         
-        tracing::info!("Combined {} bytes of raw Kafka data from {} segments", 
+        tracing::debug!("Combined {} bytes of raw Kafka data from {} segments", 
             combined_bytes.len(), num_segments);
         Ok(combined_bytes)
     }
@@ -2851,7 +2863,7 @@ impl FetchHandler {
             return Ok(());
         }
 
-        tracing::warn!(
+        tracing::debug!(
             "BUFFER→RAW_UPDATE: Storing {} bytes for {}-{}, offset_range=[{}-{}], count={}, high_watermark={}",
             raw_bytes.len(), topic, partition, base_offset, last_offset, record_count, high_watermark
         );
@@ -2881,12 +2893,12 @@ impl FetchHandler {
                 size_bytes: raw_bytes.len(),
             });
 
-            tracing::info!(
+            tracing::debug!(
                 "BUFFER→RAW_STORED: Added batch to {}-{}, now has {} batches",
                 topic, partition, buffer.raw_batches.len()
             );
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 "BUFFER→RAW_SKIP: Skipping duplicate batch at offset {} for {}-{}",
                 base_offset, topic, partition
             );
@@ -2917,7 +2929,7 @@ impl FetchHandler {
                 buffer.min_offset_in_buffer = first_meta.base_offset;  // v1.3.48: Update min after trim
             }
 
-            warn!(
+            debug!(
                 "BUFFER→TRIM: Trimmed {} old batches from {}-{} (offsets {}-{}), {} batches remain, min_offset_in_buffer={}, data still in WAL",
                 trim_count, topic, partition, first_trimmed, last_trimmed,
                 buffer.raw_batches.len(), buffer.min_offset_in_buffer
@@ -3137,7 +3149,7 @@ impl FetchHandler {
         partition: i32,
         up_to_offset: i64,
     ) -> Result<()> {
-        tracing::info!("FLUSH→MARK: Marking batches as flushed for {}-{}, up_to_offset={}",
+        tracing::debug!("FLUSH→MARK: Marking batches as flushed for {}-{}, up_to_offset={}",
             topic, partition, up_to_offset);
 
         let mut state = self.state.write().await;
@@ -3146,13 +3158,13 @@ impl FetchHandler {
         if let Some(buffer) = state.buffers.get_mut(&key) {
             let initial_count = buffer.raw_batches.len();
 
-            tracing::info!("FLUSH→BEFORE: Buffer for {}-{} has {} batches before flush",
+            tracing::debug!("FLUSH→BEFORE: Buffer for {}-{} has {} batches before flush",
                 topic, partition, initial_count);
 
             // Log which batches will be removed
             for metadata in &buffer.batch_metadata {
                 if metadata.last_offset <= up_to_offset {
-                    tracing::info!("FLUSH→REMOVE: Will remove batch base_offset={}, last_offset={} from {}-{} (last_offset <= {})",
+                    tracing::debug!("FLUSH→REMOVE: Will remove batch base_offset={}, last_offset={} from {}-{} (last_offset <= {})",
                         metadata.base_offset, metadata.last_offset, topic, partition, up_to_offset);
                 }
             }
@@ -3182,7 +3194,7 @@ impl FetchHandler {
             // Always update flushed_offset to track progress
             buffer.flushed_offset = up_to_offset;
 
-            tracing::info!("FLUSH→COMPLETE: Removed {} flushed batches (up to offset {}) from buffer for {}-{}, {} batches remain",
+            tracing::debug!("FLUSH→COMPLETE: Removed {} flushed batches (up to offset {}) from buffer for {}-{}, {} batches remain",
                 removed_count, up_to_offset, topic, partition, buffer.raw_batches.len());
         }
 

@@ -32,7 +32,7 @@ impl MetadataResponseBuilder {
             cluster_authorized_operations: if api_version >= 8 { Some(-2147483648) } else { None },
         };
 
-        tracing::info!("Metadata response has {} topics and {} brokers",
+        tracing::debug!("Metadata response has {} topics and {} brokers",
             response.topics.len(), response.brokers.len());
 
         // Debug: Log broker details
@@ -55,7 +55,7 @@ impl MetadataResponseBuilder {
         let mut encoder = Encoder::new(buf);
 
         // Validate and log metadata response structure
-        tracing::info!("Encoding metadata response v{} with {} topics, {} brokers, throttle_time: {}",
+        tracing::debug!("Encoding metadata response v{} with {} topics, {} brokers, throttle_time: {}",
             version, response.topics.len(), response.brokers.len(), response.throttle_time_ms);
 
         Self::log_response_details(response);
@@ -87,7 +87,7 @@ impl MetadataResponseBuilder {
         // Log final encoded size for debugging
         let final_buffer = encoder.debug_buffer();
         let final_size = final_buffer.len();
-        tracing::info!("Metadata response v{} encoded successfully: {} bytes", version, final_size);
+        tracing::debug!("Metadata response v{} encoded successfully: {} bytes", version, final_size);
         tracing::debug!("Final metadata response body: first 32 bytes: {:02x?}",
             &final_buffer[..final_buffer.len().min(32)]);
 

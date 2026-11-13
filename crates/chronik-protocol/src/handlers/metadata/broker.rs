@@ -27,9 +27,9 @@ impl BrokerRetriever {
             // Try to get brokers from metadata store
             match metadata_store.list_brokers().await {
                 Ok(broker_metas) => {
-                    tracing::info!("Got {} brokers from metadata store (before filter)", broker_metas.len());
+                    tracing::debug!("Got {} brokers from metadata store (before filter)", broker_metas.len());
                     for b in &broker_metas {
-                        tracing::info!("  BEFORE FILTER - Broker {}: {}:{} (status: {:?})",
+                        tracing::debug!("  BEFORE FILTER - Broker {}: {}:{} (status: {:?})",
                             b.broker_id, b.host, b.port, b.status);
                     }
 
@@ -45,9 +45,9 @@ impl BrokerRetriever {
                         })
                         .collect();
 
-                    tracing::info!("Got {} brokers from metadata store (after filter)", brokers.len());
+                    tracing::debug!("Got {} brokers from metadata store (after filter)", brokers.len());
                     for b in &brokers {
-                        tracing::info!("  AFTER FILTER - Broker {}: {}:{}", b.node_id, b.host, b.port);
+                        tracing::debug!("  AFTER FILTER - Broker {}: {}:{}", b.node_id, b.host, b.port);
                     }
 
                     // CRITICAL FIX: If filtering removed all brokers, fall back to default

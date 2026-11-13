@@ -166,7 +166,7 @@ impl MetadataWalReplicator {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        tracing::info!("📩 MetadataWalReplicator received event: {:?}", event);
+                        tracing::debug!("📩 MetadataWalReplicator received event: {:?}", event);
                         if let Err(e) = self.handle_event(event).await {
                             tracing::warn!("Failed to handle metadata event: {}", e);
                         }

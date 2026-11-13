@@ -1523,7 +1523,7 @@ impl ProtocolHandler {
         TaggedFieldsEncoder::encode_response_tagged_fields(&mut encoder, flexible);
 
         let total_encoded = buf.len() - initial_len;
-        tracing::info!("Encoded Fetch response v{}: {} bytes total", version, total_encoded);
+        tracing::debug!("Encoded Fetch response v{}: {} bytes total", version, total_encoded);
 
         Ok(())
     }
@@ -1569,7 +1569,7 @@ impl ProtocolHandler {
         // Use the new parsing function that preserves correlation ID
         let header = match parse_request_header_with_correlation(&mut buf) {
             Ok((h, _)) => {
-                tracing::info!("Protocol handler: Processing API {:?} v{}", h.api_key, h.api_version);
+                tracing::debug!("Protocol handler: Processing API {:?} v{}", h.api_key, h.api_version);
                 h
             },
             Err(Error::ProtocolWithCorrelation { correlation_id, message }) => {
@@ -1584,7 +1584,7 @@ impl ProtocolHandler {
             }
         };
         
-        tracing::info!(
+        tracing::debug!(
             "Parsed request header - API: {:?} ({}), Version: {}, Correlation ID: {}",
             header.api_key,
             header.api_key as i16,
@@ -1841,7 +1841,7 @@ impl ProtocolHandler {
         response: &ApiVersionsResponse,
         version: i16,
     ) -> Result<()> {
-        tracing::info!("Encoding ApiVersionsResponse v{} with {} APIs", version, response.api_versions.len());
+        tracing::debug!("Encoding ApiVersionsResponse v{} with {} APIs", version, response.api_versions.len());
         let mut encoder = Encoder::new(buf);
 
         // CRITICAL: For v0 protocol, field order matters!
@@ -1955,7 +1955,7 @@ impl ProtocolHandler {
         use crate::handlers::metadata::{MetadataRequestParser, BrokerRetriever, BrokerValidator, MetadataResponseBuilder};
 
         tracing::debug!("handle_metadata called with v{}", header.api_version);
-        tracing::info!("Handling metadata request v{}", header.api_version);
+        tracing::debug!("Handling metadata request v{}", header.api_version);
 
         // Phase 1: Parse metadata request
         let request = MetadataRequestParser::parse(&header, body)?;
@@ -2036,7 +2036,7 @@ impl ProtocolHandler {
 
         // Phase 8: Encode response
         let mut body_buf = BytesMut::new();
-        tracing::info!("About to encode metadata response with {} brokers", response.brokers.len());
+        tracing::debug!("About to encode metadata response with {} brokers", response.brokers.len());
         MetadataResponseBuilder::encode(&mut body_buf, &response, header.api_version)?;
         tracing::debug!("Metadata response body encoded, length={}, first 32 bytes: {:02x?}",
             body_buf.len(),
@@ -6246,7 +6246,7 @@ impl ProtocolHandler {
                     topic_meta.config.partition_count
                 };
 
-                tracing::info!("METADATA→PARTITIONS: topic={} partition_count={} assignments_count={} effective={}",
+                tracing::debug!("METADATA→PARTITIONS: topic={} partition_count={} assignments_count={} effective={}",
                               topic_meta.name, topic_meta.config.partition_count, sorted_assignments.len(), effective_partition_count);
 
                 // The measured in-sync set, per partition.
@@ -6268,7 +6268,7 @@ impl ProtocolHandler {
                     // Get leader for this partition (queries the leader-flagged assignment)
                     let leader_id = match metadata_store.get_partition_leader(&topic_meta.name, partition_id).await {
                         Ok(Some(leader)) => {
-                            tracing::info!("PARTITION_LEADER: topic={} partition={} leader={}",
+                            tracing::debug!("PARTITION_LEADER: topic={} partition={} leader={}",
                                          topic_meta.name, partition_id, leader);
                             leader
                         }
@@ -6287,7 +6287,7 @@ impl ProtocolHandler {
                     // Get replicas for this partition
                     let replica_nodes = match metadata_store.get_partition_replicas(&topic_meta.name, partition_id).await {
                         Ok(Some(replicas)) => {
-                            tracing::info!("PARTITION_REPLICAS: topic={} partition={} replicas={:?}",
+                            tracing::debug!("PARTITION_REPLICAS: topic={} partition={} replicas={:?}",
                                          topic_meta.name, partition_id, replicas);
                             replicas
                         }
@@ -6342,7 +6342,7 @@ impl ProtocolHandler {
                         offline_replicas,
                     };
 
-                    tracing::info!("METADATA_PARTITION_FINAL: topic={} partition={} error_code={} leader_id={} replicas={:?} isr={:?}",
+                    tracing::debug!("METADATA_PARTITION_FINAL: topic={} partition={} error_code={} leader_id={} replicas={:?} isr={:?}",
                                  topic_meta.name, partition_id, partition_metadata.error_code,
                                  partition_metadata.leader_id, partition_metadata.replica_nodes,
                                  partition_metadata.isr_nodes);
@@ -6351,7 +6351,7 @@ impl ProtocolHandler {
                 }
 
                 // PARTITION_DEBUG: Confirm final partition list
-                tracing::info!("PARTITION_DEBUG: METADATA_RESPONSE topic={} returning {} partitions",
+                tracing::debug!("PARTITION_DEBUG: METADATA_RESPONSE topic={} returning {} partitions",
                               topic_meta.name, partitions.len());
                 for (idx, p) in partitions.iter().enumerate() {
                     tracing::debug!("PARTITION_DEBUG:   partition={} leader={} replicas={:?}",

@@ -381,7 +381,7 @@ impl<'a> Decoder<'a> {
             if byte & 0x80 == 0 {
                 // Only log for suspiciously large values
                 if value > 10000 {
-                    tracing::warn!("Read varint value {} from bytes {:02x?}", value, bytes_read);
+                    tracing::trace!("Read varint value {} from bytes {:02x?}", value, bytes_read);
                 }
                 return Ok(value);
             }
@@ -596,7 +596,7 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
     };
 
     // DEBUG: Log the parsed client_id to verify what's being read from the wire
-    tracing::info!("Parsed client_id from request header: {:?}", client_id);
+    tracing::trace!("Parsed client_id from request header: {:?}", client_id);
 
     // Skip tagged fields if flexible
     if flexible {

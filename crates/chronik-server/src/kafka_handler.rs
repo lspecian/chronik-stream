@@ -151,7 +151,7 @@ impl KafkaProtocolHandler {
         if request_bytes.len() >= 4 {
             let api_key = i16::from_be_bytes([request_bytes[0], request_bytes[1]]);
             let api_version = i16::from_be_bytes([request_bytes[2], request_bytes[3]]);
-            tracing::info!("Request: API key={}, version={}", api_key, api_version);
+            tracing::debug!("Request: API key={}, version={}", api_key, api_version);
         }
 
 
@@ -1791,7 +1791,7 @@ impl KafkaProtocolHandler {
         api_key: ApiKey,
         api_version: i16,
     ) -> Result<Response> {
-        tracing::info!("Delegating API {:?} v{} to protocol_handler", api_key, api_version);
+        tracing::debug!("Delegating API {:?} v{} to protocol_handler", api_key, api_version);
         self.protocol_handler.handle_request(request_bytes).await
     }
 

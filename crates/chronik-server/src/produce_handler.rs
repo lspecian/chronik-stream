@@ -2650,7 +2650,7 @@ impl ProduceHandler {
 
                             if use_async_responses {
                                 // ASYNC PATH: Register for callback notification, write with acks=0 (non-blocking)
-                                info!("🔵 ASYNC_RESPONSE_PATH: topic={} partition={} base_offset={} last_offset={} acks={}",
+                                debug!("🔵 ASYNC_RESPONSE_PATH: topic={} partition={} base_offset={} last_offset={} acks={}",
                                       topic, partition, base_offset, last_offset, acks);
 
                                 // Create oneshot channel for async response
@@ -2659,7 +2659,7 @@ impl ProduceHandler {
                                 // Register with ResponsePipeline BEFORE WAL write
                                 // (callback will be triggered after group commit completes)
                                 if let Some(ref pipeline) = self.response_pipeline {
-                                    info!("🔵 REGISTERING: topic={} partition={} base_offset={} last_offset={}",
+                                    debug!("🔵 REGISTERING: topic={} partition={} base_offset={} last_offset={}",
                                           topic, partition, base_offset, last_offset);
                                     pipeline.register(
                                         topic.to_string(),
