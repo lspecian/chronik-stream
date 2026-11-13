@@ -148,6 +148,39 @@ pub struct ElectionTriggerMessage {
     reason: String,
 }
 
+/// One follower's write half. See `WalReplicationManager::connections`.
+type FollowerConnection = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
+
+/// How long one frame may take to reach a follower's socket before the
+/// connection is treated as dead and redialled. Generous: it only has to
+/// separate a follower that is behind from one that has stopped reading.
+const FOLLOWER_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Write one frame to a follower and flush it, bounded by
+/// [`FOLLOWER_WRITE_TIMEOUT`]. Holds only this connection's own lock.
+async fn write_frame(conn: &tokio::sync::Mutex<OwnedWriteHalf>, frame: &[u8]) -> std::io::Result<()> {
+    write_frame_within(conn, frame, FOLLOWER_WRITE_TIMEOUT).await
+}
+
+async fn write_frame_within(
+    conn: &tokio::sync::Mutex<OwnedWriteHalf>,
+    frame: &[u8],
+    limit: Duration,
+) -> std::io::Result<()> {
+    let mut writer = conn.lock().await;
+    let write = async {
+        writer.write_all(frame).await?;
+        writer.flush().await
+    };
+    match timeout(limit, write).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("follower did not accept the frame within {:?}", limit),
+        )),
+    }
+}
+
 /// WAL Replication Manager for PostgreSQL-style streaming
 ///
 /// Phase 3 implementation with actual TCP streaming and lock-free queue
@@ -156,9 +189,15 @@ pub struct WalReplicationManager {
     /// Queue of pending WAL records (lock-free MPMC)
     queue: Arc<SegQueue<WalReplicationRecord>>,
 
-    /// Active TCP write connections to followers (addr -> OwnedWriteHalf)
-    /// v2.2.7 Phase 4: Changed from TcpStream to OwnedWriteHalf to allow separate ACK reading
-    connections: Arc<DashMap<String, OwnedWriteHalf>>,
+    /// Active TCP write connections to followers (addr -> write half).
+    ///
+    /// Each connection sits behind its own async mutex so a sender can take it
+    /// out of the map and release the map before writing. Writing through a
+    /// `get_mut` guard held the shard's write lock across `write_all().await`:
+    /// when a follower stopped draining its socket the write waited with the
+    /// lock held, the connection manager blocked a runtime thread on the same
+    /// shard in `contains_key`, and the node stopped answering every request.
+    connections: Arc<DashMap<String, FollowerConnection>>,
 
     /// Follower addresses ("host:port")
     followers: Vec<String>,
@@ -685,6 +724,15 @@ impl WalReplicationManager {
     ///
     /// RP-2 removes the need for this — a follower's fetch is its own liveness
     /// proof, which is how Kafka avoids the problem entirely.
+    /// Drop a connection that failed, unless the connection manager has already
+    /// replaced it — a newer connection under the same address must survive an
+    /// old one's failure.
+    fn retire_connection(&self, follower_addr: &str, conn: &FollowerConnection) {
+        self.connections
+            .remove_if(follower_addr, |_, current| Arc::ptr_eq(current, conn));
+        self.mark_follower_down(follower_addr);
+    }
+
     fn mark_follower_down(&self, follower_addr: &str) {
         let (Some(tracker), Some(config)) = (&self.isr_tracker, &self.cluster_config) else {
             return;
@@ -743,29 +791,19 @@ impl WalReplicationManager {
                 follower_addr, frame.len(), self.connections.len()
             );
 
-            if let Some(mut conn) = self.connections.get_mut(follower_addr) {
-                debug!("🔍 send_to_followers: Found connection for {}, calling write_all()", follower_addr);
-
-                // Write frame to TCP stream
-                // Note: This is fast (~1ms) so sequential is fine
-                if let Err(e) = conn.write_all(&frame).await {
-                    error!("Failed to send WAL record to {}: {}", follower_addr, e);
-                    // Remove dead connection (connection manager will reconnect)
-                    drop(conn); // Drop RefMut before removing
-                    self.connections.remove(follower_addr);
-                    self.mark_follower_down(follower_addr);
-                } else {
-                    // CRITICAL: Flush the TCP stream to actually send the data
-                    // Without this, data sits in buffer and never reaches followers!
-                    if let Err(e) = conn.flush().await {
-                        error!("Failed to flush WAL record to {}: {}", follower_addr, e);
-                        drop(conn);
-                        self.connections.remove(follower_addr);
-                        self.mark_follower_down(follower_addr);
-                    } else {
+            // Clone the connection out; the map guard ends with this statement.
+            let conn = self.connections.get(follower_addr).map(|c| Arc::clone(c.value()));
+            if let Some(conn) = conn {
+                match write_frame(&conn, &frame).await {
+                    Ok(()) => {
                         debug!("✅ Sent and flushed WAL record for {}-{} to follower: {} ({} bytes)",
                             record.topic, record.partition, follower_addr, frame.len());
                         sent_to_any = true;
+                    }
+                    Err(e) => {
+                        error!("Failed to send WAL record to {}: {}", follower_addr, e);
+                        // The connection manager redials it.
+                        self.retire_connection(follower_addr, &conn);
                     }
                 }
             } else {
@@ -791,19 +829,14 @@ impl WalReplicationManager {
 
         // Send to ALL followers (heartbeat is not partition-specific)
         for follower_addr in &self.followers {
-            if let Some(mut conn) = self.connections.get_mut(follower_addr) {
-                if let Err(e) = conn.write_all(&frame).await {
-                    debug!("Failed to send heartbeat to {}: {}", follower_addr, e);
-                    drop(conn);
-                    self.connections.remove(follower_addr);
-                    self.mark_follower_down(follower_addr);
-                } else if let Err(e) = conn.flush().await {
-                    debug!("Failed to flush heartbeat to {}: {}", follower_addr, e);
-                    drop(conn);
-                    self.connections.remove(follower_addr);
-                    self.mark_follower_down(follower_addr);
-                } else {
-                    debug!("Sent heartbeat to follower: {}", follower_addr);
+            let conn = self.connections.get(follower_addr).map(|c| Arc::clone(c.value()));
+            if let Some(conn) = conn {
+                match write_frame(&conn, &frame).await {
+                    Ok(()) => debug!("Sent heartbeat to follower: {}", follower_addr),
+                    Err(e) => {
+                        debug!("Failed to send heartbeat to {}: {}", follower_addr, e);
+                        self.retire_connection(follower_addr, &conn);
+                    }
                 }
             }
         }
@@ -916,7 +949,7 @@ impl WalReplicationManager {
                             }
 
                             // Store write-half connection (for send_to_followers)
-                            self.connections.insert(follower_addr.clone(), write_half);
+                            self.connections.insert(follower_addr.clone(), Arc::new(tokio::sync::Mutex::new(write_half)));
 
                             // The link is up: re-assert the catalog now.
                             //
@@ -1688,7 +1721,7 @@ impl WalReplicationManager {
                     }
 
                     // Store write-half connection (for send_to_followers)
-                    self.connections.insert(follower_addr.clone(), write_half);
+                    self.connections.insert(follower_addr.clone(), Arc::new(tokio::sync::Mutex::new(write_half)));
                     successful += 1;
                     connection_results.push((follower_addr.clone(), true));
                 }
@@ -2476,6 +2509,40 @@ impl WalReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A follower that stops reading must cost a timeout, not a write that waits
+    /// forever. The old send path also held the connection map's shard lock for
+    /// that wait, which froze the leader's whole runtime once anything else
+    /// touched the map; the map is now released before writing, and this pins
+    /// the other half — the write itself ends.
+    #[tokio::test]
+    async fn a_follower_that_stops_reading_times_out_the_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (_never_read, _) = listener.accept().await.unwrap();
+        let (_read_half, write_half) = client.await.unwrap().into_split();
+        let conn: FollowerConnection = Arc::new(tokio::sync::Mutex::new(write_half));
+        let connections: DashMap<String, FollowerConnection> = DashMap::new();
+        connections.insert("follower".to_string(), Arc::clone(&conn));
+
+        // Fill the socket buffers until a write cannot complete.
+        let frame = vec![0u8; 1 << 20];
+        let started = std::time::Instant::now();
+        let mut outcome = Ok(());
+        for _ in 0..512 {
+            outcome = write_frame_within(&conn, &frame, Duration::from_millis(300)).await;
+            if outcome.is_err() {
+                break;
+            }
+        }
+        let err = outcome.expect_err("a peer that never reads must eventually stall the write");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(30));
+
+        // The map was never held for the write.
+        assert!(connections.contains_key("follower"));
+    }
     use chronik_config::{ClusterConfig, NodeConfig};
 
     fn create_test_cluster_config(node_id: u64) -> ClusterConfig {
