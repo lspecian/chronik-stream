@@ -655,6 +655,11 @@ pub struct GroupCommitWal {
     /// Per-partition commit queues
     partition_queues: Arc<DashMap<(String, i32), Arc<PartitionCommitQueue>>>,
 
+    /// Serialises creating a partition's queue. Creation is async (it opens
+    /// the segment file), so without this two first writes to a partition
+    /// could each create a writer for the same file.
+    queue_creation: Mutex<()>,
+
     /// Sealed segments ready for archival (topic:partition:segment_id → info)
     sealed_segments: Arc<DashMap<String, SealedSegmentInfo>>,
 
@@ -714,6 +719,7 @@ impl GroupCommitWal {
 
         let wal = Self {
             partition_queues: Arc::new(DashMap::new()),
+            queue_creation: Mutex::new(()),
             sealed_segments: Arc::new(DashMap::new()),
             config,
             base_dir: base_dir.clone(),
@@ -761,6 +767,7 @@ impl GroupCommitWal {
 
         let wal = Self {
             partition_queues: Arc::new(DashMap::new()),
+            queue_creation: Mutex::new(()),
             sealed_segments: Arc::new(DashMap::new()),
             config,
             base_dir: base_dir.clone(),
@@ -1050,7 +1057,7 @@ impl GroupCommitWal {
                 last_offset,  // v2.2.10: Offset metadata
             });
             let queue_depth = pending.len();
-            info!("📥 ENQUEUE_ADDED: Enqueued write (with wait), queue depth now: {}", queue_depth);
+            trace!("📥 ENQUEUE_ADDED: Enqueued write (with wait), queue depth now: {}", queue_depth);
 
             // Update bytes atomically (lock-free after this point)
             let total_bytes = queue.total_queued_bytes.fetch_add(data_len as u64, Ordering::Relaxed) + data_len as u64;
@@ -1062,11 +1069,11 @@ impl GroupCommitWal {
 
         // Notify committer
         queue.write_notify.notify_one();
-        info!("🔔 ENQUEUE_NOTIFY: Notified commit worker, should_commit={}", should_commit);
+        trace!("🔔 ENQUEUE_NOTIFY: Notified commit worker, should_commit={}", should_commit);
 
         // If batch is full, trigger commit immediately (don't wait for timer)
         if should_commit {
-            info!("⚡ ENQUEUE_IMMEDIATE: Triggering immediate commit due to batch size");
+            trace!("⚡ ENQUEUE_IMMEDIATE: Triggering immediate commit due to batch size");
         }
 
         Ok(rx)
@@ -1080,6 +1087,13 @@ impl GroupCommitWal {
     ) -> Result<Arc<PartitionCommitQueue>> {
         let key = (topic.to_string(), partition);
 
+        if let Some(queue) = self.partition_queues.get(&key) {
+            return Ok(queue.clone());
+        }
+
+        // One creator at a time, and look again once we are it: another caller
+        // may have created this queue while we waited.
+        let _creating = self.queue_creation.lock().await;
         if let Some(queue) = self.partition_queues.get(&key) {
             return Ok(queue.clone());
         }
@@ -1135,10 +1149,14 @@ impl GroupCommitWal {
             committed_through: Arc::new(AtomicI64::new(i64::MIN)),
         });
 
-        // Start per-partition commit worker
-        self.start_partition_committer(queue.clone());
-
+        // Publish the queue BEFORE starting its worker. The worker exits as
+        // soon as it finds its queue missing from the map (that is how a
+        // deleted topic stops it), and on a multi-threaded runtime it can run
+        // before this function continues: started first, it sometimes saw no
+        // queue, exited, and left every write to the partition waiting forever
+        // for a commit. Found as a test hung for 26 hours.
         self.partition_queues.insert(key, queue.clone());
+        self.start_partition_committer(queue.clone());
 
         if next_segment_id > 0 {
             info!("Created commit queue for {}-{} (segment_id={}, skipping {} existing segments)",
@@ -1161,7 +1179,7 @@ impl GroupCommitWal {
         let io_uring_handle = self.io_uring_handle.clone();
         let commit_callback = self.commit_callback.clone();  // v2.2.10: For async response delivery
 
-        info!("🚀 WORKER_SPAWN: Starting partition committer on construction-time runtime (prevents WalIndexer starvation)");
+        debug!("🚀 WORKER_SPAWN: Starting partition committer on construction-time runtime (prevents WalIndexer starvation)");
 
         // v2.4.0: CRITICAL — spawn on the runtime captured at construction time,
         // NOT tokio::spawn() which uses the *current* runtime.
@@ -1170,7 +1188,7 @@ impl GroupCommitWal {
         // be spawned on the WalIndexer's runtime. When those 2 threads are saturated
         // with Tantivy/Parquet/S3 work, the commit worker starves → deadlock.
         self.runtime_handle.spawn(async move {
-            info!("✅ WORKER_STARTED: Partition committer task is running");
+            debug!("✅ WORKER_STARTED: Partition committer task is running");
 
             // v2.2.7: Set high I/O priority for WAL thread to prevent Tantivy from blocking it
             // NOTE: This is optional and failure is non-fatal
@@ -1186,8 +1204,15 @@ impl GroupCommitWal {
                 config.max_wait_time_ms, config.max_batch_size, config.max_batch_bytes);
 
             loop {
-                // Check if partition queue was removed (topic deleted)
-                if !partition_queues.contains_key(&worker_key) {
+                // Exit once the map no longer holds THIS queue: removed (topic
+                // deleted), or replaced by a re-created topic's queue. Checking
+                // only for the key kept a deleted topic's worker running forever
+                // once a topic of the same name was created again.
+                let still_current = partition_queues
+                    .get(&worker_key)
+                    .map(|current| Arc::ptr_eq(current.value(), &queue))
+                    .unwrap_or(false);
+                if !still_current {
                     info!("🛑 WORKER_EXIT: Partition queue removed (topic deleted), committer exiting: {}:{}",
                         queue.topic, queue.partition);
                     return;
@@ -1244,7 +1269,7 @@ impl GroupCommitWal {
             }
         });
 
-        info!("🎯 WORKER_SPAWNED: tokio::spawn returned (worker should be running in background)");
+        debug!("🎯 WORKER_SPAWNED: tokio::spawn returned (worker should be running in background)");
     }
 
 
@@ -1281,7 +1306,7 @@ impl GroupCommitWal {
             let batch_size = std::cmp::min(pending.len(), config.max_batch_size);
             let mut batch = Vec::with_capacity(batch_size);
 
-            info!("📦 COMMIT_DRAIN: Draining {} writes from queue (total depth: {}) for batch commit", batch_size, queue_depth);
+            trace!("📦 COMMIT_DRAIN: Draining {} writes from queue (total depth: {}) for batch commit", batch_size, queue_depth);
 
             // Pre-allocate buffer for combined writes (avoids reallocations)
             let mut combined = Vec::new();
@@ -1379,7 +1404,7 @@ impl GroupCommitWal {
             .record("bytes", total_bytes)
             .record("fsync_us", fsync_duration.as_micros() as u64);
 
-        info!(
+        trace!(
             "✅ Group commit: {} writes, {} bytes, fsync took {:?}",
             batch_count, total_bytes, fsync_duration
         );
@@ -1392,12 +1417,12 @@ impl GroupCommitWal {
                     let min_offset = batch.iter().map(|w| w.base_offset).min().unwrap_or(0);
                     let max_offset = batch.iter().map(|w| w.last_offset).max().unwrap_or(0);
 
-                    info!("🔔 INVOKING_CALLBACK: topic={}, partition={}, offsets={}-{}, batch_size={}",
+                    trace!("🔔 INVOKING_CALLBACK: topic={}, partition={}, offsets={}-{}, batch_size={}",
                           &queue.topic, queue.partition, min_offset, max_offset, batch.len());
 
                     callback(&queue.topic, queue.partition, min_offset, max_offset);
 
-                    info!("✅ CALLBACK_COMPLETED: topic={}, partition={}", &queue.topic, queue.partition);
+                    trace!("✅ CALLBACK_COMPLETED: topic={}, partition={}", &queue.topic, queue.partition);
                 }
             } else {
                 warn!("⚠️  NO_CALLBACK_SET: topic={}, partition={} - responses will timeout!",
@@ -2662,5 +2687,91 @@ mod tail_cache_tests {
         let dir = tempfile::tempdir().unwrap();
         let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
         assert!(wal.read_tail("never-written", 0, 0, 10).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod queue_creation_tests {
+    use super::*;
+    use std::sync::Arc as StdArcT;
+
+    fn record(topic: &str, partition: i32, offset: i64) -> WalRecord {
+        WalRecord::new_v2(topic.to_string(), partition, vec![1u8; 32], offset, offset, 1)
+    }
+
+    /// The commit worker exits when its queue is missing from the map. It was
+    /// started before the queue was inserted, and on a multi-threaded runtime
+    /// it could run first: then nothing ever committed that partition, and its
+    /// first write waited forever. Many first writes at once make that
+    /// interleaving likely enough to catch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn the_first_write_to_every_new_partition_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = StdArcT::new(GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default()));
+
+        let mut writes = tokio::task::JoinSet::new();
+        for partition in 0..400 {
+            let wal = StdArcT::clone(&wal);
+            writes.spawn(async move {
+                let r = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    wal.append("fresh".to_string(), partition, record("fresh", partition, 0), 1),
+                )
+                .await;
+                (partition, r)
+            });
+        }
+        while let Some(done) = writes.join_next().await {
+            let (partition, r) = done.unwrap();
+            match r {
+                Ok(result) => result.unwrap(),
+                Err(_) => panic!("first write to partition {} was never committed", partition),
+            }
+        }
+    }
+
+    /// Two first writes to the same partition used to be able to create two
+    /// queues, each with its own writer on the same segment file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_first_writes_share_one_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = StdArcT::new(GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default()));
+
+        let mut creators = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let wal = StdArcT::clone(&wal);
+            creators.spawn(async move { wal.get_or_create_queue("same", 0).await.unwrap() });
+        }
+        let mut queues = Vec::new();
+        while let Some(q) = creators.join_next().await {
+            queues.push(q.unwrap());
+        }
+        assert!(
+            queues.iter().all(|q| StdArcT::ptr_eq(q, &queues[0])),
+            "every caller must get the one queue for the partition"
+        );
+        let segments = std::fs::read_dir(dir.path().join("same").join("0")).unwrap().count();
+        assert_eq!(segments, 1, "exactly one segment file was created");
+    }
+
+    /// A deleted topic's worker must stop even if a topic of the same name is
+    /// created again; it only checked that the key existed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_deleted_topics_worker_stops_when_the_name_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = GroupCommitConfig { max_wait_time_ms: 5, ..GroupCommitConfig::default() };
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), config);
+
+        let old = wal.get_or_create_queue("reused", 0).await.unwrap();
+        wal.cleanup_topic("reused").await;
+        let new = wal.get_or_create_queue("reused", 0).await.unwrap();
+        assert!(!StdArcT::ptr_eq(&old, &new));
+
+        // The old worker held a clone of `old`; once it exits, that clone drops.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while StdArcT::strong_count(&old) > 1 {
+            assert!(Instant::now() < deadline, "the deleted topic's commit worker is still running");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
