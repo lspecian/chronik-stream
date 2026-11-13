@@ -95,6 +95,15 @@ struct MetadataState {
     consumer_offsets: RwLock<HashMap<(String, String, u32), ConsumerOffset>>,
     // v2.2.14 PERFORMANCE FIX: DashMap for lock-free concurrent reads (80x cluster speedup)
     partition_assignments: DashMap<(String, u32), PartitionAssignment>,
+    /// Partition numbers that have an assignment, per topic. Lets a per-topic
+    /// lookup touch only that topic's entries: scanning `partition_assignments`
+    /// instead cost one pass over every partition in the cluster per call, and
+    /// the Metadata handler, the ISR publisher and the failover controller each
+    /// call it once per topic — topics x partitions work, every few seconds.
+    /// Updated before `partition_assignments` on insert and after it on delete,
+    /// so a reader can see an index entry with no assignment (skipped) but
+    /// never an assignment it cannot find.
+    partitions_by_topic: DashMap<String, std::collections::BTreeSet<u32>>,
     segments: RwLock<HashMap<(String, String), SegmentMetadata>>,
     partition_offsets: RwLock<HashMap<(String, u32), (i64, i64)>>,
     // Parquet segments for columnar storage (keyed by topic-partition, segment_id)
@@ -125,6 +134,7 @@ impl MetadataState {
             consumer_offsets: RwLock::new(HashMap::new()),
             // v2.2.14: DashMap doesn't need RwLock wrapper
             partition_assignments: DashMap::new(),
+            partitions_by_topic: DashMap::new(),
             segments: RwLock::new(HashMap::new()),
             partition_offsets: RwLock::new(HashMap::new()),
             parquet_segments: RwLock::new(HashMap::new()),
@@ -379,6 +389,7 @@ impl MetadataState {
                 // Remove all partition assignments for this topic
                 // v2.2.14: DashMap provides retain() for lock-free concurrent removal
                 self.partition_assignments.retain(|k, _| k.0 != *name);
+                self.partitions_by_topic.remove(name);
 
                 // Remove partition offsets for this topic
                 let mut offsets = self.partition_offsets.write().await;
@@ -577,6 +588,10 @@ impl MetadataState {
                     return Ok(());
                 }
 
+                self.partitions_by_topic
+                    .entry(assignment.topic.clone())
+                    .or_default()
+                    .insert(assignment.partition);
                 self.partition_assignments.insert(key, assignment.clone());
                 Ok(())
             }
@@ -1533,12 +1548,19 @@ impl MetadataStore for WalMetadataStore {
     }
 
     async fn get_partition_assignments(&self, topic: &str) -> Result<Vec<PartitionAssignment>> {
-        // v2.2.14 PERFORMANCE FIX: DashMap provides lock-free concurrent reads (80x speedup)
-        // No .await needed - synchronous access eliminates async lock contention
-        Ok(self.state.partition_assignments
-            .iter()
-            .filter(|entry| entry.key().0 == topic)
-            .map(|entry| entry.value().clone())
+        // Only this topic's partitions, in partition order. The index guard is
+        // released before reading the assignments.
+        let partitions: Vec<u32> = match self.state.partitions_by_topic.get(topic) {
+            Some(set) => set.iter().copied().collect(),
+            None => return Ok(Vec::new()),
+        };
+        let mut key = (topic.to_string(), 0u32);
+        Ok(partitions
+            .into_iter()
+            .filter_map(|p| {
+                key.1 = p;
+                self.state.partition_assignments.get(&key).map(|a| a.value().clone())
+            })
             .collect())
     }
 
@@ -2941,6 +2963,54 @@ mod leader_epoch_tests {
             serde_json::from_str(legacy).expect("pre-RP-3 assignments must still decode");
         assert_eq!(decoded.leader_epoch, 0);
         assert_eq!(decoded.leader_id, 1);
+    }
+
+    /// The per-topic lookup must return exactly that topic's partitions — not a
+    /// topic whose name it prefixes, not a deleted topic's — in partition order.
+    /// It used to scan every partition in the cluster on each call; this pins
+    /// the behaviour the index replaced that scan with.
+    #[tokio::test]
+    async fn per_topic_lookup_returns_only_that_topics_partitions() {
+        let store = store();
+        for p in [2u32, 0, 1] {
+            apply_event(&store, assignment_at("orders", p, 1, 0)).await;
+        }
+        apply_event(&store, assignment_at("orders-archive", 0, 2, 0)).await;
+        for t in 0..200 {
+            apply_event(&store, assignment_at(&format!("other-{t}"), 0, 3, 0)).await;
+        }
+
+        let parts: Vec<u32> = store
+            .get_partition_assignments("orders")
+            .await
+            .unwrap()
+            .iter()
+            .map(|a| a.partition)
+            .collect();
+        assert_eq!(parts, vec![0, 1, 2]);
+        assert_eq!(store.get_partition_assignments("orders-archive").await.unwrap().len(), 1);
+        assert!(store.get_partition_assignments("missing").await.unwrap().is_empty());
+
+        // An update replaces the entry instead of adding a second one.
+        apply_event(&store, assignment_at("orders", 1, 2, 1)).await;
+        let after = store.get_partition_assignments("orders").await.unwrap();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after.iter().find(|a| a.partition == 1).unwrap().leader_id, 2);
+
+        // Deleting the topic removes it from the lookup; re-creating it under
+        // the same name starts from only what is assigned again.
+        let deleted = MetadataEvent::new_with_node(
+            MetadataEventPayload::TopicDeleted { name: "orders".to_string() },
+            2,
+        );
+        store.apply_replicated_event(deleted).await.unwrap();
+        assert!(store.get_partition_assignments("orders").await.unwrap().is_empty());
+        assert_eq!(store.get_partition_assignments("orders-archive").await.unwrap().len(), 1);
+
+        apply_event(&store, assignment_at("orders", 0, 3, 0)).await;
+        let recreated = store.get_partition_assignments("orders").await.unwrap();
+        assert_eq!(recreated.len(), 1);
+        assert_eq!(recreated[0].leader_id, 3);
     }
 }
 

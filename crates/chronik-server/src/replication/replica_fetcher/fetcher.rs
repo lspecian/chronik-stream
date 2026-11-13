@@ -227,6 +227,24 @@ pub struct FollowedPartition {
     pub leader: u64,
 }
 
+/// How long to let a burst of assignment changes land before re-planning.
+const PLAN_CHANGE_SETTLE: Duration = Duration::from_millis(20);
+
+/// Whether a metadata event can change what this node fetches. The plan is a
+/// function of leaders, replica sets and the topics that exist; watermarks and
+/// ISR membership do not enter it.
+fn event_changes_plan(event: &crate::metadata_events::MetadataEvent) -> bool {
+    use crate::metadata_events::MetadataEvent::*;
+    match event {
+        PartitionAssigned { .. }
+        | LeaderChanged { .. }
+        | TopicCreated { .. }
+        | TopicDeleted { .. }
+        | BrokerRegistered { .. } => true,
+        HighWatermarkUpdated { .. } | ISRUpdated { .. } => false,
+    }
+}
+
 /// Decide which partitions this node must fetch, grouped by leader.
 ///
 /// Pure so the placement rules are testable without metadata or a cluster:
@@ -510,20 +528,46 @@ impl ReplicaFetcher {
             return;
         };
 
-        match tokio::time::timeout(self.config.refresh_interval, rx.recv()).await {
-            Ok(Ok(event)) => {
-                debug!("Re-reading assignments: metadata changed ({:?})", event);
+        // Only events that can change the plan end the wait. A high-watermark
+        // update is published for every produced batch and an ISR update on
+        // every publisher pass; re-reading the whole catalog on each of those
+        // made this loop's cost produce rate x topic count — 1.3 idle cores on
+        // a 5,600-topic cluster, spent re-planning an unchanged plan.
+        let deadline = tokio::time::Instant::now() + self.config.refresh_interval;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(event)) if event_changes_plan(&event) => {
+                    debug!("Re-reading assignments: metadata changed ({:?})", event);
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                // Lagged: events were dropped, so assignments may well have changed.
+                // Re-reading is the correct response to not knowing.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    debug!("Re-reading assignments: missed {} metadata event(s)", n);
+                    break;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    *events = None;
+                    tokio::time::sleep_until(deadline).await;
+                    return;
+                }
+                Err(_) => return, // the interval elapsed; re-read on the tick as before
             }
-            // Lagged: events were dropped, so assignments may well have changed.
-            // Re-reading is the correct response to not knowing.
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
-                debug!("Re-reading assignments: missed {} metadata event(s)", n);
+        }
+
+        // A change rarely comes alone — a topic creation is one event per
+        // partition, an anti-entropy pass one per assignment. Let the burst
+        // land, then drop what queued, so it costs one re-read rather than one
+        // per event. Short enough not to matter to a producer waiting on a
+        // follower to learn about a new partition (#36).
+        sleep(PLAN_CHANGE_SETTLE).await;
+        // Bounded, so a steady stream of events cannot keep this on a thread.
+        for _ in 0..4096 {
+            match rx.try_recv() {
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
             }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                *events = None;
-                sleep(self.config.refresh_interval).await;
-            }
-            Err(_) => {} // the interval elapsed; re-read on the tick as before
         }
     }
 
@@ -1244,6 +1288,29 @@ enum PartitionOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Watermark and ISR updates arrive with every produced batch and every
+    /// publisher pass; re-planning on them burned cores re-reading an unchanged
+    /// catalog. Only changes to leaders, replicas or the topic set re-plan.
+    #[test]
+    fn only_assignment_changes_trigger_a_replan() {
+        use crate::metadata_events::MetadataEvent;
+        let hwm = MetadataEvent::HighWatermarkUpdated { topic: "t".into(), partition: 0, offset: 7 };
+        let isr = MetadataEvent::ISRUpdated { topic: "t".into(), partition: 0, isr: vec![1, 2] };
+        let leader = MetadataEvent::LeaderChanged { topic: "t".into(), partition: 0, new_leader: 2 };
+        let assigned = MetadataEvent::PartitionAssigned {
+            topic: "t".into(),
+            partition: 0,
+            replicas: vec![1, 2, 3],
+            leader: 1,
+            leader_epoch: 0,
+            isr: vec![1, 2, 3],
+        };
+        assert!(!event_changes_plan(&hwm));
+        assert!(!event_changes_plan(&isr));
+        assert!(event_changes_plan(&leader));
+        assert!(event_changes_plan(&assigned));
+    }
 
     fn peers() -> HashMap<u64, String> {
         HashMap::from([
