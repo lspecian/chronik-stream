@@ -15,6 +15,7 @@ pub mod segment_writer;
 pub mod segment_reader;
 pub mod chronik_segment;
 pub mod chronik_segment_example;
+pub mod background;
 pub mod checksum;
 pub mod segment_checksum;
 pub mod segment_cache;

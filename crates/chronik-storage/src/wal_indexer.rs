@@ -467,6 +467,10 @@ impl WalIndexer {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)  // 2 threads sufficient for sequential indexing
             .thread_name("wal-indexer")
+            // Lower priority for every thread of this runtime, its blocking
+            // pool included; threads they spawn (Tantivy writers) inherit it.
+            // See crate::background.
+            .on_thread_start(crate::background::lower_current_thread_priority)
             .enable_all()  // Enable time and I/O drivers
             .build()
             .expect("Failed to create WalIndexer dedicated runtime");

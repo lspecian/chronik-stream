@@ -1166,6 +1166,11 @@ async fn main() -> Result<()> {
 
     // Log version information on startup
     info!("Chronik Server v{}", env!("CARGO_PKG_VERSION"));
+
+    // Before anything can touch rayon: size the global pool and lower its
+    // priority, so index rebuilds after a restart cannot take the whole CPU
+    // budget from request handling.
+    chronik_storage::background::init_global_pool();
     info!("Build features: search={}, backup={}, dynamic-config={}",
         cfg!(feature = "search"),
         cfg!(feature = "backup"),
