@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the fix). Every path that creates partition state now inserts only if
   absent and otherwise uses the state that won.
 
+- **Tantivy's per-commit INFO lines are off by default.** Tantivy logs six INFO
+  lines per index commit, and the WAL indexer commits once per partition per
+  pass: after a restart on a 5,600-topic cluster that was ~400 commits per
+  100 s per node, most of each broker's log. The server now adds
+  `tantivy=warn` to `RUST_LOG` unless the filter already names `tantivy`, so
+  an explicit choice still wins. Locally, with searchable topics and
+  `RUST_LOG=info`: 310 of 738 lines before, 0 of 428 after.
+
 - **A restart starved request handling for minutes on nodes with vector topics.**
   Rebuilding HNSW indexes at boot ran on rayon's global pool, which took one
   thread per core at normal priority. On a pod with a 16-core limit the rebuild

@@ -1154,12 +1154,58 @@ fn try_create_embedding_cache() -> Option<Arc<chronik_columnar::QueryEmbeddingCa
     Some(cache)
 }
 
+/// Dependencies whose INFO output is per-operation, not per-event.
+///
+/// Tantivy logs six INFO lines for every index commit. The WAL indexer commits
+/// once per partition per pass, so after a restart on a 5,600-topic cluster
+/// those lines were most of each broker's log (~400 commits per 100 s per
+/// node). Deployments set `RUST_LOG=info` (the operator passes `logLevel`
+/// straight through) and never thought to quiet them.
+const QUIET_DEPENDENCIES: &[&str] = &["tantivy"];
+
+/// `filter` plus `<dep>=warn` for each quiet dependency the operator did not
+/// mention. An explicit directive for that crate always wins.
+fn log_filter_with_quiet_dependencies(filter: &str) -> String {
+    let mut out = filter.trim().to_string();
+    for dep in QUIET_DEPENDENCIES {
+        let mentioned = out.split(',').any(|d| {
+            let target = d.trim().split('=').next().unwrap_or("");
+            target == *dep || target.starts_with(&format!("{dep}::"))
+        });
+        if !mentioned {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(dep);
+            out.push_str("=warn");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter_with_quiet_dependencies as f;
+
+    #[test]
+    fn quiet_dependencies_default_to_warn_unless_named() {
+        assert_eq!(f("info"), "info,tantivy=warn");
+        assert_eq!(f("info,chronik_server=debug"), "info,chronik_server=debug,tantivy=warn");
+        // An explicit choice is kept, whatever it is.
+        assert_eq!(f("info,tantivy=debug"), "info,tantivy=debug");
+        assert_eq!(f("info,tantivy::indexer=info"), "info,tantivy::indexer=info");
+        assert_eq!(f(""), "tantivy=warn");
+        // A crate whose name merely starts with the same letters is not it.
+        assert_eq!(f("tantivy_extra=info"), "tantivy_extra=info,tantivy=warn");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
-    std::env::set_var("RUST_LOG", &cli.log_level);
+    std::env::set_var("RUST_LOG", log_filter_with_quiet_dependencies(&cli.log_level));
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
