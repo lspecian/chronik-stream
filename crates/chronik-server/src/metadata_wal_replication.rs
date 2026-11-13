@@ -195,7 +195,7 @@ impl MetadataWalReplicator {
             // The leader receives this from local event bus AFTER write_and_apply() completes
             // So local state is ALREADY applied - we just need to replicate to followers
             MetadataEvent::PartitionAssigned { topic, partition, replicas, leader, leader_epoch, isr } => {
-                tracing::info!("📡 Replicating PartitionAssigned to followers: {}-{}, leader={}, epoch={}, replicas={:?}, isr={:?}",
+                tracing::debug!("📡 Replicating PartitionAssigned to followers: {}-{}, leader={}, epoch={}, replicas={:?}, isr={:?}",
                     topic, partition, leader, leader_epoch, replicas, isr);
 
                 // Rebuild the assignment exactly as it was, and ship THAT.
@@ -236,7 +236,7 @@ impl MetadataWalReplicator {
                             0,  // dummy offset (event-based, not WAL-offset-based)
                             data,
                         ).await;
-                        tracing::info!("✅ PartitionAssigned broadcast to followers: {}-{}", topic, partition);
+                        tracing::debug!("✅ PartitionAssigned broadcast to followers: {}-{}", topic, partition);
                     }
                     Err(e) => {
                         tracing::warn!("Failed to serialize PartitionAssigned {}-{}: {}", topic, partition, e);
@@ -281,7 +281,7 @@ impl MetadataWalReplicator {
             }
 
             MetadataEvent::TopicCreated { topic, num_partitions } => {
-                tracing::info!("📡 Replicating TopicCreated: {} with {} partitions",
+                tracing::debug!("📡 Replicating TopicCreated: {} with {} partitions",
                     topic, num_partitions);
 
                 // v2.3.2 CRITICAL FIX: Replicate TopicCreated events to followers.
@@ -331,7 +331,7 @@ impl MetadataWalReplicator {
             }
 
             MetadataEvent::TopicDeleted { topic } => {
-                tracing::info!("📡 Replicating TopicDeleted: {}", topic);
+                tracing::debug!("📡 Replicating TopicDeleted: {}", topic);
 
                 // v2.3.2 CRITICAL FIX: Replicate TopicDeleted events to followers.
                 // Without this, followers keep stale topic metadata after deletion.
@@ -364,7 +364,7 @@ impl MetadataWalReplicator {
             // Without this, followers don't know about brokers and return fallback metadata
             // This was the root cause of cluster mode client timeouts!
             MetadataEvent::BrokerRegistered { broker_id, host, port, rack } => {
-                tracing::info!("📡 Replicating BrokerRegistered to followers: broker_id={}, {}:{}",
+                tracing::debug!("📡 Replicating BrokerRegistered to followers: broker_id={}, {}:{}",
                     broker_id, host, port);
 
                 // Create BrokerMetadata for serialization

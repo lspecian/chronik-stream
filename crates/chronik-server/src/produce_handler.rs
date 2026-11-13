@@ -1541,7 +1541,7 @@ impl ProduceHandler {
                 partition,
                 offset,
             });
-            warn!("📡 Emitted HighWatermarkUpdated: {}-{} => {}, subscribers={}",
+            debug!("📡 Emitted HighWatermarkUpdated: {}-{} => {}, subscribers={}",
                   topic, partition, offset, subscriber_count);
         } else {
             warn!("⚠️  No event_bus configured - watermark event NOT emitted for {}-{}", topic, partition);
@@ -2618,7 +2618,7 @@ impl ProduceHandler {
                     // because only the first message's offset was updated in wire bytes (line 1157),
                     // leaving subsequent messages with incorrect offsets.
                     if canonical_record.original_v1_wire_format.is_some() {
-                        warn!("SESSION24_FIX: v1 MessageSet detected, recalculating record offsets from base_offset={}",
+                        debug!("SESSION24_FIX: v1 MessageSet detected, recalculating record offsets from base_offset={}",
                               canonical_record.base_offset);
                         canonical_record.recalculate_record_offsets();
                     }
@@ -3108,7 +3108,7 @@ impl ProduceHandler {
                     let new_watermark = (last_offset + 1) as i64;
                     let prev_watermark = partition_state.high_watermark.fetch_max(new_watermark as u64, Ordering::SeqCst) as i64;
 
-                    warn!(
+                    debug!(
                         "🔥 WATERMARK UPDATE [acks=-1, no ISR tracker]: topic={}, partition={}, old={}, new={}, last_offset={}, actually_updated={}",
                         topic, partition, old_watermark, new_watermark, last_offset, prev_watermark < new_watermark
                     );

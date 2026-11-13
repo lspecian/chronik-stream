@@ -738,13 +738,13 @@ impl WalReplicationManager {
 
         // Send to each target follower sequentially (DashMap doesn't allow moving RefMut into tasks)
         for follower_addr in &target_followers {
-            info!(
+            debug!(
                 "🔍 send_to_followers: Attempting to send to {} (frame size: {} bytes, connections map has {} entries)",
                 follower_addr, frame.len(), self.connections.len()
             );
 
             if let Some(mut conn) = self.connections.get_mut(follower_addr) {
-                info!("🔍 send_to_followers: Found connection for {}, calling write_all()", follower_addr);
+                debug!("🔍 send_to_followers: Found connection for {}, calling write_all()", follower_addr);
 
                 // Write frame to TCP stream
                 // Note: This is fast (~1ms) so sequential is fine
@@ -763,7 +763,7 @@ impl WalReplicationManager {
                         self.connections.remove(follower_addr);
                         self.mark_follower_down(follower_addr);
                     } else {
-                        info!("✅ Sent and flushed WAL record for {}-{} to follower: {} ({} bytes)",
+                        debug!("✅ Sent and flushed WAL record for {}-{} to follower: {} ({} bytes)",
                             record.topic, record.partition, follower_addr, frame.len());
                         sent_to_any = true;
                     }
@@ -998,7 +998,7 @@ impl WalReplicationManager {
         while !shutdown.load(Ordering::Relaxed) {
             // Read ACK frame header (8 bytes: magic + version + length)
             if buffer.len() < 8 {
-                info!("🔍 DEBUG ACK reader: Waiting to read header from {} (buffer: {} bytes)", follower_addr, buffer.len());
+                debug!("🔍 DEBUG ACK reader: Waiting to read header from {} (buffer: {} bytes)", follower_addr, buffer.len());
                 match timeout(Duration::from_secs(60), read_half.read_buf(&mut buffer)).await {
                     Ok(Ok(0)) => {
                         // Connection closed
@@ -1006,7 +1006,7 @@ impl WalReplicationManager {
                         return Ok(());
                     }
                     Ok(Ok(n)) => {
-                        info!("🔍 DEBUG ACK reader: Read {} bytes from {} (total buffer: {})", n, follower_addr, buffer.len());
+                        debug!("🔍 DEBUG ACK reader: Read {} bytes from {} (total buffer: {})", n, follower_addr, buffer.len());
                     }
                     Ok(Err(e)) => {
                         return Err(anyhow::anyhow!("ACK reader: Read error from {}: {}", follower_addr, e));
@@ -1025,12 +1025,12 @@ impl WalReplicationManager {
             // Parse frame header if we have enough data
             if buffer.len() >= 8 {
                 let magic = u16::from_be_bytes([buffer[0], buffer[1]]);
-                info!("🔍 DEBUG ACK reader: Got header from {}, magic=0x{:04x}", follower_addr, magic);
+                debug!("🔍 DEBUG ACK reader: Got header from {}, magic=0x{:04x}", follower_addr, magic);
 
                 // Skip heartbeat frames (if any)
                 if magic == HEARTBEAT_MAGIC {
                     buffer.advance(8);
-                    info!("ACK reader: Received heartbeat from {}", follower_addr);
+                    debug!("ACK reader: Received heartbeat from {}", follower_addr);
                     continue;
                 }
 
@@ -1045,7 +1045,7 @@ impl WalReplicationManager {
                 // Read frame length
                 let frame_length = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
                 let frame_size = 8 + frame_length; // header + payload
-                info!("🔍 DEBUG ACK reader: ACK frame length={}, total size={}", frame_length, frame_size);
+                debug!("🔍 DEBUG ACK reader: ACK frame length={}, total size={}", frame_length, frame_size);
 
                 // Wait for complete frame
                 while buffer.len() < frame_size && !shutdown.load(Ordering::Relaxed) {
@@ -1071,7 +1071,7 @@ impl WalReplicationManager {
                 // Deserialize complete ACK frame
                 let frame_bytes = buffer.split_to(frame_size);
                 let payload = &frame_bytes[8..]; // Skip header
-                info!("🔍 DEBUG ACK reader: Deserializing {} bytes of payload", payload.len());
+                debug!("🔍 DEBUG ACK reader: Deserializing {} bytes of payload", payload.len());
 
                 match bincode::deserialize::<WalAckMessage>(payload) {
                     Ok(ack_msg) => {
@@ -1090,7 +1090,7 @@ impl WalReplicationManager {
                             continue;
                         }
 
-                        info!(
+                        debug!(
                             "✅ ACK RECEIVED from {}: {}-{} offset {} (node {})",
                             follower_addr,
                             ack_msg.topic,
@@ -1100,7 +1100,7 @@ impl WalReplicationManager {
                         );
 
                         // THIS IS THE KEY FIX: Record ACK in IsrAckTracker on leader
-                        info!(
+                        debug!(
                             "🔍 DEBUG: Recording ACK in tracker for {}-{} offset {} node {}",
                             ack_msg.topic, ack_msg.partition, ack_msg.offset, ack_msg.node_id
                         );
@@ -1126,7 +1126,7 @@ impl WalReplicationManager {
                             );
                         }
 
-                        info!(
+                        debug!(
                             "✅ ACK recorded in tracker: {}-{} offset {} node {}",
                             ack_msg.topic, ack_msg.partition, ack_msg.offset, ack_msg.node_id
                         );
@@ -1393,7 +1393,7 @@ impl WalReplicationManager {
 
                     // Only log if followers changed
                     if current_followers.as_ref() != Some(&follower_addrs) {
-                        info!(
+                        debug!(
                             "Updated followers for {}-{}: {:?} (was: {:?})",
                             topic, partition, follower_addrs, current_followers
                         );
@@ -1558,7 +1558,7 @@ impl WalReplicationManager {
 
         match event {
             MetadataEvent::PartitionAssigned { topic, partition, replicas, leader, leader_epoch, isr } => {
-                info!(
+                debug!(
                     "📡 PartitionAssigned event: {}-{} => replicas={:?}, leader={} (epoch {}, isr {:?})",
                     topic, partition, replicas, leader, leader_epoch, isr
                 );
@@ -1575,7 +1575,7 @@ impl WalReplicationManager {
                     .collect();
 
                 if followers.is_empty() {
-                    info!("No followers for {}-{} (single replica or I'm not the leader)", topic, partition);
+                    debug!("No followers for {}-{} (single replica or I'm not the leader)", topic, partition);
                     return Ok(());
                 }
 
@@ -1597,7 +1597,7 @@ impl WalReplicationManager {
                 if !follower_addrs.is_empty() {
                     let partition_key = (topic.clone(), partition);
                     self.partition_followers.insert(partition_key, follower_addrs.clone());
-                    info!(
+                    debug!(
                         "✅ Registered partition followers for {}-{}: {:?}",
                         topic, partition, follower_addrs
                     );
@@ -1607,13 +1607,13 @@ impl WalReplicationManager {
             }
 
             MetadataEvent::LeaderChanged { topic, partition, new_leader } => {
-                info!("📡 LeaderChanged event: {}-{} => leader={}", topic, partition, new_leader);
+                debug!("📡 LeaderChanged event: {}-{} => leader={}", topic, partition, new_leader);
                 // Leader changes are handled by spawn_leader_change_handler
                 // This is just for logging/debugging
             }
 
             MetadataEvent::ISRUpdated { topic, partition, isr } => {
-                info!("📡 ISRUpdated event: {}-{} => ISR={:?}", topic, partition, isr);
+                debug!("📡 ISRUpdated event: {}-{} => ISR={:?}", topic, partition, isr);
                 // ISR updates don't require follower list changes (replicas are the source of truth)
             }
 
@@ -2135,7 +2135,7 @@ impl WalReceiver {
                                         e
                                     );
                                 } else {
-                                    info!(
+                                    debug!(
                                         "METADATA✓ Replicated: {}-{} offset {} ({} bytes)",
                                         wal_record.topic,
                                         wal_record.partition,
@@ -2173,7 +2173,7 @@ impl WalReceiver {
                         //
                         // See docs/RAFT_VS_WAL_METADATA_REDUNDANCY_ANALYSIS.md for full analysis
 
-                        info!(
+                        debug!(
                             "✅ Accepting WAL replication for {}-{} from leader (node {})",
                             wal_record.topic, wal_record.partition, node_id
                         );
@@ -2185,7 +2185,7 @@ impl WalReceiver {
                                 wal_record.topic, wal_record.partition, e
                             );
                         } else {
-                            info!(
+                            debug!(
                                 "WAL✓ Replicated: {}-{} offset {} ({} records, {} bytes)",
                                 wal_record.topic,
                                 wal_record.partition,
@@ -2196,7 +2196,7 @@ impl WalReceiver {
 
                             // v2.2.7 Phase 4: Send ACK back to leader for acks=-1 support
                             if let Some(ref tracker) = isr_ack_tracker {
-                                info!(
+                                debug!(
                                     "🔍 DEBUG: Preparing to send ACK for {}-{} offset {} from node {}",
                                     wal_record.topic, wal_record.partition, wal_record.base_offset, node_id
                                 );
@@ -2221,7 +2221,7 @@ impl WalReceiver {
                                         wal_record.topic, wal_record.partition, wal_record.base_offset, e
                                     );
                                 } else {
-                                    info!(
+                                    debug!(
                                         "✅ ACK SENT to leader: {}-{} offset {} from node {}",
                                         wal_record.topic, wal_record.partition, wal_record.base_offset, node_id
                                     );
@@ -2303,7 +2303,7 @@ impl WalReceiver {
                 warn!("❌ Failed to update watermark for {}-{} to {}: {}",
                     record.topic, record.partition, new_watermark, e);
             } else {
-                info!("✅ v2.2.9 Phase 7 DEBUG: Updated watermark for {}-{} to {}",
+                debug!("✅ v2.2.9 Phase 7 DEBUG: Updated watermark for {}-{} to {}",
                     record.topic, record.partition, new_watermark);
             }
         } else {
@@ -2326,7 +2326,7 @@ impl WalReceiver {
                 warn!("❌ Failed to update metadata_store offset for {}-{} to {}: {}",
                     record.topic, record.partition, new_watermark, e);
             } else {
-                info!("✅ v2.2.9 Phase 7 FIX: Updated MetadataStore offset for {}-{} to {} (for ListOffsets API)",
+                debug!("✅ v2.2.9 Phase 7 FIX: Updated MetadataStore offset for {}-{} to {} (for ListOffsets API)",
                     record.topic, record.partition, new_watermark);
             }
         } else {
@@ -2356,7 +2356,7 @@ impl WalReceiver {
         // v2.2.9 Phase 7 FIX #5: Try deserializing as MetadataEvent first (new format)
         // Then fall back to MetadataCommand (legacy format)
         if let Ok(event) = CommonMetadataEvent::from_bytes(&record.data) {
-            tracing::info!(
+            tracing::debug!(
                 "📥 Follower received MetadataEvent at offset {}: {:?}",
                 record.base_offset,
                 event.payload
@@ -2369,13 +2369,13 @@ impl WalReceiver {
                 } else {
                     match &event.payload {
                         MetadataEventPayload::PartitionAssigned { assignment } => {
-                            tracing::info!(
+                            tracing::debug!(
                                 "✅ Follower applied PartitionAssigned: {}-{}, leader={}, replicas={:?}",
                                 assignment.topic, assignment.partition, assignment.leader_id, assignment.replicas
                             );
                         }
                         MetadataEventPayload::HighWatermarkUpdated { topic, partition, new_watermark } => {
-                            tracing::info!(
+                            tracing::debug!(
                                 "✅ Follower applied HighWatermarkUpdated: {}-{} => {}",
                                 topic, partition, new_watermark
                             );
@@ -2426,7 +2426,7 @@ impl WalReceiver {
 
     /// Send ACK frame back to leader (v2.2.7 Phase 4)
     async fn send_ack(stream: &mut TcpStream, ack_msg: &WalAckMessage) -> Result<()> {
-        info!(
+        debug!(
             "🔍 DEBUG send_ack: Serializing ACK for {}-{} offset {} from node {}",
             ack_msg.topic, ack_msg.partition, ack_msg.offset, ack_msg.node_id
         );
@@ -2435,7 +2435,7 @@ impl WalReceiver {
         let serialized = bincode::serialize(ack_msg)
             .context("Failed to serialize ACK message")?;
 
-        info!(
+        debug!(
             "🔍 DEBUG send_ack: Serialized {} bytes, building frame with magic 0x{:04x}",
             serialized.len(), ACK_MAGIC
         );
@@ -2447,7 +2447,7 @@ impl WalReceiver {
         frame.put_u32(serialized.len() as u32);
         frame.put_slice(&serialized);
 
-        info!(
+        debug!(
             "🔍 DEBUG send_ack: Frame built ({} bytes total), writing to stream",
             frame.len()
         );
@@ -2456,12 +2456,12 @@ impl WalReceiver {
         stream.write_all(&frame).await
             .context("Failed to send ACK frame to leader")?;
 
-        info!("🔍 DEBUG send_ack: Frame written, flushing");
+        debug!("🔍 DEBUG send_ack: Frame written, flushing");
 
         stream.flush().await
             .context("Failed to flush ACK frame")?;
 
-        info!("🔍 DEBUG send_ack: Flush complete, ACK sent successfully");
+        debug!("🔍 DEBUG send_ack: Flush complete, ACK sent successfully");
 
         Ok(())
     }
