@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A restart starved request handling for minutes on nodes with vector topics.**
+  Rebuilding HNSW indexes at boot ran on rayon's global pool, which took one
+  thread per core at normal priority. On a pod with a 16-core limit the rebuild
+  used 12 of the 16, the container was CPU-throttled in 22% of scheduling
+  periods, and `acks=all` produce ran at 619 records/s with a 47 s p99 for about
+  ten minutes after every roll. On a local three-node cluster seeded with the
+  same index files, p99 rose from 11 ms to 101 ms and a producer writing to a
+  new topic failed partway. The pool is now sized to half the available cores
+  (`CHRONIK_BACKGROUND_THREADS` overrides it), its threads are named
+  `chronik-bg-N`, and it and the WAL indexer run at nice 10. Same reproduction
+  after the fix: every record written, p99 39–45 ms with 8 threads per node and
+  27–30 ms with 4. Index rebuilds after a restart take correspondingly longer.
+- **The first write to a new partition could wait forever.** The WAL started a
+  partition's commit worker before registering its queue. A worker that ran in
+  that gap found no queue, decided its partition had been removed, and exited;
+  writes then queued with nothing to commit them and their producers never got
+  an answer. It hung the test suite for 26 hours. Two neighbouring races are
+  fixed with it: two first writes to the same partition at once could each
+  create a queue, leaving two writers appending to one segment file; and the
+  commit worker of a deleted topic kept running if a topic with the same name
+  was created again, because it checked only that *some* queue existed under
+  its name. The queue is now registered before its worker starts, creation is
+  serialized, and a worker stops when the queue under its name is no longer
+  its own.
+- **Vector searches and writes stalled while an HNSW index was rebuilt.** The
+  rebuild ran under the index's write lock, so for its whole duration — about
+  two minutes for 22,500 vectors of 1,536 dimensions — searches and new vectors
+  for that partition waited. The graph is now built from a copy, off the async
+  runtime, and installed under the lock only at the end. Vectors that arrive
+  during a build stay searchable by brute force and are folded into the next
+  one; a build for an index that was replaced meanwhile is discarded.
+- **Logging at INFO grew with traffic.** Fetch, produce, request routing and
+  Metadata logged at INFO on every request — Metadata once per topic, so one
+  request against a 5,600-topic catalog wrote over 11,000 lines. A three-node
+  cluster on 2.16.4 with little client traffic logged 200–1,500 lines/s per
+  node, about 95% of it fetch-path lines caused by its own replica fetchers,
+  which pushed everything else out of a rotated log quickly. Those lines are now `debug`/`trace`; INFO keeps
+  events (topic changes, segment seals, periodic metrics). Measured on one node
+  producing and consuming 50,000 records while creating 60 topics: 1,046
+  lines/s before, 6 after. A replica fetching past the WAL into object storage
+  no longer logs "Segment not found" as a warning; it is the expected path.
+- **Four example and benchmark programs no longer compiled**
+  (`chronik-monitoring` `monitored_service`, `chronik-memory`
+  `realestate_whatsapp`, `chronik-storage` `object_store_usage`,
+  `chronik-columnar` `vector_search` bench), so
+  `cargo check --workspace --all-targets` failed. They are updated to the
+  current APIs.
+
 ## [2.16.4] - 2026-11-11
 
 ### Fixed
