@@ -242,6 +242,17 @@ impl WalProduceHandler {
         // This eliminates race conditions and guarantees durability
         self.inner_handler.handle_produce(request, correlation_id).await
     }
+
+    /// Passthrough for a request whose origin is known; see
+    /// [`ProduceHandler::handle_produce_from`].
+    pub async fn handle_produce_from(
+        &self,
+        request: ProduceRequest,
+        correlation_id: i32,
+        forwarded: bool,
+    ) -> Result<ProduceResponse> {
+        self.inner_handler.handle_produce_from(request, correlation_id, forwarded).await
+    }
     
     /// Truncate WAL after successful flush to segments
     pub async fn truncate_after_flush(

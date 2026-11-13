@@ -485,7 +485,11 @@ impl KafkaProtocolHandler {
 
         // WAL is mandatory - all produce requests MUST go through WAL
         // There is no fallback path - WAL is the only durability mechanism
-        let response = self.wal_handler.handle_produce(request, header.correlation_id).await?;
+        let forwarded = header.client_id.as_deref() == Some(crate::produce_handler::FORWARD_CLIENT_ID);
+        let response = self
+            .wal_handler
+            .handle_produce_from(request, header.correlation_id, forwarded)
+            .await?;
 
         // Encode the response
         let mut body_buf = BytesMut::new();

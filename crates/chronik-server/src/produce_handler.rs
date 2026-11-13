@@ -48,6 +48,11 @@ pub use crate::wal_replication::WalReplicationManager;
 /// v2.2.9: Async pipelined connection for leader forwarding (eliminates 168x slowdown)
 use crate::pipelined_connection::{PipelinedConnection, PipelinedConnectionPool};
 
+/// `client_id` on produce requests one broker forwards to the partition leader
+/// for a client. The receiving broker uses it to refuse to forward the write a
+/// second time.
+pub const FORWARD_CLIENT_ID: &str = "chronik-forward";
+
 /// Maximum segment size before rotation (256MB)
 const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -60,115 +65,6 @@ const MAX_BUFFER_RECORDS: usize = 10000;
 
 /// Timeout for replication acknowledgments
 const REPLICATION_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum connections per leader in the connection pool
-const MAX_CONNECTIONS_PER_LEADER: usize = 128;
-
-/// Connection timeout for leader forwarding
-const LEADER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Leader connection pool for reusing TCP connections
-///
-/// CRITICAL PERFORMANCE FIX (v2.2.8): Eliminates the 147x performance degradation
-/// observed when acks=1/all in cluster mode. Previous implementation created a NEW
-/// TCP connection for every forwarded produce request (Line 1504). With connection
-/// pooling, connections are reused, eliminating the ~50ms TCP handshake overhead.
-///
-/// Performance Impact:
-/// - BEFORE: acks=1 @ 1,098 msg/s (0.68% of acks=0 performance)
-/// - AFTER: Expected to match acks=0 @ 161,204 msg/s (100% performance)
-///
-/// Architecture:
-/// - DashMap keyed by leader address for lock-free concurrent access
-/// - VecDeque per leader for FIFO connection reuse
-/// - Connections are tested before reuse (write readiness check)
-/// - Failed connections trigger automatic reconnection
-/// - No lock contention on hot path (DashMap provides sharding)
-#[derive(Clone)]
-struct LeaderConnectionPool {
-    /// Pool of connections per leader address
-    /// Key: leader address (e.g., "localhost:9092")
-    /// Value: Queue of available TCP connections
-    pools: Arc<DashMap<String, Arc<Mutex<VecDeque<TcpStream>>>>>,
-    /// Maximum connections per leader
-    max_connections_per_leader: usize,
-}
-
-impl LeaderConnectionPool {
-    /// Create a new connection pool
-    fn new() -> Self {
-        Self {
-            pools: Arc::new(DashMap::new()),
-            max_connections_per_leader: MAX_CONNECTIONS_PER_LEADER,
-        }
-    }
-
-    /// Get a connection from the pool or create a new one
-    ///
-    /// Returns a connection that is ready to use. If a pooled connection
-    /// is available, it will be returned after a health check. If no pooled
-    /// connection exists or the health check fails, a new connection is created.
-    async fn get_connection(&self, leader_addr: &str) -> Result<TcpStream> {
-        // Try to get an existing connection from the pool
-        if let Some(pool_ref) = self.pools.get(leader_addr) {
-            let mut pool = pool_ref.lock().await;
-
-            // Try to reuse a pooled connection
-            while let Some(conn) = pool.pop_front() {
-                // Health check: ensure connection is still writable
-                // If connection is dead, this will fail and we'll try the next one
-                if conn.writable().await.is_ok() {
-                    trace!("Reusing pooled connection to leader {}", leader_addr);
-                    return Ok(conn);
-                } else {
-                    debug!("Discarding dead connection to leader {}", leader_addr);
-                }
-            }
-        }
-
-        // No pooled connection available or all connections failed health check
-        // Create a new connection
-        trace!("Creating new connection to leader {}", leader_addr);
-        match timeout(LEADER_CONNECTION_TIMEOUT, TcpStream::connect(leader_addr)).await {
-            Ok(Ok(stream)) => {
-                debug!("Successfully connected to leader {}", leader_addr);
-                Ok(stream)
-            }
-            Ok(Err(e)) => {
-                error!("Failed to connect to leader {}: {}", leader_addr, e);
-                Err(Error::Internal(format!("Connection failed: {}", e)))
-            }
-            Err(_) => {
-                error!("Connection timeout to leader {}", leader_addr);
-                Err(Error::Internal(format!("Connection timeout to {}", leader_addr)))
-            }
-        }
-    }
-
-    /// Return a connection to the pool for reuse
-    ///
-    /// Only returns connections to the pool if below the max limit.
-    /// Otherwise, the connection is dropped (closed).
-    async fn return_connection(&self, leader_addr: String, conn: TcpStream) {
-        // Get or create the pool for this leader
-        let pool_ref = self.pools
-            .entry(leader_addr.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
-            .clone();
-
-        let mut pool = pool_ref.lock().await;
-
-        // Only add to pool if below max limit
-        if pool.len() < self.max_connections_per_leader {
-            pool.push_back(conn);
-            trace!("Returned connection to pool for leader {} (pool size: {})",
-                   leader_addr, pool.len());
-        } else {
-            // Pool is full, drop the connection (it will close automatically)
-            trace!("Pool full for leader {}, dropping connection", leader_addr);
-        }
-    }
-}
 
 /// Configuration for the produce handler
 #[derive(Debug, Clone)]
@@ -522,10 +418,6 @@ pub struct ProduceHandler {
     /// Metadata event bus for high watermark replication (v2.2.7.2)
     /// Emits HighWatermarkUpdated events to replicate watermarks < 10ms via metadata WAL
     event_bus: Option<Arc<crate::metadata_events::MetadataEventBus>>,
-    /// PERFORMANCE OPTIMIZATION #4: Leadership cache to avoid expensive metadata store lookups
-    /// Cache key: (topic, partition), Value: (leader_id, last_updated)
-    /// Provides 15-20% throughput improvement by eliminating per-request metadata queries
-    leadership_cache: Arc<DashMap<(String, i32), (u64, std::time::Instant)>>,
     /// CRITICAL PERFORMANCE FIX #6 (v2.2.9): Async pipelined connection pool for leader forwarding
     /// Eliminates 168x performance degradation via async request pipelining (Kafka-style)
     /// OLD (v2.2.8 - synchronous): 2,197 msg/s @ 51ms p99 (head-of-line blocking)
@@ -1326,7 +1218,6 @@ impl ProduceHandler {
             isr_ack_tracker: None,  // v2.2.7 Phase 4: Initialize as None (set via set_isr_ack_tracker)
             leader_epochs: Arc::new(crate::replication::leader_epoch::LeaderEpochStore::new()),
             event_bus: None,  // v2.2.7.2: Initialize as None (set via set_event_bus)
-            leadership_cache: Arc::new(DashMap::new()),  // Optimization #4: Empty cache, populated on first access
             pipelined_pool: Arc::new(PipelinedConnectionPool::new(10000)),  // v2.2.9: Async pipelined connection pool (capacity increased from 1000 → 10000 to prevent channel blocking)
             response_pipeline: None,  // v2.2.10: Initialize as None (set via set_response_pipeline) - CRITICAL FIX #7
             searchable_topic_cache: Arc::new(DashMap::new()),  // v2.2.16: Cache for topic searchability
@@ -1476,14 +1367,14 @@ impl ProduceHandler {
                                     "Received PartitionAssigned event: {}-{} → leader {} at epoch {}, replicas {:?}",
                                     topic, partition, leader, leader_epoch, replicas
                                 );
-                                // Could update partition_states or leadership_cache here if needed
+                                // Leadership is read from the metadata store per request; nothing is cached here.
                             }
                             MetadataEvent::LeaderChanged { topic, partition, new_leader } => {
                                 debug!(
                                     "Received LeaderChanged event: {}-{} → new leader {}",
                                     topic, partition, new_leader
                                 );
-                                // Could invalidate leadership_cache entry here
+                                // Leadership is read from the metadata store per request, so there is nothing to invalidate.
                             }
                             _ => {
                                 // Other events (TopicCreated, TopicDeleted, ISRUpdated) logged but not acted upon
@@ -1694,6 +1585,18 @@ impl ProduceHandler {
         request: ProduceRequest,
         correlation_id: i32,
     ) -> Result<ProduceResponse> {
+        self.handle_produce_from(request, correlation_id, false).await
+    }
+
+    /// Like [`Self::handle_produce`], for a request whose origin is known.
+    /// `forwarded` is true when another broker sent it here on a client's
+    /// behalf ([`FORWARD_CLIENT_ID`]); such a write is never forwarded again.
+    pub async fn handle_produce_from(
+        &self,
+        request: ProduceRequest,
+        correlation_id: i32,
+        forwarded: bool,
+    ) -> Result<ProduceResponse> {
         let start_time = Instant::now();
         let mut response_topics = Vec::new();
         let acks = request.acks;
@@ -1727,7 +1630,7 @@ impl ProduceHandler {
         // Handle request with timeout
         let result = timeout(
             Duration::from_millis(timeout_ms.max(self.config.request_timeout_ms)),
-            self.process_produce_request(request, acks),
+            self.process_produce_request(request, acks, forwarded),
         ).await;
         
         match result {
@@ -1806,6 +1709,7 @@ impl ProduceHandler {
         &self,
         request: ProduceRequest,
         acks: i16,
+        forwarded: bool,
     ) -> Result<Vec<ProduceResponseTopic>> {
         let mut response_topics = Vec::new();
         let transactional_id = request.transactional_id.clone();
@@ -1892,101 +1796,56 @@ impl ProduceHandler {
                             };
                         }
 
-                        // OPTIMIZATION #4: Check leadership using cached assignments (15-20% throughput gain)
-                        // Cache-first strategy: check cache, fallback to metadata store if stale/missing
-                        let cache_key = (topic_name.clone(), partition_data.index);
-
-                        // TTL configurable via environment variable (default: 60s)
-                        // Leadership rarely changes in stable clusters, so long TTL is safe
-                        // Old default was 5s, causing excessive Raft queries (10-50ms each)
-                        let cache_ttl_secs = std::env::var("CHRONIK_LEADERSHIP_CACHE_TTL_SECS")
-                            .ok()
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(60); // 60 seconds default (12x improvement over old 5s)
-
-                        let (is_leader, leader_hint) = {
-                            // Fast path: Try cache first
-                            if let Some(entry) = self.leadership_cache.get(&cache_key) {
-                                let (leader, cached_at) = *entry;
-                                let age = cached_at.elapsed().as_secs();
-
-                                if age < cache_ttl_secs {
-                                    // Cache hit - use cached leader
-                                    let is_leader = leader == node_id as u64;
-                                    debug!(
-                                        "CACHE HIT: {}-{} leader={} is_leader={} age={}s",
-                                        topic_name, partition_data.index, leader, is_leader, age
-                                    );
-                                    (is_leader, Some(leader))
-                                } else {
-                                    // Cache stale - fallthrough to metadata query
-                                    debug!(
-                                        "CACHE STALE: {}-{} age={}s (TTL={}s), refreshing",
-                                        topic_name, partition_data.index, age, cache_ttl_secs
-                                    );
-                                    drop(entry); // Release lock before query
-
-                                    // Query and update cache
-                                    match metadata_store.get_partition_assignments(&topic_name).await {
-                                        Ok(assignments) => {
-                                            assignments.iter()
-                                                .find(|a| a.partition == partition_data.index as u32)
-                                                .map(|a| {
-                                                    let leader = a.leader_id;
-                                                    let is_leader = leader == node_id as u64;
-                                                    self.leadership_cache.insert(cache_key.clone(), (leader, std::time::Instant::now()));
-                                                    debug!(
-                                                        "CACHE REFRESH: {}-{} leader={} is_leader={}",
-                                                        topic_name, partition_data.index, leader, is_leader
-                                                    );
-                                                    (is_leader, Some(leader))
-                                                })
-                                                .unwrap_or((false, None))
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to refresh cache for {}-{}: {:?}",
-                                                topic_name, partition_data.index, e
-                                            );
-                                            (false, None)
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Cache miss - query metadata store and populate cache
-                                debug!("CACHE MISS: {}-{}, querying metadata store", topic_name, partition_data.index);
-                                match metadata_store.get_partition_assignments(&topic_name).await {
-                                    Ok(assignments) => {
-                                        assignments.iter()
-                                            .find(|a| a.partition == partition_data.index as u32)
-                                            .map(|a| {
-                                                let leader = a.leader_id;
-                                                let is_leader = leader == node_id as u64;
-                                                self.leadership_cache.insert(cache_key.clone(), (leader, std::time::Instant::now()));
-                                                debug!(
-                                                    "CACHE POPULATE: {}-{} leader={} is_leader={}",
-                                                    topic_name, partition_data.index, leader, is_leader
-                                                );
-                                                (is_leader, Some(leader))
-                                            })
-                                            .unwrap_or_else(|| {
-                                                debug!(
-                                                    "Partition {}-{} not assigned in metadata store",
-                                                    topic_name, partition_data.index
-                                                );
-                                                (false, None)
-                                            })
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to get partition assignments for {}-{}: {:?}",
-                                            topic_name, partition_data.index, e
-                                        );
-                                        (false, None)
-                                    }
-                                }
+                        // Leadership comes straight from the local metadata store
+                        // (an O(1) DashMap read), so it is never staler than this
+                        // node's replicated metadata. It used to be cached for 60 s
+                        // with no invalidation on leader changes: after any
+                        // failover or preferred-leader move a node kept routing
+                        // writes to the old leader for up to a minute, and two
+                        // nodes holding different stale leaders bounced a write
+                        // between them until it timed out.
+                        let (is_leader, leader_hint) = match metadata_store
+                            .get_partition_leader(&topic_name, partition_data.index as u32)
+                            .await
+                        {
+                            Ok(Some(leader)) if leader >= 0 => {
+                                let leader = leader as u64;
+                                (leader == node_id as u64, Some(leader))
+                            }
+                            Ok(_) => {
+                                debug!(
+                                    "Partition {}-{} not assigned in metadata store",
+                                    topic_name, partition_data.index
+                                );
+                                (false, None)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to read the leader of {}-{}: {:?}",
+                                    topic_name, partition_data.index, e
+                                );
+                                (false, None)
                             }
                         };
+
+                        // A write another broker forwarded here is never forwarded
+                        // again. If this node is not the leader either, the two
+                        // disagree about leadership; answering NOT_LEADER sends the
+                        // client back to Metadata instead of letting the write
+                        // travel between brokers.
+                        if !is_leader && forwarded {
+                            debug!(
+                                "Forwarded write for {}-{} reached node {}, which is not the leader (thinks {:?}); returning NOT_LEADER",
+                                topic_name, partition_data.index, node_id, leader_hint
+                            );
+                            return ProduceResponsePartition {
+                                index: partition_data.index,
+                                error_code: ErrorCode::NotLeaderForPartition.code(),
+                                base_offset: -1,
+                                log_append_time: -1,
+                                log_start_offset: 0,
+                            };
+                        }
 
                         if !is_leader {
                             // Forward request to leader instead of returning error (v2.2.9)
@@ -2142,7 +2001,7 @@ impl ProduceHandler {
                 encoder.write_i16(0); // API key 0 = Produce
                 encoder.write_i16(api_version);
                 encoder.write_i32(0); // correlation_id (will be set by pipelined connection)
-                encoder.write_compact_string(Some("chronik-forward")); // client_id
+                encoder.write_compact_string(Some(FORWARD_CLIENT_ID)); // client_id
                 encoder.write_unsigned_varint(0); // No tagged fields
             }
 
@@ -4192,7 +4051,6 @@ impl Clone for ProduceHandler {
             isr_ack_tracker: self.isr_ack_tracker.clone(),  // v2.2.7 Phase 4
             leader_epochs: self.leader_epochs.clone(),
             event_bus: self.event_bus.clone(),  // v2.2.7.2
-            leadership_cache: Arc::clone(&self.leadership_cache),  // Optimization #4
             pipelined_pool: Arc::clone(&self.pipelined_pool),  // v2.2.9: Async pipelined connection pool
             response_pipeline: self.response_pipeline.clone(),  // v2.2.10: Async response delivery (CRITICAL FIX #7)
             searchable_topic_cache: Arc::clone(&self.searchable_topic_cache),  // v2.2.16: Share cache
@@ -4398,6 +4256,59 @@ mod tests {
         
         // Check metrics
         assert_eq!(handler.metrics.records_produced.load(Ordering::Relaxed), 3);
+    }
+
+    /// A leadership change must take effect on the next write. Leadership used
+    /// to be cached for 60 s with no invalidation, so a node that had just lost
+    /// a partition went on writing it locally (or forwarding to the old leader)
+    /// for up to a minute. And a write another broker forwarded here must not be
+    /// forwarded again: answering NOT_LEADER is what stops two brokers that
+    /// disagree about the leader from passing a write back and forth.
+    #[tokio::test]
+    async fn a_leadership_change_applies_to_the_next_write() {
+        let (handler, _temp) = create_test_handler().await;
+        let request = |seq: i32| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition {
+                    index: 0,
+                    records: create_test_record_batch(-1, seq, vec![("k", "v")]),
+                }],
+            }],
+        };
+
+        // This node (1) leads partition 0: the write lands.
+        let first = handler.handle_produce(request(0), 1).await.unwrap();
+        assert_eq!(first.topics[0].partitions[0].error_code, 0);
+
+        // Leadership moves to node 2.
+        handler
+            .metadata_store
+            .assign_partition(chronik_common::metadata::PartitionAssignment {
+                topic: "test-topic".to_string(),
+                partition: 0,
+                broker_id: 2,
+                is_leader: true,
+                replicas: vec![2, 1],
+                leader_id: 2,
+                leader_epoch: 0,
+                isr: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        // The next write — one another broker forwarded — is refused at once,
+        // not written locally from a stale view and not forwarded onward.
+        let second = handler.handle_produce_from(request(1), 2, true).await.unwrap();
+        assert_eq!(
+            second.topics[0].partitions[0].error_code,
+            ErrorCode::NotLeaderForPartition.code(),
+            "a node that lost leadership must not keep accepting writes"
+        );
+        assert_eq!(handler.metrics.records_produced.load(Ordering::Relaxed), 1);
     }
     
     #[tokio::test]
