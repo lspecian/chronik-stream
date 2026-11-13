@@ -507,7 +507,7 @@ chronik-stream/
 
 Chronik Stream is in active development. The core streaming, SQL, search, and vector capabilities are validated at scale (43.9M records, 3-node cluster). The Kafka protocol layer has been tested with real clients across production workloads.
 
-**Current version: v2.16.4** — See [CHANGELOG.md](CHANGELOG.md) for release history.
+**Current version: v2.16.5** — See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 **Roadmap priorities:**
 - Cross-encoder reranking for search quality (Phase 10)

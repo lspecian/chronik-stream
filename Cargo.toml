@@ -30,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.16.4"
+version = "2.16.5"
 edition = "2021"
 authors = ["Chronik Stream Contributors"]
 license = "Apache-2.0"

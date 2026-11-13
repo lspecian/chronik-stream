@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.5] - 2026-11-13
+
 ### Fixed
 
 - **The first writes to a new partition could overwrite each other's acknowledged
