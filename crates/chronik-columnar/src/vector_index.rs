@@ -494,6 +494,96 @@ struct PartitionIndex {
     dot_index: Option<HnswMap<DotProductPoint, u64>>,
     /// Offsets that already have vectors (dedup across multiple loads/re-ingests)
     known_offsets: std::collections::HashSet<u64>,
+    /// Identity of this value; see `NEXT_INDEX_INSTANCE`.
+    instance: u64,
+    /// A graph build of this index is running with the lock released.
+    build_in_flight: bool,
+}
+
+
+/// Distinguishes one `PartitionIndex` value from any later one under the same
+/// key, so a build that finishes after its index was cleared or reloaded is
+/// discarded instead of being installed into the replacement.
+static NEXT_INDEX_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Step 2 of a build: everything needed to construct the graph, detached from
+/// the index so no lock is held while it runs. See
+/// [`PartitionIndex::prepare_build`].
+struct BuildJob {
+    instance: u64,
+    metric: DistanceMetric,
+    build_dims: usize,
+    dimensions: usize,
+    ef_construction: usize,
+    quantize: bool,
+    /// How many of the index's pending vectors this job covers.
+    take_pending: usize,
+    /// Built vectors followed by the covered pending ones, full dimension.
+    vectors: Vec<(u64, Vec<f32>)>,
+}
+
+enum HnswGraph {
+    Euclidean(HnswMap<EuclideanPoint, u64>),
+    Cosine(HnswMap<CosinePoint, u64>),
+    DotProduct(HnswMap<DotProductPoint, u64>),
+}
+
+struct BuildOutput {
+    instance: u64,
+    take_pending: usize,
+    graph: HnswGraph,
+    quantizer: Option<ScalarQuantizer>,
+}
+
+impl BuildJob {
+    /// Construct the graph. CPU-bound (instant-distance parallelises it on
+    /// rayon's global pool); call it off the async runtime.
+    fn run(self) -> BuildOutput {
+        let BuildJob { instance, metric, build_dims, dimensions, ef_construction, quantize, take_pending, vectors } = self;
+
+        debug!(
+            "Building HNSW index with {} vectors, {}d{}, metric={:?}",
+            vectors.len(),
+            build_dims,
+            if build_dims < dimensions { format!(" (Matryoshka, full={}d)", dimensions) } else { String::new() },
+            metric
+        );
+
+        // VO-3: train on full-dimension vectors before they are truncated.
+        let quantizer = if quantize {
+            Some(ScalarQuantizer::fit(&vectors, dimensions))
+        } else {
+            None
+        };
+
+        let ids: Vec<u64> = vectors.iter().map(|(id, _)| *id).collect();
+        // VO-6: the graph is built over truncated vectors when Matryoshka is
+        // enabled; the index keeps the full ones for adaptive re-scoring.
+        let truncated = vectors.into_iter().map(|(_, mut v)| {
+            v.truncate(build_dims);
+            v
+        });
+
+        let graph = match metric {
+            DistanceMetric::Euclidean => HnswGraph::Euclidean(
+                Builder::default()
+                    .ef_construction(ef_construction)
+                    .build(truncated.map(EuclideanPoint).collect(), ids),
+            ),
+            DistanceMetric::Cosine => HnswGraph::Cosine(
+                Builder::default()
+                    .ef_construction(ef_construction)
+                    .build(truncated.map(CosinePoint).collect(), ids),
+            ),
+            DistanceMetric::DotProduct => HnswGraph::DotProduct(
+                Builder::default()
+                    .ef_construction(ef_construction)
+                    .build(truncated.map(DotProductPoint).collect(), ids),
+            ),
+        };
+
+        BuildOutput { instance, take_pending, graph, quantizer }
+    }
 }
 
 /// Thresholds for triggering HNSW rebuild
@@ -522,6 +612,8 @@ impl PartitionIndex {
             cosine_index: None,
             dot_index: None,
             known_offsets: std::collections::HashSet::new(),
+            instance: NEXT_INDEX_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            build_in_flight: false,
         }
     }
 
@@ -564,7 +656,7 @@ impl PartitionIndex {
 
     /// Check if a rebuild is needed based on pending buffer thresholds.
     fn needs_rebuild(&self) -> bool {
-        if self.pending_vectors.is_empty() {
+        if self.build_in_flight || self.pending_vectors.is_empty() {
             return false;
         }
         // Always rebuild if HNSW graph needs constructing (built_vectors exist without graph)
@@ -588,94 +680,93 @@ impl PartitionIndex {
         false
     }
 
-    /// Build (or rebuild) the HNSW graph.
+    /// Build (or rebuild) the HNSW graph, synchronously.
     ///
-    /// VO-2: Merges pending_vectors into built_vectors, then rebuilds the HNSW
-    /// graph over all built_vectors. After build, pending_vectors is empty and
-    /// the HNSW graph covers every vector.
+    /// The same three steps the manager runs with the lock released between
+    /// them — see [`PartitionIndex::prepare_build`]. Used where nothing else
+    /// can observe the index (tests, a freshly loaded index not yet shared).
     fn build(&mut self) -> Result<()> {
-        // Nothing to do if no vectors exist at all
+        if let Some(job) = self.prepare_build() {
+            let output = job.run();
+            self.install_build(output);
+        }
+        Ok(())
+    }
+
+    /// Step 1 of a build, under the index lock: snapshot the vectors the new
+    /// graph will cover. Cheap (a copy), so the lock is held briefly.
+    ///
+    /// Building the graph is the expensive step — minutes for tens of
+    /// thousands of 1536-d vectors — and used to run with the manager's write
+    /// lock held, so every search and every embedding write for every topic
+    /// waited behind it. Now the graph is built from this snapshot with no lock
+    /// held ([`BuildJob::run`]) and swapped in afterwards
+    /// ([`PartitionIndex::install_build`]). Meanwhile the index keeps serving
+    /// from its current graph plus a brute-force scan of pending vectors,
+    /// exactly as between rebuilds.
+    ///
+    /// Returns `None` when there is nothing to build or a build of this index
+    /// is already running.
+    fn prepare_build(&mut self) -> Option<BuildJob> {
+        if self.build_in_flight {
+            return None;
+        }
         if self.built_vectors.is_empty() && self.pending_vectors.is_empty() {
-            return Ok(());
+            return None;
         }
-
-        // Already built and no new pending vectors
         if self.is_built() && self.pending_vectors.is_empty() {
-            return Ok(());
+            return None;
         }
 
-        // Merge pending into built (f32 and quantized)
-        self.built_vectors.append(&mut self.pending_vectors);
-        self.quantized_built.append(&mut self.quantized_pending);
+        let mut vectors = Vec::with_capacity(self.built_vectors.len() + self.pending_vectors.len());
+        vectors.extend(self.built_vectors.iter().cloned());
+        vectors.extend(self.pending_vectors.iter().cloned());
+        self.build_in_flight = true;
 
-        // Ensure known_offsets is complete after merge
-        for (id, _) in &self.built_vectors {
-            self.known_offsets.insert(*id);
+        Some(BuildJob {
+            instance: self.instance,
+            metric: self.config.metric.clone(),
+            build_dims: self.config.effective_search_dims(),
+            dimensions: self.config.dimensions,
+            ef_construction: self.config.ef_construction,
+            quantize: matches!(self.config.quantization, QuantizationMode::Uint8),
+            take_pending: self.pending_vectors.len(),
+            vectors,
+        })
+    }
+
+    /// Step 3 of a build, under the index lock: adopt the graph.
+    ///
+    /// The pending vectors the graph covers move into the built tier. Vectors
+    /// that arrived while it was being built stay pending, so they are still
+    /// found by the brute-force scan and go into the next build. Returns false,
+    /// changing nothing, when the output belongs to an index that has since
+    /// been replaced (cleared, or reloaded from disk).
+    fn install_build(&mut self, output: BuildOutput) -> bool {
+        if output.instance != self.instance {
+            return false;
+        }
+        self.build_in_flight = false;
+
+        // Only a build removes from `pending_vectors`, and only one build runs
+        // at a time, so its first `take_pending` entries are the ones the
+        // graph was built from.
+        let covered: Vec<_> = self.pending_vectors.drain(..output.take_pending).collect();
+        self.built_vectors.extend(covered);
+
+        match output.graph {
+            HnswGraph::Euclidean(g) => self.euclidean_index = Some(g),
+            HnswGraph::Cosine(g) => self.cosine_index = Some(g),
+            HnswGraph::DotProduct(g) => self.dot_index = Some(g),
         }
 
-        // VO-6: Determine HNSW build dimensions (truncated for Matryoshka or full)
-        let build_dims = self.config.effective_search_dims();
-        let using_matryoshka = self.config.is_matryoshka_enabled();
-
-        debug!(
-            "Building HNSW index with {} vectors, {}d{}, metric={:?}",
-            self.built_vectors.len(),
-            build_dims,
-            if using_matryoshka { format!(" (Matryoshka, full={}d)", self.config.dimensions) } else { String::new() },
-            self.config.metric
-        );
-
-        // Extract IDs for mapping
-        let ids: Vec<u64> = self.built_vectors.iter().map(|(id, _)| *id).collect();
-
-        // VO-6: Truncate vectors for HNSW build when Matryoshka is enabled.
-        // Full vectors remain in built_vectors for adaptive re-scoring.
-        match self.config.metric {
-            DistanceMetric::Euclidean => {
-                let points: Vec<EuclideanPoint> = self
-                    .built_vectors
-                    .iter()
-                    .map(|(_, v)| EuclideanPoint(truncate_vec(v, build_dims)))
-                    .collect();
-
-                let hnsw = Builder::default()
-                    .ef_construction(self.config.ef_construction)
-                    .build(points, ids);
-
-                self.euclidean_index = Some(hnsw);
-            }
-            DistanceMetric::Cosine => {
-                let points: Vec<CosinePoint> = self
-                    .built_vectors
-                    .iter()
-                    .map(|(_, v)| CosinePoint(truncate_vec(v, build_dims)))
-                    .collect();
-
-                let hnsw = Builder::default()
-                    .ef_construction(self.config.ef_construction)
-                    .build(points, ids);
-
-                self.cosine_index = Some(hnsw);
-            }
-            DistanceMetric::DotProduct => {
-                let points: Vec<DotProductPoint> = self
-                    .built_vectors
-                    .iter()
-                    .map(|(_, v)| DotProductPoint(truncate_vec(v, build_dims)))
-                    .collect();
-
-                let hnsw = Builder::default()
-                    .ef_construction(self.config.ef_construction)
-                    .build(points, ids);
-
-                self.dot_index = Some(hnsw);
-            }
-        }
-
-        // VO-3: Train quantizer and build quantized copies for uint8 mode
-        if matches!(self.config.quantization, QuantizationMode::Uint8) {
-            let quantizer = ScalarQuantizer::fit(&self.built_vectors, self.config.dimensions);
+        // VO-3: uint8 mode re-quantizes both tiers with the newly trained
+        // quantizer, so every stored copy agrees with the one used at search.
+        if let Some(quantizer) = output.quantizer {
             self.quantized_built = self.built_vectors.iter()
+                .map(|(id, vec)| (*id, quantizer.quantize_uint8(vec)))
+                .collect();
+            self.quantized_pending = self.pending_vectors.iter()
                 .map(|(id, vec)| (*id, quantizer.quantize_uint8(vec)))
                 .collect();
             self.quantizer = Some(quantizer);
@@ -685,8 +776,15 @@ impl PartitionIndex {
             );
         }
 
-        debug!("HNSW index built successfully");
-        Ok(())
+        debug!("HNSW index built successfully ({} vectors)", self.built_vectors.len());
+        true
+    }
+
+    /// A build that will not complete (its task failed): allow the next one.
+    fn abort_build(&mut self, instance: u64) {
+        if instance == self.instance {
+            self.build_in_flight = false;
+        }
     }
 
     /// Check if the HNSW index has been built
@@ -1051,14 +1149,22 @@ impl VectorIndexManager {
         );
 
         // VO-2: Automatically rebuild HNSW when pending buffer exceeds thresholds
-        if index.needs_rebuild() {
+        let rebuild = index.needs_rebuild();
+        if rebuild {
             let pending = index.pending_vectors.len();
             let built = index.built_vectors.len();
             info!(
                 "Auto-rebuilding HNSW for {}-{}: pending={}, built={}, total={}",
                 topic, partition, pending, built, pending + built
             );
-            if let Err(e) = index.build() {
+        }
+
+        // VO-2: Report tier counts to metrics
+        Self::report_tier_metrics(&indexes);
+        drop(indexes);
+
+        if rebuild {
+            if let Err(e) = self.build_detached(&key).await {
                 warn!(
                     "Failed to auto-rebuild HNSW for {}-{}: {}",
                     topic, partition, e
@@ -1066,10 +1172,43 @@ impl VectorIndexManager {
             }
         }
 
-        // VO-2: Report tier counts to metrics
-        Self::report_tier_metrics(&indexes);
-
         Ok(added)
+    }
+
+    /// Build or rebuild one index's HNSW graph without holding the lock
+    /// while the graph is constructed. Returns whether a new graph was
+    /// installed: false when there was nothing to build, a build was already
+    /// running, or the index was replaced meanwhile.
+    async fn build_detached(&self, key: &TopicPartitionKey) -> Result<bool> {
+        let job = {
+            let mut indexes = self.indexes.write().await;
+            match indexes.get_mut(key) {
+                Some(index) => index.prepare_build(),
+                None => None,
+            }
+        };
+        let Some(job) = job else {
+            return Ok(false);
+        };
+        let instance = job.instance;
+
+        match tokio::task::spawn_blocking(move || job.run()).await {
+            Ok(output) => {
+                let mut indexes = self.indexes.write().await;
+                let installed = indexes
+                    .get_mut(key)
+                    .map(|index| index.install_build(output))
+                    .unwrap_or(false);
+                Self::report_tier_metrics(&indexes);
+                Ok(installed)
+            }
+            Err(e) => {
+                if let Some(index) = self.indexes.write().await.get_mut(key) {
+                    index.abort_build(instance);
+                }
+                Err(anyhow!("HNSW build for {}-{} failed: {}", key.topic, key.partition, e))
+            }
+        }
     }
 
     /// Search for k nearest neighbors in a topic-partition (default model)
@@ -1187,22 +1326,27 @@ impl VectorIndexManager {
         );
 
         // VO-2: Automatically rebuild HNSW when pending buffer exceeds thresholds
-        if index.needs_rebuild() {
+        let rebuild = index.needs_rebuild();
+        if rebuild {
             let pending = index.pending_vectors.len();
             let built = index.built_vectors.len();
             info!(
                 "Auto-rebuilding HNSW for {}-{} model={}: pending={}, built={}, total={}",
                 topic, partition, model_id, pending, built, pending + built
             );
-            if let Err(e) = index.build() {
+        }
+
+        Self::report_tier_metrics(&indexes);
+        drop(indexes);
+
+        if rebuild {
+            if let Err(e) = self.build_detached(&key).await {
                 warn!(
                     "Failed to auto-rebuild HNSW for {}-{} model={}: {}",
                     topic, partition, model_id, e
                 );
             }
         }
-
-        Self::report_tier_metrics(&indexes);
 
         Ok(added)
     }
@@ -1249,24 +1393,20 @@ impl VectorIndexManager {
         partition: i32,
     ) -> Result<bool> {
         let key = TopicPartitionKey::new(topic, partition);
-        let mut indexes = self.indexes.write().await;
-
-        let index = indexes
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("No index for topic={}, partition={}", topic, partition))?;
-
-        // VO-2: Build if not built, or rebuild if pending vectors warrant it
-        if index.is_built() && index.pending_vectors.is_empty() {
-            return Ok(false);
+        if !self.indexes.read().await.contains_key(&key) {
+            return Err(anyhow!("No index for topic={}, partition={}", topic, partition));
         }
 
-        index.build()?;
-        info!(
-            "Built HNSW index for {}-{} with {} vectors",
-            topic, partition, index.vector_count()
-        );
-        Self::report_tier_metrics(&indexes);
-        Ok(true)
+        // VO-2: Build if not built, or rebuild if pending vectors warrant it
+        let built = self.build_detached(&key).await?;
+        if built {
+            let count = self.indexes.read().await.get(&key).map(|i| i.vector_count()).unwrap_or(0);
+            info!(
+                "Built HNSW index for {}-{} with {} vectors",
+                topic, partition, count
+            );
+        }
+        Ok(built)
     }
 
     /// Build HNSW indexes for all partitions of a topic
@@ -1284,13 +1424,9 @@ impl VectorIndexManager {
 
         let mut built = 0;
         for key in keys {
-            let mut indexes = self.indexes.write().await;
-            if let Some(index) = indexes.get_mut(&key) {
-                // VO-2: Build if not built, or rebuild if pending vectors exist
-                if !index.is_built() || !index.pending_vectors.is_empty() {
-                    index.build()?;
-                    built += 1;
-                }
+            // VO-2: Build if not built, or rebuild if pending vectors exist
+            if self.build_detached(&key).await? {
+                built += 1;
             }
         }
 
@@ -1311,25 +1447,15 @@ impl VectorIndexManager {
 
         let mut built = 0;
         for key in keys {
-            let mut indexes = self.indexes.write().await;
-            if let Some(index) = indexes.get_mut(&key) {
-                // VO-2: Build if not built, or rebuild if pending vectors exist
-                if !index.is_built() || !index.pending_vectors.is_empty() {
-                    index.build()?;
-                    built += 1;
-                    debug!(
-                        "Built HNSW index for {}-{} with {} vectors",
-                        key.topic, key.partition, index.vector_count()
-                    );
-                }
+            // VO-2: Build if not built, or rebuild if pending vectors exist
+            if self.build_detached(&key).await? {
+                built += 1;
+                debug!("Built HNSW index for {}-{}", key.topic, key.partition);
             }
         }
 
         if built > 0 {
             info!("Built {} HNSW indexes across all topics", built);
-            // VO-2: Report updated tier counts
-            let indexes = self.indexes.read().await;
-            Self::report_tier_metrics(&indexes);
         }
         Ok(built)
     }
@@ -1660,9 +1786,19 @@ impl VectorIndexManager {
             }
         }
 
+        // Register the topic config if not already registered
+        if !self.is_topic_registered(topic).await {
+            self.register_topic(topic, index.config.clone()).await;
+        }
+
+        // Store the index before building its graph: it answers searches by
+        // brute force over the loaded vectors in the meantime, instead of
+        // being absent for the minutes a large graph takes.
+        self.indexes.write().await.insert(key.clone(), index);
+
         // Rebuild the HNSW index after loading vectors (also trains quantizer for uint8)
         if vector_count > 0 {
-            if let Err(e) = index.build() {
+            if let Err(e) = self.build_detached(&key).await {
                 warn!(
                     topic = topic,
                     partition = partition,
@@ -1672,18 +1808,7 @@ impl VectorIndexManager {
                 );
             }
         }
-
-        // Register the topic config if not already registered
-        if !self.is_topic_registered(topic).await {
-            self.register_topic(topic, index.config.clone()).await;
-        }
-
-        // Track is_built before moving index
-        let is_built = index.is_built();
-
-        // Store the index
-        let mut indexes = self.indexes.write().await;
-        indexes.insert(key, index);
+        let is_built = self.indexes.read().await.get(&key).map(|i| i.is_built()).unwrap_or(false);
 
         info!(
             topic = topic,
@@ -3834,5 +3959,141 @@ mod loading_flag_tests {
 
         assert_eq!(manager.load_all_indexes().await.unwrap(), 0);
         assert!(manager.loading_complete.load(Ordering::Acquire));
+    }
+
+    // ---- Graph builds run without the index lock ---------------------------
+
+    /// Deterministic pseudo-random vectors, so the tests need no RNG crate.
+    fn lcg_vectors(n: usize, dims: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                (0..dims)
+                    .map(|_| {
+                        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn small_index(dims: usize, n: usize) -> PartitionIndex {
+        let mut index = PartitionIndex::new(HnswIndexConfig { dimensions: dims, ..Default::default() });
+        for (i, v) in lcg_vectors(n, dims, 7).into_iter().enumerate() {
+            index.add_vector(i as i64, v).unwrap();
+        }
+        index
+    }
+
+    #[test]
+    fn vectors_added_during_a_build_stay_pending_and_searchable() {
+        let mut index = small_index(8, 200);
+        let job = index.prepare_build().expect("200 pending vectors need a graph");
+
+        // Arrives while the graph is being built from the snapshot.
+        let late = vec![9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0];
+        index.add_vector(10_000, late.clone()).unwrap();
+
+        assert!(index.install_build(job.run()));
+        assert!(index.is_built());
+        assert_eq!(index.built_vectors.len(), 200, "the graph covers the snapshot");
+        assert_eq!(index.pending_vectors.len(), 1, "the late vector waits for the next build");
+        assert_eq!(index.search(&late, 1)[0].0, 10_000, "and is still found meanwhile");
+        assert!(index.needs_rebuild() || index.pending_vectors.len() < REBUILD_FIRST_BUILD_MIN);
+    }
+
+    #[test]
+    fn only_one_build_of_an_index_runs_at_a_time() {
+        let mut index = small_index(8, 200);
+        let job = index.prepare_build().unwrap();
+        for (i, v) in lcg_vectors(REBUILD_PENDING_ABSOLUTE, 8, 11).into_iter().enumerate() {
+            index.add_vector(1_000_000 + i as i64, v).unwrap();
+        }
+        assert!(!index.needs_rebuild(), "a build is already running");
+        assert!(index.prepare_build().is_none());
+
+        // A failed build releases the slot.
+        index.abort_build(job.instance);
+        assert!(index.needs_rebuild());
+        assert!(index.prepare_build().is_some());
+    }
+
+    #[test]
+    fn a_build_for_a_replaced_index_is_discarded() {
+        let mut old = small_index(8, 200);
+        let job = old.prepare_build().unwrap();
+        let mut replacement = small_index(8, 150);
+
+        assert!(!replacement.install_build(job.run()));
+        assert!(!replacement.is_built());
+        assert_eq!(replacement.pending_vectors.len(), 150, "nothing moved");
+    }
+
+    #[test]
+    fn a_uint8_build_requantizes_vectors_that_arrived_during_it() {
+        let mut index = PartitionIndex::new(HnswIndexConfig {
+            dimensions: 8,
+            quantization: QuantizationMode::Uint8,
+            ..Default::default()
+        });
+        for (i, v) in lcg_vectors(200, 8, 3).into_iter().enumerate() {
+            index.add_vector(i as i64, v).unwrap();
+        }
+        let job = index.prepare_build().unwrap();
+        index.add_vector(5_000, vec![0.25; 8]).unwrap();
+        assert!(index.install_build(job.run()));
+
+        let quantizer = index.quantizer.as_ref().expect("trained by the build");
+        assert_eq!(index.quantized_built.len(), index.built_vectors.len());
+        assert_eq!(index.quantized_pending, vec![(5_000, quantizer.quantize_uint8(&[0.25; 8]))]);
+    }
+
+    /// The bug: a graph build held the manager's write lock, so every search
+    /// waited for it — minutes per index while a node rebuilt at boot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn searches_are_answered_while_a_graph_is_being_built() {
+        const N_VECTORS: usize = 1_500;
+        let manager = Arc::new(VectorIndexManager::new(VectorIndexConfig::default()));
+        let dims = 32;
+        manager
+            .register_topic("t", HnswIndexConfig { dimensions: dims, ..Default::default() })
+            .await;
+        // Seed the index directly: add_vectors would build along the way.
+        let vectors = lcg_vectors(N_VECTORS, dims, 5);
+        let key = TopicPartitionKey::new("t", 1);
+        manager.get_or_create_index(&key).await.unwrap();
+        {
+            let mut indexes = manager.indexes.write().await;
+            let index = indexes.get_mut(&key).unwrap();
+            for (i, v) in vectors.iter().enumerate() {
+                index.add_vector(i as i64, v.clone()).unwrap();
+            }
+        }
+
+        let builder = {
+            let m = Arc::clone(&manager);
+            tokio::spawn(async move { m.build_all_indexes().await })
+        };
+        // Wait until the build has actually started.
+        loop {
+            if manager.indexes.read().await.get(&key).unwrap().build_in_flight || builder.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let started = Instant::now();
+        let hits = manager.search("t", 1, &vectors[42], 1).await.unwrap();
+        let waited = started.elapsed();
+        let build_still_running = !builder.is_finished();
+        builder.await.unwrap().unwrap();
+
+        assert_eq!(hits[0].0, 42, "exact match found mid-build, by brute force");
+        if build_still_running {
+            assert!(waited < Duration::from_millis(500), "search waited {waited:?} behind a build");
+        } else {
+            panic!("the build finished before the search ran; make it bigger so the test measures something");
+        }
     }
 }
