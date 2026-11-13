@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The first writes to a new partition could overwrite each other's acknowledged
+  records.** A leader creates a partition's in-memory state on its first write,
+  across several awaits, then inserted it unconditionally. An idempotent Java
+  producer keeps five requests in flight, so two first writes could both build a
+  state starting at offset 0 and the later insert replaced the earlier one after
+  it had already handed out offsets. Seen on a 3-node cluster: a leader
+  acknowledged 9,248 records into a fresh partition whose log ended at 9,170 —
+  the first 78-record batch was given the same offsets as the next. When the
+  replaced state had already committed a batch, followers instead saw the logs
+  diverge, stopped fetching, and `acks=all` writes failed with
+  `NOT_ENOUGH_REPLICAS` after 30 s (reproduced locally in 1 of 6 runs; 0 of 12
+  after the fix). Every path that creates partition state now inserts only if
+  absent and otherwise uses the state that won.
+
 - **A restart starved request handling for minutes on nodes with vector topics.**
   Rebuilding HNSW indexes at boot ran on rayon's global pool, which took one
   thread per core at normal priority. On a pod with a 16-core limit the rebuild

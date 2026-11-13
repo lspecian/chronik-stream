@@ -727,14 +727,16 @@ impl ProduceHandler {
             return Ok(());
         }
 
-        // Create new partition state (lock-free insert with DashMap)
-        if !self.partition_states.contains_key(&key) {
-            let state = self.create_partition_state_with_offset(topic, partition, next_offset).await?;
-            self.partition_states.insert(key.clone(), Arc::new(state));
+        let state = self.create_partition_state_with_offset(topic, partition, next_offset).await?;
+        let (state, created) = self.install_partition_state(key, Arc::new(state));
+        if created {
             info!(
                 "Created partition {}-{} with starting offset {}",
                 topic, partition, next_offset
             );
+        } else {
+            // Someone else created it meanwhile: still honour our offset.
+            state.next_offset.fetch_max(next_offset.max(0) as u64, Ordering::SeqCst);
         }
 
         Ok(())
@@ -1033,9 +1035,13 @@ impl ProduceHandler {
                 append_lock: Mutex::new(()),
             };
 
-            // Insert into partition_states (wrap in Arc)
-            self.partition_states.insert(key, Arc::new(state));
-            info!("✅ Created partition state for {}-{} with watermark {}", topic, partition, high_watermark);
+            let (state, created) = self.install_partition_state(key, Arc::new(state));
+            if created {
+                info!("✅ Created partition state for {}-{} with watermark {}", topic, partition, high_watermark);
+            } else {
+                // A concurrent writer created it first; raise it, never replace it.
+                state.raise_watermark(high_watermark.max(0) as u64);
+            }
             Ok(())
         }
     }
@@ -1129,8 +1135,10 @@ impl ProduceHandler {
         if !self.partition_states.contains_key(&key) {
             // Create new partition state with recovered offset
             let state = self.create_partition_state_with_offset(topic, partition, high_watermark as i64).await?;
-            self.partition_states.insert(key.clone(), Arc::new(state));
-            info!("Restored partition state: {}-{} with high watermark {}", topic, partition, high_watermark);
+            let (_, created) = self.install_partition_state(key, Arc::new(state));
+            if created {
+                info!("Restored partition state: {}-{} with high watermark {}", topic, partition, high_watermark);
+            }
         }
 
         Ok(())
@@ -3049,6 +3057,29 @@ impl ProduceHandler {
         })
     }
     
+    /// Install `state` for `key` unless a state is already there; return the
+    /// one that is in the map afterwards, and whether it is ours.
+    ///
+    /// Every creation path builds its state across awaits (metadata lookups,
+    /// a segment writer), so "check, build, insert" lets two callers both
+    /// find the slot empty. A plain `insert` then replaces a state that may
+    /// already have handed out offsets, and the replacement hands the same
+    /// offsets out again: acknowledged records overwritten. Insert-if-absent
+    /// is the only safe way in; a losing caller drops what it built.
+    fn install_partition_state(
+        &self,
+        key: (String, i32),
+        state: Arc<PartitionState>,
+    ) -> (Arc<PartitionState>, bool) {
+        match self.partition_states.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(existing) => (Arc::clone(existing.get()), false),
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(Arc::clone(&state));
+                (state, true)
+            }
+        }
+    }
+
     /// Get or create partition state
     async fn get_or_create_partition_state(
         &self,
@@ -3062,12 +3093,9 @@ impl ProduceHandler {
             return Ok(Arc::clone(state.value()));
         }
 
-        // Slow path - create new state (DashMap's entry API provides atomic insert-if-absent)
-        // Double-check with entry API
-        if let Some(state) = self.partition_states.get(&key) {
-            return Ok(Arc::clone(state.value()));
-        }
-        
+        // Slow path: build a state, then install it only if no concurrent
+        // caller got there first (see `install_partition_state`).
+
         // Check if partition exists by checking topic metadata
         let topic_meta = self.metadata_store
             .get_topic(topic)
@@ -3132,7 +3160,7 @@ impl ProduceHandler {
             append_lock: Mutex::new(()),
         });
 
-        self.partition_states.insert(key, Arc::clone(&state));
+        let (state, _) = self.install_partition_state(key, state);
         Ok(state)
     }
     
@@ -4311,6 +4339,71 @@ mod tests {
         assert_eq!(handler.metrics.records_produced.load(Ordering::Relaxed), 1);
     }
     
+    /// The first writes to a partition this node has never written can arrive
+    /// together — an idempotent Java producer keeps five requests in flight.
+    /// Each one used to find no state, build its own starting at offset 0, and
+    /// insert it, so a later insert replaced the state an earlier write had
+    /// already taken offsets from. Seen on Thunderbird: a leader acknowledged
+    /// 9,248 records into a fresh partition whose log ended at 9,170 — the
+    /// first batch's 78 offsets were handed out a second time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_writes_share_one_partition_state() {
+        let (handler, _temp) = create_test_handler().await;
+        let handler = Arc::new(handler);
+        let writers = 16;
+
+        let tasks: Vec<_> = (0..writers)
+            .map(|_| {
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    handler.get_or_create_partition_state("test-topic", 1).await.unwrap()
+                })
+            })
+            .collect();
+        let mut states = Vec::new();
+        for t in tasks {
+            states.push(t.await.unwrap());
+        }
+        assert!(
+            states.iter().all(|s| Arc::ptr_eq(s, &states[0])),
+            "every concurrent first write must end up on the same partition state"
+        );
+
+        // And end to end: every acknowledged record holds its own offset.
+        let tasks: Vec<_> = (0..writers)
+            .map(|_| {
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let request = ProduceRequest {
+                        transactional_id: None,
+                        acks: 1,
+                        timeout_ms: 30000,
+                        topics: vec![ProduceRequestTopic {
+                            name: "test-topic".to_string(),
+                            partitions: vec![ProduceRequestPartition {
+                                index: 2,
+                                records: create_test_record_batch(-1, 0, vec![("k", "v"), ("k", "v")]),
+                            }],
+                        }],
+                    };
+                    handler.handle_produce(request, 1).await.unwrap()
+                })
+            })
+            .collect();
+        let mut acked = 0;
+        for t in tasks {
+            if t.await.unwrap().topics[0].partitions[0].error_code == 0 {
+                acked += 2;
+            }
+        }
+        assert_eq!(acked, writers * 2);
+        assert_eq!(
+            handler.get_partition_high_watermark("test-topic", 2).await,
+            acked as i64,
+            "the log must end where the acknowledged records end"
+        );
+    }
+
     #[tokio::test]
     async fn test_idempotent_produce() {
         let (handler, _temp) = create_test_handler().await;
