@@ -3,8 +3,11 @@
 use chronik_storage::object_store::{
     ObjectStoreFactory, ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials,
     ObjectStoreTrait, PutOptions, GetOptions, ListOptions, ChronikStorageAdapter, SegmentLocation,
-    PerformanceConfig, RetryConfig,
+    PerformanceConfig,
 };
+// `ObjectStoreConfig::retry` takes the config-file form of the retry policy;
+// the `RetryConfig` re-exported at `object_store::` is the runtime one.
+use chronik_storage::object_store::config::RetryConfig;
 use chronik_storage::{
     chronik_segment::{ChronikSegmentBuilder, CompressionType},
     RecordBatch, Record,
@@ -16,7 +19,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing for observability
-    tracing_subscriber::init();
+    tracing_subscriber::fmt::init();
 
     println!("=== Chronik Stream Object Storage Examples ===\n");
 
@@ -76,8 +79,8 @@ async fn local_storage_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get metadata
     let metadata = store.head(key).await?;
-    println!("✓ Document size: {} bytes, modified: {}", 
-             metadata.size, metadata.last_modified.format("%Y-%m-%d %H:%M:%S"));
+    println!("✓ Document size: {} bytes, modified: {} ms since epoch", 
+             metadata.size, metadata.last_modified);
 
     // List operations
     store.put("documents/guide.md", Bytes::from("# User Guide")).await?;
@@ -317,7 +320,7 @@ async fn multipart_upload_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify the assembled file
     let final_data = store.get(key).await?;
-    assert_eq!(final_data.len(), chunk_size * total_chunks);
+    assert_eq!(final_data.len(), chunk_size * total_chunks as usize);
     println!("✓ Verified assembled file: {} bytes", final_data.len());
 
     // Check that different parts have different content

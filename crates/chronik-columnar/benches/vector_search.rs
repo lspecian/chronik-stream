@@ -56,6 +56,7 @@ fn setup_index(vector_count: usize, dimensions: usize, metric: DistanceMetric) -
             m: 16,
             ef_construction: 100,
             ef_search: 50,
+            ..Default::default()
         },
         max_vectors_in_memory: 100_000,
         snapshot_interval_secs: 300,
@@ -105,6 +106,7 @@ fn bench_index_populate(c: &mut Criterion) {
                             m: 16,
                             ef_construction: 100,
                             ef_search: 50,
+                            ..Default::default()
                         },
                         max_vectors_in_memory: 100_000,
                         snapshot_interval_secs: 300,
@@ -205,6 +207,7 @@ fn bench_search_multi_partition(c: &mut Criterion) {
             m: 16,
             ef_construction: 100,
             ef_search: 50,
+            ..Default::default()
         },
         max_vectors_in_memory: 100_000,
         snapshot_interval_secs: 300,
@@ -336,6 +339,7 @@ fn bench_hnsw_m_parameter(c: &mut Criterion) {
                 m: *m,
                 ef_construction: 100,
                 ef_search: 50,
+                ..Default::default()
             },
             max_vectors_in_memory: 100_000,
             snapshot_interval_secs: 300,

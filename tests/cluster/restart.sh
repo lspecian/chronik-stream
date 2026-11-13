@@ -6,7 +6,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BINARY="$PROJECT_ROOT/target/release/chronik-server"
+# Same binary selection as start.sh: a restart that ignored `CHRONIK_BIN` would
+# silently run the local build in the second half of a pre/post comparison.
+BINARY="${CHRONIK_BIN:-$PROJECT_ROOT/target/release/chronik-server}"
 
 # Colors
 RED='\033[0;31m'

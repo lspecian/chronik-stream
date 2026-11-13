@@ -74,6 +74,7 @@ tempfile = "3.8"
 criterion = { workspace = true }
 tokio = { workspace = true }
 walkdir = "2.4"
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "segment_comparison"

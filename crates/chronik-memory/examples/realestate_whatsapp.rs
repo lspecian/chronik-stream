@@ -138,6 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             object: serde_json::json!("pt-PT"),
             polarity: "asserted".into(),
             text: "This agent should reply in European Portuguese.".into(),
+            // The client asked for it; the agent is only recording it.
+            speaker: "user".into(),
         }),
         Some("agent:realestate-bot|preferred_reply_language".into()),
         1.0,
