@@ -50,6 +50,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   producing and consuming 50,000 records while creating 60 topics: 1,046
   lines/s before, 6 after. A replica fetching past the WAL into object storage
   no longer logs "Segment not found" as a warning; it is the expected path.
+- **A leader could freeze while sending metadata to a follower that fell
+  behind.** The leader wrote each frame through a lock on its table of
+  follower connections and held that lock until the write finished. When a
+  follower stopped draining its socket — a burst of topic creations was
+  enough — the write waited with the lock held. The connection manager's next
+  look at the same table then blocked one of the runtime's threads, and the
+  node stopped answering every request, ApiVersions included, until it was
+  restarted. Creating 5,600 topics hung the leader in two of three runs. Each
+  connection is now locked on its own and the table is released before
+  writing; a write a follower does not accept within 10 s retires the
+  connection, and it is redialled.
+- **Writes stalled for up to a minute after a leadership change, and could
+  travel back and forth between brokers.** Each broker cached partition leaders
+  for 60 s and nothing cleared the cache when a leader changed, so after a
+  failover or a preferred-leader move a broker kept writing locally, or
+  forwarding to the old leader, for up to a minute. Two brokers holding
+  different stale leaders passed a write between them until it timed out.
+  Leadership is now read from local metadata on every write, and a write that
+  another broker forwarded is never forwarded again: the broker answers
+  `NOT_LEADER_FOR_PARTITION` and the client refreshes its metadata.
+- **Metadata requests and background work slowed down as the catalog grew.**
+  Looking up one topic's partition assignments scanned every partition in the
+  cluster, and the Metadata handler, the ISR publisher (every 5 s) and the
+  failover controller (every 2 s) each did that once per topic. Replica
+  fetchers also re-read the whole catalog on every watermark and ISR update,
+  which arrive with every produced batch. On a local three-node cluster with
+  5,600 topics × 3 partitions: describing every topic went from 3.8–4.4 s to
+  64–221 ms, listing them from 3.7–8.3 s to 40–491 ms, idle CPU from
+  1.6–2.2 cores per node to 0.15–0.18, and `acks=all` p99 at 2,000 records/s
+  from 4.1 s to 43–66 ms. Lookups now touch only the topic asked for, and
+  fetchers re-plan only when an assignment, a leader or the topic set changes.
+- **More per-request logging off INFO.** Every `acks=all` batch logged a
+  WARN ("Emitted HighWatermarkUpdated"), and metadata replication logged
+  several INFO lines per event and per acknowledgement, replayed for every
+  partition at startup. Seen on a cluster running the earlier logging fix.
 - **Four example and benchmark programs no longer compiled**
   (`chronik-monitoring` `monitored_service`, `chronik-memory`
   `realestate_whatsapp`, `chronik-storage` `object_store_usage`,
