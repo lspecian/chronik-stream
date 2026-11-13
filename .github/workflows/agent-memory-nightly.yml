@@ -20,11 +20,30 @@ env:
   RUST_LOG: info
 
 jobs:
+  # GitHub does not allow `secrets` in a job-level `if:` — a workflow that
+  # tries is rejected before any job starts (it failed on every push with zero
+  # jobs). Check the keys in a step and gate the real jobs on its outputs.
+  keys:
+    name: Check API keys
+    runs-on: ubuntu-latest
+    outputs:
+      anthropic: ${{ steps.check.outputs.anthropic }}
+      openai: ${{ steps.check.outputs.openai }}
+    steps:
+      - id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "anthropic=$([ -n "$ANTHROPIC_API_KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "openai=$([ -n "$OPENAI_API_KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   longmemeval-baseline:
     name: LongMemEval-S baseline check
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    needs: keys
+    if: needs.keys.outputs.anthropic == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -187,7 +206,8 @@ jobs:
     name: Provider parity (warn-only)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: ${{ secrets.ANTHROPIC_API_KEY != '' && secrets.OPENAI_API_KEY != '' }}
+    needs: keys
+    if: needs.keys.outputs.anthropic == 'true' && needs.keys.outputs.openai == 'true'
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
