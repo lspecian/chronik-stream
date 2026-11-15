@@ -242,7 +242,6 @@ fn event_changes_plan(event: &crate::metadata_events::MetadataEvent) -> bool {
         | TopicDeleted { .. }
         | BrokerRegistered { .. } => true,
         HighWatermarkUpdated { .. } | ISRUpdated { .. } | SecurityChanged { .. } => false,
-| ISRUpdated { .. } => false,
     }
 }
 
@@ -326,8 +325,13 @@ pub struct ReplicaFetcher {
     /// Partitions whose fetched records could not be applied, and when they
     /// may be asked for again. See `REFUSAL_BACKOFF_MAX`.
     refused: Arc<DashMap<(String, i32), Refusal>>,
+    /// Partitions where the leader sent a batch straddling our log end, not yet
+    /// resolved by an epoch truncation. See `rebuild_unresolved_straddles`.
+    straddled: Arc<DashMap<(String, i32), Straddle>>,
     shutdown: Arc<AtomicBool>,
     batches_applied: Arc<AtomicU64>,
+    /// Partitions rebuilt from the leader because a straddle could not be placed.
+    rebuilds: Arc<AtomicU64>,
     fetch_errors: Arc<AtomicU64>,
 }
 
@@ -350,6 +354,8 @@ impl ReplicaFetcher {
             metadata_events: None,
             positions: Arc::new(DashMap::new()),
             refused: Arc::new(DashMap::new()),
+            straddled: Arc::new(DashMap::new()),
+            rebuilds: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             batches_applied: Arc::new(AtomicU64::new(0)),
             fetch_errors: Arc::new(AtomicU64::new(0)),
@@ -395,6 +401,12 @@ impl ReplicaFetcher {
 
     pub fn batches_applied(&self) -> u64 {
         self.batches_applied.load(Ordering::Relaxed)
+    }
+
+    /// Partitions rebuilt from the leader because their divergence could not be
+    /// placed by the leader-epoch exchange.
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds.load(Ordering::Relaxed)
     }
 
     pub fn fetch_errors(&self) -> u64 {
@@ -828,6 +840,67 @@ impl ReplicaFetcher {
         connection: &mut LeaderConnection,
         partitions: &[FollowedPartition],
     ) -> chronik_common::Result<()> {
+        self.epoch_handshake(connection, partitions).await?;
+        self.rebuild_unresolved_straddles(partitions).await;
+        Ok(())
+    }
+
+    /// Rebuild every partition whose straddle the epoch exchange did not resolve.
+    ///
+    /// A straddle is direct evidence that the two logs differ: this follower
+    /// only ever appends whole leader batches, so a leader batch spanning our log
+    /// end means we hold records at those offsets that the leader does not. The
+    /// epoch exchange is meant to find where the histories parted. When it cuts,
+    /// `truncate_partition` clears the mark and the next fetch shows whether the
+    /// cut was enough. When it cannot — the leader answers "unknown", our log
+    /// carries no epochs, or the answer says we are a prefix although the batch
+    /// says otherwise — nothing below the straddle is known to be shared.
+    ///
+    /// Cutting back to the straddling batch's base is NOT safe then. Observed on
+    /// a live cluster: two followers held 21,734 records written in August by a
+    /// node that led with no history (#58), from offset 0, while the leader held
+    /// a different 1.8 M. Cutting to the batch base (21,722) would have spliced
+    /// the follower's 0..21,721 onto the leader's records from 21,722 — two
+    /// histories in one log, silently. Instead the follower discarded nothing,
+    /// re-fetched the same batch, refused it, and looped for months with the
+    /// partition on a single copy.
+    ///
+    /// The only point both logs are known to agree on is the empty log. So the
+    /// replica is rebuilt from the leader, as Kafka's leader-authoritative model
+    /// requires: whatever this node holds that the leader does not was never
+    /// readable through the leader, and keeping it is what stopped replication.
+    /// The node stays out of the in-sync set until it catches up, so nothing
+    /// acknowledged depends on the copy being discarded.
+    async fn rebuild_unresolved_straddles(&self, partitions: &[FollowedPartition]) {
+        for followed in partitions {
+            let key = (followed.topic.clone(), followed.partition);
+            let Some((_, straddle)) = self.straddled.remove(&key) else {
+                continue;
+            };
+            error!(
+                "{}-{}: the leader's batch [{}, {}] spans our log end {} and the leader-epoch \
+                 exchange cannot place where the logs parted. This replica's copy diverges from \
+                 the leader's below that batch; rebuilding it from the leader — discarding \
+                 offsets 0..{} held here.",
+                followed.topic,
+                followed.partition,
+                straddle.base_offset,
+                straddle.last_offset,
+                straddle.local_end,
+                straddle.local_end
+            );
+            self.rebuilds.fetch_add(1, Ordering::Relaxed);
+            self.truncate_partition(&followed.topic, followed.partition, 0, straddle.local_end)
+                .await;
+        }
+    }
+
+    /// The leader-epoch exchange itself: ask, and truncate to the answers.
+    async fn epoch_handshake(
+        &self,
+        connection: &mut LeaderConnection,
+        partitions: &[FollowedPartition],
+    ) -> chronik_common::Result<()> {
         use chronik_protocol::offset_for_leader_epoch_types::{
             OffsetForLeaderEpochRequest, OffsetForLeaderPartition, OffsetForLeaderTopic,
         };
@@ -959,6 +1032,9 @@ impl ReplicaFetcher {
             );
         }
         self.positions.insert((topic.to_string(), partition), new_end);
+        // The cut is the repair the straddle asked for; the next fetch shows
+        // whether it was enough.
+        self.straddled.remove(&(topic.to_string(), partition));
 
         if let Some(state) = &self.follower_state {
             state
@@ -1130,7 +1206,19 @@ impl ReplicaFetcher {
                 // starts below our LEO and ends above it, so the two logs hold
                 // different records at the same offsets. Appending would
                 // interleave two histories. Re-run the epoch handshake and
-                // truncate to whatever the leader says.
+                // truncate to whatever the leader says — and remember the
+                // straddle, so that if the handshake cannot place the
+                // divergence the partition is rebuilt rather than looping.
+                if let ApplyRefusal::Straddle { expected, base_offset, last_offset } = &refusal {
+                    self.straddled.insert(
+                        (topic.to_string(), index),
+                        Straddle {
+                            local_end: *expected,
+                            base_offset: *base_offset,
+                            last_offset: *last_offset,
+                        },
+                    );
+                }
                 warn!(
                     "{}-{}: {} — reconciling with the leader before fetching again.",
                     topic, index, refusal
@@ -1193,6 +1281,14 @@ impl ReplicaFetcher {
             }
         }
     }
+}
+
+/// A leader batch that spanned this follower's log end, awaiting repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Straddle {
+    local_end: i64,
+    base_offset: i64,
+    last_offset: i64,
 }
 
 /// What a follower does with a leader's answer to "where did my epoch end?".
@@ -1789,6 +1885,152 @@ mod tests {
             "an unstamped log must not be truncated on a guess"
         );
         assert_eq!(*state.reset_to.lock().unwrap(), None);
+    }
+
+    // ---- A straddle the epoch exchange cannot place ----
+    //
+    // Live on signal-stream: both followers of a 1.8 M-record partition held a
+    // different 21,734 records from offset 0 (written by a node that led with no
+    // history, #58). Every fetch returned the leader's batch [21722, 21736]
+    // across their log end 21734, the leader answered the epoch query "unknown",
+    // and they discarded nothing and refetched the same batch — for months, the
+    // partition on a single copy.
+
+    /// Feed the follower a leader batch spanning its log end, through the real
+    /// apply path, and return what the fetch loop would be told.
+    async fn deliver_straddling_batch(
+        fetcher: &ReplicaFetcher,
+        topic: &str,
+        partition: i32,
+        base_offset: i64,
+        record_count: i32,
+    ) -> PartitionOutcome {
+        fetcher
+            .handle_partition_response(
+                topic,
+                super::super::protocol::FetchedPartition {
+                    partition,
+                    error_code: 0,
+                    high_watermark: 1_000,
+                    last_stable_offset: 1_000,
+                    log_start_offset: 0,
+                    preferred_read_replica: -1,
+                    records: bytes::Bytes::from(super::super::apply::tests::batch(
+                        base_offset,
+                        record_count,
+                        0,
+                    )),
+                },
+            )
+            .await
+    }
+
+    /// The case that was live: a straddle, and a leader that cannot say where our
+    /// epoch ended. The replica must be rebuilt from the leader, not left looping.
+    #[tokio::test]
+    async fn a_straddle_the_epoch_exchange_cannot_place_rebuilds_the_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic, partition) = ("default-traces", 0);
+
+        let addr = spawn_epoch_leader(-1).await;
+        let (fetcher, state, wal) =
+            follower_with_log(dir.path(), topic, partition, 100, 3, &addr).await;
+
+        assert_eq!(
+            deliver_straddling_batch(&fetcher, topic, partition, 95, 10).await,
+            PartitionOutcome::Diverged,
+            "a leader batch [95, 104] across our log end 100 is divergence"
+        );
+        assert_eq!(
+            readable_offsets(&wal, topic, partition).await.len(),
+            100,
+            "detection alone must not discard anything"
+        );
+
+        let mut connection = LeaderConnection::new(addr);
+        let followed = vec![FollowedPartition { topic: topic.to_string(), partition, leader: 1 }];
+        fetcher.reconcile_with_leader(&mut connection, &followed).await.unwrap();
+
+        assert!(
+            readable_offsets(&wal, topic, partition).await.is_empty(),
+            "nothing below the straddle is known to be shared, so nothing may be kept: \
+             keeping 0..95 and appending the leader's batch from 95 splices two histories"
+        );
+        assert_eq!(
+            fetcher.positions.get(&(topic.to_string(), partition)).map(|o| *o),
+            Some(0),
+            "replication restarts from the leader's beginning"
+        );
+        assert_eq!(*state.reset_to.lock().unwrap(), Some((topic.to_string(), partition, 0)));
+        assert!(state.epochs.snapshot(topic, partition).is_empty(), "history of the discarded log goes too");
+        assert_eq!(fetcher.rebuilds(), 1);
+
+        // Resolved: a second reconcile with no new straddle touches nothing.
+        fetcher.reconcile_with_leader(&mut connection, &followed).await.unwrap();
+        assert_eq!(fetcher.rebuilds(), 1, "a rebuild is one-shot per straddle");
+    }
+
+    /// A follower whose log predates epoch stamping cannot even ask. A straddle
+    /// is still proof of divergence, so it is rebuilt the same way.
+    #[tokio::test]
+    async fn a_straddle_on_a_log_without_epoch_history_rebuilds_the_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic, partition) = ("diverge-4192862", 0);
+
+        let addr = spawn_epoch_leader(10).await;
+        let (fetcher, _state, wal) =
+            follower_with_log(dir.path(), topic, partition, 100, -1, &addr).await;
+
+        deliver_straddling_batch(&fetcher, topic, partition, 98, 5).await;
+        let mut connection = LeaderConnection::new(addr);
+        let followed = vec![FollowedPartition { topic: topic.to_string(), partition, leader: 1 }];
+        fetcher.reconcile_with_leader(&mut connection, &followed).await.unwrap();
+
+        assert!(readable_offsets(&wal, topic, partition).await.is_empty());
+        assert_eq!(fetcher.rebuilds(), 1);
+    }
+
+    /// When the epoch exchange CAN place the divergence, its cut is the repair —
+    /// the replica is not rebuilt on top of it.
+    #[tokio::test]
+    async fn a_straddle_the_epoch_exchange_places_is_cut_not_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic, partition) = ("orders", 0);
+
+        let addr = spawn_epoch_leader(60).await;
+        let (fetcher, _state, wal) =
+            follower_with_log(dir.path(), topic, partition, 100, 0, &addr).await;
+
+        deliver_straddling_batch(&fetcher, topic, partition, 95, 10).await;
+        let mut connection = LeaderConnection::new(addr);
+        let followed = vec![FollowedPartition { topic: topic.to_string(), partition, leader: 1 }];
+        fetcher.reconcile_with_leader(&mut connection, &followed).await.unwrap();
+
+        assert_eq!(
+            readable_offsets(&wal, topic, partition).await,
+            (0..60).collect::<Vec<_>>(),
+            "the epoch cut, and only the epoch cut"
+        );
+        assert_eq!(fetcher.rebuilds(), 0);
+    }
+
+    /// No straddle, no rebuild — whatever the leader answers. A follower that is
+    /// merely behind, or a leader that cannot answer, must never cost the log.
+    #[tokio::test]
+    async fn without_a_straddle_an_unknown_epoch_still_discards_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic, partition) = ("orders", 0);
+
+        let addr = spawn_epoch_leader(-1).await;
+        let (fetcher, _state, wal) =
+            follower_with_log(dir.path(), topic, partition, 100, 0, &addr).await;
+
+        let mut connection = LeaderConnection::new(addr);
+        let followed = vec![FollowedPartition { topic: topic.to_string(), partition, leader: 1 }];
+        fetcher.reconcile_with_leader(&mut connection, &followed).await.unwrap();
+
+        assert_eq!(readable_offsets(&wal, topic, partition).await.len(), 100);
+        assert_eq!(fetcher.rebuilds(), 0);
     }
 
     // ---- RP-3.3: deciding whether to discard a divergent tail ----

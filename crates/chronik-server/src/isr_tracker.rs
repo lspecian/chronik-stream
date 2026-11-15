@@ -34,8 +34,22 @@ type PartitionKey = (String, i32);
 struct FollowerState {
     /// Last acknowledged offset
     last_offset: i64,
-    /// Last update timestamp (milliseconds since epoch)
+    /// When the follower last fetched at all (milliseconds since epoch). Says it
+    /// is replicating, NOT that it is keeping up — the retention interlock uses it.
     last_update_ms: u64,
+    /// When the follower was last caught up to the leader's log end — Kafka's
+    /// `lastCaughtUpTimeMs`, and what the `max_lag_ms` bound measures.
+    ///
+    /// The bound used to measure `last_update_ms` instead, which every fetch
+    /// refreshes. A follower that fetched the same offset forever therefore
+    /// never aged out: measured, two followers stuck at offset 100 of a 1,000-
+    /// record partition stayed in ISR indefinitely, one was elected when the
+    /// leader died, and every acknowledged `acks=all` record was gone.
+    last_caught_up_ms: u64,
+    /// The leader's log end when this follower last fetched. Lets a follower
+    /// count as caught up under continuous writes, where the log end always
+    /// moves between its fetches (Kafka's `lastFetchLeaderLogEndOffset`).
+    last_fetch_leader_end: i64,
 }
 
 /// Whether a follower counts as in-sync, and — critically — whether we know at all.
@@ -225,7 +239,9 @@ impl IsrTracker {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        if now_ms.saturating_sub(state.last_update_ms) > self.max_lag_ms {
+        // Behind: in sync only if it was caught up recently. Fetching without
+        // catching up does not count — see `last_caught_up_ms`.
+        if now_ms.saturating_sub(state.last_caught_up_ms) > self.max_lag_ms {
             return SyncState::Lagging;
         }
 
@@ -309,19 +325,64 @@ impl IsrTracker {
         partition: i32,
         offset: i64,
     ) {
+        // A bare offset report carries no leader position, so it asserts the
+        // follower is caught up as of now. The fetch path, which knows the
+        // leader's log end, uses `record_follower_fetch`.
+        self.record_follower_fetch(node_id, topic, partition, offset, offset);
+    }
+
+    /// Record a follower's fetch at `fetch_offset` while the leader's log ended
+    /// at `leader_end` — Kafka's `Replica.updateFetchState`.
+    ///
+    /// The follower is caught up as of now if it asked for the leader's end. If
+    /// it reached where the leader's end stood at its previous fetch, it was
+    /// caught up as of that fetch: under continuous writes the end moves between
+    /// fetches, and a healthy follower is always a few records behind it.
+    /// Otherwise its caught-up time does not move, and after `max_lag_ms` it
+    /// leaves the in-sync set. A follower seen for the first time starts with a
+    /// full grace period, as Kafka grants one when it becomes leader.
+    pub fn record_follower_fetch(
+        &self,
+        node_id: u64,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        leader_end: i64,
+    ) {
         let key = (node_id, (topic.to_string(), partition));
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64;
+
+        let previous = self.follower_offsets.get(&key).map(|s| s.value().clone());
+        let last_caught_up_ms = match previous {
+            _ if fetch_offset >= leader_end => now_ms,
+            Some(p) if fetch_offset >= p.last_fetch_leader_end => p.last_update_ms,
+            Some(p) => p.last_caught_up_ms,
+            None => now_ms,
+        };
 
         self.follower_offsets.insert(
             key,
             FollowerState {
-                last_offset: offset,
+                last_offset: fetch_offset,
                 last_update_ms: now_ms,
+                last_caught_up_ms,
+                last_fetch_leader_end: leader_end,
             },
         );
+    }
+
+    /// The highest leader log end seen on any follower's fetch of this
+    /// partition. Lets a caller holding only a high watermark judge "caught up"
+    /// against the log end, as the fetch path does.
+    pub fn leader_end_seen(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.follower_offsets
+            .iter()
+            .filter(|e| e.key().1 .0 == topic && e.key().1 .1 == partition)
+            .map(|e| e.value().last_fetch_leader_end)
+            .max()
     }
 
     /// Get all in-sync replicas for a partition
@@ -633,7 +694,7 @@ mod tests {
 
         tracker.follower_offsets.insert(
             (2, ("orders".to_string(), 0)),
-            FollowerState { last_offset: 500, last_update_ms: long_ago_ms },
+            FollowerState { last_offset: 500, last_update_ms: long_ago_ms, last_caught_up_ms: long_ago_ms, last_fetch_leader_end: 500 },
         );
 
         assert_eq!(
@@ -715,7 +776,7 @@ mod tests {
 
         tracker.follower_offsets.insert(
             (2, ("idle".to_string(), 0)),
-            FollowerState { last_offset: 500, last_update_ms: long_ago_ms },
+            FollowerState { last_offset: 500, last_update_ms: long_ago_ms, last_caught_up_ms: long_ago_ms, last_fetch_leader_end: 500 },
         );
 
         // Caught up to the leader → in-sync however long the topic has been quiet.
@@ -852,7 +913,7 @@ mod tests {
 
         tracker.follower_offsets.insert(
             (2, ("t".to_string(), 0)),
-            FollowerState { last_offset: 10, last_update_ms: future_ms },
+            FollowerState { last_offset: 10, last_update_ms: future_ms, last_caught_up_ms: future_ms, last_fetch_leader_end: 10 },
         );
 
         // Behind by 5, timestamp in the future: saturating_sub yields 0 elapsed,
@@ -1058,5 +1119,68 @@ mod tests {
         tracker.retain_leading(&std::collections::HashSet::new()); // lost it
         tracker.note_leading("t", 0); // and got it back
         assert!(!tracker.leadership_grace_expired("t", 0));
+    }
+
+    fn backdate_caught_up(tracker: &IsrTracker, node: u64, topic: &str, partition: i32, ms_ago: u64) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        tracker
+            .follower_offsets
+            .get_mut(&(node, (topic.to_string(), partition)))
+            .unwrap()
+            .last_caught_up_ms = now - ms_ago;
+    }
+
+    /// Fetching is not keeping up. Measured: two followers stuck at offset 100
+    /// of a 1,000-record partition (a straddling batch they could not apply)
+    /// fetched every few hundred ms, so the old "time since last update" never
+    /// grew; they stayed in ISR, one was elected when the leader died, and every
+    /// acknowledged acks=all record was lost.
+    #[test]
+    fn a_follower_that_fetches_without_catching_up_leaves_isr() {
+        let tracker = IsrTracker::new(10_000, 10_000);
+        tracker.record_follower_fetch(2, "sd", 0, 100, 1_000);
+        assert_eq!(tracker.sync_state(2, "sd", 0, 1_000), SyncState::InSync, "first sighting: grace period");
+
+        backdate_caught_up(&tracker, 2, "sd", 0, 11_000);
+        tracker.record_follower_fetch(2, "sd", 0, 100, 1_000); // still fetching, still at 100
+        assert_eq!(
+            tracker.sync_state(2, "sd", 0, 1_000),
+            SyncState::Lagging,
+            "900 behind (inside the entry bound) and not caught up for 11s"
+        );
+    }
+
+    /// Under continuous writes the leader's end moves between fetches, so a
+    /// healthy follower never asks for the CURRENT end. Reaching where the end
+    /// stood at its previous fetch is caught up as of that fetch (Kafka's rule),
+    /// or every busy partition would lose its followers.
+    #[test]
+    fn a_follower_keeping_pace_with_a_moving_log_end_stays_in_sync() {
+        let tracker = IsrTracker::new(10_000, 10_000);
+        tracker.record_follower_fetch(2, "busy", 0, 90, 100);
+        backdate_caught_up(&tracker, 2, "busy", 0, 60_000);
+
+        tracker.record_follower_fetch(2, "busy", 0, 100, 110); // reached the previous end
+        assert_eq!(tracker.sync_state(2, "busy", 0, 110), SyncState::InSync);
+
+        backdate_caught_up(&tracker, 2, "busy", 0, 60_000);
+        tracker.record_follower_fetch(2, "busy", 0, 105, 120); // fell short of it (110)
+        assert_eq!(tracker.sync_state(2, "busy", 0, 120), SyncState::Lagging);
+    }
+
+    /// Callers hold a high watermark; "caught up" is about the log end the
+    /// follower saw. A stuck follower must not pass by matching the watermark.
+    #[test]
+    fn caught_up_is_judged_against_the_log_end_not_the_watermark() {
+        let tracker = IsrTracker::new(10_000, 10_000);
+        tracker.record_follower_fetch(2, "sd", 0, 100, 1_000);
+        backdate_caught_up(&tracker, 2, "sd", 0, 11_000);
+
+        assert_eq!(tracker.leader_end_seen("sd", 0), Some(1_000));
+        assert_eq!(
+            crate::isr_publisher::in_sync_replicas(&tracker, "sd", 0, 100, &[1, 2], 1),
+            Some(vec![1]),
+            "a watermark of 100 must not make the follower at 100 look caught up"
+        );
     }
 }
