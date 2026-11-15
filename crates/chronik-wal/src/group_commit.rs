@@ -598,10 +598,23 @@ impl TailCache {
     /// records below its start, so "partly" has to count as a miss.
     /// `durable_through` is the highest offset the commit worker has fsynced;
     /// records above it are queued, not written, and must not be served.
+    #[cfg(test)]
     fn read_from(
         &self,
         offset: i64,
         max_records: usize,
+        durable_through: i64,
+    ) -> Option<Vec<WalRecord>> {
+        self.read_bounded(offset, max_records, usize::MAX, durable_through)
+    }
+
+    /// [`read_from`](Self::read_from) with a byte budget: the first record
+    /// always, then nothing that would cross `max_bytes`.
+    fn read_bounded(
+        &self,
+        offset: i64,
+        max_records: usize,
+        max_bytes: usize,
         durable_through: i64,
     ) -> Option<Vec<WalRecord>> {
         // Serve only from within the gap-free run that reaches the log end.
@@ -613,6 +626,7 @@ impl TailCache {
 
         let mut out = Vec::new();
         let mut messages = 0usize;
+        let mut bytes = 0usize;
         for record in &self.records {
             if record.get_last_offset() < offset {
                 continue;
@@ -626,6 +640,11 @@ impl TailCache {
             if messages >= max_records {
                 break;
             }
+            let size = record.heap_size();
+            if !out.is_empty() && bytes.saturating_add(size) > max_bytes {
+                break;
+            }
+            bytes += size;
             messages += record.get_record_count().max(1) as usize;
             out.push(record.clone());
         }
@@ -1725,6 +1744,7 @@ impl GroupCommitWal {
         partition: i32,
         offset: i64,
         max_records: usize,
+        max_bytes: usize,
     ) -> Option<Vec<WalRecord>> {
         // Clone the Arc out and drop the map reference before awaiting: holding
         // a DashMap guard across an await is how this codebase has deadlocked
@@ -1736,7 +1756,7 @@ impl GroupCommitWal {
 
         let durable_through = queue.committed_through.load(Ordering::SeqCst);
         let tail = queue.tail.lock().await;
-        tail.read_from(offset, max_records, durable_through)
+        tail.read_bounded(offset, max_records, max_bytes, durable_through)
     }
 
     pub async fn truncate_to(
@@ -2123,15 +2143,6 @@ impl GroupCommitWal {
             .collect()
     }
 
-    /// Mark segment as archived after successful S3 upload
-    pub fn mark_segment_archived(&self, topic: &str, partition: i32, segment_id: u64) {
-        let key = format!("{}:{}:{}", topic, partition, segment_id);
-        if let Some(mut entry) = self.sealed_segments.get_mut(&key) {
-            entry.state = SegmentState::Archived;
-            info!("Marked segment {}/{} segment_id={} as Archived", topic, partition, segment_id);
-        }
-    }
-
     /// Force-delete a sealed segment's on-disk file and drop its tracking entry,
     /// regardless of archive state. Used by the Kafka DeleteRecords API to reclaim
     /// disk for segments that fall entirely below a partition's new log start offset.
@@ -2155,22 +2166,31 @@ impl GroupCommitWal {
         Ok(())
     }
 
-    /// Remove archived segment (called after S3 upload and local cleanup)
-    pub fn remove_segment(&self, topic: &str, partition: i32, segment_id: u64) -> Result<()> {
+    /// Delete a sealed segment's file once its records are in the segment tier.
+    /// Returns whether a file was removed.
+    ///
+    /// This used to delete only segments in the `Archived` state, which nothing
+    /// ever set: from v1.3.62 to v2.16.8 every call dropped the tracking entry,
+    /// deleted nothing, and returned `Ok` — so the indexer logged "Deleted WAL
+    /// segment after indexing" for files that stayed on disk forever, and
+    /// re-indexed all of them on every restart. Measured on signal-stream: one
+    /// partition at 14,179 WAL files, 419 "deletions" logged in three minutes
+    /// with every file still present.
+    pub fn remove_segment(&self, topic: &str, partition: i32, segment_id: u64) -> Result<bool> {
         let key = format!("{}:{}:{}", topic, partition, segment_id);
 
-        if let Some((_, segment_info)) = self.sealed_segments.remove(&key) {
-            // Delete local file if configured
-            if segment_info.state == SegmentState::Archived {
-                if let Err(e) = std::fs::remove_file(&segment_info.file_path) {
-                    warn!("Failed to delete archived segment file {:?}: {}", segment_info.file_path, e);
-                } else {
-                    info!("Deleted archived segment file {:?}", segment_info.file_path);
-                }
+        let Some((key, segment_info)) = self.sealed_segments.remove(&key) else {
+            return Ok(false);
+        };
+        match std::fs::remove_file(&segment_info.file_path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => {
+                // Keep tracking it, so the file is not forgotten while still on disk.
+                self.sealed_segments.insert(key, segment_info);
+                Err(e.into())
             }
         }
-
-        Ok(())
     }
 
     /// Seal segments that have been idle for longer than the threshold.
@@ -2657,6 +2677,23 @@ mod tail_cache_tests {
         );
     }
 
+    #[test]
+    fn a_byte_budget_bounds_a_cached_read_but_never_below_one_batch() {
+        let mut cache = TailCache::new(1 << 20);
+        for b in 0..10 {
+            push(&mut cache, b * 10, b * 10 + 9, 1000);
+        }
+        let one = cache.records[0].heap_size();
+
+        let got = cache
+            .read_bounded(0, usize::MAX, one * 3, i64::MAX)
+            .expect("covered");
+        assert_eq!(got.len(), 3, "three batches fit the budget");
+
+        let got = cache.read_bounded(0, usize::MAX, 1, i64::MAX).expect("covered");
+        assert_eq!(got.len(), 1, "the first batch always, whatever its size");
+    }
+
     /// The cache exists to answer without I/O, and a truncation must reach it
     /// even though the records it holds were never rejected by the writer.
     #[tokio::test]
@@ -2670,14 +2707,14 @@ mod tail_cache_tests {
                 .unwrap();
         }
         assert!(
-            wal.read_tail("t", 0, 0, 1000).await.is_some(),
+            wal.read_tail("t", 0, 0, 1000, usize::MAX).await.is_some(),
             "appends populate the cache"
         );
 
         wal.truncate_to("t", 0, 20).await.unwrap();
 
         assert!(
-            wal.read_tail("t", 0, 0, 1000).await.is_none(),
+            wal.read_tail("t", 0, 0, 1000, usize::MAX).await.is_none(),
             "after a cut the cache must not answer — the file is authoritative again"
         );
     }
@@ -2686,7 +2723,30 @@ mod tail_cache_tests {
     async fn an_unknown_partition_is_a_miss() {
         let dir = tempfile::tempdir().unwrap();
         let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
-        assert!(wal.read_tail("never-written", 0, 0, 10).await.is_none());
+        assert!(wal.read_tail("never-written", 0, 0, 10, usize::MAX).await.is_none());
+    }
+
+    /// The indexer's reclaim step. Until v2.16.9 it removed only segments
+    /// marked `Archived`, a state nothing set, so it deleted nothing and said
+    /// it had.
+    #[tokio::test]
+    async fn removing_a_sealed_segment_deletes_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("t").join("0");
+        std::fs::create_dir_all(&part).unwrap();
+        let sealed = part.join("wal_0_3.log");
+        std::fs::write(&sealed, record(0, 9, 64).to_bytes().unwrap()).unwrap();
+
+        // Discovered at startup, as every segment left by a previous run is.
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+        assert!(wal.get_sealed_segments().iter().any(|s| s.file_path == sealed));
+
+        assert!(wal.remove_segment("t", 0, 3).unwrap(), "a tracked file must be reported removed");
+        assert!(!sealed.exists(), "and must actually be gone");
+        assert!(
+            !wal.remove_segment("t", 0, 3).unwrap(),
+            "a second removal finds nothing, and says so"
+        );
     }
 }
 

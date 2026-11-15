@@ -1688,9 +1688,13 @@ impl WalIndexer {
                 "Keeping WAL segment — not yet replicated to followers"
             );
         } else if Self::may_delete_wal_segment(config.delete_after_index, errors_at_start, stats.errors) {
-            wal_manager.delete_segment(segment_id).await
+            let removed = wal_manager.delete_segment(segment_id).await
                 .map_err(|e| Error::Internal(format!("Failed to delete segment {}: {}", segment_id, e)))?;
-            info!(segment = %segment_id, "Deleted WAL segment after indexing");
+            if removed {
+                info!(segment = %segment_id, "Deleted WAL segment after indexing");
+            } else {
+                warn!(segment = %segment_id, "WAL segment indexed but no file was deleted (not tracked or already gone)");
+            }
         } else if config.delete_after_index {
             warn!(
                 segment = %segment_id,

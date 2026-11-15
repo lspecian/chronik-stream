@@ -112,9 +112,14 @@ produce() { # $1=first $2=last $3=acks $4=tag $5=brokers
 # payload appears more than once in the WAL (the canonical batch and the
 # preserved wire bytes both carry it), so a raw grep -c over-counts by ~3x and
 # would satisfy a threshold while the replica held a third of the data.
+#
+# Both tiers: once a WAL segment is indexed its records live in the node's raw
+# segment files and the WAL copy is deleted (v2.16.9 — before that the delete
+# silently did nothing, so the WAL alone used to hold everything).
 records_on_node() { # $1 = node, $2 = tag
-  grep -aoE "$2-[0-9]+" "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log 2>/dev/null \
-    | sort -u | wc -l
+  grep -aoE "$2-[0-9]+" "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log \
+      "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment 2>/dev/null \
+    | sed 's/^[^:]*://' | sort -u | wc -l
 }
 
 wait_for_all_replicas() { # $1 = tag, $2 = expected count

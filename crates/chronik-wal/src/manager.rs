@@ -282,9 +282,25 @@ impl WalManager {
         offset: i64,
         max_records: usize,
     ) -> Result<Vec<WalRecord>> {
+        self.read_from_bounded(topic, partition, offset, max_records, usize::MAX)
+            .await
+    }
+
+    /// [`read_from`](Self::read_from), stopping at `max_bytes` of records — the
+    /// first batch always, then nothing that would cross the budget. Fetch
+    /// paths must use this: a message count is no bound on the work a read
+    /// does (see `PartitionIndex::read_from_bounded`).
+    pub async fn read_from_bounded(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<WalRecord>> {
         debug!(
-            "Reading from WAL (GroupCommitWal): topic={}, partition={}, offset={}, max_records={}",
-            topic, partition, offset, max_records
+            "Reading from WAL (GroupCommitWal): topic={}, partition={}, offset={}, max_records={}, max_bytes={}",
+            topic, partition, offset, max_records, max_bytes
         );
 
         // Reads that want the end of the log — a follower replicating, a
@@ -293,7 +309,7 @@ impl WalManager {
         // costs O(segment size) and grows until rotation (RP-9).
         if let Some(cached) = self
             .group_commit_wal
-            .read_tail(topic, partition, offset, max_records)
+            .read_tail(topic, partition, offset, max_records, max_bytes)
             .await
         {
             debug!(
@@ -338,7 +354,7 @@ impl WalManager {
 
         let records = {
             let mut index = index.lock().await;
-            index.read_from(offset, max_records).await?
+            index.read_from_bounded(offset, max_records, max_bytes).await?
         };
 
         debug!(
@@ -928,8 +944,9 @@ impl WalManager {
         Ok(records)
     }
 
-    /// Delete a sealed segment after archival (v1.3.62+: Now removes sealed segment)
-    pub async fn delete_segment(&self, segment_id: &str) -> Result<()> {
+    /// Delete a sealed segment after archival. Returns whether a file was
+    /// removed — `false` when the segment was not tracked or already gone.
+    pub async fn delete_segment(&self, segment_id: &str) -> Result<bool> {
         // Parse segment_id format: "topic:partition:segment_id"
         let parts: Vec<&str> = segment_id.split(':').collect();
         if parts.len() != 3 {
@@ -945,13 +962,8 @@ impl WalManager {
         self.remove_segment(topic, partition, seg_id)
     }
 
-    /// Mark segment as archived after successful S3 upload (v1.3.62+)
-    pub fn mark_segment_archived(&self, topic: &str, partition: i32, segment_id: u64) {
-        self.group_commit_wal.mark_segment_archived(topic, partition, segment_id);
-    }
-
-    /// Remove archived segment after S3 upload (v1.3.62+)
-    pub fn remove_segment(&self, topic: &str, partition: i32, segment_id: u64) -> Result<()> {
+    /// Remove a sealed segment's file after S3 upload. Returns whether a file was removed.
+    pub fn remove_segment(&self, topic: &str, partition: i32, segment_id: u64) -> Result<bool> {
         self.group_commit_wal.remove_segment(topic, partition, segment_id)
     }
 
