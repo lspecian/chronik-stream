@@ -146,3 +146,6 @@ pub const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 90;
 
 /// Invalid transaction state
 pub const INVALID_TXN_STATE: i16 = 91;
+
+/// DescribeCluster asked for an endpoint type this node does not serve (KIP-919)
+pub const UNSUPPORTED_ENDPOINT_TYPE: i16 = 119;

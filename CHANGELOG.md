@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Admin tools saw a one-broker cluster.** `DescribeCluster` returned only
+  the broker that answered, while `Metadata` listed all of them. Tools that
+  take live brokers from `DescribeCluster` marked every partition led elsewhere
+  as unavailable: `kafka-topics.sh --describe --unavailable-partitions` listed
+  83 of 123 healthy partitions on a local 3-node cluster (5,715 on a production
+  one), and UIs drew a single node. It now reports the same broker list as
+  `Metadata`. The v1 request's `endpoint_type` is parsed instead of being read
+  as a tag count, and a request for controllers gets
+  `UNSUPPORTED_ENDPOINT_TYPE` (KIP-919).
+- **Every restart rewrote the in-sync set of every led partition.** The ISR
+  publisher gated writes on an in-process map that starts empty, so each boot
+  issued one replicated metadata write per led partition (about 5,600 per node
+  on a large cluster) even when nothing had changed. It now writes only when
+  the stored set differs from the measured one: 0 writes on a restart that
+  changes nothing, versus 123 before, on the same 123-partition cluster. Real
+  shrinks and expansions are still published, and the log line now names the
+  previous set.
+
 ## [2.16.6] - 2026-11-15
 
 ### Fixed

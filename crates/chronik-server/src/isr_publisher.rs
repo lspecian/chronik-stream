@@ -23,7 +23,6 @@
 //! An ISR update therefore cannot masquerade as a leadership change and cannot
 //! set followers truncating.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,22 +138,24 @@ impl IsrPublisher {
             self.node_id, self.interval
         );
 
-        // Last set published per partition, so a metadata write happens on
-        // change rather than on every tick.
-        let mut last: HashMap<(String, i32), Vec<u64>> = HashMap::new();
-
         while !self.shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(self.interval).await;
-            if let Err(e) = self.publish_once(&mut last).await {
+            if let Err(e) = self.publish_once().await {
                 warn!("Could not publish in-sync sets: {}", e);
             }
         }
     }
 
-    async fn publish_once(
-        &self,
-        last: &mut HashMap<(String, i32), Vec<u64>>,
-    ) -> chronik_common::Result<()> {
+    /// One pass: publish every led partition whose stored set differs from the
+    /// measured one.
+    ///
+    /// The store is the only reference. A per-process "last published" map used
+    /// to sit in front of it, and because it starts empty, every boot rewrote the
+    /// in-sync set of every partition the node led — about 5,600 metadata writes,
+    /// each replicated to every peer, on a restart that changed nothing. Peers
+    /// that missed an update are healed by the catalog anti-entropy pass, which
+    /// re-sends assignments with their ISR, not by this loop.
+    async fn publish_once(&self) -> chronik_common::Result<()> {
         let topics = self.metadata_store.list_topics().await?;
 
         // Partitions led this pass. Feeds the tracker's leadership clock, which
@@ -207,9 +208,8 @@ impl IsrPublisher {
                     continue; // nothing measured yet — publishing a guess is worse
                 };
 
-                let key = (topic.name.clone(), partition);
-                if last.get(&key) == Some(&isr) && assignment.isr == isr {
-                    continue;
+                if assignment.isr == isr {
+                    continue; // already what the cluster holds
                 }
 
                 // Same leader_id, so `assign_partition` keeps the epoch: this
@@ -221,12 +221,10 @@ impl IsrPublisher {
 
                 match self.metadata_store.assign_partition(update).await {
                     Ok(()) => {
-                        if last.insert(key, isr.clone()).as_ref() != Some(&isr) {
-                            info!(
-                                "{}-{}: in-sync set is now {:?} (of replicas {:?})",
-                                topic.name, partition, isr, assignment.replicas
-                            );
-                        }
+                        info!(
+                            "{}-{}: in-sync set is now {:?} (was {:?}, of replicas {:?})",
+                            topic.name, partition, isr, assignment.isr, assignment.replicas
+                        );
                         self.published.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => warn!(
@@ -304,5 +302,72 @@ mod tests {
             in_sync_replicas(&tracker, "orders", 0, 100, &[3, 1, 2], 2),
             Some(vec![3, 1, 2])
         );
+    }
+
+    /// A restart that changed nothing must write nothing.
+    ///
+    /// The publisher used to gate writes on an in-memory "last published" map
+    /// that starts empty, so every boot rewrote the in-sync set of every led
+    /// partition — ~5,600 replicated metadata writes per node restart on a
+    /// cluster where none of them changed. The store is the reference now.
+    #[tokio::test]
+    async fn a_set_the_store_already_holds_is_not_rewritten() {
+        use chronik_common::metadata::{InMemoryMetadataStore, TopicConfig};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryMetadataStore::new());
+        let handler = Arc::new(
+            crate::produce_handler::tests::handler_with_pipeline(&temp_dir, store.clone()).await,
+        );
+
+        let mut config = TopicConfig::default();
+        config.partition_count = 2;
+        store.create_topic("orders", config).await.unwrap();
+        for (partition, isr) in [(0u32, vec![1, 2]), (1u32, vec![1])] {
+            store
+                .assign_partition(PartitionAssignment {
+                    topic: "orders".into(),
+                    partition,
+                    broker_id: 1,
+                    is_leader: true,
+                    replicas: vec![1, 2],
+                    leader_id: 1,
+                    leader_epoch: 0, // derived by the store, not taken from here
+                    isr,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Follower 2 is caught up on both partitions, so both measure [1, 2].
+        let tracker = Arc::new(IsrTracker::new(100, 10_000));
+        tracker.update_follower_offset(2, "orders", 0, 0);
+        tracker.update_follower_offset(2, "orders", 1, 0);
+
+        let epochs_before: std::collections::HashMap<u32, i32> = store
+            .get_partition_assignments("orders")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.partition, a.leader_epoch))
+            .collect();
+
+        let publisher = IsrPublisher::new(1, store.clone(), tracker, handler);
+
+        // Fresh process: only partition 1, whose stored set is stale, is written.
+        publisher.publish_once().await.unwrap();
+        assert_eq!(publisher.published(), 1, "partition 0 already held [1, 2]");
+
+        let stored = store.get_partition_assignments("orders").await.unwrap();
+        for a in &stored {
+            assert_eq!(a.isr, vec![1, 2], "partition {} converged", a.partition);
+            assert_eq!(
+                a.leader_epoch, epochs_before[&a.partition],
+                "an ISR update is not a leadership change");
+        }
+
+        // Nothing changed since: the next pass writes nothing at all.
+        publisher.publish_once().await.unwrap();
+        assert_eq!(publisher.published(), 1);
     }
 }

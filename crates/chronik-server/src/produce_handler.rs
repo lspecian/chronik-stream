@@ -4204,7 +4204,7 @@ impl Clone for ProduceHandler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chronik_common::metadata::{InMemoryMetadataStore, TopicConfig};
     use chronik_storage::object_store::backends::local::LocalBackend;
@@ -5561,7 +5561,7 @@ mod tests {
     /// `response_pipeline.is_some() && acks != 0`, so a handler *without* one takes
     /// the synchronous path and replicates fine — which is why every pre-existing
     /// test missed this bug. Only this wiring reproduces the async path.
-    async fn handler_with_pipeline(
+    pub(crate) async fn handler_with_pipeline(
         temp_dir: &tempfile::TempDir,
         metadata_store: Arc<InMemoryMetadataStore>,
     ) -> ProduceHandler {
