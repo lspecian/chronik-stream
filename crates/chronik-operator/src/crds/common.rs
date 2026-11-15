@@ -68,7 +68,7 @@ pub struct VectorSearchSpec {
 }
 
 /// Reference to a key within a Kubernetes Secret.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SecretKeyRef {
     /// Secret name.
     pub name: String,

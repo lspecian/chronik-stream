@@ -1,0 +1,138 @@
+//! Broker-to-broker authentication (`__chronik_broker`).
+//!
+//! With SASL required, every connection must authenticate before it may do
+//! anything but negotiate, and that includes the replica fetcher. It had no
+//! credentials, so on a SASL cluster every follower fetch was cut off: the
+//! followers held none of their leaders' partitions while the cluster looked
+//! healthy (the in-sync set still listed them, and `acks=all` writes were still
+//! acknowledged through the duplicate-retry path).
+//!
+//! Brokers authenticate as the reserved user
+//! [`INTER_BROKER_USER`](chronik_protocol::sasl::INTER_BROKER_USER) with
+//! SCRAM-SHA-512, using a secret shared by every broker in the cluster. The
+//! name is fixed; the secret is per deployment and never in the source.
+//!
+//! The principal bypasses ACLs, as Kafka's inter-broker principal effectively
+//! does: replication must read every partition, and a missing rule would stop
+//! it silently.
+
+use std::sync::OnceLock;
+
+use chronik_protocol::sasl::SaslUser;
+use chronik_protocol::scram::{ScramCredential, DEFAULT_ITERATIONS};
+
+use crate::connection::SaslMode;
+
+/// Environment variable holding the shared secret.
+pub const SECRET_ENV: &str = "CHRONIK_INTER_BROKER_SECRET";
+
+/// Shortest secret accepted. The secret guards a principal that bypasses every
+/// ACL, and anyone who can reach the Kafka port can try to guess it.
+pub const MIN_SECRET_LEN: usize = 16;
+
+/// The `User:` principal brokers authenticate as.
+pub fn principal() -> String {
+    format!("User:{}", chronik_protocol::sasl::INTER_BROKER_USER)
+}
+
+fn parse_secret(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// The configured secret, read once.
+pub fn secret() -> Option<&'static str> {
+    static SECRET: OnceLock<Option<String>> = OnceLock::new();
+    SECRET
+        .get_or_init(|| parse_secret(std::env::var(SECRET_ENV).ok()))
+        .as_deref()
+}
+
+/// The broker user the server accepts, or `None` when no secret is set.
+///
+/// SCRAM-SHA-512 only. PLAIN would send the secret in the clear on every
+/// reconnect, and there is no TLS between brokers yet.
+pub fn server_user() -> Option<SaslUser> {
+    let secret = secret()?;
+    match ScramCredential::derive(
+        secret,
+        chronik_protocol::sasl::SaslMechanism::ScramSha512,
+        DEFAULT_ITERATIONS,
+    ) {
+        Ok(credential) => Some(SaslUser::from_scram_credential(credential)),
+        Err(e) => {
+            tracing::error!("Could not derive the inter-broker credential: {}", e);
+            None
+        }
+    }
+}
+
+/// Decide whether a cluster node may start with this SASL mode and secret.
+///
+/// Required without a secret is refused rather than warned about, because the
+/// failure it causes is silent: the broker runs, serves clients, and replicates
+/// nothing. Optional without a secret still works (unauthenticated fetches are
+/// served) and only warns.
+pub fn check_cluster_startup(mode: SaslMode, secret: Option<&str>) -> Result<(), String> {
+    if let Some(secret) = secret {
+        if secret.len() < MIN_SECRET_LEN {
+            return Err(format!(
+                "{SECRET_ENV} is {} characters; it must be at least {MIN_SECRET_LEN}. \
+                 It authenticates brokers as a principal that bypasses ACLs.",
+                secret.len()
+            ));
+        }
+        return Ok(());
+    }
+    match mode {
+        SaslMode::Required => Err(format!(
+            "CHRONIK_SASL_ENABLED requires authentication, but {SECRET_ENV} is not set. \
+             Followers could not authenticate to their leaders and would replicate nothing. \
+             Set the same random secret (at least {MIN_SECRET_LEN} characters) on every broker."
+        )),
+        SaslMode::Optional => {
+            tracing::warn!(
+                "SASL is optional and {} is not set: replica fetches run unauthenticated. \
+                 Set it before switching CHRONIK_SASL_ENABLED to true, or followers will stop \
+                 replicating at that moment.",
+                SECRET_ENV
+            );
+            Ok(())
+        }
+        SaslMode::Disabled => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_sasl_without_a_secret_refuses_to_start() {
+        let err = check_cluster_startup(SaslMode::Required, None).unwrap_err();
+        assert!(err.contains(SECRET_ENV), "{err}");
+    }
+
+    #[test]
+    fn a_short_secret_is_refused_in_every_mode() {
+        for mode in [SaslMode::Required, SaslMode::Optional, SaslMode::Disabled] {
+            assert!(check_cluster_startup(mode, Some("short")).is_err());
+        }
+    }
+
+    #[test]
+    fn optional_or_disabled_without_a_secret_may_start() {
+        assert!(check_cluster_startup(SaslMode::Optional, None).is_ok());
+        assert!(check_cluster_startup(SaslMode::Disabled, None).is_ok());
+    }
+
+    #[test]
+    fn required_with_a_good_secret_starts() {
+        assert!(check_cluster_startup(SaslMode::Required, Some("0123456789abcdef")).is_ok());
+    }
+
+    #[test]
+    fn blank_secret_counts_as_unset() {
+        assert_eq!(parse_secret(Some("   ".into())), None);
+        assert_eq!(parse_secret(Some(" abc ".into())), Some("abc".into()));
+    }
+}

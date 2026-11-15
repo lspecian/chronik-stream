@@ -115,6 +115,8 @@ struct MetadataState {
     /// ACL bindings (Security Phase 3). Replicated and recovered like topics,
     /// so a rule survives restart and applies on every broker.
     acls: RwLock<Vec<AclBindingRecord>>,
+    /// Moves on every applied ACL change (see `MetadataStore::acl_changes`).
+    acl_generation: tokio::sync::watch::Sender<u64>,
     /// SCRAM credentials, keyed by (username, mechanism code).
     scram_credentials: RwLock<HashMap<(String, i8), ScramCredentialRecord>>,
     /// Timestamp of the newest `CatalogSnapshot` applied, so an older or
@@ -141,6 +143,7 @@ impl MetadataState {
             transactions: RwLock::new(HashMap::new()),
             next_producer_id: AtomicI64::new(producer_id_base(node_id)),
             acls: RwLock::new(Vec::new()),
+            acl_generation: tokio::sync::watch::Sender::new(0),
             scram_credentials: RwLock::new(HashMap::new()),
             last_catalog_snapshot: RwLock::new(None),
             last_snapshot_size: RwLock::new(None),
@@ -346,12 +349,16 @@ impl MetadataState {
                 if !acls.iter().any(|existing| existing == binding) {
                     acls.push(binding.clone());
                 }
+                drop(acls);
+                self.acl_generation.send_modify(|g| *g += 1);
                 Ok(())
             }
 
             MetadataEventPayload::AclDeleted { binding } => {
                 let mut acls = self.acls.write().await;
                 acls.retain(|existing| existing != binding);
+                drop(acls);
+                self.acl_generation.send_modify(|g| *g += 1);
                 Ok(())
             }
 
@@ -1273,6 +1280,10 @@ impl MetadataStore for WalMetadataStore {
 
     async fn list_acls(&self) -> Result<Vec<AclBindingRecord>> {
         Ok(self.state.acls.read().await.clone())
+    }
+
+    fn acl_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.state.acl_generation.subscribe())
     }
 
     async fn upsert_scram_credential(&self, credential: ScramCredentialRecord) -> Result<()> {

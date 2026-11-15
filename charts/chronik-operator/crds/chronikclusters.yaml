@@ -127,6 +127,25 @@ spec:
                   - name
                   type: object
                 type: array
+              interBrokerSecret:
+                description: |-
+                  Secret holding the broker-to-broker SASL secret (`CHRONIK_INTER_BROKER_SECRET`).
+
+                  With SASL required (`CHRONIK_SASL_ENABLED` = `true`/`1`/`yes`/`required` in `env`) a cluster broker refuses to start without this secret, and replica fetchers use it to authenticate to the partition leader. It must be at least 16 characters and identical on every broker.
+
+                  Leave it unset and the operator generates one in a Secret named `<cluster>-inter-broker` (key `secret`), once, and never rotates it. Set it to supply your own. Either way it is only injected while SASL is enabled: a broker with SASL disabled cannot accept the broker login, so handing it the secret would break replication. If `CHRONIK_SASL_ENABLED` itself comes from a Secret the operator cannot tell whether SASL is on, so it injects only a secret set here, and generates none.
+                nullable: true
+                properties:
+                  key:
+                    description: Key within the Secret.
+                    type: string
+                  name:
+                    description: Secret name.
+                    type: string
+                required:
+                - key
+                - name
+                type: object
               listeners:
                 default: []
                 description: Named listeners (Strimzi-inspired). Each defines a Kafka access point.

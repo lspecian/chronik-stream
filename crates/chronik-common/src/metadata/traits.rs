@@ -623,6 +623,19 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Notifies whenever this node's set of ACL bindings changes, whatever the
+    /// source: a local CreateAcls/DeleteAcls, a change replicated from another
+    /// broker, or log replay. The value is a counter; only its movement matters.
+    ///
+    /// The authorizer keeps its own index for the hot path and loads it from
+    /// `list_acls` at startup. Without this signal a rule that arrived by
+    /// replication sat in the store and was never enforced, so a rule created
+    /// or revoked on one broker did not apply on the others until they
+    /// restarted. `None` for stores that do not persist ACLs.
+    fn acl_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+
     // ---- SCRAM credentials (Security Phase 1) ----
 
     /// Create or replace a user's credential for one mechanism.
@@ -713,7 +726,7 @@ pub struct AclBindingRecord {
 /// configuration. With users coming only from `CHRONIK_SASL_USERS`, every broker
 /// had to be redeployed to add one, and `kafka-configs.sh` could not manage
 /// them at all.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScramCredentialRecord {
     pub username: String,
     /// 1 = SCRAM-SHA-256, 2 = SCRAM-SHA-512 (Kafka's ScramMechanism codes).
@@ -722,4 +735,44 @@ pub struct ScramCredentialRecord {
     pub salt: Vec<u8>,
     pub stored_key: Vec<u8>,
     pub server_key: Vec<u8>,
+}
+
+// Hand-written so the keys never reach a log. These records travel through
+// metadata events, and several code paths log events with `{:?}`; a derived
+// impl printed the stored and server keys. With them an attacker can pose as
+// the server, and with one observed exchange recover the client key.
+impl std::fmt::Debug for ScramCredentialRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScramCredentialRecord")
+            .field("username", &self.username)
+            .field("mechanism", &self.mechanism)
+            .field("iterations", &self.iterations)
+            .field("salt", &"<redacted>")
+            .field("stored_key", &"<redacted>")
+            .field("server_key", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod scram_record_tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_key_material() {
+        let record = ScramCredentialRecord {
+            username: "alice".to_string(),
+            mechanism: 2,
+            iterations: 4096,
+            salt: vec![0xAB; 16],
+            stored_key: vec![0xCD; 64],
+            server_key: vec![0xEF; 64],
+        };
+        let printed = format!("{:?}", record);
+        assert!(printed.contains("alice"));
+        // Vec<u8> prints as decimal: 171, 205, 239.
+        for byte in ["171", "205", "239"] {
+            assert!(!printed.contains(byte), "key material leaked: {}", printed);
+        }
+    }
 }

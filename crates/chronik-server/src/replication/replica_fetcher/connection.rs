@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chronik_common::{Error, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -48,11 +48,21 @@ const READ_TIMEOUT_SLACK: Duration = Duration::from_secs(30);
 /// on it stalls the truncation that has to happen before replication resumes.
 const EPOCH_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Budget for the whole SASL exchange. PBKDF2 at 4096 iterations is a few
+/// milliseconds; anything near this is a leader that is not answering.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+
+const SASL_HANDSHAKE_API_KEY: i16 = 17;
+const SASL_AUTHENTICATE_API_KEY: i16 = 36;
+
 /// A lazily-connected, self-healing link to one leader's Kafka port.
 pub struct LeaderConnection {
     addr: String,
     stream: Option<TcpStream>,
     next_correlation_id: i32,
+    /// Inter-broker secret. When set, every new socket authenticates as
+    /// `__chronik_broker` before its first request.
+    secret: Option<String>,
 }
 
 impl LeaderConnection {
@@ -61,7 +71,22 @@ impl LeaderConnection {
             addr: addr.into(),
             stream: None,
             next_correlation_id: 1,
+            secret: None,
         }
+    }
+
+    /// A connection for replication: authenticates with
+    /// `CHRONIK_INTER_BROKER_SECRET` when it is set.
+    pub fn for_replication(addr: impl Into<String>) -> Self {
+        let mut conn = Self::new(addr);
+        conn.secret = crate::inter_broker::secret().map(str::to_string);
+        conn
+    }
+
+    /// Authenticate every new socket with this secret.
+    pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
+        self.secret = Some(secret.into());
+        self
     }
 
     pub fn addr(&self) -> &str {
@@ -235,9 +260,94 @@ impl LeaderConnection {
             warn!("Could not disable Nagle on the link to {}: {}", self.addr, e);
         }
 
+        let mut stream = stream;
+        if let Some(secret) = self.secret.clone() {
+            // A leader with SASL required closes the socket on the first
+            // non-SASL request, which surfaced only as "early eof" on every
+            // fetch. Authenticate first, and say so when it fails.
+            timeout(AUTH_TIMEOUT, self.authenticate(&mut stream, &secret))
+                .await
+                .map_err(|_| {
+                    Error::Network(format!(
+                        "Authentication to leader {} timed out after {:?}",
+                        self.addr, AUTH_TIMEOUT
+                    ))
+                })??;
+            debug!("Replica fetcher authenticated to leader {}", self.addr);
+        }
+
         debug!("Replica fetcher connected to leader {}", self.addr);
         self.stream = Some(stream);
         Ok(())
+    }
+
+    /// SASL SCRAM-SHA-512 as `__chronik_broker`: SaslHandshake v1, then two
+    /// SaslAuthenticate v1 rounds. The server's final signature is verified, so
+    /// a peer that does not hold the secret cannot pose as the leader.
+    async fn authenticate(&mut self, stream: &mut TcpStream, secret: &str) -> Result<()> {
+        use chronik_protocol::sasl::{SaslMechanism, INTER_BROKER_USER};
+        use chronik_protocol::scram::ScramClient;
+
+        let auth_err = |what: String| Error::Network(format!("Authentication to leader failed: {what}"));
+
+        // SaslHandshake v1: mechanism string.
+        let correlation_id = self.take_correlation_id();
+        let mut body = BytesMut::new();
+        put_request_header(&mut body, SASL_HANDSHAKE_API_KEY, 1, correlation_id);
+        put_string(&mut body, SaslMechanism::ScramSha512.as_str());
+        let mut response = sasl_round_trip(stream, &self.addr, &body, correlation_id).await?;
+        let error_code = get_i16(&mut response)?;
+        if error_code != 0 {
+            return Err(auth_err(format!(
+                "leader {} refused SCRAM-SHA-512 (error {error_code})",
+                self.addr
+            )));
+        }
+
+        let mut client = ScramClient::new(SaslMechanism::ScramSha512, INTER_BROKER_USER, secret);
+
+        let server_first = self
+            .sasl_authenticate(stream, &client.client_first())
+            .await?;
+        let client_final = client
+            .client_final(&server_first)
+            .map_err(|e| auth_err(e.to_string()))?;
+        let server_final = self.sasl_authenticate(stream, &client_final).await?;
+        client
+            .verify_server_final(&server_final)
+            .map_err(|e| auth_err(format!("{} ({})", e, self.addr)))?;
+        Ok(())
+    }
+
+    /// One SaslAuthenticate v1 round; returns the server's auth bytes.
+    async fn sasl_authenticate(&mut self, stream: &mut TcpStream, auth: &[u8]) -> Result<Vec<u8>> {
+        let correlation_id = self.take_correlation_id();
+        let mut body = BytesMut::new();
+        put_request_header(&mut body, SASL_AUTHENTICATE_API_KEY, 1, correlation_id);
+        body.put_i32(auth.len() as i32);
+        body.put_slice(auth);
+
+        let mut response = sasl_round_trip(stream, &self.addr, &body, correlation_id).await?;
+        let error_code = get_i16(&mut response)?;
+        let message = get_nullable_string(&mut response)?;
+        if error_code != 0 {
+            return Err(Error::Network(format!(
+                "Authentication to leader {} failed as {} (error {}): {}. \
+                 Check that CHRONIK_INTER_BROKER_SECRET is identical on every broker.",
+                self.addr,
+                chronik_protocol::sasl::INTER_BROKER_USER,
+                error_code,
+                message.unwrap_or_default()
+            )));
+        }
+        let len = get_i32(&mut response)?;
+        if len < 0 || response.len() < len as usize {
+            return Err(Error::Protocol(format!(
+                "SaslAuthenticate response from {} has a bad auth_bytes length {len}",
+                self.addr
+            )));
+        }
+        Ok(response.split_to(len as usize).to_vec())
     }
 
     fn take_correlation_id(&mut self) -> i32 {
@@ -274,6 +384,67 @@ async fn read_frame(stream: &mut TcpStream, addr: &str) -> Result<Bytes> {
         .map_err(|e| Error::Network(format!("Fetch response body read from {addr} failed: {e}")))?;
 
     Ok(Bytes::from(payload))
+}
+
+/// Request header v1: api key, version, correlation id, nullable client id.
+/// SaslHandshake and SaslAuthenticate v1 are not flexible, so no tagged fields.
+fn put_request_header(buf: &mut BytesMut, api_key: i16, version: i16, correlation_id: i32) {
+    buf.put_i16(api_key);
+    buf.put_i16(version);
+    buf.put_i32(correlation_id);
+    put_string(buf, super::protocol::REPLICA_CLIENT_ID);
+}
+
+fn put_string(buf: &mut BytesMut, s: &str) {
+    buf.put_i16(s.len() as i16);
+    buf.put_slice(s.as_bytes());
+}
+
+fn get_i16(buf: &mut Bytes) -> Result<i16> {
+    if buf.remaining() < 2 {
+        return Err(Error::Protocol("SASL response truncated".into()));
+    }
+    Ok(buf.get_i16())
+}
+
+fn get_i32(buf: &mut Bytes) -> Result<i32> {
+    if buf.remaining() < 4 {
+        return Err(Error::Protocol("SASL response truncated".into()));
+    }
+    Ok(buf.get_i32())
+}
+
+fn get_nullable_string(buf: &mut Bytes) -> Result<Option<String>> {
+    let len = get_i16(buf)?;
+    if len < 0 {
+        return Ok(None);
+    }
+    if buf.remaining() < len as usize {
+        return Err(Error::Protocol("SASL response truncated".into()));
+    }
+    Ok(Some(String::from_utf8_lossy(&buf.split_to(len as usize)).into_owned()))
+}
+
+/// Send one SASL request and return the response body after the correlation
+/// id (response header v0, no tagged fields at v1).
+async fn sasl_round_trip(
+    stream: &mut TcpStream,
+    addr: &str,
+    body: &[u8],
+    correlation_id: i32,
+) -> Result<Bytes> {
+    stream
+        .write_all(&frame_request(body))
+        .await
+        .map_err(|e| Error::Network(format!("SASL write to {addr} failed: {e}")))?;
+    let mut payload = read_frame(stream, addr).await?;
+    let echoed = get_i32(&mut payload)?;
+    if echoed != correlation_id {
+        return Err(Error::Protocol(format!(
+            "SASL response from {addr} carried correlation id {echoed} but {correlation_id} was sent"
+        )));
+    }
+    Ok(payload)
 }
 
 #[cfg(test)]

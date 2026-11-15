@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.16.5.
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.16.6.
 
 **Key Differentiators:**
 - Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)
@@ -1106,7 +1106,8 @@ Key environment variables:
 - `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
 - `CHRONIK_ADMIN_TLS_CERT` / `CHRONIK_ADMIN_TLS_KEY` - **NOT IMPLEMENTED.** Setting either logs a warning ("axum-server crate not available") and the admin API still serves plain **HTTP**. The whole Unified API (6092) is plaintext; there is no HTTPS anywhere yet. Tracked as Phase 4 in [docs/ROADMAP_SECURITY.md](docs/ROADMAP_SECURITY.md).
 - `CHRONIK_SASL_ENABLED` - SASL authentication on the Kafka port (default: `false`). `true`/`required` refuses unauthenticated connections (they may send only ApiVersions/SaslHandshake/SaslAuthenticate; anything else closes the connection). `optional` verifies credentials when offered but still serves — and logs — unauthenticated clients: use it to stage a rollout, watch for "unauthenticated requests" warnings, then switch to `true`. Mechanisms offered: **SCRAM-SHA-512, SCRAM-SHA-256, PLAIN** (strongest first; PLAIN sends the password in the clear and is only safe under TLS).
-- `CHRONIK_SASL_USERS` - `user1:pass1,user2:pass2`. There are **no default users**; with SASL enabled and this unset, every client is rejected.
+- `CHRONIK_SASL_USERS` - `user1:pass1,user2:pass2`. There are **no default users**; with SASL enabled and this unset, every client is rejected. Names starting with `__chronik` are reserved and ignored.
+- `CHRONIK_INTER_BROKER_SECRET` - Shared secret brokers use to authenticate to each other (replica fetches) as the reserved user `__chronik_broker`, SCRAM-SHA-512 (v2.16.6+). Same value on every broker, at least 16 characters. **Required in cluster mode when `CHRONIK_SASL_ENABLED=true`** — the node refuses to start without it, because followers would otherwise replicate nothing. The principal bypasses ACLs and cannot be created or deleted through `AlterUserScramCredentials`. The operator (chart 0.3.3+) generates it for SASL clusters as Secret `<cluster>-inter-broker`.
 - `CHRONIK_ACL_ENABLED` - Require ACL authorization (default: `false`). Enforced on Produce (Write), Fetch (Read), consumer-group APIs (Read on group), and the ACL admin APIs (Alter on cluster).
 - `CHRONIK_ACL_ALLOW_IF_NO_ACL` - Whether an operation with no matching rule is allowed (default: `true`). Set `false` to start closed.
 - `CHRONIK_ACL_SUPER_USERS` - `User:admin,User:ops` — bypass all ACL checks. Keep one, or a mis-configured policy is unrecoverable.

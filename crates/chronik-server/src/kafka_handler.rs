@@ -82,6 +82,9 @@ impl KafkaProtocolHandler {
             let loaded = acl_store.load_bootstrap_acls(&spec).await;
             tracing::info!("Loaded {} bootstrap ACL binding(s)", loaded);
         }
+        // Follow the metadata store from here on, so rules created or revoked on
+        // another broker are enforced here without a restart.
+        acl_store.clone().spawn_reload_on_change(metadata_store.clone());
 
         Ok(Self {
             protocol_handler: ProtocolHandler::with_full_config(
@@ -674,6 +677,10 @@ impl KafkaProtocolHandler {
         let mut results = Vec::new();
 
         for deletion in &request.deletions {
+            if chronik_protocol::sasl::is_reserved_username(&deletion.name) {
+                results.push(reserved_user_result(&deletion.name));
+                continue;
+            }
             let outcome = self
                 .metadata_store
                 .delete_scram_credential(&deletion.name, deletion.mechanism)
@@ -686,6 +693,10 @@ impl KafkaProtocolHandler {
         }
 
         for upsertion in &request.upsertions {
+            if chronik_protocol::sasl::is_reserved_username(&upsertion.name) {
+                results.push(reserved_user_result(&upsertion.name));
+                continue;
+            }
             let mechanism = match upsertion.mechanism {
                 MECHANISM_SCRAM_SHA_256 => SaslMechanism::ScramSha256,
                 MECHANISM_SCRAM_SHA_512 => SaslMechanism::ScramSha512,
@@ -1232,6 +1243,7 @@ impl KafkaProtocolHandler {
         header: &chronik_protocol::parser::RequestHeader,
         request: &chronik_protocol::FetchRequest,
         denied: &[String],
+        error_code: i16,
     ) -> Result<Response> {
         use chronik_protocol::{FetchResponse, FetchResponsePartition, FetchResponseTopic};
 
@@ -1251,7 +1263,7 @@ impl KafkaProtocolHandler {
                     .iter()
                     .map(|p| FetchResponsePartition {
                         partition: p.partition,
-                        error_code: ERROR_TOPIC_AUTHORIZATION_FAILED,
+                        error_code,
                         high_watermark: -1,
                         last_stable_offset: -1,
                         log_start_offset: -1,
@@ -1484,6 +1496,39 @@ impl KafkaProtocolHandler {
         // Parse the fetch request
         let request = self.protocol_handler.parse_fetch_request(&header, &mut buf)?;
 
+        // A fetch carrying a replica id is a follower replicating: its offset
+        // moves the in-sync set and settles `acks=all` writes. Any client that
+        // could send one could make the leader acknowledge writes no follower
+        // holds. Kafka requires ClusterAction for it; here, an authenticated
+        // connection must be the broker principal, or hold ClusterAction when
+        // ACLs are on. Unauthenticated connections only reach this point when
+        // SASL is off or optional, where the network is the trust boundary.
+        if request.replica_id >= 0 {
+            if let Some(principal) = ctx.principal().await {
+                let allowed = principal == crate::inter_broker::principal()
+                    || (self.authorizer.is_enabled()
+                        && self
+                            .authorizer
+                            .authorize_cluster(ctx, AclOperation::ClusterAction)
+                            .await);
+                if !allowed {
+                    tracing::warn!(
+                        "Replica fetch (replica_id={}) refused for {}: only brokers may replicate",
+                        request.replica_id,
+                        principal
+                    );
+                    let topics: Vec<String> =
+                        request.topics.iter().map(|t| t.name.clone()).collect();
+                    return self.fetch_authorization_denied(
+                        &header,
+                        &request,
+                        &topics,
+                        crate::authorizer::ERROR_CLUSTER_AUTHORIZATION_FAILED,
+                    );
+                }
+            }
+        }
+
         // Authorization: Fetch requires Read on each topic (not Describe - a
         // Describe-only principal must not be able to read records).
         if self.authorizer.is_enabled() {
@@ -1494,7 +1539,12 @@ impl KafkaProtocolHandler {
                 .partition_topics(ctx, &topic_names, AclOperation::Read)
                 .await;
             if !denied.is_empty() {
-                return self.fetch_authorization_denied(&header, &request, &denied);
+                return self.fetch_authorization_denied(
+                    &header,
+                    &request,
+                    &denied,
+                    ERROR_TOPIC_AUTHORIZATION_FAILED,
+                );
             }
         }
 
@@ -2998,3 +3048,22 @@ impl KafkaProtocolHandler {
     }
 }
 
+
+/// Refusal for an AlterUserScramCredentials entry naming a reserved user.
+///
+/// `__chronik_broker` bypasses ACLs. Letting a client set its credential would
+/// let anyone holding cluster Alter mint a broker identity; letting a client
+/// delete it would cut replication. Either way the result is per-user, so the
+/// rest of the request still applies, as Kafka does for per-user errors.
+fn reserved_user_result(
+    name: &str,
+) -> chronik_protocol::scram_credentials_types::AlterUserScramCredentialsResult {
+    chronik_protocol::scram_credentials_types::AlterUserScramCredentialsResult {
+        user: name.to_string(),
+        error_code: 42, // INVALID_REQUEST
+        error_message: Some(format!(
+            "'{}' is reserved for Chronik; brokers authenticate with CHRONIK_INTER_BROKER_SECRET",
+            name
+        )),
+    }
+}

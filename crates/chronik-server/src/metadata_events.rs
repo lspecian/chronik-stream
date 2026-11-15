@@ -85,6 +85,18 @@ pub enum MetadataEvent {
         port: i32,
         rack: Option<String>,
     },
+
+    /// An ACL or SCRAM credential change, carried exactly as it was written to
+    /// the metadata log and shipped to followers unchanged.
+    ///
+    /// These had no variant here, so the adapter in the server builder dropped
+    /// them as "non-replication events": a rule or credential created, altered
+    /// or revoked on one broker was never seen by the others. The other
+    /// variants are summaries the replicator re-expands; security records are
+    /// small and must arrive exactly as written, so they travel whole.
+    SecurityChanged {
+        event: chronik_common::metadata::MetadataEvent,
+    },
 }
 
 /// Event bus for metadata changes

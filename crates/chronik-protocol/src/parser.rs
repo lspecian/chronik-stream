@@ -565,35 +565,20 @@ pub fn parse_request_header_with_correlation(buf: &mut Bytes) -> Result<(Request
 
     tracing::trace!("Request header: api_key={:?}, version={}, flexible={}", ApiKey::from_i16(api_key_raw), api_version, flexible);
     
-    // Read client ID
-    // CRITICAL: Despite using flexible header v2, Java client sends client_id as regular STRING (INT16 length)
-    // NOT as COMPACT_STRING (varint length). This is inconsistent with the Kafka spec but matches Java behavior.
-    // librdkafka does send COMPACT_STRING for flexible versions.
-    // For maximum compatibility, we detect which encoding based on the bytes.
-    let client_id = if flexible {
-        // Peek at first 2 bytes to detect encoding
-        if decoder.remaining() >= 2 {
-            let first_byte = decoder.buf[0];
-            let second_byte = decoder.buf[1];
-
-            // If first byte is 0x00 and second byte >= 0x01, it's likely INT16 string length (Java style)
-            // If first byte >= 0x01 and is a reasonable varint, it's likely COMPACT_STRING (librdkafka style)
-            if first_byte == 0x00 {
-                // Probably Java INT16-length string
-                tracing::trace!("Using STRING encoding for client_id (Java client style)");
-                decoder.read_string()?
-            } else {
-                // Probably librdkafka COMPACT_STRING
-                tracing::trace!("Using COMPACT_STRING encoding for client_id (librdkafka client style)");
-                decoder.read_compact_string()?
-            }
-        } else {
-            // Not enough bytes, try compact string
-            decoder.read_compact_string()?
-        }
-    } else {
-        decoder.read_string()?
-    };
+    // Read client ID.
+    //
+    // Request header v2 keeps `client_id` as a NULLABLE_STRING (INT16 length),
+    // exactly like v1 — the Kafka schema marks it `flexibleVersions: none`.
+    // Only the tagged fields after it are new. Java and librdkafka both write it
+    // this way (librdkafka writes it before switching the buffer to flexver).
+    //
+    // This used to guess from the first byte: 0x00 meant INT16, anything else a
+    // compact string. A null client id is 0xFFFF, so it took the compact branch
+    // and the request failed to parse ("compact string of length 16382"). The
+    // Java client sends SaslAuthenticate with a null client id, so no stock
+    // Java client could complete SASL authentication. A client id of 256 bytes
+    // or more failed the same way.
+    let client_id = decoder.read_string()?;
 
     // DEBUG: Log the parsed client_id to verify what's being read from the wire
     tracing::trace!("Parsed client_id from request header: {:?}", client_id);
@@ -944,6 +929,45 @@ pub trait KafkaEncodable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Header v2 as the Java client writes it for SaslAuthenticate v2: null
+    /// client id (INT16 -1), then an empty tagged-field buffer, then the body.
+    #[test]
+    fn flexible_header_with_null_client_id() {
+        let mut raw = BytesMut::new();
+        raw.put_i16(36); // SaslAuthenticate
+        raw.put_i16(2);
+        raw.put_i32(2147483642);
+        raw.put_i16(-1); // client_id = null
+        raw.put_u8(0); // no tagged fields
+        raw.put_u8(0xAB); // first body byte
+        let mut buf = raw.freeze();
+
+        let header = parse_request_header(&mut buf).expect("header parses");
+        assert_eq!(header.api_key, ApiKey::SaslAuthenticate);
+        assert_eq!(header.correlation_id, 2147483642);
+        assert_eq!(header.client_id, None);
+        assert_eq!(buf.as_ref(), &[0xAB], "body must start right after the tag buffer");
+    }
+
+    /// Client ids of 256+ bytes have a non-zero first length byte, which the old
+    /// first-byte guess misread as a compact string.
+    #[test]
+    fn flexible_header_with_long_client_id() {
+        let id = "c".repeat(300);
+        let mut raw = BytesMut::new();
+        raw.put_i16(3); // Metadata
+        raw.put_i16(12);
+        raw.put_i32(7);
+        raw.put_i16(id.len() as i16);
+        raw.put_slice(id.as_bytes());
+        raw.put_u8(0);
+        let mut buf = raw.freeze();
+
+        let header = parse_request_header(&mut buf).expect("header parses");
+        assert_eq!(header.client_id.as_deref(), Some(id.as_str()));
+        assert!(buf.is_empty());
+    }
 
     #[test]
     fn acl_apis_capped_to_non_flexible_versions() {

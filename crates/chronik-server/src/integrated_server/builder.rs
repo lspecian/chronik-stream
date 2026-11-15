@@ -394,6 +394,16 @@ impl IntegratedKafkaServerBuilder {
                     num_partitions: config.partition_count as i32,
                 })
             }
+            // Security state must be the same on every broker: a credential or
+            // rule revoked through one broker has to stop working on all of
+            // them. These used to fall into `_ => None` below, so they never
+            // left the broker that served the request.
+            MetadataEventPayload::AclCreated { .. }
+            | MetadataEventPayload::AclDeleted { .. }
+            | MetadataEventPayload::ScramCredentialUpserted { .. }
+            | MetadataEventPayload::ScramCredentialDeleted { .. } => {
+                Some(ServerEvent::SecurityChanged { event: common_event.clone() })
+            }
             _ => None, // Skip other event types (e.g., OffsetUpdated)
         };
 
@@ -2496,5 +2506,54 @@ mod tests {
 
         // Drop server in blocking context (WalIndexer has its own tokio runtime)
         tokio::task::spawn_blocking(move || drop(server)).await.unwrap();
+    }
+
+    /// Security events used to fall into the adapter's `_ => None` and never
+    /// reach the replicator. Each must come out the other side, whole.
+    #[test]
+    fn security_events_are_forwarded_to_the_replicator() {
+        use chronik_common::metadata::{
+            AclBindingRecord, MetadataEvent as CommonEvent, MetadataEventPayload, ScramCredentialRecord,
+        };
+        use crate::metadata_events::{MetadataEvent as ServerEvent, MetadataEventBus};
+
+        let binding = AclBindingRecord {
+            resource_type: 2,
+            resource_name: "orders".to_string(),
+            pattern_type: 3,
+            principal: "User:alice".to_string(),
+            host: "*".to_string(),
+            operation: 4,
+            permission_type: 3,
+        };
+        let credential = ScramCredentialRecord {
+            username: "alice".to_string(),
+            mechanism: 2,
+            iterations: 4096,
+            salt: vec![1; 16],
+            stored_key: vec![2; 64],
+            server_key: vec![3; 64],
+        };
+        let payloads = vec![
+            MetadataEventPayload::AclCreated { binding: binding.clone() },
+            MetadataEventPayload::AclDeleted { binding },
+            MetadataEventPayload::ScramCredentialUpserted { credential },
+            MetadataEventPayload::ScramCredentialDeleted { username: "alice".to_string(), mechanism: 2 },
+        ];
+
+        let bus = Arc::new(MetadataEventBus::new(16));
+        let mut rx = bus.subscribe();
+        for payload in payloads {
+            let sent = CommonEvent::new_with_node(payload, 1);
+            let delivered =
+                IntegratedKafkaServerBuilder::convert_and_publish_metadata_event(&bus, sent.clone());
+            assert_eq!(delivered, 1, "dropped: {:?}", sent.payload);
+            match rx.try_recv().unwrap() {
+                ServerEvent::SecurityChanged { event } => {
+                    assert_eq!(event.to_bytes().unwrap(), sent.to_bytes().unwrap());
+                }
+                other => panic!("unexpected event: {:?}", other),
+            }
+        }
     }
 }

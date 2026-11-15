@@ -69,6 +69,7 @@ mod cluster;  // Phase 1.2: Cluster mode refactoring (complexity reduction from 
 mod tls;  // Phase 5: TLS encryption for Kafka protocol connections
 mod acl;  // Phase 5: Access Control Lists for authorization
 mod connection;  // Security Phase 0: per-connection identity + SASL enforcement
+mod inter_broker;  // Broker-to-broker SASL as __chronik_broker
 mod authorizer;  // Security Phase 3: maps Kafka requests onto ACL checks
 mod schema_registry;  // Phase 5: Confluent-compatible Schema Registry
 
@@ -1342,6 +1343,18 @@ async fn run_cluster_mode(
 
     info!("Starting Chronik in CLUSTER mode (node_id={})", config.node_id);
     info!("Cluster peers: {} nodes", config.peers.len());
+
+    // Before anything binds: a node that cannot authenticate to its peers runs
+    // and serves clients while replicating nothing, so refuse it outright.
+    let sasl_mode = connection::SaslMode::from_env();
+    inter_broker::check_cluster_startup(sasl_mode, inter_broker::secret())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if inter_broker::secret().is_some() {
+        info!(
+            "Inter-broker authentication: replica fetches authenticate as {} (SCRAM-SHA-512)",
+            chronik_protocol::sasl::INTER_BROKER_USER
+        );
+    }
 
     // Parse object store configuration
     let object_store_config = parse_object_store_config_from_env();

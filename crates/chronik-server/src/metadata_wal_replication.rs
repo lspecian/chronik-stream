@@ -402,6 +402,28 @@ impl MetadataWalReplicator {
                     }
                 }
             }
+
+            // Shipped verbatim: the follower persists it to its own metadata
+            // log and applies it, which updates its SCRAM credentials and
+            // signals its ACL index to reload.
+            MetadataEvent::SecurityChanged { event } => {
+                match event.to_bytes() {
+                    Ok(data) => {
+                        self.replication_mgr.broadcast_metadata(
+                            self.wal.topic_name().to_string(),
+                            self.wal.partition(),
+                            0,
+                            data,
+                        ).await;
+                        // Never log the payload: a SCRAM record carries the stored and
+                        // server keys.
+                        tracing::debug!("Security change broadcast to followers");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to serialize security change for replication: {}", e);
+                    }
+                }
+            }
         }
 
         Ok(())
