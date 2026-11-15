@@ -28,7 +28,9 @@ opt-level = 2
 opt-level = 2
 lto = "thin"
 codegen-units = 16
-incremental = true
+# Off: release builds are thin-LTO, so incremental reuse is small while its
+# cache grew to 114 GB (target/release/incremental) and filled the disk.
+incremental = false
 strip = true
 panic = "abort"
 
