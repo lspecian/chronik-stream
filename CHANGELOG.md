@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.9] - 2026-11-15
+
+### Fixed
+
+- **A leader serving a large partition pinned a worker and starved its
+  followers and consumers forever.** Live on signal-stream after v2.16.8: every
+  follower fetch of a 1.8M-record partition hit the 30s deadline, consumers
+  read nothing, and `perf` showed one tokio worker at 100% in a single loop.
+  The fetch fallback merged each storage tier's records with a linear search
+  per record — ~10^11 comparisons for this partition, in a loop with no await,
+  which the 30s timeout cannot interrupt. It was entered whenever the raw read
+  timed out, and the pinned worker made more reads time out. Merges are now
+  linear, and the fallback no longer reruns a read that just timed out (60s
+  per fetch instead of 30).
+- **Fetch reads ignored their byte budget.** A replica fetch of 10MB became a
+  million-message WAL read — 967MB per fetch on that partition. WAL reads,
+  the tail cache, the segment tier, the Tantivy tier and the parsed fallback
+  now all stop at the partition's `max_bytes` (Kafka's rule: the first batch
+  always, so an oversized batch still makes progress). Reading a partition of
+  14,179 WAL files no longer stats each file through a separate thread-pool
+  round trip (170ms → 37ms per read).
+- **Records that existed only in the segment tier were skipped by consumers
+  and followers.** Each tier answered "records from this offset on" with
+  whatever it held next, and the first answer won: asked for offset 6105, a
+  leader whose WAL had lost 6105–67953 returned 67954, silently skipping 61,849
+  records sitting in its own segment tier. An answer that starts above the
+  offset now only bounds the search; colder tiers are asked for the gap, and
+  only a gap no tier holds is stepped over. Live on rp3, a follower logged
+  "offsets 0..100 are not recoverable" for records the leader held.
+- **The segment tier could not find or read archived segments.** It looked
+  them up in the metadata catalog, which only the metadata leader writes, so a
+  partition led elsewhere had its archive registered nowhere; and it decoded
+  only the old `Segment` container, not the canonical-record files the WAL
+  indexer has written for years. It now lists this node's own object store and
+  decodes both, serving the original wire bytes. On Thunderbird, 10 partitions
+  held only in the leader's segment tier could never be copied by followers.
+- **WAL segments were never deleted after indexing.** Since v1.3.62 the
+  reclaim step deleted only segments marked `Archived`, a state nothing set:
+  it logged "Deleted WAL segment after indexing" and removed nothing. WAL grew
+  without bound (14,179 files in one partition on signal-stream) and every
+  restart re-indexed all of it. Segments are now deleted once indexed and
+  replicated, and the log reports only deletions that happened.
+- The WAL index's search for batches stored out of order no longer scans the
+  rest of the log when a read lands in a gap (4.2s → milliseconds per fetch).
+- The fetch segment cache returned an incomplete list for later ranges and was
+  never invalidated; removed.
+
 ## [2.16.8] - 2026-11-15
 
 ### Fixed

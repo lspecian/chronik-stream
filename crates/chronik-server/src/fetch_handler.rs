@@ -53,8 +53,6 @@ struct BatchMetadata {
 struct FetchState {
     /// In-memory buffers for recent data
     buffers: HashMap<(String, i32), PartitionBuffer>,
-    /// Cached segment metadata
-    segment_cache: HashMap<(String, i32), Vec<SegmentInfo>>,
 }
 
 /// Segment metadata for fetch operations
@@ -169,7 +167,6 @@ impl FetchHandler {
             produce_handler: None,
             state: Arc::new(RwLock::new(FetchState {
                 buffers: HashMap::new(),
-                segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
@@ -197,7 +194,6 @@ impl FetchHandler {
             produce_handler: Some(produce_handler),
             state: Arc::new(RwLock::new(FetchState {
                 buffers: HashMap::new(),
-                segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
@@ -225,7 +221,6 @@ impl FetchHandler {
             produce_handler: None, // Not provided in this constructor
             state: Arc::new(RwLock::new(FetchState {
                 buffers: HashMap::new(),
-                segment_cache: HashMap::new(),
             })),
             config: FetchHandlerConfig::default(),
             isr_tracker: None,
@@ -258,7 +253,6 @@ impl FetchHandler {
             produce_handler: Some(produce_handler),
             state: Arc::new(RwLock::new(FetchState {
                 buffers: HashMap::new(),
-                segment_cache: HashMap::new(),
             })),
             config,
             isr_tracker: None,
@@ -1013,7 +1007,17 @@ impl FetchHandler {
 
                 raw_bytes
             }
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+            Err(_) => {
+                // The parsed-records fallback below reads the same WAL range,
+                // so running it after a timeout only doubled the time a stuck
+                // read held the request — 60s per fetch instead of 30.
+                tracing::warn!(
+                    "Fetch read exceeded the {}s safety deadline for {}-{} at offset {} — returning empty",
+                    READ_SAFETY_DEADLINE.as_secs(), topic, partition, fetch_offset
+                );
+                Vec::new()
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => {
                 // Fall back to parsed records (will recompute CRC)
                 tracing::debug!("CRC-RECOMPUTED: no raw bytes available, falling back to parsed records for {}-{}",
                     topic, partition);
@@ -1331,10 +1335,56 @@ impl FetchHandler {
         }
 
         let mut combined_bytes = Vec::new();
-        for segment_info in &segments {
-            // Read segment and extract raw_kafka_batches
-            let segment_data = self.object_store.get(&segment_info.object_key).await?;
-            let segment = Segment::deserialize(segment_data)?;
+        // Labelled: a full budget must end the scan, not just this segment —
+        // otherwise every remaining segment up to the high watermark is still
+        // downloaded and deserialized, only to contribute nothing.
+        'segments: for segment_info in &segments {
+            // A segment the catalog names may not be in this node's store; it
+            // is one fewer source, not a failed fetch.
+            let data = match self.object_store.get(&segment_info.object_key).await {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::debug!("RAW→SEGMENT: {} unavailable: {}", segment_info.object_key, e);
+                    continue 'segments;
+                }
+            };
+
+            // The WalIndexer writes raw segments as bincode `Vec<CanonicalRecord>`
+            // — the WAL's own batches, with their original wire bytes. This tier
+            // only understood the older `Segment` container, so every read of an
+            // indexer-written segment failed to deserialize, the error ended the
+            // raw read, and archived records could only be served re-encoded by
+            // the parsed fallback (which the CRC rules above exist to avoid).
+            let segment = match Segment::deserialize(data.clone()) {
+                Ok(segment) => segment,
+                Err(_) => {
+                    let mut canonicals: Vec<chronik_storage::canonical_record::CanonicalRecord> =
+                        match bincode::deserialize(&data) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "RAW→SEGMENT: {} is neither a Segment nor canonical records: {}",
+                                    segment_info.object_key, e
+                                );
+                                continue 'segments;
+                            }
+                        };
+                    canonicals.sort_by_key(|c| c.base_offset);
+                    for c in &canonicals {
+                        if c.last_offset() < fetch_offset || c.base_offset >= high_watermark {
+                            continue;
+                        }
+                        let batch = c.to_kafka_batch().map_err(|e| {
+                            Error::Internal(format!("rebuilding batch from {}: {}", segment_info.object_key, e))
+                        })?;
+                        if !combined_bytes.is_empty() && combined_bytes.len() + batch.len() > max_bytes as usize {
+                            break 'segments;
+                        }
+                        combined_bytes.extend_from_slice(&batch);
+                    }
+                    continue 'segments;
+                }
+            };
 
             tracing::debug!(
                 "RAW→SEGMENT: segment {} has {} bytes of raw_kafka_batches",
@@ -1348,7 +1398,12 @@ impl FetchHandler {
                     "RAW→SEGMENT: Segment {} has no raw_kafka_batches, cannot preserve CRC",
                     segment_info.segment_id
                 );
-                return Ok(None);
+                // Serve what was gathered; the next fetch starts here and falls
+                // back to the parsed path for this segment.
+                if combined_bytes.is_empty() {
+                    return Ok(None);
+                }
+                break 'segments;
             }
 
             // CRITICAL FIX: Parse batch headers to filter by offset range
@@ -1407,7 +1462,7 @@ impl FetchHandler {
                     // This batch is in range, include it
                     if combined_bytes.len() + total_batch_size > max_bytes as usize && !combined_bytes.is_empty() {
                         // Would exceed max_bytes, stop here
-                        break;
+                        break 'segments;
                     }
 
                     let batch_bytes = &segment.raw_kafka_batches[batch_start..batch_start + total_batch_size];
@@ -1566,15 +1621,7 @@ impl FetchHandler {
                     tantivy_records.len(), topic, partition
                 );
 
-                // Merge Tantivy records with existing records
-                for t_rec in tantivy_records {
-                    if !records.iter().any(|r| r.offset == t_rec.offset) {
-                        records.push(t_rec);
-                    }
-                }
-
-                // Sort by offset to maintain order
-                records.sort_by_key(|r| r.offset);
+                merge_by_offset(&mut records, tantivy_records);
             }
             Ok(_) => {
                 debug!(
@@ -1625,15 +1672,7 @@ impl FetchHandler {
                     s3_records.len(), topic, partition
                 );
 
-                // Merge S3 records with existing records
-                for s3_rec in s3_records {
-                    if !records.iter().any(|r| r.offset == s3_rec.offset) {
-                        records.push(s3_rec);
-                    }
-                }
-
-                // Sort by offset to maintain order
-                records.sort_by_key(|r| r.offset);
+                merge_by_offset(&mut records, s3_records);
             }
             Ok(_) => {
                 debug!(
@@ -1698,14 +1737,7 @@ impl FetchHandler {
                                 "FETCH→WAL: Successfully fetched {} records from WAL for {}-{}",
                                 wal_records.len(), topic, partition
                             );
-                            // Merge WAL records with buffer records
-                            for wal_rec in wal_records {
-                                if !records.iter().any(|r| r.offset == wal_rec.offset) {
-                                    records.push(wal_rec);
-                                }
-                            }
-                            // Sort by offset to maintain order
-                            records.sort_by_key(|r| r.offset);
+                            merge_by_offset(&mut records, wal_records);
                         } else {
                             debug!(
                                 "FETCH→WAL: No records found in WAL for {}-{} at offset {}",
@@ -1809,8 +1841,25 @@ impl FetchHandler {
         Ok((records, bytes_fetched, buffer_max_offset, buffer_min))
     }
 
-    /// Fetch records with proper priority: Buffer → WAL → Segments
+    /// Fetch records with proper priority: Buffer → WAL → Segments, cut to the
+    /// fetch's byte budget.
     async fn fetch_records(
+        &self,
+        topic: &str,
+        partition: i32,
+        fetch_offset: i64,
+        high_watermark: i64,
+        max_bytes: i32,
+    ) -> Result<Vec<chronik_storage::Record>> {
+        let mut records = self
+            .fetch_records_uncapped(topic, partition, fetch_offset, high_watermark, max_bytes)
+            .await?;
+        records.sort_by_key(|r| r.offset);
+        cap_to_byte_budget(&mut records, max_bytes);
+        Ok(records)
+    }
+
+    async fn fetch_records_uncapped(
         &self,
         topic: &str,
         partition: i32,
@@ -1851,8 +1900,11 @@ impl FetchHandler {
 
         // PHASE 3: Try downloading raw segments from S3 (Tier 2: warm storage - extracted helper)
         // This is the NEW v1.3.64 flow where sealed WAL segments are uploaded to S3
-        let need_earlier_records = records.is_empty() ||
-            (buffer_highest_offset >= 0 && fetch_offset < buffer_highest_offset);
+        // Colder tiers are needed when nothing was found, or when what was found
+        // starts above the fetch offset: that gap may be in the segment tier
+        // (see `fetch_raw_bytes`). Asking whenever the buffer merely reached
+        // higher sent nearly every fallback read to the archives.
+        let need_earlier_records = records.iter().map(|r| r.offset).min().map_or(true, |lowest| lowest > fetch_offset);
 
         if records.is_empty() || need_earlier_records {
             records = self.try_fetch_from_s3_phase(
@@ -1885,7 +1937,7 @@ impl FetchHandler {
 
         Ok(records)
     }
-    
+
     /// Fetch records from WAL manager
     ///
     /// NEW (v1.3.36): Handle WAL V2 CanonicalRecord format
@@ -1904,7 +1956,7 @@ impl FetchHandler {
         // Old limit (max_bytes / 100) caused consumer timeouts at ~75K messages
         let max_records = std::cmp::max(10000, max_bytes as usize / 10);
 
-        let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
+        let wal_records = wal_manager.read_from_bounded(topic, partition, fetch_offset, max_records, fetch_byte_budget(max_bytes)).await
             .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?;
 
         // Convert WalRecord to chronik_storage::Record
@@ -1960,47 +2012,13 @@ impl FetchHandler {
     ) -> Result<Vec<chronik_storage::Record>> {
         use chronik_storage::canonical_record::CanonicalRecord;
 
-        // Use metadata store to find segments instead of parsing filenames
-        debug!(
-            "METADATA→LIST: Looking for segments for {}-{}",
-            topic, partition
-        );
-
-        // List segments from metadata store
-        let all_segments = match self.metadata_store.list_segments(topic, Some(partition as u32)).await {
-            Ok(segs) => segs,
-            Err(e) => {
-                warn!("METADATA→LIST: Failed to list segments for {}-{}: {}", topic, partition, e);
-                return Ok(vec![]);
-            }
-        };
-
-        if all_segments.is_empty() {
-            debug!("METADATA→LIST: No segments found for {}-{}", topic, partition);
-            return Ok(vec![]);
-        }
-
-        debug!(
-            "METADATA→LIST: Found {} segment(s) for {}-{}",
-            all_segments.len(), topic, partition
-        );
-
-        // Find segments that overlap with [fetch_offset, high_watermark)
-        let mut matching_segments = Vec::new();
-        for seg_meta in all_segments {
-            let min_offset = seg_meta.start_offset;
-            let max_offset = seg_meta.end_offset;
-
-            // Check if this segment overlaps with [fetch_offset, high_watermark)
-            if max_offset >= fetch_offset && min_offset < high_watermark {
-                debug!(
-                    "METADATA→MATCH: Segment {} covers offsets {}-{}, overlaps with fetch range {}-{}",
-                    seg_meta.path, min_offset, max_offset, fetch_offset, high_watermark
-                );
-                matching_segments.push((seg_meta.path.clone(), min_offset, max_offset));
-            }
-        }
-
+        // Same lookup as the raw path: what this node's store holds, in offset order.
+        let matching_segments: Vec<(String, i64, i64)> = self
+            .get_segments_for_range(topic, partition, fetch_offset, high_watermark)
+            .await?
+            .into_iter()
+            .map(|s| (s.object_key, s.base_offset, s.last_offset))
+            .collect();
         if matching_segments.is_empty() {
             debug!(
                 "S3→NO_MATCH: No segments overlap with fetch range {}-{} for {}-{}",
@@ -2009,13 +2027,10 @@ impl FetchHandler {
             return Ok(vec![]);
         }
 
-        // Sort by min_offset to process in order
-        matching_segments.sort_by_key(|(_, min, _)| *min);
-
         let mut all_records = Vec::new();
         let mut bytes_fetched = 0usize;
 
-        for (object_key, segment_min, segment_max) in matching_segments {
+        'segments: for (object_key, segment_min, segment_max) in matching_segments {
             if bytes_fetched >= max_bytes as usize && !all_records.is_empty() {
                 break;
             }
@@ -2069,8 +2084,11 @@ impl FetchHandler {
                             + entry.key.as_ref().map(|k| k.len()).unwrap_or(0)
                             + 24; // Estimated overhead
 
+                        // The whole scan stops: breaking only this loop left
+                        // `bytes_fetched` just under the budget, so every remaining
+                        // segment to the high watermark was still downloaded.
                         if bytes_fetched + record_size > max_bytes as usize && !all_records.is_empty() {
-                            break;
+                            break 'segments;
                         }
 
                         let storage_record = chronik_storage::Record {
@@ -2122,7 +2140,7 @@ impl FetchHandler {
         let max_records = std::cmp::max(10000, max_bytes as usize / 10);
 
         let read_start = Instant::now();
-        let wal_records = wal_manager.read_from(topic, partition, fetch_offset, max_records).await
+        let wal_records = wal_manager.read_from_bounded(topic, partition, fetch_offset, max_records, fetch_byte_budget(max_bytes)).await
             .map_err(|e| Error::Internal(format!("WAL read failed: {}", e)))?;
         let read_took = read_start.elapsed();
         if read_took > Duration::from_millis(1) {
@@ -2341,23 +2359,54 @@ impl FetchHandler {
             topic, partition, fetch_offset, high_watermark
         );
 
-        // PHASE 1: Try buffer first (raw bytes already available - extracted helper)
-        if let Some(bytes) = self.try_fetch_raw_from_buffer(topic, partition, fetch_offset, high_watermark, max_bytes).await {
-            return Ok(Some(bytes));
+        // Tiers from hottest to coldest: buffer, WAL, segments, Tantivy. Each
+        // answers "records from `fetch_offset` on", so a tier that has lost the
+        // offset — the WAL after the indexer reclaims a segment, the buffer
+        // after a trim — answers with whatever it holds NEXT. Taking the first
+        // non-empty answer served that as if the offsets in between did not
+        // exist: asked for 6105, the leader returned 67954, and 61,849 records
+        // sitting in the segment tier were skipped by every consumer and
+        // follower.
+        //
+        // So an answer that starts above the offset only bounds the search:
+        // colder tiers are asked for the gap, [fetch_offset, its first base),
+        // and the earliest answer wins. Only when no tier holds the gap is it
+        // a genuine hole, stepped over as Kafka's consumers do.
+        let mut upper = high_watermark;
+        let mut later: Option<Vec<u8>> = None;
+        for tier in 0..4 {
+            let answer = match tier {
+                0 => self.try_fetch_raw_from_buffer(topic, partition, fetch_offset, upper, max_bytes).await,
+                // A partition can have no WAL left at all — reclaimed, or never
+                // re-created after its directory went — while its records sit in
+                // the segment tier. A WAL error is a miss for this tier, not the
+                // end of the read: propagating it failed every fetch of such a
+                // partition, so followers could never copy it. Live on
+                // Thunderbird: 10 partitions held by the leader's segments only.
+                1 => match self.try_fetch_raw_from_wal(topic, partition, fetch_offset, upper, max_bytes).await {
+                    Ok(answer) => answer,
+                    Err(e) => {
+                        tracing::debug!("RAW→WAL: {}-{} unreadable from WAL ({}), trying segments", topic, partition, e);
+                        None
+                    }
+                },
+                2 => self.try_fetch_raw_from_segments(topic, partition, fetch_offset, upper, max_bytes).await?,
+                _ => self.try_fetch_raw_from_tantivy(topic, partition, fetch_offset, upper, max_bytes).await?,
+            };
+            let Some(bytes) = answer else { continue };
+            match first_batch_base(&bytes) {
+                Some(base) if base > fetch_offset => {
+                    tracing::debug!(
+                        "RAW tier {} for {}-{} starts at {} above fetch offset {} — asking colder tiers for the gap",
+                        tier, topic, partition, base, fetch_offset
+                    );
+                    upper = base;
+                    later = Some(bytes);
+                }
+                _ => return Ok(Some(bytes)),
+            }
         }
-
-        // PHASE 2: Try WAL (extracted helper)
-        if let Some(bytes) = self.try_fetch_raw_from_wal(topic, partition, fetch_offset, high_watermark, max_bytes).await? {
-            return Ok(Some(bytes));
-        }
-
-        // PHASE 3: Try segments (extracted helper)
-        if let Some(bytes) = self.try_fetch_raw_from_segments(topic, partition, fetch_offset, high_watermark, max_bytes).await? {
-            return Ok(Some(bytes));
-        }
-
-        // PHASE 4: Try Tantivy segments (extracted helper)
-        self.try_fetch_raw_from_tantivy(topic, partition, fetch_offset, high_watermark, max_bytes).await
+        Ok(later)
     }
 
     /// Fetch records from Tantivy archives (cold storage) - for consumption
@@ -2368,7 +2417,7 @@ impl FetchHandler {
         partition: i32,
         fetch_offset: i64,
         high_watermark: i64,
-        _max_bytes: i32,
+        max_bytes: i32,
     ) -> Result<Vec<chronik_storage::Record>> {
         let segment_index = match &self.segment_index {
             Some(idx) => idx,
@@ -2376,12 +2425,17 @@ impl FetchHandler {
         };
 
         // Query segment index for matching Tantivy segments
-        let tantivy_segments = segment_index.find_segments_by_offset_range(
+        let mut tantivy_segments = segment_index.find_segments_by_offset_range(
             topic,
             partition,
             fetch_offset,
             high_watermark,
         ).await?;
+        // In offset order, so the byte budget below keeps the records nearest
+        // the fetch offset and the rest are never downloaded.
+        tantivy_segments.sort_by_key(|s| s.min_offset);
+        let budget = fetch_byte_budget(max_bytes);
+        let mut gathered = 0usize;
 
         if tantivy_segments.is_empty() {
             debug!("No Tantivy segments found for {}-{} range {}-{}",
@@ -2398,6 +2452,9 @@ impl FetchHandler {
         let mut all_entries = Vec::new();
 
         for segment_metadata in tantivy_segments {
+            if gathered >= budget && !all_entries.is_empty() {
+                break;
+            }
             // Download segment from object store
             let segment_data = match self.object_store.get(&segment_metadata.object_store_path).await {
                 Ok(data) => data,
@@ -2439,6 +2496,7 @@ impl FetchHandler {
                 entries.len(), segment_metadata.segment_id
             );
 
+            gathered += entries.iter().map(|e| e.value.as_ref().map_or(0, |v| v.len()) + e.key.as_ref().map_or(0, |k| k.len())).sum::<usize>();
             all_entries.extend(entries);
         }
 
@@ -2587,73 +2645,61 @@ impl FetchHandler {
         start_offset: i64,
         end_offset: i64,
     ) -> Result<Vec<SegmentInfo>> {
-        tracing::debug!(
-            "get_segments_for_range - topic: {}, partition: {}, range: {}-{}",
-            topic, partition, start_offset, end_offset
-        );
-        // Check cache first
-        {
-            let state = self.state.read().await;
-            if let Some(cached) = state.segment_cache.get(&(topic.to_string(), partition)) {
-                let relevant: Vec<_> = cached.iter()
-                    .filter(|s| s.last_offset >= start_offset && s.base_offset < end_offset)
-                    .cloned()
-                    .collect();
-                
-                if !relevant.is_empty() {
-                    return Ok(relevant);
-                }
+        // What THIS node's object store holds. The indexer writes raw segments
+        // as `segments/<topic>/<partition>/<min>-<max>.segment`, so the key is
+        // the index.
+        //
+        // This used to ask the metadata catalog, which the indexer writes only
+        // on the metadata leader ("followers don't own __chronik_metadata"):
+        // a partition led by any other node had its archived segments
+        // registered nowhere, and the tier answered "no segments" for records
+        // sitting in its own store. On a local cluster, 1,599 archived segments
+        // were unreachable through Fetch. The catalog is still consulted when
+        // the store lists nothing, for stores that cannot list.
+        let prefix = format!("segments/{}/{}/", topic, partition);
+        let mut infos: Vec<SegmentInfo> = match self.object_store.list(&prefix).await {
+            Ok(objects) => objects
+                .into_iter()
+                .filter_map(|o| {
+                    let name = o.key.rsplit('/').next()?.strip_suffix(".segment")?;
+                    let (lo, hi) = name.split_once('-')?;
+                    let (base, last) = (lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?);
+                    Some(SegmentInfo {
+                        segment_id: name.to_string(),
+                        base_offset: base,
+                        last_offset: last,
+                        object_key: o.key,
+                    })
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!("SEGMENT→LIST: cannot list {}: {}", prefix, e);
+                Vec::new()
             }
+        };
+
+        if infos.is_empty() {
+            infos = self
+                .metadata_store
+                .list_segments(topic, Some(partition as u32))
+                .await?
+                .into_iter()
+                .map(|s| SegmentInfo {
+                    segment_id: s.segment_id,
+                    base_offset: s.start_offset,
+                    last_offset: s.end_offset,
+                    object_key: s.path,
+                })
+                .collect();
         }
-        
-        // Query metadata store
-        tracing::debug!("SEGMENT→QUERY: Requesting segments from metadata store for {}-{}", topic, partition);
-        let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
-        
+
+        infos.retain(|s| s.last_offset >= start_offset && s.base_offset < end_offset);
+        infos.sort_by_key(|s| s.base_offset);
         tracing::debug!(
-            "SEGMENT→QUERY: Retrieved {} total segments from metadata store for {}-{}",
-            segments.len(), topic, partition
+            "get_segments_for_range {}-{} [{}, {}): {} segments",
+            topic, partition, start_offset, end_offset, infos.len()
         );
-        
-        for seg in &segments {
-            tracing::debug!(
-                "  Segment {}: offsets {}-{}, path: {}",
-                seg.segment_id, seg.start_offset, seg.end_offset, seg.path
-            );
-        }
-        
-        let segment_infos: Vec<_> = segments.into_iter()
-            .filter(|s| {
-                // A segment is relevant if it overlaps with our range
-                let overlaps = s.end_offset >= start_offset && s.start_offset < end_offset;
-                if overlaps {
-                    tracing::debug!(
-                        "  Including segment {} (offsets {}-{}) for range {}-{}",
-                        s.segment_id, s.start_offset, s.end_offset, start_offset, end_offset
-                    );
-                }
-                overlaps
-            })
-            .map(|s| SegmentInfo {
-                segment_id: s.segment_id,
-                base_offset: s.start_offset,
-                last_offset: s.end_offset,
-                object_key: s.path,
-            })
-            .collect();
-        
-        tracing::debug!(
-            "Filtered to {} segments for offset range {}-{}",
-            segment_infos.len(), start_offset, end_offset
-        );
-        
-        // Update cache
-        {
-            let mut state = self.state.write().await;
-            state.segment_cache.insert((topic.to_string(), partition), segment_infos.clone());
-        }
-        
-        Ok(segment_infos)
+        Ok(infos)
     }
     
     /// Fetch records from a specific segment
@@ -3152,7 +3198,6 @@ impl FetchHandler {
     pub async fn clear_topic_buffers(&self, topic: &str) -> Result<()> {
         let mut state = self.state.write().await;
         state.buffers.retain(|(t, _), _| t != topic);
-        state.segment_cache.retain(|(t, _), _| t != topic);
         Ok(())
     }
     
@@ -3273,6 +3318,65 @@ impl FetchHandler {
 /// serving path produced it. The batch content is left byte-identical; only the CRC
 /// field (bytes 17-20 of each batch, little-endian) is (re)written. Non-v2 or partial
 /// trailing bytes are left untouched.
+/// The byte budget a partition fetch may read from the WAL.
+///
+/// Kafka's `partition_max_bytes`: the first batch is returned whatever its
+/// size (the WAL read guarantees that), so a non-positive value still makes
+/// progress one batch at a time.
+fn fetch_byte_budget(max_bytes: i32) -> usize {
+    max_bytes.max(1) as usize
+}
+
+/// Base offset of the first record batch in raw fetch bytes (big-endian i64
+/// at the start of a v2 batch), if there is a whole header.
+fn first_batch_base(bytes: &[u8]) -> Option<i64> {
+    let head: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    Some(i64::from_be_bytes(head))
+}
+
+/// Add `incoming` to `records`, skipping offsets already present, and leave
+/// the result ordered by offset.
+///
+/// Each storage tier's records used to be merged with a linear search of the
+/// existing ones per record. The archive tiers return everything from the
+/// fetch offset to the high watermark, so on a 1.8M-record partition that was
+/// ~10^11 comparisons — in a loop with no await, which the fetch's 30-second
+/// timeout cannot interrupt. Measured live on signal-stream v2.16.8: one tokio
+/// worker at 100% in this loop for as long as followers kept fetching, every
+/// follower fetch of the partition timing out, consumers reading nothing.
+fn merge_by_offset(records: &mut Vec<chronik_storage::Record>, incoming: Vec<chronik_storage::Record>) {
+    let mut held: std::collections::HashSet<i64> = records.iter().map(|r| r.offset).collect();
+    records.extend(incoming.into_iter().filter(|r| held.insert(r.offset)));
+    records.sort_by_key(|r| r.offset);
+}
+
+/// Cut offset-ordered `records` to roughly `max_bytes` of payload — the first
+/// record always, so a fetch makes progress whatever the budget.
+///
+/// The archive tiers read to the high watermark; without this the whole
+/// remainder of the partition was encoded into one response.
+fn cap_to_byte_budget(records: &mut Vec<chronik_storage::Record>, max_bytes: i32) {
+    let budget = fetch_byte_budget(max_bytes);
+    let mut used = 0usize;
+    let mut keep = records.len();
+    for (i, r) in records.iter().enumerate() {
+        let size = r.value.len()
+            + r.key.as_ref().map_or(0, |k| k.len())
+            + r.headers.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+            + RECORD_OVERHEAD_BYTES;
+        if i > 0 && used + size > budget {
+            keep = i;
+            break;
+        }
+        used += size;
+    }
+    records.truncate(keep);
+}
+
+/// Per-record framing in a v2 batch (length, attributes, deltas, counts) —
+/// an estimate; the budget is approximate, as Kafka's own is per batch.
+const RECORD_OVERHEAD_BYTES: usize = 16;
+
 /// Does this response carry anything at all?
 ///
 /// The question a fetch's wait is really asking: Kafka holds a request open
@@ -3545,5 +3649,63 @@ mod fetch_wait_budget_tests {
             started.elapsed() < Duration::from_millis(150),
             "max_wait_ms=0 must not block"
         );
+    }
+}
+#[cfg(test)]
+mod tier_merge_tests {
+    use super::{cap_to_byte_budget, merge_by_offset, RECORD_OVERHEAD_BYTES};
+    use chronik_storage::Record;
+    use std::time::{Duration, Instant};
+
+    fn rec(offset: i64, value_len: usize) -> Record {
+        Record {
+            offset,
+            timestamp: 0,
+            key: None,
+            value: vec![0u8; value_len],
+            headers: Default::default(),
+        }
+    }
+
+    fn offsets(records: &[Record]) -> Vec<i64> {
+        records.iter().map(|r| r.offset).collect()
+    }
+
+    #[test]
+    fn merging_keeps_one_copy_of_each_offset_in_order() {
+        let mut held = vec![rec(5, 1), rec(1, 1)];
+        merge_by_offset(&mut held, vec![rec(3, 1), rec(5, 1), rec(1, 1), rec(9, 1), rec(3, 1)]);
+        assert_eq!(offsets(&held), vec![1, 3, 5, 9]);
+    }
+
+    /// The archive tiers hand over everything to the high watermark. Merging
+    /// 300,000 records into 300,000 used to be ~10^11 comparisons with no
+    /// await; it must now be a fraction of a second.
+    #[test]
+    fn merging_a_whole_partition_is_not_quadratic() {
+        let mut held: Vec<Record> = (0..300_000).map(|o| rec(o, 0)).collect();
+        let incoming: Vec<Record> = (150_000..450_000).map(|o| rec(o, 0)).collect();
+        let started = Instant::now();
+        merge_by_offset(&mut held, incoming);
+        assert_eq!(held.len(), 450_000);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "merge took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_cuts_a_merged_result() {
+        let mut records: Vec<Record> = (0..100).map(|o| rec(o, 100)).collect();
+        cap_to_byte_budget(&mut records, (3 * (100 + RECORD_OVERHEAD_BYTES)) as i32);
+        assert_eq!(offsets(&records), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_record_larger_than_the_budget_is_still_returned() {
+        let mut records = vec![rec(0, 10_000), rec(1, 10)];
+        cap_to_byte_budget(&mut records, 1);
+        assert_eq!(offsets(&records), vec![0]);
     }
 }

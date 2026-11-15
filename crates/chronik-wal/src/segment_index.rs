@@ -19,7 +19,7 @@
 
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::debug;
@@ -178,6 +178,9 @@ struct SegmentMarks {
     /// Highest `last_offset` of any record in the file — the maximum, not the
     /// last record's, because batches are not always stored in offset order.
     max_last_offset: Option<i64>,
+    /// Lowest `base_offset` of any record in the file, so a search for batches
+    /// below some offset can skip files that cannot hold one.
+    min_base_offset: Option<i64>,
     /// (highest `last_offset` of every record BEFORE this position, byte
     /// position of a record's first byte), roughly one per `MARK_INTERVAL`.
     ///
@@ -197,6 +200,7 @@ impl SegmentMarks {
             path,
             indexed_len: 0,
             max_last_offset: None,
+            min_base_offset: None,
             marks: Vec::new(),
         }
     }
@@ -204,18 +208,21 @@ impl SegmentMarks {
     fn reset(&mut self) {
         self.indexed_len = 0;
         self.max_last_offset = None;
+        self.min_base_offset = None;
         self.marks.clear();
     }
 
     /// Read whatever has been appended since the last refresh and extend the
     /// marks over it. A file that shrank is rescanned from the start, which is
     /// what makes a truncation safe without any signal from the writer.
-    async fn refresh(&mut self) -> Result<()> {
-        let len = match tokio::fs::metadata(&self.path).await {
-            Ok(m) => m.len(),
+    ///
+    /// `len` is the file's current length, `None` if it no longer exists.
+    async fn refresh(&mut self, len: Option<u64>) -> Result<()> {
+        let len = match len {
+            Some(len) => len,
             // Rotation and reclamation both delete files; a segment that has
             // gone simply has nothing to contribute.
-            Err(_) => {
+            None => {
                 self.reset();
                 return Ok(());
             }
@@ -252,6 +259,9 @@ impl SegmentMarks {
                     self.max_last_offset = Some(
                         self.max_last_offset.map_or(layout.last_offset, |m| m.max(layout.last_offset)),
                     );
+                    self.min_base_offset = Some(
+                        self.min_base_offset.map_or(layout.base_offset, |m| m.min(layout.base_offset)),
+                    );
                     cursor += layout.total_len;
                 }
                 // Stop at the first incomplete or torn record and leave
@@ -280,6 +290,20 @@ impl SegmentMarks {
     }
 }
 
+/// Every segment file of `partition` in `dir`: (segment id, path, current
+/// length, or `None` if it vanished between listing and stat). Blocking.
+fn list_segments(dir: &Path, partition: i32) -> std::io::Result<Vec<(u64, PathBuf, Option<u64>)>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if let Some(id) = PartitionIndex::segment_id(&path, partition) {
+            let len = std::fs::metadata(&path).ok().map(|m| m.len());
+            found.push((id, path, len));
+        }
+    }
+    Ok(found)
+}
+
 /// The sparse index for one partition's segments.
 pub struct PartitionIndex {
     dir: PathBuf,
@@ -306,31 +330,30 @@ impl PartitionIndex {
     }
 
     /// Bring the index up to date with what is on disk.
+    ///
+    /// The listing and every segment's length are taken in one blocking task.
+    /// Asking tokio for each length separately is a thread-pool round trip
+    /// per file on every read: a signal-stream partition of 14,179 segments
+    /// spent ~170ms per fetch here before reading a single record.
     async fn refresh(&mut self) -> Result<()> {
-        let mut entries = match tokio::fs::read_dir(&self.dir).await {
-            Ok(e) => e,
-            Err(_) => {
-                return Err(WalError::SegmentNotFound(format!(
-                    "{:?}/{}",
-                    self.dir, self.partition
-                )))
-            }
-        };
+        let dir = self.dir.clone();
+        let partition = self.partition;
+        let listing = tokio::task::spawn_blocking(move || list_segments(&dir, partition))
+            .await
+            .map_err(|e| WalError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|_| {
+                WalError::SegmentNotFound(format!("{:?}/{}", self.dir, self.partition))
+            })?;
 
-        let mut seen = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if let Some(id) = Self::segment_id(&path, self.partition) {
-                seen.push(id);
-                self.segments
-                    .entry(id)
-                    .or_insert_with(|| SegmentMarks::new(path));
-            }
-        }
+        let seen: HashSet<u64> = listing.iter().map(|(id, _, _)| *id).collect();
         self.segments.retain(|id, _| seen.contains(id));
 
-        for marks in self.segments.values_mut() {
-            marks.refresh().await?;
+        for (id, path, len) in listing {
+            self.segments
+                .entry(id)
+                .or_insert_with(|| SegmentMarks::new(path))
+                .refresh(len)
+                .await?;
         }
         Ok(())
     }
@@ -341,6 +364,27 @@ impl PartitionIndex {
     /// `max_records` counts Kafka messages, not WAL batches, matching the
     /// contract `read_from` has always had.
     pub async fn read_from(&mut self, offset: i64, max_records: usize) -> Result<Vec<WalRecord>> {
+        self.read_from_bounded(offset, max_records, usize::MAX).await
+    }
+
+    /// [`read_from`](Self::read_from), stopping once `max_bytes` of records
+    /// have been gathered — Kafka's fetch contract: the first batch is always
+    /// returned whatever its size, so an oversized batch cannot stall a
+    /// reader, and nothing after it that would cross the budget.
+    ///
+    /// A message count alone is no bound on work. A replica fetch asks for
+    /// 10MB, which the fetch path turned into a million messages; on a
+    /// partition of ~4.5KB trace records that is 967MB per read, read,
+    /// decoded and concatenated before the response was cut. On a busy leader
+    /// that ran past the 30-second fetch deadline every time, so a follower
+    /// rebuilding from offset 0 never got past its first response — measured
+    /// on signal-stream, v2.16.8.
+    pub async fn read_from_bounded(
+        &mut self,
+        offset: i64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<WalRecord>> {
         self.refresh().await?;
 
         // Batches are not always stored in offset order (see `SegmentMarks::
@@ -354,7 +398,14 @@ impl PartitionIndex {
         // only a contiguous run. A batch stored further away than the slack is
         // found by the next fetch, which asks for exactly the offset it starts
         // at — nothing is skipped, at worst a fetch returns less.
-        let window = max_records.saturating_mul(2).max(max_records.saturating_add(READ_SLACK_MESSAGES));
+        let window = Budget {
+            messages: max_records
+                .saturating_mul(2)
+                .max(max_records.saturating_add(READ_SLACK_MESSAGES)),
+            bytes: max_bytes
+                .saturating_mul(2)
+                .max(max_bytes.saturating_add(READ_SLACK_BYTES)),
+        };
         let mut out = Vec::new();
         let truncated = self.collect(offset, window, |_| true, &mut out).await?;
         out.sort_by_key(|r| r.get_base_offset());
@@ -365,25 +416,46 @@ impl PartitionIndex {
         let first_base = out.first().map(|r| r.get_base_offset()).unwrap_or(i64::MAX);
         if truncated && first_base > offset {
             let mut earlier = Vec::new();
-            self.collect(offset, usize::MAX, |l| l.base_offset < first_base, &mut earlier).await?;
+            // Bounded by segment: only files holding a batch that starts below
+            // `first_base` are read. Unbounded, this scanned the whole rest of
+            // the log on every fetch that landed in a gap — 4.2s per fetch on a
+            // 1.4GB partition once reclaimed WAL left gaps the segment tier fills.
+            self.collect_below(offset, first_base, &mut earlier).await?;
             out.extend(earlier);
             out.sort_by_key(|r| r.get_base_offset());
         }
 
-        Ok(contiguous_run(out, max_records))
+        Ok(contiguous_run(out, max_records, max_bytes))
+    }
+
+    /// Records with `last_offset >= offset` and `base_offset < below`, reading
+    /// only segments that hold such a batch.
+    async fn collect_below(&self, offset: i64, below: i64, out: &mut Vec<WalRecord>) -> Result<()> {
+        let mut spent = Spent::default();
+        let plan: Vec<(PathBuf, u64)> = self
+            .segments
+            .values()
+            .filter(|marks| marks.min_base_offset.is_some_and(|m| m < below))
+            .filter_map(|marks| marks.seek_to(offset).map(|pos| (marks.path.clone(), pos)))
+            .collect();
+        for (path, start) in plan {
+            self.read_segment_from(&path, start, offset, &Budget::UNBOUNDED, |l| l.base_offset < below, &mut spent, out)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Records with `last_offset >= offset` that `accept` keeps, from every
-    /// segment that can hold them, until `limit` messages. Returns whether the
+    /// segment that can hold them, until `limit` is spent. Returns whether the
     /// limit cut the scan short.
     async fn collect(
         &self,
         offset: i64,
-        limit: usize,
+        limit: Budget,
         accept: impl Fn(&RecordLayout) -> bool + Copy,
         out: &mut Vec<WalRecord>,
     ) -> Result<bool> {
-        let mut messages = 0usize;
+        let mut spent = Spent::default();
         // BTreeMap iterates by segment id, which is log order.
         let plan: Vec<(PathBuf, u64)> = self
             .segments
@@ -392,13 +464,13 @@ impl PartitionIndex {
             .collect();
 
         for (path, start) in plan {
-            if messages >= limit {
+            if spent.reached(&limit) {
                 return Ok(true);
             }
-            self.read_segment_from(&path, start, offset, limit, accept, &mut messages, out)
+            self.read_segment_from(&path, start, offset, &limit, accept, &mut spent, out)
                 .await?;
         }
-        Ok(messages >= limit)
+        Ok(spent.reached(&limit))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -407,9 +479,9 @@ impl PartitionIndex {
         path: &Path,
         start: u64,
         offset: i64,
-        max_records: usize,
+        limit: &Budget,
         accept: impl Fn(&RecordLayout) -> bool,
-        messages: &mut usize,
+        spent: &mut Spent,
         out: &mut Vec<WalRecord>,
     ) -> Result<()> {
         let mut file = match tokio::fs::File::open(path).await {
@@ -432,14 +504,15 @@ impl PartitionIndex {
             loop {
                 match parse_record(&buf[cursor..]) {
                     Parsed::Record(layout) => {
-                        if layout.last_offset >= offset && *messages < max_records && accept(&layout) {
+                        if layout.last_offset >= offset && !spent.reached(limit) && accept(&layout) {
                             if let Some(record) = layout.to_record(&buf[cursor..]) {
-                                *messages += layout.record_count.max(1) as usize;
+                                spent.messages += layout.record_count.max(1) as usize;
+                                spent.bytes += layout.total_len;
                                 out.push(record);
                             }
                         }
                         cursor += layout.total_len;
-                        if *messages >= max_records {
+                        if spent.reached(limit) {
                             stop = true;
                             break;
                         }
@@ -466,8 +539,39 @@ impl PartitionIndex {
 /// order can still be returned in order.
 const READ_SLACK_MESSAGES: usize = 1000;
 
+/// The same slack, for the byte budget.
+const READ_SLACK_BYTES: usize = 1024 * 1024;
+
+/// How much a scan may gather before it stops.
+#[derive(Clone, Copy)]
+struct Budget {
+    messages: usize,
+    bytes: usize,
+}
+
+impl Budget {
+    const UNBOUNDED: Budget = Budget {
+        messages: usize::MAX,
+        bytes: usize::MAX,
+    };
+}
+
+/// What a scan has gathered so far.
+#[derive(Default)]
+struct Spent {
+    messages: usize,
+    bytes: usize,
+}
+
+impl Spent {
+    fn reached(&self, limit: &Budget) -> bool {
+        self.messages >= limit.messages || self.bytes >= limit.bytes
+    }
+}
+
 /// From batches sorted by base offset, the longest run without a gap, up to
-/// `max_records` messages.
+/// `max_records` messages and `max_bytes` bytes — the first batch always, so a
+/// batch larger than the budget is still delivered.
 ///
 /// A batch wholly covered by what is already in the run is a second copy of
 /// those offsets (they exist on disk from before v2.16.1) and is dropped; the
@@ -475,10 +579,11 @@ const READ_SLACK_MESSAGES: usize = 1000;
 /// for the gap's first offset, and finds the batch if it exists. The run may
 /// begin above the requested offset: that is a genuine hole, and consumers
 /// step over it as Kafka's do.
-fn contiguous_run(sorted: Vec<WalRecord>, max_records: usize) -> Vec<WalRecord> {
+fn contiguous_run(sorted: Vec<WalRecord>, max_records: usize, max_bytes: usize) -> Vec<WalRecord> {
     let mut run = Vec::new();
     let mut next: Option<i64> = None;
     let mut messages = 0usize;
+    let mut bytes = 0usize;
     for record in sorted {
         let (base, last) = (record.get_base_offset(), record.get_last_offset());
         if let Some(n) = next {
@@ -489,6 +594,11 @@ fn contiguous_run(sorted: Vec<WalRecord>, max_records: usize) -> Vec<WalRecord> 
                 break;
             }
         }
+        let size = record.heap_size();
+        if !run.is_empty() && bytes.saturating_add(size) > max_bytes {
+            break;
+        }
+        bytes += size;
         next = Some(last + 1);
         messages += record.get_record_count().max(1) as usize;
         run.push(record);
@@ -748,6 +858,73 @@ mod tests {
         while next < 1000 {
             let got = index.read_from(next, 12).await.unwrap();
             assert!(!got.is_empty(), "stalled at {next}");
+            for r in &got {
+                seen.push(r.get_base_offset());
+                next = r.get_last_offset() + 1;
+            }
+        }
+        assert_eq!(seen, (0..200).map(|b| b * 5).collect::<Vec<_>>());
+    }
+
+    /// What `contiguous_run` charges for one batch written by `write_segment`.
+    fn batch_cost() -> usize {
+        WalRecord::from_bytes(&record_bytes("t", 0, 0, 0, 256))
+            .unwrap()
+            .heap_size()
+    }
+
+    #[tokio::test]
+    async fn a_byte_budget_stops_the_read_however_many_messages_are_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let batches: Vec<(i64, i64)> = (0..100).map(|b| (b * 10, b * 10 + 9)).collect();
+        write_segment(dir.path(), 0, 0, &batches).await;
+
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        let got = index
+            .read_from_bounded(0, usize::MAX, batch_cost() * 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![0, 10, 20],
+            "three batches fit the budget; a message limit that allows everything must not override it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_larger_than_the_budget_is_still_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 0, 0, &[(0, 9), (10, 19)]).await;
+
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        let got = index.read_from_bounded(0, usize::MAX, 1).await.unwrap();
+        assert_eq!(
+            got.iter().map(|r| r.get_base_offset()).collect::<Vec<_>>(),
+            vec![0],
+            "the first batch always, or a reader with a small budget never moves"
+        );
+    }
+
+    #[tokio::test]
+    async fn successive_bounded_reads_cover_every_offset_once_across_many_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in 0..50u64 {
+            let first = id as i64 * 20;
+            let mut batches = vec![(first, first + 4), (first + 5, first + 9), (first + 10, first + 14), (first + 15, first + 19)];
+            batches.swap(1, 2); // stored out of order, as pre-v2.16.1 logs are
+            write_segment(dir.path(), 0, id, &batches).await;
+        }
+
+        let mut index = PartitionIndex::new(dir.path().to_path_buf(), 0);
+        let mut next = 0i64;
+        let mut seen = Vec::new();
+        while next < 1000 {
+            let got = index
+                .read_from_bounded(next, usize::MAX, batch_cost() * 7)
+                .await
+                .unwrap();
+            assert!(!got.is_empty(), "stalled at {next}");
+            assert!(got.len() <= 7, "read {} batches against a budget of 7", got.len());
             for r in &got {
                 seen.push(r.get_base_offset());
                 next = r.get_last_offset() + 1;
