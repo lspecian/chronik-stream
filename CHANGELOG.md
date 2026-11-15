@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.7] - 2026-11-15
+
 ### Fixed
+
+- **CI failed on every PR since v2.16.6, on the runner rather than the code.**
+  `ubuntu-latest` moved to CMake 4, which refuses the librdkafka 2.3.0 bundled
+  by `rdkafka-sys`. `CMAKE_POLICY_VERSION_MINIMUM=3.5` is now set for CI.
 
 - **Admin tools saw a one-broker cluster.** `DescribeCluster` returned only
   the broker that answered, while `Metadata` listed all of them. Tools that
