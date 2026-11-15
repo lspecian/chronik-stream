@@ -241,7 +241,8 @@ fn event_changes_plan(event: &crate::metadata_events::MetadataEvent) -> bool {
         | TopicCreated { .. }
         | TopicDeleted { .. }
         | BrokerRegistered { .. } => true,
-        HighWatermarkUpdated { .. } | ISRUpdated { .. } => false,
+        HighWatermarkUpdated { .. } | ISRUpdated { .. } | SecurityChanged { .. } => false,
+| ISRUpdated { .. } => false,
     }
 }
 
@@ -664,7 +665,7 @@ impl ReplicaFetcher {
         addr: String,
         partitions: Vec<FollowedPartition>,
     ) {
-        let mut connection = LeaderConnection::new(addr);
+        let mut connection = LeaderConnection::for_replication(addr);
 
         // Reconcile before the first fetch. This task exists because the
         // supervisor saw an assignment change, which includes a leader change —

@@ -157,6 +157,10 @@ impl IsrPublisher {
     ) -> chronik_common::Result<()> {
         let topics = self.metadata_store.list_topics().await?;
 
+        // Partitions led this pass. Feeds the tracker's leadership clock, which
+        // is what lets a follower that never fetches fall out of the set.
+        let mut led: std::collections::HashSet<(String, i32)> = std::collections::HashSet::new();
+
         for topic in topics {
             // Internal topics are not replicated through this path.
             if topic.name.starts_with("__") {
@@ -183,6 +187,9 @@ impl IsrPublisher {
                 }
 
                 let partition = assignment.partition as i32;
+                self.isr_tracker.note_leading(&topic.name, partition);
+                led.insert((topic.name.clone(), partition));
+
                 let leader_offset = self
                     .produce_handler
                     .get_high_watermark(&topic.name, partition)
@@ -229,6 +236,11 @@ impl IsrPublisher {
                 }
             }
         }
+
+        // A partition skipped this pass (moved away, or its assignments could
+        // not be read) restarts its grace period when next led. Erring that way
+        // only delays a shrink; keeping a stale clock could shrink too early.
+        self.isr_tracker.retain_leading(&led);
 
         Ok(())
     }

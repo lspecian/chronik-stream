@@ -198,8 +198,51 @@ stringData:
 | `raftPort` | `5001` | Raft consensus port |
 | `antiAffinity` | `preferred` | Pod anti-affinity (`preferred` or `required`) |
 | `adminApiKeySecret` | none | Secret containing admin API key |
+| `interBrokerSecret` | generated | Secret key holding the broker-to-broker SASL secret (see below) |
 | `updateStrategy.maxUnavailable` | `1` | Max nodes unavailable during rolling update |
 | `autoRecover` | `true` | Enable automatic quorum recovery |
+
+### SASL Clusters
+
+SASL is turned on through `env`, as on a bare broker:
+
+```yaml
+spec:
+  env:
+    - name: CHRONIK_SASL_ENABLED
+      value: "required"          # or true / 1 / yes / optional
+    - name: CHRONIK_SASL_USERS
+      valueFromSecret:
+        name: chronik-sasl-users
+        key: users
+```
+
+With SASL required, a cluster broker refuses to start unless
+`CHRONIK_INTER_BROKER_SECRET` is set to the same value (16+ characters) on every
+broker: replica fetchers log in to the partition leader with it, as the reserved
+user `__chronik_broker`. The operator handles this with no manual step:
+
+- When `CHRONIK_SASL_ENABLED` enables SASL (`required`/`true`/`1`/`yes`, or
+  `optional`/`warn`; trimmed, case-insensitive) and `interBrokerSecret` is unset,
+  it creates the Secret `<cluster>-inter-broker` (key `secret`, 48 random
+  alphanumeric characters), owned by the ChronikCluster, and injects it into
+  every broker by `secretKeyRef`. The Secret is created once and **never
+  regenerated** — every broker must hold the same value, so a rotation would split
+  a running cluster. To rotate deliberately, delete the Secret and restart every
+  broker together.
+- Set `interBrokerSecret: {name, key}` to supply your own Secret instead.
+- If you set `CHRONIK_INTER_BROKER_SECRET` in `env` yourself, the operator leaves
+  it alone.
+- With SASL disabled nothing is injected, even if `interBrokerSecret` is set: a
+  broker with SASL off cannot accept the broker login, so the secret would break
+  replication.
+- If `CHRONIK_SASL_ENABLED` itself comes from a Secret (`valueFromSecret`), the
+  operator cannot see the mode, so it generates nothing — set `interBrokerSecret`.
+
+`ChronikStandalone` needs none of this: a single node has no replica fetchers.
+
+Turning SASL on changes `env`, so it rolls the cluster's brokers like any other
+`env` edit.
 
 ### How Config Generation Works
 

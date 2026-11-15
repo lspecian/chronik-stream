@@ -330,6 +330,117 @@ impl ScramExchange {
     }
 }
 
+/// The client half of SCRAM, used by a broker that authenticates to another
+/// broker (the replica fetcher, as `__chronik_broker`).
+///
+/// It verifies the server's signature as well as proving its own identity.
+/// That second check is what makes SCRAM mutual: a follower that skipped it
+/// would replicate from anything that answered on the leader's address,
+/// because a server that does not know the password can still say "OK".
+pub struct ScramClient {
+    mechanism: SaslMechanism,
+    password: String,
+    client_first_bare: String,
+    client_nonce: String,
+    /// Set once `client-final` is built; checked against `server-final`.
+    expected_server_signature: Option<Vec<u8>>,
+}
+
+impl ScramClient {
+    pub fn new(mechanism: SaslMechanism, username: &str, password: &str) -> Self {
+        let client_nonce = generate_nonce();
+        let client_first_bare = format!("n={},r={}", saslprep_encode(username), client_nonce);
+        Self {
+            mechanism,
+            password: password.to_string(),
+            client_first_bare,
+            client_nonce,
+            expected_server_signature: None,
+        }
+    }
+
+    /// `client-first`: GS2 header (no channel binding) plus the bare message.
+    pub fn client_first(&self) -> Vec<u8> {
+        format!("n,,{}", self.client_first_bare).into_bytes()
+    }
+
+    /// Consume `server-first` and produce `client-final`.
+    pub fn client_final(&mut self, server_first: &[u8]) -> Result<Vec<u8>, SaslError> {
+        let server_first = std::str::from_utf8(server_first)
+            .map_err(|_| SaslError::ProtocolError("server-first is not valid UTF-8".into()))?;
+
+        let nonce = attribute(server_first, 'r')
+            .ok_or_else(|| SaslError::ProtocolError("server-first has no nonce".into()))?;
+        // The server must extend OUR nonce with its own. One that does not is
+        // replaying an old exchange or is not talking to us.
+        if !nonce.starts_with(&self.client_nonce) || nonce.len() <= self.client_nonce.len() {
+            return Err(SaslError::ProtocolError(
+                "server-first nonce does not extend the client nonce".into(),
+            ));
+        }
+        let salt = attribute(server_first, 's')
+            .and_then(|s| b64().decode(s.as_bytes()).ok())
+            .ok_or_else(|| SaslError::ProtocolError("server-first has no valid salt".into()))?;
+        let iterations: u32 = attribute(server_first, 'i')
+            .and_then(|i| i.parse().ok())
+            .ok_or_else(|| SaslError::ProtocolError("server-first has no iteration count".into()))?;
+        // A server asking for fewer iterations is asking for a cheaper-to-crack
+        // proof; refuse rather than comply.
+        if iterations < MIN_ITERATIONS {
+            return Err(SaslError::ProtocolError(format!(
+                "server asked for {} iterations, below the minimum of {}",
+                iterations, MIN_ITERATIONS
+            )));
+        }
+
+        let salted = hi(self.password.as_bytes(), &salt, iterations, self.mechanism)?;
+        let client_key = hmac(&salted, CLIENT_KEY_LABEL, self.mechanism)?;
+        let stored_key = hash(&client_key, self.mechanism);
+        let server_key = hmac(&salted, SERVER_KEY_LABEL, self.mechanism)?;
+
+        let without_proof = format!("c=biws,r={}", nonce);
+        let auth_message = format!(
+            "{},{},{}",
+            self.client_first_bare, server_first, without_proof
+        );
+        let client_signature = hmac(&stored_key, auth_message.as_bytes(), self.mechanism)?;
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_signature.iter())
+            .map(|(k, s)| k ^ s)
+            .collect();
+
+        self.expected_server_signature =
+            Some(hmac(&server_key, auth_message.as_bytes(), self.mechanism)?);
+
+        Ok(format!("{},p={}", without_proof, b64().encode(proof)).into_bytes())
+    }
+
+    /// Check `server-final`. Only after this succeeds is the server known to
+    /// hold the credential.
+    pub fn verify_server_final(&self, server_final: &[u8]) -> Result<(), SaslError> {
+        let message = std::str::from_utf8(server_final)
+            .map_err(|_| SaslError::ProtocolError("server-final is not valid UTF-8".into()))?;
+        if let Some(error) = attribute(message, 'e') {
+            return Err(SaslError::AuthenticationFailed(error));
+        }
+        let expected = self
+            .expected_server_signature
+            .as_ref()
+            .ok_or_else(|| SaslError::ProtocolError("server-final before client-final".into()))?;
+        let offered = attribute(message, 'v')
+            .and_then(|v| b64().decode(v.as_bytes()).ok())
+            .ok_or_else(|| SaslError::ProtocolError("server-final has no signature".into()))?;
+        if offered.len() != expected.len() || offered.ct_eq(expected).unwrap_u8() != 1 {
+            return Err(SaslError::AuthenticationFailed(
+                "server signature does not match: the server does not hold this credential"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Length of the GS2 header, i.e. the offset at which `client-first-bare` begins.
 fn gs2_header_len(message: &str) -> Result<usize, SaslError> {
     // "n,," or "y,," or "n,a=authzid,"
@@ -798,5 +909,67 @@ mod salted_password_tests {
             1000,
         );
         assert!(result.is_err());
+    }
+
+    fn client_exchange(
+        stored: &str,
+        offered: &str,
+        tamper_server_key: bool,
+    ) -> Result<(), SaslError> {
+        let mechanism = SaslMechanism::ScramSha512;
+        let mut credential =
+            ScramCredential::derive(stored, mechanism, DEFAULT_ITERATIONS).unwrap();
+        let mut client = ScramClient::new(mechanism, "__chronik_broker", offered);
+
+        let (exchange, server_first) =
+            ScramExchange::start(mechanism, &client.client_first(), |user| {
+                assert_eq!(user, "__chronik_broker");
+                Some(credential.clone())
+            })?;
+        let client_final = client.client_final(&server_first)?;
+        if tamper_server_key {
+            credential.server_key[0] ^= 1;
+            let impostor = ScramExchange { credential, ..exchange };
+            let server_final = impostor.finish(&client_final)?;
+            return client.verify_server_final(&server_final);
+        }
+        let server_final = exchange.finish(&client_final)?;
+        client.verify_server_final(&server_final)
+    }
+
+    /// The client half interoperates with the server half, both directions verified.
+    #[test]
+    fn client_and_server_complete_a_mutual_exchange() {
+        client_exchange("s3cret-s3cret-s3cret", "s3cret-s3cret-s3cret", false).unwrap();
+    }
+
+    #[test]
+    fn client_with_wrong_secret_is_refused_by_the_server() {
+        assert!(client_exchange("right-secret-0000", "wrong-secret-0000", false).is_err());
+    }
+
+    /// A server that accepts the proof but cannot sign as the credential holder
+    /// is an impostor; the client must not treat the session as authenticated.
+    #[test]
+    fn client_rejects_a_server_that_does_not_hold_the_credential() {
+        let err = client_exchange("s3cret-s3cret-s3cret", "s3cret-s3cret-s3cret", true)
+            .unwrap_err();
+        assert!(err.to_string().contains("server signature"), "{err}");
+    }
+
+    #[test]
+    fn client_refuses_a_server_nonce_that_drops_its_own() {
+        let mut client = ScramClient::new(SaslMechanism::ScramSha512, "u", "p");
+        let forged = format!("r=other,s={},i=4096", b64().encode([0u8; 16]));
+        assert!(client.client_final(forged.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn client_refuses_a_downgraded_iteration_count() {
+        let mut client = ScramClient::new(SaslMechanism::ScramSha512, "u", "p");
+        let first = String::from_utf8(client.client_first()).unwrap();
+        let nonce = attribute(&first[3..], 'r').unwrap();
+        let weak = format!("r={}xyz,s={},i=1", nonce, b64().encode([0u8; 16]));
+        assert!(client.client_final(weak.as_bytes()).is_err());
     }
 }

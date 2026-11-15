@@ -63,6 +63,10 @@ pub struct AclStore {
     /// ACLs indexed by resource type and name
     acls: RwLock<HashMap<(ResourceType, String), Vec<AclBinding>>>,
 
+    /// Rules from `CHRONIK_ACL_BINDINGS`. They live only in configuration, never
+    /// in the metadata log, so a reload from the log must add them back.
+    bootstrap: RwLock<Vec<AclBinding>>,
+
     /// Whether authorization is enabled
     enabled: bool,
 
@@ -131,6 +135,7 @@ impl AclStore {
     ) -> Self {
         Self {
             acls: RwLock::new(HashMap::new()),
+            bootstrap: RwLock::new(Vec::new()),
             enabled,
             allow_if_no_acl,
             super_users,
@@ -182,9 +187,11 @@ impl AclStore {
                         binding.resource_type,
                         binding.resource_name
                     );
+                    let kept = binding.clone();
                     if let Err(e) = self.create_acl(binding).await {
                         warn!("Bootstrap ACL '{}' rejected: {}", entry, e);
                     } else {
+                        self.bootstrap.write().await.push(kept);
                         info!("Bootstrap ACL: {}", description);
                         loaded += 1;
                     }
@@ -304,6 +311,14 @@ impl AclStore {
         // Super users bypass all checks
         if self.super_users.iter().any(|u| u == principal) {
             debug!("Super user {} bypasses ACL check", principal);
+            return true;
+        }
+
+        // The broker principal replicates every partition. Requiring an operator
+        // to remember a rule for it would make "forgot the rule" indistinguishable
+        // from "replication broken". Only reachable with the inter-broker secret:
+        // the name is refused in CHRONIK_SASL_USERS and AlterUserScramCredentials.
+        if principal == crate::inter_broker::principal() {
             return true;
         }
 
@@ -990,6 +1005,63 @@ impl AclStore {
         loaded
     }
 
+    /// Replace the in-memory index with the metadata store's rules plus the
+    /// bootstrap rules.
+    ///
+    /// Runs whenever the store reports an ACL change (`acl_changes`), which is
+    /// how a rule created or revoked on another broker reaches this one. A
+    /// rebuild rather than an incremental patch, so a deletion is honoured just
+    /// like a creation and repeated signals are harmless.
+    ///
+    /// If the store cannot be read, the current index is kept: swapping in a
+    /// partial policy would deny everything or, with `allow_if_no_acl`, permit
+    /// everything.
+    pub async fn reload_persisted(&self, store: &dyn MetadataStore) {
+        if !self.enabled {
+            return;
+        }
+        let records = match store.list_acls().await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("Failed to reload ACLs after a change: {} - keeping the previous policy", e);
+                return;
+            }
+        };
+
+        let mut index: HashMap<(ResourceType, String), Vec<AclBinding>> = HashMap::new();
+        let bootstrap = self.bootstrap.read().await.clone();
+        let persisted = records.iter().map(AclBinding::from_record);
+        for binding in persisted.chain(bootstrap) {
+            let entries = index
+                .entry((binding.resource_type, binding.resource_name.clone()))
+                .or_insert_with(Vec::new);
+            if !entries.iter().any(|e| e == &binding) {
+                entries.push(binding);
+            }
+        }
+
+        let total: usize = index.values().map(Vec::len).sum();
+        *self.acls.write().await = index;
+        debug!("ACL index reloaded: {} binding(s)", total);
+    }
+
+    /// Keep the index in step with the metadata store for the life of the
+    /// process. Returns immediately if ACLs are disabled or the store cannot
+    /// signal changes.
+    pub fn spawn_reload_on_change(self: Arc<Self>, store: Arc<dyn MetadataStore>) {
+        if !self.enabled {
+            return;
+        }
+        let Some(mut changes) = store.acl_changes() else {
+            return;
+        };
+        tokio::spawn(async move {
+            while changes.changed().await.is_ok() {
+                self.reload_persisted(store.as_ref()).await;
+            }
+        });
+    }
+
     /// Create an ACL and persist it.
     ///
     /// Persistence happens FIRST: if the event log write fails, the rule must not
@@ -1020,7 +1092,13 @@ impl AclStore {
             .await
             .map_err(|e| AclError::StorageError(e.to_string()))?;
 
-        self.create_acl(binding).await
+        // The store write signals `acl_changes`, and the reload it triggers may
+        // already have put this rule in the index. It is persisted and in force
+        // either way, so a duplicate here is success, not an error.
+        match self.create_acl(binding).await {
+            Err(AclError::DuplicateAcl) => Ok(()),
+            other => other,
+        }
     }
 
     /// Delete ACLs matching a filter, removing them from the log as well.
@@ -1120,5 +1198,117 @@ mod implication_tests {
         assert!(!implies(AclOperation::Read, AclOperation::Write));
         assert!(!implies(AclOperation::Describe, AclOperation::Read));
         assert!(!implies(AclOperation::DescribeConfigs, AclOperation::AlterConfigs));
+    }
+}
+
+/// A rule created or revoked on one broker must take effect on every broker,
+/// without a restart. These drive a follower's store exactly as replication
+/// does (`apply_replicated_event`) and observe the authorizer, not the store:
+/// the store always had the rule, it was the authorizer that never heard.
+#[cfg(test)]
+mod replication_tests {
+    use super::*;
+    use chronik_common::metadata::{
+        MetadataEvent, MetadataEventPayload, WalAppendFn, WalMetadataStore,
+    };
+    use std::time::Duration;
+
+    fn follower_store() -> Arc<dyn MetadataStore> {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        Arc::new(WalMetadataStore::new(2, wal_append))
+    }
+
+    fn write_orders(principal: &str) -> AclBinding {
+        AclBinding {
+            resource_type: ResourceType::Topic,
+            resource_name: "orders".to_string(),
+            pattern_type: PatternType::Literal,
+            principal: principal.to_string(),
+            host: "*".to_string(),
+            operation: AclOperation::Write,
+            permission_type: AclPermissionType::Allow,
+        }
+    }
+
+    async fn may_write(acls: &AclStore, principal: &str) -> bool {
+        acls.authorize(principal, "10.0.0.1", ResourceType::Topic, "orders", AclOperation::Write)
+            .await
+    }
+
+    /// Wait for the reload task to catch up; fail if it never does.
+    async fn eventually(acls: &AclStore, principal: &str, expected: bool) {
+        for _ in 0..200 {
+            if may_write(acls, principal).await == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("authorizer never reached allowed={} for {}", expected, principal);
+    }
+
+    #[tokio::test]
+    async fn replicated_create_and_delete_are_enforced() {
+        let store = follower_store();
+        // Strict mode, so "no rule" is a denial and a missed revoke is visible.
+        let acls = Arc::new(AclStore::with_config(true, false, Vec::new()));
+        acls.load_persisted(store.as_ref()).await;
+        acls.clone().spawn_reload_on_change(store.clone());
+
+        assert!(!may_write(&acls, "User:alice").await);
+
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::AclCreated { binding: write_orders("User:alice").to_record() },
+                1,
+            ))
+            .await
+            .unwrap();
+        eventually(&acls, "User:alice", true).await;
+
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::AclDeleted { binding: write_orders("User:alice").to_record() },
+                1,
+            ))
+            .await
+            .unwrap();
+        eventually(&acls, "User:alice", false).await;
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_bootstrap_rules() {
+        let store = follower_store();
+        let acls = Arc::new(AclStore::with_config(true, false, Vec::new()));
+        acls.load_bootstrap_acls("User:bob,Topic,orders,Write,Allow").await;
+        acls.clone().spawn_reload_on_change(store.clone());
+
+        // A replicated change triggers a full rebuild from the store, which
+        // never held bob's rule. It must survive.
+        store
+            .apply_replicated_event(MetadataEvent::new_with_node(
+                MetadataEventPayload::AclCreated { binding: write_orders("User:alice").to_record() },
+                1,
+            ))
+            .await
+            .unwrap();
+        eventually(&acls, "User:alice", true).await;
+        assert!(may_write(&acls, "User:bob").await, "bootstrap rule lost on reload");
+    }
+
+    /// The store write wakes the reload task, which can insert the rule before
+    /// `create_acl_durable` does. That must not surface as DuplicateAcl.
+    #[tokio::test]
+    async fn durable_create_is_not_failed_by_its_own_reload() {
+        let store = follower_store();
+        let acls = Arc::new(AclStore::with_config(true, false, Vec::new()));
+        acls.clone().spawn_reload_on_change(store.clone());
+
+        for i in 0..100 {
+            let principal = format!("User:u{}", i);
+            acls.create_acl_durable(write_orders(&principal), store.as_ref())
+                .await
+                .unwrap_or_else(|e| panic!("create {} failed: {:?}", i, e));
+            tokio::task::yield_now().await;
+        }
     }
 }

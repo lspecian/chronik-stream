@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Api, Patch, PatchParams, PostParams};
 use kube::runtime::controller::{Action, Controller};
@@ -16,7 +16,8 @@ use tracing::{error, info, warn};
 use crate::config_generator::{self, NodeConfigParams, PeerEntry};
 use crate::constants::{self, labels, values, FINALIZER};
 use crate::crds::cluster::{
-    ChronikCluster, ChronikClusterSpec, ChronikClusterStatus, ClusterNodeStatus,
+    generated_inter_broker_secret_name, ChronikCluster, ChronikClusterSpec, ChronikClusterStatus,
+    ClusterNodeStatus, InterBrokerSecretSource, GENERATED_INTER_BROKER_SECRET_KEY,
 };
 use crate::crds::common::Condition;
 use crate::error::OperatorError;
@@ -168,6 +169,13 @@ async fn apply(client: Client, cluster: &ChronikCluster) -> Result<Action, Opera
         spec.wal_port,
         spec.raft_port,
     );
+
+    // 3b. Broker-to-broker SASL secret. Must exist before any Pod references
+    // it, or the kubelet holds every broker in CreateContainerConfigError.
+    if spec.inter_broker_secret_source() == Some(InterBrokerSecretSource::Generated) {
+        let secret_api: Api<Secret> = Api::namespaced(client.clone(), &namespace);
+        ensure_inter_broker_secret(&secret_api, &name, &namespace, owner_ref.clone()).await?;
+    }
 
     // 4. Ensure per-node resources (Service, PVC, ConfigMap, Pod)
     let pod_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
@@ -475,6 +483,86 @@ async fn cleanup(_client: Client, cluster: &ChronikCluster) -> Result<Action, Op
     Ok(Action::await_change())
 }
 
+/// Length of a generated inter-broker secret. Alphanumeric, so ~5.95 bits per
+/// character: 48 characters is ~285 bits, far above the broker's 16-character
+/// minimum, and safe to paste into a shell or a TOML file.
+const GENERATED_INTER_BROKER_SECRET_LEN: usize = 48;
+
+/// Generate an inter-broker secret from the operating system's CSPRNG.
+fn generate_inter_broker_secret() -> String {
+    use rand::distributions::{Alphanumeric, DistString};
+    Alphanumeric.sample_string(&mut rand::rngs::OsRng, GENERATED_INTER_BROKER_SECRET_LEN)
+}
+
+/// Build the `<cluster>-inter-broker` Secret holding a fresh random secret.
+fn build_inter_broker_secret(
+    cluster_name: &str,
+    namespace: &str,
+    owner_ref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+) -> Secret {
+    Secret {
+        metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            name: Some(generated_inter_broker_secret_name(cluster_name)),
+            namespace: Some(namespace.into()),
+            owner_references: Some(vec![owner_ref]),
+            labels: Some(BTreeMap::from([
+                (labels::MANAGED_BY.into(), values::MANAGED_BY.into()),
+                (labels::INSTANCE.into(), cluster_name.into()),
+            ])),
+            ..Default::default()
+        },
+        string_data: Some(BTreeMap::from([(
+            GENERATED_INTER_BROKER_SECRET_KEY.into(),
+            generate_inter_broker_secret(),
+        )])),
+        type_: Some("Opaque".into()),
+        ..Default::default()
+    }
+}
+
+/// Ensure the generated inter-broker Secret exists. Created once and never
+/// rewritten: every broker must hold the same value, so regenerating it would
+/// split a running cluster mid-roll — the Pods already started keep the old
+/// secret while new ones get the new, and followers can no longer fetch.
+async fn ensure_inter_broker_secret(
+    secret_api: &Api<Secret>,
+    cluster_name: &str,
+    namespace: &str,
+    owner_ref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+) -> Result<(), OperatorError> {
+    let secret_name = generated_inter_broker_secret_name(cluster_name);
+    if let Some(existing) = secret_api.get_opt(&secret_name).await? {
+        // Someone may have edited it. Say so rather than "fix" it: a rewrite is
+        // exactly the split described above.
+        let len = existing
+            .data
+            .as_ref()
+            .and_then(|d| d.get(GENERATED_INTER_BROKER_SECRET_KEY))
+            .map(|v| String::from_utf8_lossy(&v.0).trim().len())
+            .unwrap_or(0);
+        if len < 16 {
+            warn!(
+                name = %cluster_name,
+                secret = %secret_name,
+                key = GENERATED_INTER_BROKER_SECRET_KEY,
+                "Inter-broker Secret has no usable value (brokers need at least 16 characters); \
+                 brokers with SASL required will refuse to start. Not regenerating it — delete \
+                 the Secret to have the operator create a new one, then restart every broker."
+            );
+        }
+        return Ok(());
+    }
+
+    let secret = build_inter_broker_secret(cluster_name, namespace, owner_ref);
+    info!(name = %cluster_name, secret = %secret_name, "Creating inter-broker SASL Secret");
+    match secret_api.create(&PostParams::default(), &secret).await {
+        Ok(_) => Ok(()),
+        // Another reconcile created it between our get and create. Keep theirs.
+        Err(kube::Error::Api(kube::core::ErrorResponse { code: 409, .. })) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Compute a deterministic hash of the ChronikCluster spec fields that affect pod config.
 /// Used as a pod annotation to detect when the spec has changed and pods need recreation.
 fn compute_cluster_spec_hash(spec: &ChronikClusterSpec) -> String {
@@ -544,6 +632,23 @@ fn cluster_spec_hash_at(spec: &ChronikClusterSpec, pod_shape_generation: u32) ->
     }
     if let Some(ref sc) = spec.pod_security_context {
         format!("{:?}", sc).hash(&mut hasher);
+    }
+
+    // The injected CHRONIK_INTER_BROKER_SECRET. Mixed in only when it is
+    // injected, which needs SASL enabled in `env` — so a cluster without SASL
+    // hashes exactly as before this existed, while a SASL cluster's Pods are
+    // rebuilt to carry it (a broker on an image that requires it would
+    // otherwise crash-loop the next time its container restarted).
+    match spec.inter_broker_secret_source() {
+        None => {}
+        Some(InterBrokerSecretSource::Generated) => {
+            "inter_broker_secret=generated".hash(&mut hasher);
+        }
+        Some(InterBrokerSecretSource::User(r)) => {
+            "inter_broker_secret=user".hash(&mut hasher);
+            r.name.hash(&mut hasher);
+            r.key.hash(&mut hasher);
+        }
     }
 
     // The shape of the Pod this operator builds, independent of the spec.
@@ -915,6 +1020,111 @@ mod tests {
             "spelling out the default builds the same Pod, so it must not force \
              a restart"
         );
+    }
+
+    /// Inter-broker secret support must not roll a single Pod of a cluster
+    /// without SASL. The golden values were computed by the operator BEFORE
+    /// `interBrokerSecret` existed (same POD_SHAPE_GENERATION), so a change here
+    /// means every non-SASL broker under the operator would be recreated.
+    #[test]
+    fn inter_broker_secret_support_leaves_non_sasl_hashes_unchanged() {
+        let cases = [
+            ("{}", "a754f5cb9f9a4558"),
+            // Explicitly disabled SASL, plus unrelated env and an admin key.
+            (
+                r#"{"image":"chronik-server:v2.16.0","walProfile":"high",
+                    "env":[{"name":"CHRONIK_HOT_TEXT_MAX_DOCS","value":"2000"},
+                           {"name":"CHRONIK_SASL_ENABLED","value":"false"}],
+                    "adminApiKeySecret":{"name":"adm","key":"k"}}"#,
+                "a3c20af37cd8e0b9",
+            ),
+            // interBrokerSecret set but SASL off: nothing is injected (a broker
+            // with SASL disabled cannot accept the broker login), so the Pod and
+            // the hash are what they were.
+            (
+                r#"{"image":"chronik-server:v2.16.0","walProfile":"high",
+                    "env":[{"name":"CHRONIK_HOT_TEXT_MAX_DOCS","value":"2000"},
+                           {"name":"CHRONIK_SASL_ENABLED","value":"false"}],
+                    "adminApiKeySecret":{"name":"adm","key":"k"},
+                    "interBrokerSecret":{"name":"mine","key":"s"}}"#,
+                "a3c20af37cd8e0b9",
+            ),
+        ];
+        for (json, golden) in cases {
+            let spec: ChronikClusterSpec = serde_json::from_str(json).unwrap();
+            assert_eq!(spec.inter_broker_secret_source(), None, "spec: {json}");
+            assert_eq!(
+                compute_cluster_spec_hash(&spec),
+                golden,
+                "a non-SASL cluster's hash moved — upgrading the operator would \
+                 recreate its brokers. spec: {json}"
+            );
+        }
+    }
+
+    /// A SASL cluster's Pods gain CHRONIK_INTER_BROKER_SECRET, so its hash has
+    /// to move or existing brokers never pick it up — and the next container
+    /// restart on an image that requires it crash-loops.
+    #[test]
+    fn a_sasl_cluster_hash_moves_to_carry_the_inter_broker_secret() {
+        let generated: ChronikClusterSpec = serde_json::from_str(
+            r#"{"image":"chronik-server:v2.16.0",
+                "env":[{"name":"CHRONIK_SASL_ENABLED","value":"required"}]}"#,
+        )
+        .unwrap();
+        // The pre-change operator's hash for this exact spec.
+        assert_ne!(compute_cluster_spec_hash(&generated), "1be857562a7bc6b3");
+
+        let user: ChronikClusterSpec = serde_json::from_str(
+            r#"{"image":"chronik-server:v2.16.0",
+                "env":[{"name":"CHRONIK_SASL_ENABLED","value":"required"}],
+                "interBrokerSecret":{"name":"mine","key":"s"}}"#,
+        )
+        .unwrap();
+        let user_other_key: ChronikClusterSpec = serde_json::from_str(
+            r#"{"image":"chronik-server:v2.16.0",
+                "env":[{"name":"CHRONIK_SASL_ENABLED","value":"required"}],
+                "interBrokerSecret":{"name":"mine","key":"other"}}"#,
+        )
+        .unwrap();
+        let hashes = [
+            compute_cluster_spec_hash(&generated),
+            compute_cluster_spec_hash(&user),
+            compute_cluster_spec_hash(&user_other_key),
+        ];
+        assert_ne!(hashes[0], hashes[1], "switching to a user secret must roll");
+        assert_ne!(hashes[1], hashes[2], "pointing at another key must roll");
+    }
+
+    #[test]
+    fn the_generated_inter_broker_secret_is_owned_random_and_long_enough() {
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "chronik.io/v1alpha1".into(),
+            kind: "ChronikCluster".into(),
+            name: "prod".into(),
+            uid: "uid-1".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let a = build_inter_broker_secret("prod", "ns", owner.clone());
+        let b = build_inter_broker_secret("prod", "ns", owner);
+
+        assert_eq!(a.metadata.name.as_deref(), Some("prod-inter-broker"));
+        assert_eq!(a.metadata.namespace.as_deref(), Some("ns"));
+        let owners = a.metadata.owner_references.as_ref().unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].kind, "ChronikCluster");
+        assert_eq!(owners[0].uid, "uid-1");
+
+        let value = |s: &Secret| s.string_data.as_ref().unwrap()["secret"].clone();
+        let va = value(&a);
+        assert_eq!(va.len(), GENERATED_INTER_BROKER_SECRET_LEN);
+        assert!(
+            va.len() >= 32,
+            "must comfortably exceed the broker's 16-char minimum"
+        );
+        assert!(va.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(va, value(&b), "each generation must be fresh randomness");
     }
 
     /// Operational check: compute the spec hash of a live cluster's `.spec` JSON.

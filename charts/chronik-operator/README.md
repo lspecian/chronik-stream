@@ -60,6 +60,17 @@ Every broker currently running carries the old probe and is one restart away fro
 the same crash-loop, so the roll is the point rather than a side effect — but do
 it when you are watching.
 
+### 0.3.3 rolls SASL clusters only
+
+0.3.3 adds `spec.interBrokerSecret` to `ChronikCluster` — apply `crds/` first.
+Brokers with SASL required now refuse to start without
+`CHRONIK_INTER_BROKER_SECRET`, so for a cluster whose `env` enables
+`CHRONIK_SASL_ENABLED` the operator generates a `<cluster>-inter-broker` Secret
+(once, never rotated) and injects it by `secretKeyRef`. That changes those
+clusters' Pods, so **clusters with SASL enabled roll once** on upgrade. Clusters
+without SASL keep a byte-identical Pod and spec hash and are not touched. See
+docs/KUBERNETES_OPERATOR.md, "SASL Clusters".
+
 Later chart versions do not roll Pods unless their notes say so.
 
 ## Rolling a new operator version

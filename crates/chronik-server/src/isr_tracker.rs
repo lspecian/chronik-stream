@@ -73,6 +73,22 @@ pub struct IsrTracker {
     /// death minutes late, if at all.
     node_last_seen_ms: DashMap<u64, u64>,
 
+    /// When this node started leading each partition, in ms since epoch, as
+    /// observed by the ISR publisher.
+    ///
+    /// The clock that turns "never heard from" into "not in sync". A follower
+    /// proves it is replicating by fetching; one that never fetches leaves no
+    /// trace in `follower_offsets` at all, and without a start time there is no
+    /// way to tell "the cluster has just started" from "this follower has not
+    /// fetched once in hours". Measured: with SASL required, the replica fetcher
+    /// could not authenticate, no follower ever fetched, and every partition
+    /// reported a full in-sync set indefinitely while followers held nothing.
+    ///
+    /// Kafka does the same: a new leader gives each follower
+    /// `replica.lag.time.max.ms` from the moment it took over, then shrinks the
+    /// set if the follower has not caught up.
+    leading_since_ms: DashMap<PartitionKey, u64>,
+
     /// Maximum lag in number of entries before marking out-of-sync
     max_lag_entries: u64,
 
@@ -98,6 +114,7 @@ impl IsrTracker {
         Self {
             follower_offsets: DashMap::new(),
             node_last_seen_ms: DashMap::new(),
+            leading_since_ms: DashMap::new(),
             max_lag_entries,
             max_lag_ms,
             node_liveness_ms: max_lag_ms.saturating_mul(3),
@@ -227,6 +244,11 @@ impl IsrTracker {
         replicas: &[u64],
         leader_id: u64,
     ) -> bool {
+        // Past the grace period, silence is evidence: a follower that has not
+        // fetched once in `max_lag_ms` of our leadership is not replicating.
+        if self.leadership_grace_expired(topic, partition) {
+            return false;
+        }
         replicas
             .iter()
             .filter(|&&node_id| node_id != leader_id) // the leader never ACKs to itself
@@ -235,6 +257,42 @@ impl IsrTracker {
                     .follower_offsets
                     .contains_key(&(node_id, (topic.to_string(), partition)))
             })
+    }
+
+    /// Record that this node leads `topic`-`partition`, starting the grace
+    /// period on the first call. Idempotent: later calls keep the original time.
+    pub fn note_leading(&self, topic: &str, partition: i32) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.leading_since_ms
+            .entry((topic.to_string(), partition))
+            .or_insert(now_ms);
+    }
+
+    /// Forget leadership of every partition not in `led`, so that leading a
+    /// partition again later starts a fresh grace period instead of inheriting
+    /// a stale one that would shrink the set before followers had a chance.
+    pub fn retain_leading(&self, led: &std::collections::HashSet<PartitionKey>) {
+        self.leading_since_ms.retain(|key, _| led.contains(key));
+    }
+
+    /// True once this node has led the partition for longer than `max_lag_ms`.
+    /// A partition never marked as led has no grace period to expire.
+    fn leadership_grace_expired(&self, topic: &str, partition: i32) -> bool {
+        let Some(since) = self
+            .leading_since_ms
+            .get(&(topic.to_string(), partition))
+            .map(|v| *v)
+        else {
+            return false;
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now_ms.saturating_sub(since) > self.max_lag_ms
     }
 
     /// Update follower offset after successful replication
@@ -943,5 +1001,62 @@ mod tests {
         tracker.record_node_alive(2);
 
         assert_eq!(tracker.replicated_watermark("t", 0, 100, &[1, 2], 1), 100);
+    }
+
+    fn a_minute_ago_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 60_000
+    }
+
+    /// A follower that never fetches leaves the in-sync set once the leader has
+    /// led for longer than the lag bound.
+    ///
+    /// The case the tracker could not see: no fetch, so no entry, so "unknown",
+    /// so the publisher kept the full replica set. Measured with SASL required
+    /// and an unauthenticated replica fetcher: every partition kept a full
+    /// in-sync set while no follower held any of its data.
+    #[test]
+    fn a_follower_that_never_fetches_is_not_unknown_forever() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        let replicas = vec![1, 2, 3];
+
+        // Just took over: followers get their chance.
+        tracker.note_leading("t", 0);
+        assert!(tracker.is_unknown_for_all("t", 0, &replicas, 1));
+
+        // Led for a minute without one fetch: that is evidence.
+        tracker
+            .leading_since_ms
+            .insert(("t".to_string(), 0), a_minute_ago_ms());
+        assert!(!tracker.is_unknown_for_all("t", 0, &replicas, 1));
+        assert!(tracker.get_isr("t", 0, 0, &[2, 3]).is_empty());
+    }
+
+    /// A partition this node does not lead never expires: only the leader can
+    /// measure followers, so nobody else may conclude they are absent.
+    #[test]
+    fn grace_never_expires_for_a_partition_not_led() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        assert!(tracker.is_unknown_for_all("t", 0, &[1, 2, 3], 1));
+    }
+
+    /// `note_leading` keeps the first time; losing and regaining leadership
+    /// starts over.
+    #[test]
+    fn regaining_leadership_restarts_the_grace_period() {
+        let tracker = IsrTracker::new(1000, 10_000);
+        tracker
+            .leading_since_ms
+            .insert(("t".to_string(), 0), a_minute_ago_ms());
+
+        tracker.note_leading("t", 0); // must not reset an ongoing leadership
+        assert!(tracker.leadership_grace_expired("t", 0));
+
+        tracker.retain_leading(&std::collections::HashSet::new()); // lost it
+        tracker.note_leading("t", 0); // and got it back
+        assert!(!tracker.leadership_grace_expired("t", 0));
     }
 }

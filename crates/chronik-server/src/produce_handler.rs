@@ -536,6 +536,109 @@ fn produce_error_code(e: &Error) -> i16 {
 }
 
 impl ProduceHandler {
+    /// For `acks=all`: how many replicas, the leader included, must hold a
+    /// batch before it is acknowledged, or `None` when the leader's published
+    /// in-sync set is already smaller than that.
+    ///
+    /// `None` is Kafka's NOT_ENOUGH_REPLICAS, refused before anything is
+    /// written. The size is `min_insync_replicas`, clamped to the replica count
+    /// (RP-1.3: requiring every replica would let one slow follower block every
+    /// write). An empty published set means "not measured yet" and imposes no
+    /// check, the same reading failover gives it.
+    ///
+    /// The in-sync check only became meaningful once a follower that never
+    /// fetches leaves the set; before that the set always looked full.
+    async fn acks_all_quorum(&self, topic: &str, partition: i32) -> Option<usize> {
+        let assignments = match self.metadata_store.get_partition_assignments(topic).await {
+            Ok(assignments) => assignments,
+            Err(e) => {
+                warn!(
+                    "⚠️  Failed to get partition assignments for {}-{}: {:?}, using quorum=1",
+                    topic, partition, e
+                );
+                return Some(1);
+            }
+        };
+        let Some(assignment) = assignments.iter().find(|a| a.partition == partition as u32) else {
+            // Standalone partitions have no assignment; the leader alone is the quorum.
+            warn!(
+                "⚠️  No partition assignment found for {}-{} in metadata_store, using quorum=1",
+                topic, partition
+            );
+            return Some(1);
+        };
+
+        let size = self
+            .config
+            .min_insync_replicas
+            .clamp(1, assignment.replicas.len().max(1));
+
+        if !assignment.isr.is_empty() && assignment.isr.len() < size {
+            warn!(
+                "acks=all refused for {}-{}: in-sync set {:?} is smaller than min_insync_replicas={} \
+                 — NOT_ENOUGH_REPLICAS, nothing written",
+                topic, partition, assignment.isr, size
+            );
+            return None;
+        }
+        Some(size)
+    }
+
+    /// Answer an `acks=all` retry of a batch the leader already holds.
+    ///
+    /// Clients treat DUPLICATE_SEQUENCE_NUMBER as success, so answering it
+    /// straight away acknowledged the original write as replicated whether or
+    /// not any follower had it. Measured: 10 records at `acks=all` reported
+    /// delivered with no follower holding any of them, after the first attempt
+    /// timed out with NOT_ENOUGH_REPLICAS and the retry hit this path.
+    ///
+    /// The original batch's offset is not tracked per sequence, but it is at or
+    /// below the leader's own acknowledged position, so waiting for a quorum to
+    /// reach that position covers it. It can wait for a little more than
+    /// strictly needed (later batches too), never less. Kafka holds duplicate
+    /// responses in the same purgatory as first writes for the same reason.
+    async fn answer_duplicate_once_replicated(
+        &self,
+        topic: &str,
+        partition: i32,
+        message: String,
+        quorum: Option<usize>,
+    ) -> Result<ProduceResponsePartition> {
+        let duplicate = Error::DuplicateSequenceNumber(message);
+        let (Some(tracker), Some(quorum)) = (self.isr_ack_tracker.as_ref(), quorum) else {
+            return Err(duplicate);
+        };
+        let Some(position) = tracker.replica_offset(topic, partition, self.config.node_id as u64)
+        else {
+            // The leader has acknowledged nothing for this partition since it
+            // started, so the original was written by an earlier incarnation and
+            // whatever replicated it then is not measurable now. Answering
+            // NOT_ENOUGH_REPLICAS would make the producer retry forever.
+            return Err(duplicate);
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tracker.register_wait(topic.to_string(), partition, position, quorum, tx);
+
+        match timeout(REPLICATION_TIMEOUT, rx).await {
+            Ok(Ok(Ok(()))) => Err(duplicate),
+            _ => {
+                warn!(
+                    "acks=all duplicate for {}-{}: quorum of {} never reached offset {} — \
+                     NOT_ENOUGH_REPLICAS instead of acknowledging",
+                    topic, partition, quorum, position
+                );
+                Ok(ProduceResponsePartition {
+                    index: partition,
+                    error_code: chronik_protocol::produce_types::error_codes::NOT_ENOUGH_REPLICAS,
+                    base_offset: -1,
+                    log_append_time: -1,
+                    log_start_offset: 0,
+                })
+            }
+        }
+    }
+
     /// Get reference to metadata store
     pub fn get_metadata_store(&self) -> &Arc<dyn MetadataStore> {
         &self.metadata_store
@@ -2145,6 +2248,28 @@ impl ProduceHandler {
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         debug!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
 
+        // acks=all: refuse BEFORE writing when the in-sync set is already too
+        // small, as Kafka does. Refusing after the write (the old behaviour,
+        // via the 30s quorum timeout) left the batch in the leader's log, so the
+        // producer's retry was answered "duplicate", which clients treat as
+        // success: a write acknowledged as replicated that only the leader held.
+        let acks_all_quorum = if acks == -1 && self.isr_ack_tracker.is_some() {
+            match self.acks_all_quorum(topic, partition).await {
+                Some(size) => Some(size),
+                None => {
+                    return Ok(ProduceResponsePartition {
+                        index: partition,
+                        error_code: chronik_protocol::produce_types::error_codes::NOT_ENOUGH_REPLICAS,
+                        base_offset: -1,
+                        log_append_time: -1,
+                        log_start_offset: 0,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         // P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking with AtomicU64
         // Check memory limit and atomically reserve memory
         let bytes_to_reserve = records_data.len() as u64; // Declare outside loop for later use
@@ -2236,10 +2361,19 @@ impl ProduceHandler {
             // Phase 1, outside the append lock: wait until this batch is next
             // in its producer's sequence. Duplicates are rejected here, so a
             // retry never reserves offsets.
-            self.validate_producer_sequence(
-                &temp_batch, topic, partition, transactional_id, SequenceCheck::WaitForTurn,
-            )
-            .await?;
+            match self
+                .validate_producer_sequence(
+                    &temp_batch, topic, partition, transactional_id, SequenceCheck::WaitForTurn,
+                )
+                .await
+            {
+                Err(Error::DuplicateSequenceNumber(msg)) if acks == -1 => {
+                    return self
+                        .answer_duplicate_once_replicated(topic, partition, msg, acks_all_quorum)
+                        .await;
+                }
+                other => other?,
+            }
         }
 
         // From here until the batch is in the WAL queue, this request holds the
@@ -2278,10 +2412,22 @@ impl ProduceHandler {
         // closes that, and cannot deadlock — N+1 waited in phase 1 holding
         // nothing, and N advances while holding this lock.
         if sequenced {
-            self.validate_producer_sequence(
-                &temp_batch, topic, partition, transactional_id, SequenceCheck::AdvanceNow,
-            )
-            .await?;
+            match self
+                .validate_producer_sequence(
+                    &temp_batch, topic, partition, transactional_id, SequenceCheck::AdvanceNow,
+                )
+                .await
+            {
+                Err(Error::DuplicateSequenceNumber(msg)) if acks == -1 => {
+                    // Never wait for replication holding the append lock: every
+                    // other write to this partition would queue behind it.
+                    drop(append_guard);
+                    return self
+                        .answer_duplicate_once_replicated(topic, partition, msg, acks_all_quorum)
+                        .await;
+                }
+                other => other?,
+            }
         }
 
         // ATOMIC: Reserve offset range in ONE operation (prevents race conditions)
@@ -2833,42 +2979,9 @@ impl ProduceHandler {
                 if let Some(ref tracker) = self.isr_ack_tracker {
                     // Register this produce request for ISR quorum tracking
                     // v2.2.9 Phase 2: Option 4 - Get ISR from metadata_store (WAL-only, no Raft)
-                    let quorum_size = match self.metadata_store.get_partition_assignments(topic).await {
-                        Ok(assignments) => {
-                            match assignments.iter().find(|a| a.partition == partition as u32) {
-                                Some(assignment) => {
-                                    // RP-1.3: wait for min_insync_replicas ACKs (leader's own
-                                    // included), not for every assigned replica.
-                                    //
-                                    // Requiring all of them means a single slow or dead follower
-                                    // blocks every write to the partition until the replication
-                                    // timeout, even at RF=3 / minISR=2 where the write is already
-                                    // durable enough. Kafka fails a produce only when the in-sync
-                                    // set drops below min.insync.replicas.
-                                    let replicas = &assignment.replicas;
-                                    let size = self
-                                        .config
-                                        .min_insync_replicas
-                                        .clamp(1, replicas.len().max(1));
-                                    debug!("📊 ISR for {}-{} from metadata_store: {:?}, quorum={} (min_insync={})",
-                                        topic, partition, replicas, size, self.config.min_insync_replicas);
-                                    size
-                                }
-                                None => {
-                                    // Fallback: if partition not found, use 1 (just the leader)
-                                    warn!("⚠️  No partition assignment found for {}-{} in metadata_store, using quorum=1",
-                                        topic, partition);
-                                    1
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Error querying metadata_store, fall back to quorum=1
-                            warn!("⚠️  Failed to get partition assignments for {}-{}: {:?}, using quorum=1",
-                                topic, partition, e);
-                            1
-                        }
-                    };
+                    // Decided before the write (see `acks_all_quorum`), so the
+                    // in-sync check and the wait use one reading of the assignment.
+                    let quorum_size = acks_all_quorum.unwrap_or(1);
 
                     // These four lines fire on every `acks=all` produce. They were
                     // `info!` while the path was believed to be rare and broken;
@@ -5593,6 +5706,151 @@ mod tests {
         assert_eq!(
             response.topics[0].partitions[0].error_code, 0,
             "produce failed after quorum was reached"
+        );
+    }
+
+    /// Set up a two-replica partition led by node 1 with `min_insync_replicas=2`
+    /// and the given published in-sync set.
+    async fn acks_all_partition(
+        temp_dir: &tempfile::TempDir,
+        topic: &str,
+        isr: Vec<u64>,
+    ) -> (Arc<ProduceHandler>, Arc<crate::isr_ack_tracker::IsrAckTracker>) {
+        use chronik_common::metadata::traits::PartitionAssignment;
+
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        let mut handler = handler_with_pipeline(temp_dir, metadata_store.clone()).await;
+        handler.config.min_insync_replicas = 2;
+        let ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
+        handler.set_isr_ack_tracker(ack_tracker.clone());
+
+        let mut topic_config = TopicConfig::default();
+        topic_config.partition_count = 1;
+        metadata_store.create_topic(topic, topic_config).await.unwrap();
+        metadata_store
+            .assign_partition(PartitionAssignment {
+                topic: topic.to_string(),
+                partition: 0,
+                broker_id: 1,
+                is_leader: true,
+                replicas: vec![1, 2],
+                leader_id: 1,
+                leader_epoch: 0,
+                isr,
+            })
+            .await
+            .unwrap();
+        (Arc::new(handler), ack_tracker)
+    }
+
+    fn idempotent_batch(producer_id: i64, base_sequence: i32, messages: Vec<&str>) -> Vec<u8> {
+        let mut batch = KafkaRecordBatch::new(
+            0,
+            chrono::Utc::now().timestamp_millis(),
+            producer_id,
+            0, // producer_epoch
+            base_sequence,
+            CompressionType::None,
+            false,
+        );
+        for msg in messages {
+            batch.add_record(
+                None,
+                Some(bytes::Bytes::from(msg.to_string())),
+                vec![],
+                chrono::Utc::now().timestamp_millis(),
+            );
+        }
+        batch.encode().unwrap().to_vec()
+    }
+
+    fn acks_all_request(topic: &str, records: Vec<u8>) -> ProduceRequest {
+        ProduceRequest {
+            transactional_id: None,
+            acks: -1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: topic.to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        }
+    }
+
+    /// With the in-sync set already below `min_insync_replicas`, acks=all is
+    /// refused at once and NOTHING is written, as in Kafka.
+    ///
+    /// Refusing only after the write (the 30 s quorum timeout) left the batch in
+    /// the leader's log, and the producer's retry was then answered "duplicate",
+    /// which clients count as success.
+    #[tokio::test]
+    async fn acks_all_is_refused_before_writing_when_the_isr_is_too_small() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let (handler, ack_tracker) = acks_all_partition(&temp_dir, "thin", vec![1]).await;
+
+        let started = std::time::Instant::now();
+        let response = handler
+            .handle_produce(acks_all_request("thin", create_simple_record_batch(0, vec!["a"])), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.topics[0].partitions[0].error_code,
+            chronik_protocol::produce_types::error_codes::NOT_ENOUGH_REPLICAS
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "refusal must not wait");
+        assert_eq!(
+            ack_tracker.replica_offset("thin", 0, 1),
+            None,
+            "the leader acknowledged a write it should have refused"
+        );
+        let state = handler.partition_states.get(&("thin".to_string(), 0));
+        let next = state.map(|s| s.next_offset.load(Ordering::SeqCst)).unwrap_or(0);
+        assert_eq!(next, 0, "a refused acks=all batch reserved offsets");
+    }
+
+    /// A retry of a batch the leader holds but no follower has must not be
+    /// acknowledged until the follower has it.
+    ///
+    /// Clients treat DUPLICATE_SEQUENCE_NUMBER as success. Answering it at once
+    /// told the producer its write was replicated when only the leader held it
+    /// (measured: 10 records "delivered" at acks=all with both followers dead).
+    #[tokio::test]
+    async fn an_acks_all_duplicate_waits_for_the_quorum() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        // Published set empty = "not measured yet": no pre-write refusal, so the
+        // write lands and the retry reaches the duplicate path.
+        let (handler, ack_tracker) = acks_all_partition(&temp_dir, "dup", Vec::new()).await;
+
+        let batch = idempotent_batch(7, 0, vec!["x", "y"]);
+        let first = tokio::spawn({
+            let handler = handler.clone();
+            let batch = batch.clone();
+            async move { handler.handle_produce(acks_all_request("dup", batch), 1).await }
+        });
+        // Let the original reach the log and its quorum wait.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!first.is_finished(), "original answered before any follower acknowledged");
+
+        let retry = tokio::spawn({
+            let handler = handler.clone();
+            async move { handler.handle_produce(acks_all_request("dup", batch), 2).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !retry.is_finished(),
+            "the duplicate was answered while no follower held the batch"
+        );
+
+        // Follower 2 reaches the end of the batch (2 records from offset 0).
+        ack_tracker.record_ack("dup", 0, 2, 2);
+
+        let wait = std::time::Duration::from_secs(10);
+        let first = tokio::time::timeout(wait, first).await.unwrap().unwrap().unwrap();
+        let retry = tokio::time::timeout(wait, retry).await.unwrap().unwrap().unwrap();
+        assert_eq!(first.topics[0].partitions[0].error_code, 0);
+        assert_eq!(
+            retry.topics[0].partitions[0].error_code,
+            ErrorCode::DuplicateSequenceNumber.code(),
+            "once replicated, the retry is answered as the duplicate it is"
         );
     }
 

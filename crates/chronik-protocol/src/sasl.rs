@@ -11,6 +11,21 @@ use thiserror::Error;
 
 use crate::scram::{self, ScramCredential, ScramExchange};
 
+/// The identity brokers use to authenticate to each other (replica fetches).
+///
+/// Its only credential is derived from `CHRONIK_INTER_BROKER_SECRET`; it can
+/// never be configured in `CHRONIK_SASL_USERS` or created through
+/// `AlterUserScramCredentials`, and it bypasses ACLs. Hardcoding the name is
+/// safe, hardcoding a password would not be: it would be the same in every
+/// installation and public in the source.
+pub const INTER_BROKER_USER: &str = "__chronik_broker";
+
+/// Names reserved for Chronik's own principals. A client-managed user with one
+/// of these names could otherwise shadow, or be confused with, the broker.
+pub fn is_reserved_username(name: &str) -> bool {
+    name.starts_with("__chronik")
+}
+
 /// SASL mechanism types supported
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaslMechanism {
@@ -565,7 +580,10 @@ pub fn encode_sasl_authenticate_response(
         None => buf.put_i16(-1),                              // null
     }
 
-    // Auth bytes (nullable bytes)
+    // Auth bytes: NON-nullable BYTES in every version. "Nothing to send" (a
+    // completed PLAIN exchange, a failure) is the empty array. Encoding it as
+    // null made the Java client drop the connection with "non-nullable field
+    // authBytes was serialized as null".
     match &response.auth_bytes {
         Some(bytes) if flexible => {
             put_unsigned_varint(&mut buf, bytes.len() as u32 + 1);
@@ -575,8 +593,8 @@ pub fn encode_sasl_authenticate_response(
             buf.put_i32(bytes.len() as i32);
             buf.put_slice(bytes);
         }
-        None if flexible => put_unsigned_varint(&mut buf, 0), // null
-        None => buf.put_i32(-1),                              // null
+        None if flexible => put_unsigned_varint(&mut buf, 1), // empty
+        None => buf.put_i32(0),                               // empty
     }
 
     // SessionLifetimeMs: present from v1, and NOT optional. Zero means "no
@@ -630,6 +648,25 @@ mod tests {
     }
     use base64::Engine as _;
     use super::*;
+
+    /// AuthBytes is non-nullable: an absent value must be the empty array in
+    /// both the flexible (v2) and classic (v0-v1) encodings.
+    #[test]
+    fn absent_auth_bytes_encode_as_empty_not_null() {
+        let response = SaslAuthenticateResponse {
+            error_code: 0,
+            error_message: None,
+            auth_bytes: None,
+            session_lifetime_ms: None,
+        };
+        // v2: error_code, null compact string (0), empty compact bytes (1),
+        // session lifetime, no tags.
+        let v2 = encode_sasl_authenticate_response(&response, 2);
+        assert_eq!(v2.as_ref(), &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // v1: error_code, null string (-1), empty bytes (0), session lifetime.
+        let v1 = encode_sasl_authenticate_response(&response, 1);
+        assert_eq!(v1.as_ref(), &[0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
 
     #[test]
     fn test_sasl_mechanisms() {

@@ -446,12 +446,23 @@ CHRONIK_ADMIN_API_KEY         # Admin API authentication (REQUIRED for productio
 ## Security
 
 ```bash
-# SASL authentication (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
-CHRONIK_SASL_USERS='myuser:securepass123,app:app-secret' ./chronik-server start
+# SASL authentication (SCRAM-SHA-512, SCRAM-SHA-256, PLAIN). Off by default;
+# there are no default users.
+CHRONIK_SASL_ENABLED=true \
+CHRONIK_SASL_USERS='myuser:securepass123,app:app-secret' \
+  ./chronik-server start
 
-# Disable default test users in production
-CHRONIK_SASL_NO_DEFAULTS=1 ./chronik-server start
+# Cluster mode additionally needs a shared inter-broker secret (same on every
+# broker, 16+ chars) so followers can authenticate to leaders. Without it a
+# SASL-required node refuses to start. Generate it ONCE (e.g. openssl rand -hex 32)
+# and give every broker that same value.
+CHRONIK_SASL_ENABLED=true \
+CHRONIK_SASL_USERS='myuser:securepass123' \
+CHRONIK_INTER_BROKER_SECRET='<the same 64-hex-char value on every broker>' \
+  ./chronik-server start --config cluster.toml
 ```
+
+The Kubernetes operator generates the inter-broker secret for SASL clusters.
 
 Admin API and Schema Registry support API key and HTTP Basic Auth respectively. See [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md).
 

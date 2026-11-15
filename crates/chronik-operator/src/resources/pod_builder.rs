@@ -530,6 +530,25 @@ pub fn build_cluster_node_pod(
         });
     }
 
+    // Broker-to-broker SASL secret. Only while SASL is on (see
+    // `inter_broker_secret_source`), and always by reference: the value must
+    // never appear in the Pod spec.
+    if let Some(source) = spec.inter_broker_secret_source() {
+        let secret_ref = source.secret_key_ref(cluster_name);
+        env_vars.push(EnvVar {
+            name: crate::crds::cluster::INTER_BROKER_SECRET_ENV.into(),
+            value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+                    name: Some(secret_ref.name),
+                    key: secret_ref.key,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     if spec.columnar_enabled {
         env_vars.push(EnvVar {
             name: "CHRONIK_HOT_BUFFER_ENABLED".into(),
@@ -1456,6 +1475,84 @@ mod tests {
         );
     }
 
+    fn inter_broker_env(spec_json: &str) -> Vec<EnvVar> {
+        use crate::crds::cluster::ChronikClusterSpec;
+        let spec: ChronikClusterSpec = serde_json::from_str(spec_json).unwrap();
+        let pod = build_cluster_node_pod("prod", "ns", 1, &spec, test_owner_ref(), None);
+        pod.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.name == "CHRONIK_INTER_BROKER_SECRET")
+            .collect()
+    }
+
+    fn secret_ref_of(e: &EnvVar) -> (String, String) {
+        let sel = e
+            .value_from
+            .as_ref()
+            .and_then(|v| v.secret_key_ref.as_ref())
+            .expect("must come from a secretKeyRef");
+        (sel.name.clone().unwrap(), sel.key.clone())
+    }
+
+    #[test]
+    fn a_sasl_cluster_gets_the_inter_broker_secret_by_reference() {
+        for mode in ["required", " TRUE ", "1", "yes", "optional"] {
+            let env = inter_broker_env(&format!(
+                r#"{{"env":[{{"name":"CHRONIK_SASL_ENABLED","value":"{mode}"}}]}}"#
+            ));
+            assert_eq!(env.len(), 1, "CHRONIK_SASL_ENABLED={mode:?}");
+            assert!(env[0].value.is_none(), "the secret must never be a literal");
+            assert_eq!(
+                secret_ref_of(&env[0]),
+                ("prod-inter-broker".to_string(), "secret".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_supplied_inter_broker_secret_is_used_instead() {
+        let env = inter_broker_env(
+            r#"{"env":[{"name":"CHRONIK_SASL_ENABLED","value":"required"}],
+                "interBrokerSecret":{"name":"mine","key":"s"}}"#,
+        );
+        assert_eq!(env.len(), 1);
+        assert!(env[0].value.is_none());
+        assert_eq!(
+            secret_ref_of(&env[0]),
+            ("mine".to_string(), "s".to_string())
+        );
+    }
+
+    #[test]
+    fn an_inter_broker_secret_already_in_env_is_not_duplicated() {
+        let env = inter_broker_env(
+            r#"{"env":[{"name":"CHRONIK_SASL_ENABLED","value":"required"},
+                       {"name":"CHRONIK_INTER_BROKER_SECRET",
+                        "valueFromSecret":{"name":"theirs","key":"k"}}]}"#,
+        );
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            secret_ref_of(&env[0]),
+            ("theirs".to_string(), "k".to_string())
+        );
+    }
+
+    #[test]
+    fn a_cluster_without_sasl_gets_no_inter_broker_secret() {
+        for json in [
+            "{}",
+            r#"{"env":[{"name":"CHRONIK_SASL_ENABLED","value":"false"}]}"#,
+            // Supplying a secret does not turn SASL on, and a SASL-disabled
+            // broker cannot accept the broker login it would trigger.
+            r#"{"interBrokerSecret":{"name":"mine","key":"s"}}"#,
+        ] {
+            assert!(inter_broker_env(json).is_empty(), "spec: {json}");
+        }
+    }
+
     /// Emit the Pod the operator would actually create, so it can be applied to
     /// a real cluster and checked rather than asserted about.
     ///
@@ -1465,8 +1562,13 @@ mod tests {
     fn dump_cluster_pod_yaml() {
         use crate::crds::cluster::ChronikClusterSpec;
 
-        let spec: ChronikClusterSpec =
-            serde_json::from_str(r#"{"image":"chronik-server:v2.14.1","replicas":1}"#).unwrap();
+        // CHRONIK_SPEC_JSON, when set, names a file holding a ChronikCluster
+        // `.spec`, so the Pod a live spec produces can be diffed across builds.
+        let raw = match std::env::var("CHRONIK_SPEC_JSON") {
+            Ok(path) => std::fs::read_to_string(path).expect("spec file should be readable"),
+            Err(_) => r#"{"image":"chronik-server:v2.14.1","replicas":1}"#.to_string(),
+        };
+        let spec: ChronikClusterSpec = serde_json::from_str(&raw).unwrap();
         let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
             api_version: "chronik.io/v1alpha1".into(),
             kind: "ChronikCluster".into(),

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::common::{
     Condition, EnvVar, ImagePullSecret, ListenerSpec, ListenerStatus, ObjectStoreSpec, PdbSpec,
-    PodSecurityContextSpec, ResourceRequirements, SchemaRegistrySpec, StorageSpec, Toleration,
-    UpdateStrategy, VectorSearchSpec,
+    PodSecurityContextSpec, ResourceRequirements, SchemaRegistrySpec, SecretKeyRef, StorageSpec,
+    Toleration, UpdateStrategy, VectorSearchSpec,
 };
 
 /// Spec for a multi-node Chronik Raft cluster.
@@ -164,6 +164,110 @@ pub struct ChronikClusterSpec {
     /// then be made writable by UID 1001 some other way.
     #[serde(default)]
     pub fix_data_ownership: Option<bool>,
+
+    /// Secret holding the broker-to-broker SASL secret
+    /// (`CHRONIK_INTER_BROKER_SECRET`).
+    ///
+    /// With SASL required (`CHRONIK_SASL_ENABLED` = `true`/`1`/`yes`/`required`
+    /// in `env`) a cluster broker refuses to start without this secret, and
+    /// replica fetchers use it to authenticate to the partition leader. It
+    /// must be at least 16 characters and identical on every broker.
+    ///
+    /// Leave it unset and the operator generates one in a Secret named
+    /// `<cluster>-inter-broker` (key `secret`), once, and never rotates it.
+    /// Set it to supply your own. Either way it is only injected while SASL is
+    /// enabled: a broker with SASL disabled cannot accept the broker login, so
+    /// handing it the secret would break replication. If `CHRONIK_SASL_ENABLED`
+    /// itself comes from a Secret the operator cannot tell whether SASL is on,
+    /// so it injects only a secret set here, and generates none.
+    #[serde(default)]
+    pub inter_broker_secret: Option<SecretKeyRef>,
+}
+
+/// Env var that turns on SASL in the broker.
+pub const SASL_ENABLED_ENV: &str = "CHRONIK_SASL_ENABLED";
+
+/// Env var carrying the broker-to-broker SASL secret.
+pub const INTER_BROKER_SECRET_ENV: &str = "CHRONIK_INTER_BROKER_SECRET";
+
+/// Key inside the generated `<cluster>-inter-broker` Secret.
+pub const GENERATED_INTER_BROKER_SECRET_KEY: &str = "secret";
+
+/// Name of the Secret the operator generates for a cluster's inter-broker secret.
+pub fn generated_inter_broker_secret_name(cluster_name: &str) -> String {
+    format!("{cluster_name}-inter-broker")
+}
+
+/// Whether a cluster spec turns SASL on, as the broker will read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaslSetting {
+    /// `CHRONIK_SASL_ENABLED` unset or a value the broker treats as off.
+    Disabled,
+    /// `required`/`optional` (or their aliases): brokers need the secret.
+    Enabled,
+    /// `CHRONIK_SASL_ENABLED` comes from a Secret the operator does not read.
+    Unknown,
+}
+
+/// Where the broker Pods get `CHRONIK_INTER_BROKER_SECRET` from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InterBrokerSecretSource {
+    /// `spec.interBrokerSecret`, supplied by the user.
+    User(SecretKeyRef),
+    /// The operator-generated `<cluster>-inter-broker` Secret.
+    Generated,
+}
+
+impl InterBrokerSecretSource {
+    /// The Secret key the Pods reference, for a cluster named `cluster_name`.
+    pub fn secret_key_ref(&self, cluster_name: &str) -> SecretKeyRef {
+        match self {
+            Self::User(r) => r.clone(),
+            Self::Generated => SecretKeyRef {
+                name: generated_inter_broker_secret_name(cluster_name),
+                key: GENERATED_INTER_BROKER_SECRET_KEY.into(),
+            },
+        }
+    }
+}
+
+impl ChronikClusterSpec {
+    /// The last `env` entry with this name — the one Kubernetes applies when a
+    /// container lists a name twice.
+    fn user_env(&self, name: &str) -> Option<&EnvVar> {
+        self.env.iter().rev().find(|e| e.name == name)
+    }
+
+    /// Read SASL mode from `env` exactly as the broker parses
+    /// `CHRONIK_SASL_ENABLED` (trimmed, case-insensitive).
+    pub fn sasl_setting(&self) -> SaslSetting {
+        let Some(var) = self.user_env(SASL_ENABLED_ENV) else {
+            return SaslSetting::Disabled;
+        };
+        match var.value.as_deref() {
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "required" | "optional" | "warn" => SaslSetting::Enabled,
+                _ => SaslSetting::Disabled,
+            },
+            None if var.value_from_secret.is_some() => SaslSetting::Unknown,
+            None => SaslSetting::Disabled,
+        }
+    }
+
+    /// Where the operator should source `CHRONIK_INTER_BROKER_SECRET` from, or
+    /// `None` when it must not inject it at all: SASL is off, or the user
+    /// already set the variable in `env`.
+    pub fn inter_broker_secret_source(&self) -> Option<InterBrokerSecretSource> {
+        if self.user_env(INTER_BROKER_SECRET_ENV).is_some() {
+            return None;
+        }
+        match (self.sasl_setting(), &self.inter_broker_secret) {
+            (SaslSetting::Disabled, _) => None,
+            (_, Some(r)) => Some(InterBrokerSecretSource::User(r.clone())),
+            (SaslSetting::Enabled, None) => Some(InterBrokerSecretSource::Generated),
+            (SaslSetting::Unknown, None) => None,
+        }
+    }
 }
 
 /// Status for ChronikCluster.
@@ -281,5 +385,101 @@ mod tests {
         // not at the CRD schema level, so users get a clear error message.
         let spec: ChronikClusterSpec = serde_json::from_str(r#"{"replicas": 1}"#).unwrap();
         assert_eq!(spec.replicas, 1); // Schema allows it; controller rejects it
+    }
+
+    fn with_sasl(value_json: &str) -> ChronikClusterSpec {
+        serde_json::from_str(&format!(
+            r#"{{"env":[{{"name":"CHRONIK_SASL_ENABLED",{value_json}}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    /// Mirrors the broker's `SaslMode::from_env`: trimmed, case-insensitive.
+    #[test]
+    fn sasl_setting_parses_like_the_broker() {
+        for v in [
+            "true", "1", "yes", "required", "Required", "  YES ", "optional", "warn",
+        ] {
+            assert_eq!(
+                with_sasl(&format!(r#""value":"{v}""#)).sasl_setting(),
+                SaslSetting::Enabled,
+                "{v:?}"
+            );
+        }
+        for v in ["false", "0", "no", "", "nonsense"] {
+            assert_eq!(
+                with_sasl(&format!(r#""value":"{v}""#)).sasl_setting(),
+                SaslSetting::Disabled,
+                "{v:?}"
+            );
+        }
+        let none: ChronikClusterSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(none.sasl_setting(), SaslSetting::Disabled);
+        assert_eq!(
+            with_sasl(r#""valueFromSecret":{"name":"s","key":"k"}"#).sasl_setting(),
+            SaslSetting::Unknown
+        );
+    }
+
+    #[test]
+    fn the_last_duplicate_env_entry_wins_as_in_kubernetes() {
+        let spec: ChronikClusterSpec = serde_json::from_str(
+            r#"{"env":[{"name":"CHRONIK_SASL_ENABLED","value":"required"},
+                       {"name":"CHRONIK_SASL_ENABLED","value":"false"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.sasl_setting(), SaslSetting::Disabled);
+    }
+
+    #[test]
+    fn inter_broker_secret_source_resolution() {
+        let user_ref = SecretKeyRef {
+            name: "mine".into(),
+            key: "s".into(),
+        };
+
+        let enabled = with_sasl(r#""value":"required""#);
+        assert_eq!(
+            enabled.inter_broker_secret_source(),
+            Some(InterBrokerSecretSource::Generated)
+        );
+        assert_eq!(
+            InterBrokerSecretSource::Generated.secret_key_ref("prod"),
+            SecretKeyRef {
+                name: "prod-inter-broker".into(),
+                key: "secret".into()
+            }
+        );
+
+        let mut enabled_user = enabled.clone();
+        enabled_user.inter_broker_secret = Some(user_ref.clone());
+        assert_eq!(
+            enabled_user.inter_broker_secret_source(),
+            Some(InterBrokerSecretSource::User(user_ref.clone()))
+        );
+
+        // SASL from a Secret: honour an explicit ref, but never generate one.
+        let unknown = with_sasl(r#""valueFromSecret":{"name":"s","key":"k"}"#);
+        assert_eq!(unknown.inter_broker_secret_source(), None);
+        let mut unknown_user = unknown.clone();
+        unknown_user.inter_broker_secret = Some(user_ref.clone());
+        assert_eq!(
+            unknown_user.inter_broker_secret_source(),
+            Some(InterBrokerSecretSource::User(user_ref))
+        );
+
+        // The user set the variable themselves: leave it alone.
+        let own: ChronikClusterSpec = serde_json::from_str(
+            r#"{"env":[{"name":"CHRONIK_SASL_ENABLED","value":"required"},
+                       {"name":"CHRONIK_INTER_BROKER_SECRET","value":"0123456789abcdef"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(own.inter_broker_secret_source(), None);
+    }
+
+    #[test]
+    fn the_crd_schema_carries_inter_broker_secret() {
+        let yaml = serde_yaml::to_string(&ChronikCluster::crd()).unwrap();
+        assert!(yaml.contains("interBrokerSecret"));
     }
 }

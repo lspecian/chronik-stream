@@ -91,6 +91,21 @@ pub enum SaslMode {
     Required,
 }
 
+impl SaslMode {
+    /// Read `CHRONIK_SASL_ENABLED` without the logging `SaslConfig::from_env`
+    /// does, for callers that only need the mode (the cluster startup check).
+    pub fn from_env() -> Self {
+        match std::env::var("CHRONIK_SASL_ENABLED") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "required" => SaslMode::Required,
+                "optional" | "warn" => SaslMode::Optional,
+                _ => SaslMode::Disabled,
+            },
+            Err(_) => SaslMode::Disabled,
+        }
+    }
+}
+
 /// Server-wide SASL settings, resolved once at startup and shared by every
 /// connection.
 #[derive(Debug, Clone)]
@@ -108,6 +123,10 @@ pub struct SaslConfig {
     /// until the process was replaced, which defeats the point of managing them
     /// at runtime.
     stored_users: Arc<std::sync::RwLock<Vec<(String, SaslUser)>>>,
+    /// The broker-to-broker user (`__chronik_broker`), derived from
+    /// `CHRONIK_INTER_BROKER_SECRET`. Installed last, so no configured or
+    /// stored user can replace it.
+    inter_broker: Option<SaslUser>,
 }
 
 impl SaslConfig {
@@ -121,14 +140,7 @@ impl SaslConfig {
         // `CHRONIK_SASL_ENABLED` accepts true/1/yes (require) and, since the
         // staged-rollout mode was added, `optional`. It stays the single knob so
         // existing configurations keep their meaning.
-        let mode = match std::env::var("CHRONIK_SASL_ENABLED") {
-            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" | "required" => SaslMode::Required,
-                "optional" | "warn" => SaslMode::Optional,
-                _ => SaslMode::Disabled,
-            },
-            Err(_) => SaslMode::Disabled,
-        };
+        let mode = SaslMode::from_env();
 
         let users = std::env::var("CHRONIK_SASL_USERS")
             .ok()
@@ -168,6 +180,12 @@ impl SaslConfig {
             mode,
             users,
             stored_users: Arc::new(std::sync::RwLock::new(Vec::new())),
+            // Whenever the secret is set, even with SASL off here: a fetcher
+            // with the secret always logs in, and nodes pass through different
+            // modes during a rollout (off -> optional -> required). A broker
+            // that answered the handshake but lacked the user would cut
+            // replication from every peer already switched over.
+            inter_broker: crate::inter_broker::server_user(),
         }
     }
 
@@ -178,6 +196,7 @@ impl SaslConfig {
             mode: SaslMode::Disabled,
             users: Vec::new(),
             stored_users: Arc::new(std::sync::RwLock::new(Vec::new())),
+            inter_broker: None,
         }
     }
 
@@ -187,6 +206,7 @@ impl SaslConfig {
             mode: SaslMode::Required,
             users,
             stored_users: Arc::new(std::sync::RwLock::new(Vec::new())),
+            inter_broker: None,
         }
     }
 
@@ -196,11 +216,27 @@ impl SaslConfig {
             mode: SaslMode::Optional,
             users,
             stored_users: Arc::new(std::sync::RwLock::new(Vec::new())),
+            inter_broker: None,
         }
     }
 
     pub fn mode(&self) -> SaslMode {
         self.mode
+    }
+
+    /// Install the broker user from an explicit secret (tests; production reads
+    /// the environment in `from_env`).
+    #[cfg(test)]
+    pub fn with_inter_broker_secret(mut self, secret: &str) -> Self {
+        self.inter_broker = Some(SaslUser::from_scram_credential(
+            chronik_protocol::scram::ScramCredential::derive(
+                secret,
+                chronik_protocol::sasl::SaslMechanism::ScramSha512,
+                chronik_protocol::scram::DEFAULT_ITERATIONS,
+            )
+            .unwrap(),
+        ));
+        self
     }
 
     /// Whether authentication is offered at all (required or optional).
@@ -231,6 +267,9 @@ impl SaslConfig {
             Err(_) => Vec::new(),
         };
         for (username, user) in &stored {
+            if chronik_protocol::sasl::is_reserved_username(username) {
+                continue; // refused at write time too; never trust the store alone
+            }
             match authenticator.user_mut(username) {
                 Some(existing) => {
                     for mechanism in user.available_mechanisms() {
@@ -241,6 +280,12 @@ impl SaslConfig {
                 }
                 None => authenticator.add_user_with_credentials(username.clone(), user.clone()),
             }
+        }
+        if let Some(broker) = &self.inter_broker {
+            authenticator.add_user_with_credentials(
+                chronik_protocol::sasl::INTER_BROKER_USER.to_string(),
+                broker.clone(),
+            );
         }
         authenticator
     }
@@ -264,6 +309,14 @@ fn parse_users(config: &str) -> Vec<(String, String)> {
         .filter_map(|pair| {
             let mut parts = pair.trim().splitn(2, ':');
             match (parts.next(), parts.next()) {
+                (Some(user), _) if chronik_protocol::sasl::is_reserved_username(user) => {
+                    warn!(
+                        "CHRONIK_SASL_USERS entry '{}' ignored: names starting with __chronik are \
+                         reserved. Brokers authenticate with CHRONIK_INTER_BROKER_SECRET.",
+                        user
+                    );
+                    None
+                }
                 (Some(user), Some(pass)) if !user.is_empty() => {
                     Some((user.to_string(), pass.to_string()))
                 }

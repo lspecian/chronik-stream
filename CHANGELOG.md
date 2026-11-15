@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.6] - 2026-11-15
+
+### Fixed
+
+- **`acks=all` could acknowledge writes that no follower held.** When the
+  quorum wait timed out (30 s), the leader answered `NOT_ENOUGH_REPLICAS`, but
+  the batch was already in its log. The idempotent producer retried; the retry
+  was answered `DUPLICATE_SEQUENCE_NUMBER` at once, and the Java client counts
+  that as success. Measured with the stock `kafka-verifiable-producer`
+  (idempotent, retrying) and both followers killed: v2.16.5 reported 10 of 10
+  records delivered after 31 s; this release reports 0 of 10. This affected
+  every cluster, not only SASL ones. Two changes, both Kafka's behaviour: an
+  `acks=all` write is refused before anything is written when the published
+  in-sync set is smaller than `min_insync_replicas`, and a duplicate under
+  `acks=all` waits for the quorum like a first write.
+
+- **The in-sync set never dropped a follower that never fetched.** A follower
+  with no fetch at all counted as "unknown", and unknown was published as fully
+  in sync, so the ISR could list replicas holding nothing. A new leader now
+  gives each follower the lag window (`CHRONIK_REPLICA_LAG_TIME_MAX_MS`,
+  default 10 s) to fetch, then drops it. Healthy clusters keep a full ISR,
+  idle or busy.
+
+- **With SASL required, followers replicated nothing.** The replica fetcher
+  connected without authenticating, so the leader closed every follower fetch
+  ("early eof") and each node held only the partitions it led. Brokers now
+  authenticate to each other as the reserved user `__chronik_broker`
+  (SCRAM-SHA-512, server signature verified) using the new
+  **`CHRONIK_INTER_BROKER_SECRET`**, which must be the same on every broker
+  (at least 16 characters). A cluster node with `CHRONIK_SASL_ENABLED=true`
+  and no secret refuses to start and says why. The name is refused in
+  `CHRONIK_SASL_USERS` and `AlterUserScramCredentials`, and the principal
+  bypasses ACLs. The Kubernetes operator (chart 0.3.3) generates the secret
+  for SASL clusters as `<cluster>-inter-broker`; set `interBrokerSecret` to
+  supply your own.
+
+- **Any authenticated client could pose as a replica.** A fetch carrying a
+  replica id moves the in-sync set and settles `acks=all` writes. On an
+  authenticated connection it is now accepted only from the broker principal,
+  or from a principal holding ClusterAction when ACLs are on.
+
+- **No stock Java client could complete SASL authentication.** The request
+  header parser guessed the client-id encoding from its first byte; the null
+  client id the Java client sends on SaslAuthenticate fell into the
+  compact-string branch ("compact string of length 16382"), and client ids of
+  256 bytes or more failed the same way. Header v2 client ids are now always
+  read as a nullable INT16-length string, as the spec and librdkafka have it.
+  SaslAuthenticate responses also encoded an absent `authBytes` as null, a
+  non-nullable field, which the Java client rejected.
+
+- **ACL and SCRAM changes never left the broker that made them.** Creating a
+  user or granting an ACL through one broker had no effect on the others, and
+  a user or rule **revoked** through one broker kept working on the rest. The
+  four security events now replicate, and the authorizer reloads its rules when
+  replicated changes arrive instead of only at boot. Verified with the Kafka
+  3.7 tools on a 3-node cluster: create, grant, full restart, revoke and delete,
+  all made through node 1 and enforced on nodes 2 and 3. A broker that is down
+  during a security change still misses it until it is repeated; the Raft
+  catalog work closes that.
+
+- **SCRAM key material in debug logs.** `ScramCredentialRecord` derived
+  `Debug`, so `RUST_LOG=debug` printed salts, stored keys and server keys from
+  several paths. It now prints them as `<redacted>`.
+
 ## [2.16.5] - 2026-11-13
 
 ### Fixed
