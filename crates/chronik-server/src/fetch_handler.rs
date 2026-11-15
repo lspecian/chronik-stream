@@ -1142,8 +1142,9 @@ impl FetchHandler {
         // a liveness heartbeat, and a reconnect probe to approximate the same
         // thing (see the RP-1 cluster findings).
         if replica_id >= 0 {
+            // The follower's position is recorded below, once the leader's log
+            // end is known: whether it is keeping up is relative to that.
             if let Some(ref tracker) = self.isr_tracker {
-                tracker.update_follower_offset(replica_id as u64, topic, partition, fetch_offset);
                 tracker.record_node_alive(replica_id as u64);
                 debug!(
                     "Follower fetch: node {} at offset {} for {}-{}",
@@ -1208,6 +1209,20 @@ impl FetchHandler {
         let high_watermark = self
             .readable_end_offset(topic, partition, fetch_offset, replica_id)
             .await?;
+
+        // For a follower that bound IS the leader's log end, so this is where
+        // its fetch can be judged: caught up, or merely still fetching.
+        if replica_id >= 0 {
+            if let Some(ref tracker) = self.isr_tracker {
+                tracker.record_follower_fetch(
+                    replica_id as u64,
+                    topic,
+                    partition,
+                    fetch_offset,
+                    high_watermark,
+                );
+            }
+        }
 
         // Log start offset (low watermark). Advanced by the Kafka DeleteRecords API;
         // records below it have been deleted and must not be served. Sourced from

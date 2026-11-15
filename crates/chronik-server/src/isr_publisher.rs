@@ -66,6 +66,14 @@ pub fn in_sync_replicas(
         return None;
     }
 
+    // "Caught up" means reaching the leader's LOG END. Callers hold a high
+    // watermark, which trails the in-sync followers by definition, so a stuck
+    // follower measured against it can look caught up; the tracker has seen
+    // the log end on every follower fetch, and the larger of the two wins.
+    let leader_offset = tracker
+        .leader_end_seen(topic, partition)
+        .map_or(leader_offset, |end| end.max(leader_offset));
+
     let mut isr = tracker.get_isr(topic, partition, leader_offset, replicas);
     if !isr.contains(&leader_id) {
         isr.insert(0, leader_id);

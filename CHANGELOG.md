@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.8] - 2026-11-15
+
+### Fixed
+
+- **A follower that fetched without catching up stayed in the in-sync set, and
+  could be elected over the data.** The `CHRONIK_REPLICA_LAG_TIME_MAX_MS` bound
+  measured time since the follower last *fetched*, which every fetch resets, so
+  a follower stuck at one offset never aged out. Reproduced on a local 3-node
+  cluster with v2.16.7: two followers stuck at offset 100 of a 1,000-record
+  partition were reported in sync; when the leader was killed one was elected,
+  and all 1,000 records acknowledged at `acks=all` were gone (100 unrelated
+  records were served instead). The bound now measures time since the follower
+  was last caught up to the leader's log end, as Kafka's
+  `replica.lag.time.max.ms` does, including Kafka's rule that reaching the log
+  end seen at the previous fetch counts as caught up under continuous writes.
+  "Caught up" is judged against the log end, not the high watermark, which
+  trails the in-sync followers by definition.
+- **Followers looped forever on a batch spanning their log end.** When the
+  leader sent a batch starting below a follower's log end and ending above it,
+  the follower re-ran the leader-epoch exchange; if that could not place the
+  divergence (the leader answered "unknown", or the follower's log predates
+  epoch stamping), it discarded nothing and fetched the same batch again,
+  indefinitely. Live on two clusters: on one, both followers of a 1.8 M-record
+  partition were stuck at offset 21,734, holding records written in August by a
+  node that led with no history (#58), leaving the partition on a single copy.
+  Such a replica is now rebuilt from the leader, which is the only safe repair:
+  cutting back to the straddling batch would splice two histories, since
+  nothing below it is known to be shared. Logged at ERROR, once per straddle.
+  Verified on the reproduction: after the rebuild, killing the leader serves
+  exactly its 1,000 records and none of the followers' old ones.
+
 ## [2.16.7] - 2026-11-15
 
 ### Fixed

@@ -505,13 +505,13 @@ fn read_i64(bytes: &[u8], pos: usize) -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Build a minimal but structurally valid v2 batch header. The record body
     /// is filler — `plan_batches` reads only the header, which is the point:
     /// it can classify batches without paying to decode them.
-    fn batch(base_offset: i64, record_count: i32, body_padding: usize) -> Vec<u8> {
+    pub(crate) fn batch(base_offset: i64, record_count: i32, body_padding: usize) -> Vec<u8> {
         let mut b = Vec::new();
         let payload_len = MIN_BATCH_HEADER - 12 + body_padding;
         b.extend_from_slice(&base_offset.to_be_bytes());
