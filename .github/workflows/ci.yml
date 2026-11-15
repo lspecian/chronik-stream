@@ -7,6 +7,12 @@ on:
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
+  # ubuntu-latest moved to CMake 4, which refuses librdkafka 2.3.0's
+  # `cmake_minimum_required(VERSION 3.2)` (bundled by rdkafka-sys 4.8, pulled in
+  # by chronik-bench/perf/memory/ontology and the integration tests). Every PR
+  # since v2.16.6 failed Check and Test on this, not on code. CMake 4 honours
+  # this override; older CMake ignores it.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   check:

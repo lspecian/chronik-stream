@@ -233,3 +233,86 @@ fn implemented_scram_credential_apis_stay_advertised() {
         );
     }
 }
+
+/// DescribeCluster must list every broker, not just the one answering.
+///
+/// It returned only the answering node, so admin tools saw a one-broker cluster:
+/// `kafka-topics.sh --describe --unavailable-partitions` reported every
+/// partition led by another broker as unavailable (5,715 on a healthy 3-node
+/// cluster) and UIs drew a single node. Metadata, from the same store, always
+/// listed all three. The two APIs must agree.
+#[tokio::test]
+async fn describe_cluster_lists_every_broker_metadata_knows() {
+    use chronik_common::metadata::{BrokerMetadata, BrokerStatus, InMemoryMetadataStore, MetadataStore};
+    use std::sync::Arc;
+
+    let store = Arc::new(InMemoryMetadataStore::new());
+    for id in 1..=3 {
+        store
+            .register_broker(BrokerMetadata {
+                broker_id: id,
+                host: format!("node{id}.example"),
+                port: 9091 + id,
+                rack: (id == 2).then(|| "rack-b".to_string()),
+                status: BrokerStatus::Online,
+                created_at: chronik_common::Utc::now(),
+                updated_at: chronik_common::Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+    let handler = ProtocolHandler::with_metadata_store(store);
+
+    let response = handler
+        .handle_request(&describe_cluster_request(1, 11))
+        .await
+        .expect("DescribeCluster v1 must be answered");
+    let mut body = response.body;
+    let mut d = Decoder::new(&mut body);
+
+    assert_eq!(d.read_i32().unwrap(), 0); // throttle
+    assert_eq!(d.read_i16().unwrap(), 0); // error_code
+    assert_eq!(d.read_compact_string().unwrap(), None);
+    assert_eq!(d.read_i8().unwrap(), 1); // endpoint_type
+    assert_eq!(d.read_compact_string().unwrap().as_deref(), Some(CLUSTER_ID));
+    let _controller = d.read_i32().unwrap();
+
+    let n = d.read_unsigned_varint().unwrap() - 1;
+    let mut brokers = Vec::new();
+    for _ in 0..n {
+        let id = d.read_i32().unwrap();
+        let host = d.read_compact_string().unwrap().unwrap();
+        let port = d.read_i32().unwrap();
+        let rack = d.read_compact_string().unwrap();
+        assert_eq!(d.read_unsigned_varint().unwrap(), 0);
+        brokers.push((id, host, port, rack));
+    }
+    brokers.sort();
+    assert_eq!(
+        brokers,
+        vec![
+            (1, "node1.example".to_string(), 9092, None),
+            (2, "node2.example".to_string(), 9093, Some("rack-b".to_string())),
+            (3, "node3.example".to_string(), 9094, None),
+        ],
+        "every broker in the cluster, with its address and rack"
+    );
+    let _ops = d.read_i32().unwrap();
+    assert_eq!(d.read_unsigned_varint().unwrap(), 0);
+    assert_eq!(d.remaining(), 0);
+}
+
+/// KIP-919: a broker answers endpoint_type=1 only; asking it for controllers
+/// gets UNSUPPORTED_ENDPOINT_TYPE, not a broker list mislabelled as controllers.
+#[tokio::test]
+async fn describe_cluster_refuses_the_controller_endpoint_type() {
+    let mut req = describe_cluster_request(1, 12).to_vec();
+    let n = req.len();
+    req[n - 2] = 2; // endpoint_type = controllers
+    let handler = ProtocolHandler::new();
+    let response = handler.handle_request(&Bytes::from(req)).await.unwrap();
+    let mut body = response.body;
+    let mut d = Decoder::new(&mut body);
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.read_i16().unwrap(), 119, "UNSUPPORTED_ENDPOINT_TYPE");
+}

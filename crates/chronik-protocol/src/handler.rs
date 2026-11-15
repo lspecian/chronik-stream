@@ -4709,141 +4709,108 @@ impl ProtocolHandler {
     }
 
     /// Handle DescribeCluster request (API key 60)
+    ///
+    /// Reports every broker the cluster knows, from the same source as Metadata.
+    /// It used to report only the answering node, so admin tools concluded the
+    /// cluster had one live broker: `kafka-topics.sh --unavailable-partitions`
+    /// listed every partition led elsewhere as unavailable (5,715 of them on a
+    /// healthy 3-node cluster), and UIs drew a one-node cluster.
     async fn handle_describe_cluster(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
         use crate::parser::{Encoder, Decoder};
         use bytes::BytesMut;
 
-        tracing::info!("Handling DescribeCluster request v{} from client_id={:?}, correlation_id={}",
+        tracing::debug!("Handling DescribeCluster request v{} from client_id={:?}, correlation_id={}",
             header.api_version,
             header.client_id.as_deref().unwrap_or("unknown"),
             header.correlation_id
         );
 
-        // Parse request body
-        let include_cluster_authorized_operations = if !body.is_empty() {
-            let mut decoder = Decoder::new(body);
-            let result = decoder.read_i8().unwrap_or(0) != 0;
+        if header.api_version > 1 {
+            return Err(Error::Protocol(format!("DescribeCluster v{} not implemented", header.api_version)));
+        }
 
-            // For v1, also need to skip any tagged fields in the request
-            if header.api_version >= 1 {
-                let tag_count = decoder.read_unsigned_varint().unwrap_or(0);
-                for _ in 0..tag_count {
-                    let _tag_id = decoder.read_unsigned_varint().unwrap_or(0);
-                    let tag_size = decoder.read_unsigned_varint().unwrap_or(0);
-                    decoder.skip(tag_size as usize).ok();
-                }
-            }
-
-            result
+        // Request: include_cluster_authorized_operations BOOL, then at v1
+        // endpoint_type INT8 (KIP-919), then (flexible) a tag buffer.
+        let mut decoder = Decoder::new(body);
+        let include_cluster_authorized_operations = decoder.read_i8().unwrap_or(0) != 0;
+        let endpoint_type = if header.api_version >= 1 {
+            decoder.read_i8().unwrap_or(1)
         } else {
-            false
+            1
         };
 
-        tracing::debug!("DescribeCluster request: include_cluster_authorized_operations = {}",
-            include_cluster_authorized_operations);
+        let authorized_operations = if include_cluster_authorized_operations {
+            0x7FFFFFFF_i32
+        } else {
+            i32::MIN
+        };
+
+        // Same list Metadata returns: a client must not see one set of brokers
+        // from Metadata and another from DescribeCluster.
+        let brokers = crate::handlers::metadata::BrokerRetriever::get_brokers(
+            self.metadata_store.clone(),
+            self.broker_id,
+            self.advertised_host.clone(),
+            self.advertised_port,
+        )
+        .await?;
 
         let mut body_buf = BytesMut::new();
         let mut encoder = Encoder::new(&mut body_buf);
 
-        // Build response based on version
         if header.api_version == 0 {
-            // v0: NON-FLEXIBLE encoding
-            //
-            // throttle_time_ms is the FIRST field of DescribeClusterResponse at
-            // every version. Omitting it shifted the whole body by four bytes,
-            // and the Java AdminClient died on the misread — see the v1 arm.
-            encoder.write_i32(0); // Throttle time
-            encoder.write_i16(0); // Error code: NONE
-            encoder.write_string(None); // Error message: null
-
-            encoder.write_string(Some(CLUSTER_ID)); // Cluster ID as nullable string
-
-            encoder.write_i32(self.broker_id); // Controller ID
-
-            encoder.write_i32(1); // Number of brokers: 1
-
-            // Broker entry
-            encoder.write_i32(self.broker_id); // Broker ID
-            encoder.write_string(Some(&self.advertised_host)); // Host as nullable string
-            encoder.write_i32(self.advertised_port); // Port
-            encoder.write_string(None); // Rack: null
-
-            // Cluster authorized operations
-            let authorized_operations = if include_cluster_authorized_operations {
-                0x7FFFFFFF_i32
-            } else {
-                -2147483648_i32
-            };
+            // v0. throttle_time_ms is the FIRST field at every version; omitting
+            // it shifted the body by four bytes and killed the Java AdminClient.
+            encoder.write_i32(0); // throttle_time_ms
+            encoder.write_i16(0); // error_code
+            encoder.write_string(None); // error_message (v0 framing is non-flexible here; see make_response)
+            encoder.write_string(Some(CLUSTER_ID));
+            encoder.write_i32(self.broker_id); // controller_id
+            encoder.write_i32(brokers.len() as i32);
+            for b in &brokers {
+                encoder.write_i32(b.node_id);
+                encoder.write_string(Some(&b.host));
+                encoder.write_i32(b.port);
+                encoder.write_string(b.rack.as_deref());
+            }
             encoder.write_i32(authorized_operations);
-
-        } else if header.api_version == 1 {
-            // v1: FLEXIBLE/COMPACT encoding
-            //
-            // Two fields were missing here, and the first one broke every Java
-            // AdminClient that tried to describe this cluster (#35):
-            //
-            //   throttle_time_ms  — the first field at EVERY version. Without it
-            //     the client read the four bytes of `error_code || error_message
-            //     || cluster_id_len` as the throttle, then took a byte of the
-            //     cluster id as a string length. Observed exactly:
-            //     "Error reading byte array of 84 byte(s): only 49 byte(s)
-            //     available", where 84 came from 'U' in the cluster id. The
-            //     AdminClient thread then died and every subsequent call failed
-            //     with "The AdminClient thread has exited", which is why this was
-            //     reported as a null clusterId — the id never arrived at all.
-            //
-            //   endpoint_type — added at v1 by KIP-919, immediately after
-            //     error_message. Fixing only the throttle would have left the
-            //     body one byte short of the schema.
-            encoder.write_i32(0); // Throttle time
-            encoder.write_i16(0); // Error code: NONE
-            encoder.write_compact_string(None); // Error message: null (compact nullable string)
-            encoder.write_i8(1); // Endpoint type: 1 = brokers (v1+, KIP-919)
-
-            encoder.write_compact_string(Some(CLUSTER_ID)); // Cluster ID as compact nullable string
-
-            encoder.write_i32(self.broker_id); // Controller ID (still i32 in v1)
-
-            // Brokers array - compact array format
-            encoder.write_unsigned_varint(2); // Array length + 1 (1 broker means write 2)
-
-            // Broker entry
-            encoder.write_i32(self.broker_id); // Broker ID
-            encoder.write_compact_string(Some(&self.advertised_host)); // Host as compact string
-            encoder.write_i32(self.advertised_port); // Port
-            encoder.write_compact_string(None); // Rack: compact null
-
-            // Tagged fields for broker
-            encoder.write_unsigned_varint(0); // No tagged fields
-
-            // Cluster authorized operations (still i32 in v1)
-            let authorized_operations = if include_cluster_authorized_operations {
-                0x7FFFFFFF_i32
-            } else {
-                -2147483648_i32
-            };
+        } else if endpoint_type != 1 {
+            // KIP-919: a broker only answers for endpoint_type=1 (brokers).
+            // Controllers are not separately addressable here.
+            encoder.write_i32(0); // throttle_time_ms
+            encoder.write_i16(crate::error_codes::UNSUPPORTED_ENDPOINT_TYPE);
+            encoder.write_compact_string(Some("Only endpoint_type=1 (brokers) is supported"));
+            encoder.write_i8(endpoint_type);
+            encoder.write_compact_string(Some(CLUSTER_ID));
+            encoder.write_i32(-1); // controller_id
+            encoder.write_unsigned_varint(1); // empty brokers array
             encoder.write_i32(authorized_operations);
-
-            // Tagged fields for response
-            encoder.write_unsigned_varint(0); // No tagged fields
-
+            encoder.write_unsigned_varint(0);
         } else {
-            // Unsupported version
-            return Err(Error::Protocol(format!("DescribeCluster v{} not implemented", header.api_version)));
+            // v1 (flexible). Two fields were once missing here and broke every
+            // Java AdminClient (#35): throttle_time_ms (first field at every
+            // version) and endpoint_type (KIP-919, right after error_message).
+            encoder.write_i32(0); // throttle_time_ms
+            encoder.write_i16(0); // error_code
+            encoder.write_compact_string(None); // error_message
+            encoder.write_i8(1); // endpoint_type = brokers
+            encoder.write_compact_string(Some(CLUSTER_ID));
+            encoder.write_i32(self.broker_id); // controller_id
+            encoder.write_unsigned_varint(brokers.len() as u32 + 1);
+            for b in &brokers {
+                encoder.write_i32(b.node_id);
+                encoder.write_compact_string(Some(&b.host));
+                encoder.write_i32(b.port);
+                encoder.write_compact_string(b.rack.as_deref());
+                encoder.write_unsigned_varint(0); // broker tagged fields
+            }
+            encoder.write_i32(authorized_operations);
+            encoder.write_unsigned_varint(0); // response tagged fields
         }
 
         let body_bytes = body_buf.freeze();
-
-        let cluster_id = CLUSTER_ID;
-        tracing::info!("DescribeCluster v{} response: cluster_id={}, controller={}, broker={}:{}, body_size={}",
-                      header.api_version, cluster_id, self.broker_id, self.advertised_host, self.advertised_port, body_bytes.len());
-
-        // Debug: log exact bytes for troubleshooting
-        let hex_bytes = body_bytes.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        tracing::debug!("DescribeCluster response body hex: {}", hex_bytes);
+        tracing::debug!("DescribeCluster v{} response: cluster_id={}, controller={}, brokers={}, body_size={}",
+            header.api_version, CLUSTER_ID, self.broker_id, brokers.len(), body_bytes.len());
 
         Ok(Self::make_response(&header, ApiKey::DescribeCluster, body_bytes))
     }
