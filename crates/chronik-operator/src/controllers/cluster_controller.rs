@@ -765,6 +765,8 @@ fn pick_leader(reports: &[(i64, Option<(u64, bool)>)]) -> Option<i64> {
         .min()
 }
 
+/// Update the ChronikCluster status subresource.
+#[allow(clippy::too_many_arguments)]
 async fn update_status(
     client: &Client,
     name: &str,
@@ -874,25 +876,38 @@ mod tests {
 
     #[test]
     fn the_node_that_reports_leading_is_the_leader() {
-        let reports = vec![(1, Some((1, false))), (2, Some((2, false))), (3, Some((3, true)))];
+        let reports = vec![
+            (1, Some((1, false))),
+            (2, Some((2, false))),
+            (3, Some((3, true))),
+        ];
         assert_eq!(pick_leader(&reports), Some(3));
     }
 
     #[test]
     fn no_leader_when_nobody_claims_it_or_nobody_answers() {
-        assert_eq!(pick_leader(&[(1, Some((1, false))), (2, None), (3, None)]), None);
+        assert_eq!(
+            pick_leader(&[(1, Some((1, false))), (2, None), (3, None)]),
+            None
+        );
         assert_eq!(pick_leader(&[(1, None), (2, None)]), None);
     }
 
     #[test]
     fn a_claim_for_a_different_node_id_is_ignored() {
         // A pod IP reused by another broker answers with its own id.
-        assert_eq!(pick_leader(&[(1, Some((2, true))), (2, Some((2, false)))]), None);
+        assert_eq!(
+            pick_leader(&[(1, Some((2, true))), (2, Some((2, false)))]),
+            None
+        );
     }
 
     #[test]
     fn two_claims_during_an_election_take_the_lowest() {
-        assert_eq!(pick_leader(&[(2, Some((2, true))), (3, Some((3, true)))]), Some(2));
+        assert_eq!(
+            pick_leader(&[(2, Some((2, true))), (3, Some((3, true)))]),
+            Some(2)
+        );
     }
 
     #[test]
