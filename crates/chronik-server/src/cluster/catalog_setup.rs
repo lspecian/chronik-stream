@@ -74,7 +74,15 @@ pub async fn start_catalog_grpc_server(catalog: Arc<ClusterCatalog>, bind_addr: 
         .with_context(|| format!("binding the catalog raft endpoint on {}", addr))?;
     let service = catalog.service();
     catalog_runtime().spawn(async move {
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        // TCP_NODELAY on every accepted connection: raft messages are small, and
+        // Nagle against delayed ACKs held each round trip ~40 ms.
+        let incoming = match tonic::transport::server::TcpIncoming::from_listener(listener, true, None) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::error!("Catalog raft endpoint: {}", e);
+                return;
+            }
+        };
         if let Err(e) = tonic::transport::Server::builder().add_service(service).serve_with_incoming(incoming).await {
             tracing::error!("Catalog raft endpoint stopped: {}", e);
         }

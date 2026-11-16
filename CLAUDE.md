@@ -272,28 +272,28 @@ match ApiKey::try_from(header.api_key)? {
 - Config flag `use_wal_metadata` controls metadata store type (default: true)
 
 **Builder Pattern for Server Initialization** (v2.2.8+):
-The `IntegratedKafkaServer` uses a 14-stage builder pattern to reduce complexity from 764 (30x over threshold) to <25 per function:
+The `IntegratedKafkaServer` is assembled in stages by `IntegratedKafkaServerBuilder`:
 
 ```rust
-// Single-node mode
+// Single-node mode (starts a one-voter catalog, no network)
 let server = IntegratedKafkaServerBuilder::new(config)
     .build()
     .await?;
 
-// Cluster mode with Raft
+// Cluster mode (main starts the ClusterCatalog and its gRPC endpoint)
 let server = IntegratedKafkaServerBuilder::new(config)
-    .with_raft_cluster(raft_cluster)
+    .with_cluster_catalog(catalog)
     .build()
     .await?;
 ```
 
-**Builder Stages** (14 stages for separation of concerns):
+**Builder Stages**:
 1. **Directories** - Data directory structure creation
-2. **Raft Cluster** - Single-node or multi-node consensus (optional)
-3. **Metadata WAL** - Event-sourced metadata persistence
-4. **Event Bus** - Metadata replication event channel
-5. **Metadata Store** - WalMetadataStore with recovery
-6. **Metadata Replication** - Background replication tasks
+2. **Cluster Catalog** - The Raft-replicated catalog (adopted in cluster mode, one-voter in single-node)
+3. **Metadata WAL** - Local event-sourced persistence for node-local metadata
+4. **Event Bus** - Local metadata change notifications
+5. **Metadata Store** - `CatalogMetadataStore`: catalog state via Raft, local state via `WalMetadataStore`
+6. **Catalog Bridge** - Applied catalog changes → local purge, security reload, event bus (fetcher re-plan)
 7. **Storage Layer** - ObjectStore, StorageService, SegmentReader
 8. **WAL Manager** - Message WAL with group commit
 9. **ProduceHandler** - Message production with ISR tracking
@@ -302,8 +302,9 @@ let server = IntegratedKafkaServerBuilder::new(config)
 12. **KafkaProtocolHandler** - Request routing
 13. **WalIndexer** - Background Tantivy indexing
 14. **MetadataUploader** - Disaster recovery (S3/GCS/Azure only)
+16–19. **ReplicaFetcher, PartitionFailover, IsrPublisher, AssignmentRepair** (cluster mode)
 
-Each stage is independently testable with complexity <25. See [crates/chronik-server/src/integrated_server/builder.rs](crates/chronik-server/src/integrated_server/builder.rs) for implementation.
+See [crates/chronik-server/src/integrated_server/builder.rs](crates/chronik-server/src/integrated_server/builder.rs) for implementation.
 
 **Metadata Store Abstraction**:
 ```rust
@@ -434,13 +435,11 @@ The `chronik-server` binary now has a single `start` command that auto-detects m
 
 **CRITICAL**: Raft is ONLY for multi-node clusters (3+ nodes for quorum). Single-node deployments should use standalone mode.
 
-#### Why Single-Node Raft is Rejected
+#### Single-Node Mode
 
-Raft provides **zero benefit** for single-node deployments:
-- ❌ No fault tolerance (1 node dies = cluster down)
-- ❌ No replication (data only exists on 1 node)
-- ❌ Adds latency (Raft state machine overhead)
-- ✅ WAL already provides durability for single-node
+Single-node mode has no cluster config and no network Raft. Its catalog is a
+one-voter Raft group that commits locally (an fsync, no round trips); data
+durability comes from the WAL as before. Clustering needs 3+ nodes for quorum.
 
 **Use single-node mode** (v2.2.0+):
 ```bash
@@ -489,12 +488,12 @@ min_insync_replicas = 2
 
 [node.addresses]
 kafka = "0.0.0.0:9092"    # Where to bind
-wal = "0.0.0.0:9291"      # Metadata replication receiver (partition data is pulled over the Kafka port)
+wal = "0.0.0.0:9291"      # Unused since the catalog moved to Raft (kept for config compatibility)
 raft = "0.0.0.0:5001"     # Raft consensus
 
 [node.advertise]
 kafka = "localhost:9092"   # What clients connect to
-wal = "localhost:9291"     # What peers connect to for metadata
+wal = "localhost:9291"     # Unused (see above)
 raft = "localhost:5001"    # What peers connect to
 
 [[peers]]
@@ -546,8 +545,8 @@ Add a new node to a running cluster without downtime:
   --raft localhost:5004 \
   --config cluster.toml
 
-# Step 2: Start the new node
-./target/release/chronik-server start --config cluster-node4.toml
+# Step 2: Start the new node, joining (not founding) the cluster
+CHRONIK_CLUSTER_JOIN=true ./target/release/chronik-server start --config cluster-node4.toml
 
 # Step 3: Verify (partitions automatically rebalance)
 ./target/release/chronik-server cluster status --config cluster.toml
@@ -744,118 +743,28 @@ Comprehensive test suite for node management:
 - [docs/PRIORITY4_COMPLETE.md](docs/PRIORITY4_COMPLETE.md) - Node removal design
 - [docs/CLUSTER_PLAN_STATUS_UPDATE.md](docs/CLUSTER_PLAN_STATUS_UPDATE.md) - Complete status
 
-### Raft Snapshots & Log Compaction (v2.0.0+)
+### Cluster Catalog on Raft (v2.17.0+)
 
-**NEW**: Chronik Raft clusters now support automatic snapshot-based log compaction to prevent unbounded Raft log growth.
+Topics, partition assignments (replicas, leader, leader epoch, ISR), brokers, ACLs, SCRAM credentials and node addresses form the **cluster catalog**. It is a deterministic state machine (`chronik-common/src/metadata/catalog.rs`) replicated by one Raft group on every node, single-node included.
 
-#### How Snapshots Work
+- **One writer, one order.** Every change is a `CatalogCommand`. Any node accepts a write and forwards it to the catalog leader; the caller is answered once the command is applied **on the node it asked** (read-your-writes). Validation happens at apply time, so two concurrent creates of a name both commit and exactly one succeeds (`TOPIC_ALREADY_EXISTS` for the other). Auto-create and explicit create go through the same path.
+- **Placement** is decided by the catalog: round-robin over registered brokers, replication factor honoured, a cursor rotates first replicas across topics. Explicit client replica assignments pass through.
+- **Fencing.** Leader epochs move only when the leader changes, inside the state machine. ISR reports (`UpdateIsr`) are accepted only from the current leader at the current epoch; failover/preferred-leader moves carry the epoch they were planned at and are refused if it moved on.
+- **Convergence by replay.** A node that was down reads the log (or installs a snapshot) when it returns. There is no anti-entropy, pruning or push replication; port 9291 (`wal` address) is no longer used.
+- **Caught-up gate.** A node that has not heard from a leader within an election timeout, or has not applied what the leader had committed since boot, does not auto-create topics.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   Raft Snapshot Lifecycle                   │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. AUTOMATIC TRIGGER (background loop every 5 minutes)    │
-│     ├─ Log size threshold (default: 10,000 entries)        │
-│     └─ Time threshold (default: 1 hour)                    │
-│                                                             │
-│  2. SNAPSHOT CREATION                                       │
-│     ├─ Serialize partition state (metadata + data)         │
-│     ├─ Compress with Gzip/Zstd (default: Gzip)            │
-│     ├─ Upload to S3/GCS/Azure/Local object storage        │
-│     └─ CRC32 checksum for integrity                        │
-│                                                             │
-│  3. LOG TRUNCATION                                          │
-│     ├─ Truncate Raft log up to snapshot index             │
-│     └─ Free disk space                                     │
-│                                                             │
-│  4. NODE RECOVERY (on startup)                             │
-│     ├─ Download latest snapshot from object storage       │
-│     ├─ Apply to Raft state machine                        │
-│     └─ Replay only log entries AFTER snapshot             │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**Code:**
+- `crates/chronik-raft/src/log_store.rs` - durable Raft log (segments, no gap filling, torn-tail cut)
+- `crates/chronik-raft/src/driver.rs` - event-driven driver on its own thread; proposals resolve with the applied result
+- `crates/chronik-raft/src/net.rs` - `CatalogRaft` gRPC service (message batches, forwarded proposals)
+- `crates/chronik-server/src/cluster_catalog.rs` - `ClusterCatalog` (execute, membership, caught-up gate)
+- `crates/chronik-server/src/catalog_metadata_store.rs` - `MetadataStore` over the catalog
 
-#### Configuration
+**Storage:** `<data_dir>/catalog-raft/` (`state`, `snapshot`, `log/*.seg`). A snapshot is taken every `CHRONIK_CATALOG_SNAPSHOT_EVERY` applied entries (default 10,000); a follower too far behind receives it.
 
-Configure snapshots via environment variables:
+**Membership:** `cluster add-node` records the node's raft address and broker in the catalog and makes it a voter. Start the new node with `CHRONIK_CLUSTER_JOIN=true` so it starts blank instead of founding its own cluster. `cluster remove-node` moves the node's replicas away (epoch-fenced) before the membership change.
 
-```bash
-# Enable/disable (default: true)
-CHRONIK_SNAPSHOT_ENABLED=true
-
-# Create snapshot after N log entries (default: 10,000)
-CHRONIK_SNAPSHOT_LOG_THRESHOLD=10000
-
-# Create snapshot after N seconds (default: 3600 = 1 hour)
-CHRONIK_SNAPSHOT_TIME_THRESHOLD_SECS=3600
-
-# Maximum concurrent snapshots (default: 2)
-CHRONIK_SNAPSHOT_MAX_CONCURRENT=2
-
-# Compression: gzip (default), none, zstd
-CHRONIK_SNAPSHOT_COMPRESSION=gzip
-
-# Keep last N snapshots (default: 3)
-CHRONIK_SNAPSHOT_RETENTION_COUNT=3
-```
-
-**Snapshot Path Format**:
-```
-s3://{bucket}/{prefix}/snapshots/{topic}/{partition}/{snapshot_id}.snap
-```
-
-#### Performance Characteristics
-
-**Snapshot Creation**:
-- 10,000 entries: ~1-2 seconds (Gzip compression)
-- 100,000 entries: ~10-20 seconds
-- Size reduction: ~70-80% with Gzip
-
-**Node Recovery**:
-- Snapshot bootstrap: ~10 seconds for 50MB
-- Full log replay: ~30-60 seconds for 100K entries
-- **Speedup**: 3-6x faster recovery
-
-**Disk Space Savings**:
-- Before compaction: ~100MB per 10K entries
-- After snapshot: ~5MB compressed
-- **Savings**: ~95% disk space
-
-#### Example Usage
-
-```bash
-# Start a cluster node with snapshots enabled (default).
-# NOTE: the `raft-cluster` subcommand and the `--node-id` / `--advertised-addr`
-# top-level flags were REMOVED in v2.2.0. Cluster mode is `start --config`.
-./target/release/chronik-server start --config cluster-node1.toml
-
-# Disable snapshots for testing
-CHRONIK_SNAPSHOT_ENABLED=false \
-  ./target/release/chronik-server start --config cluster-node1.toml
-
-# Custom snapshot configuration
-CHRONIK_SNAPSHOT_LOG_THRESHOLD=50000 \
-CHRONIK_SNAPSHOT_TIME_THRESHOLD_SECS=7200 \
-CHRONIK_SNAPSHOT_COMPRESSION=zstd \
-CHRONIK_SNAPSHOT_RETENTION_COUNT=5 \
-  ./target/release/chronik-server start --config cluster-node1.toml
-```
-
-#### Monitoring
-
-Check snapshot status via logs:
-```bash
-# Snapshot creation logs
-grep "Creating snapshot for" /var/log/chronik/server.log
-
-# Snapshot upload logs
-grep "Snapshot uploaded to" /var/log/chronik/server.log
-
-# Log truncation logs
-grep "Truncated Raft log" /var/log/chronik/server.log
-```
+**Acceptance suite:** `tests/cluster/catalog/t*.sh` (needs `KAFKA_HOME` and JDK 17). `CHRONIK_FAULT_FILE=<path with %n>` enables test-only fault injection on catalog traffic (`drop <peer>`, `delay <ms>`).
 
 WAL compaction CLI:
 ```bash
@@ -1101,8 +1010,9 @@ Key environment variables:
 - `CHRONIK_LEADER_REBALANCE_MAX_PER_PASS` - Cap on preferred-leader moves per check (default: 50), so a skewed catalog is rebalanced in steps.
 - `CHRONIK_WAL_INDEXER_SEGMENT_PAUSE_MS` - Pause between segments within one indexing run (default: 0). Runs are always separated by a full indexing interval; this adds headroom inside a run on constrained disks.
 - `CHRONIK_BACKGROUND_THREADS` - Threads for background CPU work such as rebuilding HNSW vector indexes at boot (default: half the cores the process may use, at least 1). Those threads, and the WAL indexer's, run at nice 10 so request handling is scheduled first. Lower it if produce latency suffers right after a restart; raise it to finish rebuilds faster on an idle node.
-- `CHRONIK_METADATA_CATALOG_PRUNE` - Whether a follower may remove topics the authoritative node no longer has (default: `true`). The catalog anti-entropy pass re-publishes what exists, so without pruning a node that missed a `TopicDeleted` while it was down keeps that topic forever. Set `false` to disable removal entirely.
-- `CHRONIK_METADATA_MAX_PRUNE_FRACTION` - Ceiling on how much of the catalog one pass may remove (default: `0.20`). A snapshot that would prune more is treated as coming from a node that has not finished recovering, and refused: a leader 60s into a restart has been observed reporting 16 topics of 5,611, and obeying that would have emptied every follower.
+- `CHRONIK_CLUSTER_JOIN` - `true` on a node added with `cluster add-node`: it starts with an empty catalog and is brought up to date by the leader instead of founding a cluster from its config. Leave unset on founding nodes.
+- `CHRONIK_CATALOG_SNAPSHOT_EVERY` - Catalog Raft snapshot interval in applied entries (default 10000).
+- `CHRONIK_FAULT_FILE` - Test-only: fault injection on catalog Raft traffic (see Cluster Catalog on Raft). Never set in production.
 - `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
 - `CHRONIK_ADMIN_TLS_CERT` / `CHRONIK_ADMIN_TLS_KEY` - **NOT IMPLEMENTED.** Setting either logs a warning ("axum-server crate not available") and the admin API still serves plain **HTTP**. The whole Unified API (6092) is plaintext; there is no HTTPS anywhere yet. Tracked as Phase 4 in [docs/ROADMAP_SECURITY.md](docs/ROADMAP_SECURITY.md).
 - `CHRONIK_SASL_ENABLED` - SASL authentication on the Kafka port (default: `false`). `true`/`required` refuses unauthenticated connections (they may send only ApiVersions/SaslHandshake/SaslAuthenticate; anything else closes the connection). `optional` verifies credentials when offered but still serves — and logs — unauthenticated clients: use it to stage a rollout, watch for "unauthenticated requests" warnings, then switch to `true`. Mechanisms offered: **SCRAM-SHA-512, SCRAM-SHA-256, PLAIN** (strongest first; PLAIN sends the password in the clear and is only safe under TLS).

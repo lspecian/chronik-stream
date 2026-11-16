@@ -1807,7 +1807,6 @@ impl IntegratedKafkaServerBuilder {
             cluster_config.node_id,
             raft.clone(),
             metadata_store.clone(),
-            None,
         );
         controller.start();
         self.partition_failover = Some(controller);
@@ -2064,6 +2063,17 @@ impl IntegratedKafkaServerBuilder {
         // not blind for the first ~30s after startup.
         if let Err(e) = self.warm_up_hot_text_index().await {
             warn!("Hot text index warm-up failed (continuing): {}", e);
+        }
+
+        // The catalog applies its log while the stages above run, before every
+        // listener has subscribed (the ACL cache subscribes in Stage 12), so
+        // changes applied during boot are announced once more as a reset when
+        // the catalog has caught up.
+        if let (Some(store), Some(catalog)) = (self.catalog_store.clone(), self.cluster_catalog.clone()) {
+            tokio::spawn(async move {
+                while !catalog.wait_caught_up(std::time::Duration::from_secs(30)).await {}
+                store.handle_change(&chronik_common::metadata::catalog::CatalogChange::Reset).await;
+            });
         }
 
         // Create the final server instance using the new_from_components constructor

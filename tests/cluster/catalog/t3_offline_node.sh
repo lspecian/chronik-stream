@@ -3,7 +3,7 @@
 # PASS: node 3 converges with no anti-entropy, and a SCRAM user revoked while
 # it was down is refused by node 3.
 source "$(dirname "$0")/lib.sh"
-export EXTRA_ENV="CHRONIK_SASL_ENABLED=optional CHRONIK_SASL_USERS=admin:admin-secret CHRONIK_INTER_BROKER_SECRET=t3-inter-broker-secret-value"
+export EXTRA_ENV="CHRONIK_SASL_ENABLED=optional CHRONIK_SASL_USERS=admin:admin-secret CHRONIK_INTER_BROKER_SECRET=t3-inter-broker-secret-value CHRONIK_ACL_ENABLED=true"
 cluster_start || { fail "cluster did not start"; finish T3; }
 kt() { "$K/kafka-topics.sh" --bootstrap-server localhost:9092 "$@" >/dev/null 2>&1; }
 scram_ok() { # $1 port $2 user $3 password

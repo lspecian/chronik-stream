@@ -323,6 +323,7 @@ impl RaftDriver {
             status: status_tx,
             leader_contact: leader_contact.clone(),
             last_heard: HashMap::new(),
+            fatal: None,
             epoch,
         };
         core.publish_status(None);
@@ -374,6 +375,8 @@ struct DriverCore<S: StateMachine, O: Outbox> {
     leader_contact: Arc<AtomicU64>,
     /// When each peer was last heard from.
     last_heard: HashMap<u64, Instant>,
+    /// Set when this node must stop: storage it cannot trust, or a log it lost.
+    fatal: Option<String>,
     epoch: Instant,
 }
 
@@ -419,7 +422,11 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
             if self.node.raft.state == StateRole::Leader {
                 self.touch_leader_contact();
             }
-            if let Err(Fatal(msg)) = self.process_ready() {
+            let result = match self.fatal.take() {
+                Some(msg) => Err(Fatal(msg)),
+                None => self.process_ready(),
+            };
+            if let Err(Fatal(msg)) = result {
                 tracing::error!("Raft node {} stopping: {}", self.id, msg);
                 self.fail_pending(ProposeError::Stopped);
                 self.publish_status(Some(msg));
@@ -460,6 +467,22 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
                 }
             }
             Event::Step(msg) => {
+                // A heartbeat committing beyond our log means this node lost
+                // entries it had acknowledged (its data was wiped or restored
+                // from an old copy). raft-rs would abort the process; stop the
+                // catalog with the remedy instead.
+                if msg.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeat
+                    && msg.commit > self.node.raft.raft_log.last_index()
+                {
+                    self.fatal = Some(format!(
+                        "leader {} has committed through {} but this node's catalog log ends at {}: \
+                         this node lost raft state it had acknowledged (data wiped or restored). \
+                         Remove it from the cluster (cluster remove-node {} --force), add it back \
+                         (cluster add-node), and start it with CHRONIK_CLUSTER_JOIN=true.",
+                        msg.from, msg.commit, self.node.raft.raft_log.last_index(), self.id
+                    ));
+                    return false; // the loop reports `fatal` and stops
+                }
                 let from = msg.from;
                 if from != 0 {
                     self.last_heard.insert(from, Instant::now());
@@ -1064,5 +1087,37 @@ mod tests {
         let mut want: Vec<u64> = c.ids.iter().copied().filter(|&i| i != follower).collect();
         want.sort();
         assert_eq!(c.h(leader).sample_live(window).await, Some(want));
+    }
+
+    /// A voter whose log was wiped must stop with the remedy, not abort the
+    /// process (raft-rs panics when a heartbeat commits beyond its log).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wiped_voter_stops_with_the_remedy_instead_of_panicking() {
+        let mut c = Cluster::new(&[1, 2, 3], config);
+        let leader = c.leader().await;
+        let mut last = 0;
+        for i in 0..20 {
+            last = create(&c.h(leader), &format!("w{}", i)).await.unwrap().index;
+        }
+        c.settle(last).await;
+        let victim = *c.ids.iter().find(|&&i| i != leader).unwrap();
+        c.stop(victim);
+        c.dirs.insert(victim, TempDir::new().unwrap());
+        c.start(victim);
+        let mut status = c.h(victim).subscribe();
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(f) = status.borrow_and_update().failed.clone() {
+                    return f;
+                }
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the wiped node never reported a failure");
+        assert!(failed.contains("lost raft state"), "{}", failed);
+        assert!(failed.contains("CHRONIK_CLUSTER_JOIN"), "{}", failed);
+        // The rest of the cluster keeps working.
+        create(&c.h(leader), "after-wipe").await.unwrap();
     }
 }

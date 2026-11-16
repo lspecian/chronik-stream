@@ -2591,9 +2591,23 @@ impl ProtocolHandler {
 
             let configs = match resource.resource_type {
                 2 => {
-                    // Topic configs
+                    // Topic configs, as the topic holds them.
+                    let topic = match &self.metadata_store {
+                        Some(store) => store.get_topic(&resource.resource_name).await.ok().flatten(),
+                        None => None,
+                    };
+                    let Some(topic) = topic else {
+                        results.push(DescribeConfigsResult {
+                            error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
+                            error_message: Some(format!("Topic '{}' does not exist", resource.resource_name)),
+                            resource_type: resource.resource_type,
+                            resource_name: resource.resource_name,
+                            configs: vec![],
+                        });
+                        continue;
+                    };
                     ConfigProvider::get_topic_configs(
-                        &resource.resource_name,
+                        &topic,
                         &resource.configuration_keys,
                         request.include_synonyms,
                         request.include_documentation,

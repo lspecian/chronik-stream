@@ -9,12 +9,11 @@ repository.workspace = true
 [features]
 # async-io enabled by default: on Linux it activates io_uring for kernel-level async WAL I/O,
 # on non-Linux it compiles the stub (no-op). crossbeam is cross-platform.
-default = ["raft-storage", "async-io"]
+default = ["async-io"]
 wal = ["dep:memmap2"]
 wal-encryption = ["wal", "dep:ring"]
 wal-compression = ["wal", "dep:zstd"]
 async-io = ["dep:crossbeam"]
-raft-storage = ["dep:chronik-raft", "dep:raft", "dep:prost"]
 
 [dependencies]
 # Workspace dependencies
@@ -48,11 +47,7 @@ crossbeam = { version = "0.8", optional = true }
 # Local dependencies (MUST be before target-specific sections!)
 chronik-common = { path = "../chronik-common" }
 chronik-monitoring = { path = "../chronik-monitoring" }
-chronik-raft = { path = "../chronik-raft", optional = true }
 
-# Raft dependencies (for adapter) - uses prost-codec
-raft = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
 
 # Linux-only: tokio-uring for kernel-level async I/O
 # Not optional - if on Linux and async-io feature is enabled, io_uring code is used

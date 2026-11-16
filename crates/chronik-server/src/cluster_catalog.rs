@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use chronik_common::metadata::catalog::{CatalogChange, CatalogCommand, CatalogResult, CatalogState};
 use chronik_raft::driver::{DriverConfig, ProposeError, RaftDriver, RaftHandle, RaftStatus, StateMachine};
-use chronik_raft::net::{forward_propose, CatalogRaftServer, ForwardError, NetFaults, PeerDirectory, PeerOutbox};
+use chronik_raft::net::{CatalogRaftServer, ForwardError, Forwarder, NetFaults, PeerDirectory, PeerOutbox};
 use chronik_raft::LogStoreOptions;
 use parking_lot::{RwLock, RwLockReadGuard};
 use raft::eraftpb::{ConfChangeV2, ConfState};
@@ -158,6 +158,7 @@ pub struct ClusterCatalog {
     booted: AtomicBool,
     leader_flag: Arc<AtomicBool>,
     faults: NetFaults,
+    forwarder: Forwarder,
 }
 
 impl ClusterCatalog {
@@ -217,6 +218,7 @@ impl ClusterCatalog {
             booted: AtomicBool::new(false),
             leader_flag,
             faults,
+            forwarder: Forwarder::new(),
         })
     }
 
@@ -346,7 +348,7 @@ impl ClusterCatalog {
                 Err(ProposeError::NotLeader { leader: Some(leader) }) if leader != self.node_id => {
                     if let Some(addr) = self.directory.get(leader).filter(|_| !self.faults.is_dropped(leader)) {
                         let remaining = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100));
-                        match forward_propose(&addr, bytes.clone(), conf_change, remaining).await {
+                        match self.forwarder.propose(&addr, bytes.clone(), conf_change, remaining).await {
                             Ok(a) => {
                                 // Read-your-writes: answer only once applied here too.
                                 let wait = deadline.saturating_duration_since(Instant::now()).max(self.election_timeout);

@@ -238,7 +238,48 @@ impl std::fmt::Display for ForwardError {
     }
 }
 
-/// Send a command (or an encoded `ConfChangeV2`) to the node at `addr`.
+/// Forwards proposals to the leader over cached connections.
+///
+/// A connection that cannot be established means the command was never sent
+/// (`Unreachable`, safe to retry). Once a request has gone out on a
+/// connection, any failure is `Lost`: the leader may have applied it. A
+/// failed connection is dropped so the next call connects afresh.
+#[derive(Default)]
+pub struct Forwarder {
+    channels: tokio::sync::Mutex<HashMap<String, Channel>>,
+}
+
+impl Forwarder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn propose(&self, addr: &str, data: Vec<u8>, conf_change: bool, timeout: Duration) -> Result<Applied, ForwardError> {
+        let cached = self.channels.lock().await.get(addr).cloned();
+        let channel = match cached {
+            Some(c) => c,
+            None => {
+                let ep = endpoint(addr).map_err(|e| ForwardError::Unreachable(e.to_string()))?;
+                let c = ep.connect().await.map_err(|e| ForwardError::Unreachable(e.to_string()))?;
+                self.channels.lock().await.insert(addr.to_string(), c.clone());
+                c
+            }
+        };
+        let mut request = Request::new(proto::ProposeRequest { data, conf_change });
+        request.set_timeout(timeout);
+        let resp = match client(channel).propose(request).await {
+            Ok(r) => r.into_inner(),
+            Err(s) => {
+                self.channels.lock().await.remove(addr);
+                return Err(ForwardError::Lost(s.to_string()));
+            }
+        };
+        outcome(resp)
+    }
+}
+
+/// Send a command (or an encoded `ConfChangeV2`) to the node at `addr` over a
+/// fresh connection.
 pub async fn forward_propose(addr: &str, data: Vec<u8>, conf_change: bool, timeout: Duration) -> Result<Applied, ForwardError> {
     let ep = endpoint(addr).map_err(|e| ForwardError::Unreachable(e.to_string()))?.timeout(timeout);
     let channel = ep.connect().await.map_err(|e| ForwardError::Unreachable(e.to_string()))?;
@@ -247,6 +288,10 @@ pub async fn forward_propose(addr: &str, data: Vec<u8>, conf_change: bool, timeo
         .await
         .map_err(|s| ForwardError::Lost(s.to_string()))?
         .into_inner();
+    outcome(resp)
+}
+
+fn outcome(resp: proto::ProposeResponse) -> Result<Applied, ForwardError> {
     match resp.outcome {
         Some(Outcome::Applied(a)) => Ok(Applied { index: a.index, term: a.term, result: a.result }),
         Some(Outcome::NotLeader(l)) => Err(ForwardError::Raft(ProposeError::NotLeader { leader: (l != 0).then_some(l) })),
