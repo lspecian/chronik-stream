@@ -28,7 +28,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$ROOT/target/release/chronik-server"
+BIN="${CHRONIK_BIN:-$ROOT/target/release/chronik-server}"
 DIR="$ROOT/tests/cluster"
 LOGS="$DIR/logs"
 PREFIX_N="${CATCHUP_PREFIX:-100}"

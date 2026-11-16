@@ -62,8 +62,8 @@ fail() { say "FAIL: $*"; FAIL=1; }
 # ---------------------------------------------------------------- local mode --
 local_setup() {
   command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
-  [ -x "$SCRIPT_DIR/../../target/release/chronik-server" ] \
-    || { say "SKIP: target/release/chronik-server not built"; exit 0; }
+  [ -x "${CHRONIK_BIN:-$SCRIPT_DIR/../../target/release/chronik-server}" ] \
+    || { say "SKIP: ${CHRONIK_BIN:-target/release/chronik-server} not built"; exit 0; }
   "$SCRIPT_DIR/stop.sh" >/dev/null 2>&1
   "$SCRIPT_DIR/start.sh" >/dev/null 2>&1 &
   sleep 25
