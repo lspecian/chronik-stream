@@ -14,6 +14,9 @@ on:
 
 env:
   RUST_BACKTRACE: 1
+  # CMake 4 (ubuntu-latest) refuses librdkafka 2.3.0's cmake_minimum_required(3.2),
+  # bundled by rdkafka-sys and pulled in by chronik-memory. Same override as ci.yml.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
   CARGO_TERM_COLOR: always
 
 jobs:
