@@ -333,6 +333,16 @@ pub struct ReplicaFetcher {
     /// Partitions rebuilt from the leader because a straddle could not be placed.
     rebuilds: Arc<AtomicU64>,
     fetch_errors: Arc<AtomicU64>,
+    /// This node's archive (raw segments, plus the Tantivy/Parquet index).
+    /// A truncation cuts it with the WAL; see `truncate_partition`.
+    archive: Option<LocalArchive>,
+}
+
+/// Where this node keeps what the WAL indexer moved out of the WAL.
+#[derive(Clone)]
+pub struct LocalArchive {
+    pub store: Arc<dyn chronik_storage::ObjectStoreTrait>,
+    pub index: Option<Arc<chronik_storage::SegmentIndex>>,
 }
 
 impl ReplicaFetcher {
@@ -359,6 +369,7 @@ impl ReplicaFetcher {
             shutdown: Arc::new(AtomicBool::new(false)),
             batches_applied: Arc::new(AtomicU64::new(0)),
             fetch_errors: Arc::new(AtomicU64::new(0)),
+            archive: None,
         })
     }
 
@@ -371,6 +382,17 @@ impl ReplicaFetcher {
             inner.produce_handler = Some(handler);
         } else {
             warn!("ReplicaFetcher already shared; produce handler not attached");
+        }
+        self
+    }
+
+    /// Attach this node's archive, so a truncation removes archived records
+    /// above the cut instead of leaving them to be served and counted.
+    pub fn with_archive(mut self: Arc<Self>, archive: LocalArchive) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.archive = Some(archive);
+        } else {
+            warn!("ReplicaFetcher already shared; archive not attached");
         }
         self
     }
@@ -998,7 +1020,48 @@ impl ReplicaFetcher {
             topic, partition, local_end, target, target, local_end
         );
 
-        let outcome = match self.wal_manager.truncate_to(topic, partition, target).await {
+        // The log is the WAL AND the archive the indexer moved out of it. Cut
+        // both, under the lock the indexer holds while it archives, or a pass
+        // in flight re-archives what this cut removes.
+        let lock = self.wal_manager.archive_lock(topic, partition);
+        let _archiving = lock.lock().await;
+
+        // An archived segment is removed whole, so one straddling the target
+        // moves the cut down to its base; the WAL must be cut there too.
+        let target = match &self.archive {
+            Some(archive) => match chronik_storage::archive::plan_archive_cut(
+                archive.store.as_ref(),
+                archive.index.as_ref(),
+                topic,
+                partition,
+                target,
+            )
+            .await
+            {
+                Ok(cut) => {
+                    if cut < target {
+                        info!(
+                            "{}-{}: an archived segment straddles {}; cutting at {} and \
+                             re-fetching {}..{} from the leader",
+                            topic, partition, target, cut, cut, target
+                        );
+                    }
+                    cut
+                }
+                Err(e) => {
+                    error!(
+                        "{}-{}: cannot list the archive to truncate it to {}: {}. Replication \
+                         of this partition is stalled until it can.",
+                        topic, partition, target, e
+                    );
+                    self.fetch_errors.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            },
+            None => target,
+        };
+
+        let mut outcome = match self.wal_manager.truncate_to(topic, partition, target).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 // The divergent records are still on disk. Refuse to fetch past
@@ -1013,17 +1076,71 @@ impl ReplicaFetcher {
             }
         };
 
+        let archive_cut = match &self.archive {
+            Some(archive) => match chronik_storage::archive::truncate_archive(
+                archive.store.as_ref(),
+                archive.index.as_ref(),
+                topic,
+                partition,
+                target,
+            )
+            .await
+            {
+                Ok(cut) if cut.cut < target => {
+                    // Cannot happen under the lock (the plan saw the same
+                    // archive), but a WAL left above the archive's cut would
+                    // be a log with a hole in it.
+                    warn!(
+                        "{}-{}: the archive was cut at {}, below the planned {}; cutting the WAL there too",
+                        topic, partition, cut.cut, target
+                    );
+                    match self.wal_manager.truncate_to(topic, partition, cut.cut).await {
+                        Ok(recut) => outcome = recut,
+                        Err(e) => {
+                            error!(
+                                "{}-{}: could not cut the WAL to {}: {}. Replication of this partition is stalled.",
+                                topic, partition, cut.cut, e
+                            );
+                            self.fetch_errors.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    Some(cut)
+                }
+                Ok(cut) => Some(cut),
+                Err(e) => {
+                    // Archived records above the cut are still servable.
+                    error!(
+                        "{}-{}: truncated the WAL to {} but could not cut the archive: {}. \
+                         Replication of this partition is stalled until it can.",
+                        topic, partition, target, e
+                    );
+                    self.fetch_errors.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            },
+            None => None,
+        };
+
         // The log may end below the target: a target inside a batch takes that
-        // whole batch. Resume from where it actually ends.
+        // whole batch. Resume from where it actually ends — the end of the WAL,
+        // or of the archive when the indexer has reclaimed the WAL below the
+        // cut (a WAL that holds nothing is not a log that holds nothing).
         //
-        // `None` means the log holds no records at all, which is a real outcome
-        // — everything above the target, nothing below it — and only then is 0
-        // right. It must not be reached by a truncation that simply had no work
-        // to do; that path now reports the real log end, because collapsing "I
-        // do not know" into 0 threw away a healthy log and re-replicated the
-        // whole partition.
-        let new_end = outcome.new_log_end_offset.unwrap_or(0);
-        if outcome.new_log_end_offset.is_none() && !outcome.touched_disk() {
+        // `None` from both means the log holds no records at all, which is a
+        // real outcome — everything above the target, nothing below it — and
+        // only then is 0 right. It must not be reached by a truncation that
+        // simply had no work to do; that path now reports the real log end,
+        // because collapsing "I do not know" into 0 threw away a healthy log and
+        // re-replicated the whole partition.
+        let archived_end = archive_cut.as_ref().and_then(|c| c.archived_end);
+        let archive_removed = archive_cut.as_ref().map(|c| c.removed).unwrap_or(0);
+        let log_end = match (outcome.new_log_end_offset, archived_end) {
+            (Some(wal), Some(archived)) => Some(wal.max(archived)),
+            (wal, archived) => wal.or(archived),
+        };
+        let new_end = log_end.unwrap_or(0);
+        if log_end.is_none() && !outcome.touched_disk() && archive_removed == 0 {
             warn!(
                 "{}-{}: truncation to {} changed nothing and could not say where the log ends. \
                  Treating it as empty and restarting replication from 0 — if this partition had \
@@ -1049,8 +1166,10 @@ impl ReplicaFetcher {
         }
 
         info!(
-            "{}-{}: truncated to {} ({} segment(s) removed, {} bytes discarded); resuming replication",
-            topic, partition, new_end, outcome.segments_deleted, outcome.bytes_discarded
+            "{}-{}: truncated to {} ({} WAL segment(s) removed, {} bytes discarded, {} archived \
+             segment(s) removed); resuming replication",
+            topic, partition, new_end, outcome.segments_deleted, outcome.bytes_discarded,
+            archive_removed
         );
     }
 

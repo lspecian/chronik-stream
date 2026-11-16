@@ -27,7 +27,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$ROOT/target/release/chronik-server"
+BIN="${CHRONIK_BIN:-$ROOT/target/release/chronik-server}"
 DIR="$ROOT/tests/cluster"
 LOGS="$DIR/logs"
 BOOT="localhost:9392,localhost:9393,localhost:9394"
@@ -57,6 +57,14 @@ start_node() { # $1 = node id
   # inventory said it plainly: one segment, id 0, zero bytes, milliseconds after
   # recovery reported 140 records loaded. Reclamation now needs the topic to be
   # missing on several consecutive passes, so this test exercises the real path.
+  # DIVERGE_ARCHIVED keeps the followers frozen through an idle seal and an
+  # indexer pass, far past the 10s lag window. Out of the in-sync set, they are
+  # correctly never elected and the partition stays offline — which is not the
+  # case under test, and happened or not depending on whether the leader's
+  # in-sync set was published before it died. Widen the window for that mode.
+  local lag=""
+  [ "${DIVERGE_ARCHIVED:-0}" = "1" ] && lag="CHRONIK_REPLICA_LAG_TIME_MAX_MS=600000"
+  env $lag \
   CHRONIK_UNIFIED_API_PORT=$((6391 + $1)) \
   RUST_LOG=info \
   "$BIN" start --config "$DIR/altport-node$1.toml" \
@@ -145,8 +153,20 @@ broker_of() { # $1 = node id → its kafka address
 # held barely a third of the prefix, which is exactly the state this wait exists
 # to prevent: measured, two replicas were frozen holding 75 of 100 while the
 # check reported all three complete.
+#
+# The WAL is not the whole log: the indexer moves sealed segments into the
+# archive (`segments/<topic>/<partition>/*.segment`) and the fetch tier serves
+# them. A truncation that cut only the WAL left its discarded records there,
+# servable — so this counts both. `-h` drops the file name, or the same record
+# in two files would count twice.
 records_on_node() { # $1 = node, $2 = tag
-  grep -aoE "$2-[0-9]+" "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log 2>/dev/null \
+  grep -ahoE "$2-[0-9]+" "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log \
+    "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment 2>/dev/null \
+    | sort -u | wc -l
+}
+
+archived_on_node() { # $1 = node, $2 = tag — the archive alone
+  grep -ahoE "$2-[0-9]+" "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment 2>/dev/null \
     | sort -u | wc -l
 }
 
@@ -218,6 +238,21 @@ orphans_here=$(records_on_node "$OLD" orphan)
 say "   leader's log holds ${orphans_here:-0} orphan marker(s) on disk"
 [ "${orphans_here:-0}" -ge 1 ] || { fail "no orphans landed — no divergence to test"; exit 1; }
 
+# DIVERGE_ARCHIVED=1: let the indexer archive the divergent tail before the
+# leader dies, so the cut has to reach the archive too. The WAL copy stays (the
+# followers do not have it, so the retention interlock keeps it) — the archive
+# copy is the one a WAL-only truncation left behind.
+if [ "${DIVERGE_ARCHIVED:-0}" = "1" ]; then
+  say "-- waiting for node $OLD to archive the orphans (idle seal + indexer pass)"
+  for _ in $(seq 1 120); do
+    [ "$(archived_on_node "$OLD" orphan)" -ge "$orphans_here" ] && break
+    sleep 2
+  done
+  archived=$(archived_on_node "$OLD" orphan)
+  say "   node $OLD's archive holds ${archived:-0} orphan marker(s)"
+  [ "${archived:-0}" -ge 1 ] || { fail "the orphans were never archived — nothing for the cut to reach"; exit 1; }
+fi
+
 # 4. Kill the leader, thaw the followers. They hold quorum and must elect.
 say "-- killing node $OLD and thawing the followers"
 kill -9 "$(pid_of "$OLD")" 2>/dev/null
@@ -263,26 +298,36 @@ grep -aE "truncated to|diverged from the leader|log is a prefix|not truncating|R
 # silently inert while looking healthy is the exact failure mode RP-3.3 keeps
 # producing (the epoch warm-up ran too late for months and logged nothing about
 # it). So the assertion is on the bytes.
-discarded=$(grep -aoE "truncated to [0-9]+ \([0-9]+ segment\(s\) removed, [0-9]+ bytes discarded\)" \
-  "$LOGS/alt-node$OLD.log" 2>/dev/null | tail -1 \
-  | grep -oE "[0-9]+ bytes" | grep -oE "^[0-9]+")
+#
+# The log is the WAL and the archive, so the cut is measured in both: WAL bytes
+# discarded, and archived segments removed. Either alone can be the whole cut —
+# when the indexer had already reclaimed the WAL holding the divergent tail,
+# the archive is the only place it still was.
+cut_line=$(grep -aoE "truncated to [0-9]+ \([0-9]+ WAL segment\(s\) removed, [0-9]+ bytes discarded, [0-9]+ archived segment\(s\) removed\)" \
+  "$LOGS/alt-node$OLD.log" 2>/dev/null | tail -1)
+discarded=$(echo "$cut_line" | grep -oE "[0-9]+ bytes" | grep -oE "^[0-9]+")
 discarded="${discarded:-0}"
+archived_removed=$(echo "$cut_line" | grep -oE "[0-9]+ archived" | grep -oE "^[0-9]+")
+archived_removed="${archived_removed:-0}"
 
 # And the records must be gone from the returning node's own disk, not merely
 # invisible to a consumer — a partition this node no longer leads would read as
 # clean either way.
 orphans_left=$(records_on_node "$OLD" orphan)
 
+prefix_left=$(count_tag prefix "$BOOT")
 winners=$(count_tag winner "$BOOT")
 orphans=$(count_tag orphan "$BOOT")
 say ""
-say "   bytes discarded by the cut: ${discarded} (must be > 0; $orphans_here orphan marker(s) were on disk)"
+say "   cut: ${discarded} WAL byte(s), ${archived_removed} archived segment(s) (one must be > 0; $orphans_here orphan marker(s) were on disk)"
 say "   orphan markers left on node $OLD's disk: ${orphans_left:-0} (must be 0)"
+say "   committed prefix records readable: ${prefix_left:-0} / $PREFIX_N"
 say "   committed (winner) records readable: ${winners:-0} / $WINNER_N"
 say "   uncommitted (orphan) records readable: ${orphans:-0} (must be 0)"
 
-[ "$discarded" -gt 0 ] || fail "node $OLD logged a truncation that discarded nothing — the cut did not run against the diverged log"
+[ "$discarded" -gt 0 ] || [ "$archived_removed" -gt 0 ] || fail "node $OLD logged a truncation that discarded nothing — the cut did not run against the diverged log"
 [ "${orphans_left:-0}" -eq 0 ] || fail "${orphans_left} orphan marker(s) still on node $OLD's disk after truncation"
+[ "${prefix_left:-0}" -ge "$PREFIX_N" ] || fail "only ${prefix_left:-0} of $PREFIX_N prefix records survived — the cut took committed records"
 [ "${winners:-0}" -ge "$WINNER_N" ] || fail "only ${winners:-0} of $WINNER_N committed records survived — truncation took too much"
 [ "${orphans:-0}" -eq 0 ] || fail "${orphans} record(s) the cluster never committed are still readable"
 

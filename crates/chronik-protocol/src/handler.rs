@@ -6171,7 +6171,20 @@ impl ProtocolHandler {
             
             // Convert to Kafka metadata format
             let mut result = Vec::new();
-            
+
+            // Whether "this broker" can stand in for a partition nobody leads.
+            // With one broker it is the only possible leader. With several, it
+            // is a guess that differs by which broker answers: producers then
+            // write the partition to whichever node they asked, nothing
+            // replicates it, and the records end up spread across nodes with
+            // one copy each. Kafka reports LEADER_NOT_AVAILABLE and the client
+            // retries; so do we.
+            let single_broker = metadata_store
+                .list_brokers()
+                .await
+                .map(|brokers| brokers.len() <= 1)
+                .unwrap_or(false);
+
             // First add all existing topics with their proper metadata
             for topic_meta in topics_to_process {
                 let mut partitions = Vec::new();
@@ -6239,15 +6252,31 @@ impl ProtocolHandler {
                                          topic_meta.name, partition_id, leader);
                             leader
                         }
-                        Ok(None) => {
-                            tracing::warn!("No leader found for partition {}/{}, using default broker {}",
-                                         topic_meta.name, partition_id, self.broker_id);
-                            self.broker_id
-                        }
-                        Err(e) => {
+                        Ok(None) if single_broker => self.broker_id,
+                        Err(e) if single_broker => {
                             tracing::error!("Failed to get leader for partition {}/{}: {:?}",
                                           topic_meta.name, partition_id, e);
                             self.broker_id
+                        }
+                        unknown => {
+                            match unknown {
+                                Err(e) => tracing::error!(
+                                    "Failed to get leader for partition {}/{}: {:?} — reporting LEADER_NOT_AVAILABLE",
+                                    topic_meta.name, partition_id, e),
+                                _ => tracing::warn!(
+                                    "No leader assigned for partition {}/{}: reporting LEADER_NOT_AVAILABLE",
+                                    topic_meta.name, partition_id),
+                            }
+                            partitions.push(MetadataPartition {
+                                error_code: error_codes::LEADER_NOT_AVAILABLE,
+                                partition_index: partition_id as i32,
+                                leader_id: -1,
+                                leader_epoch: -1,
+                                replica_nodes: vec![],
+                                isr_nodes: vec![],
+                                offline_replicas: vec![],
+                            });
+                            continue;
                         }
                     };
 

@@ -379,3 +379,135 @@ async fn metadata_falls_back_to_replicas_when_isr_was_never_measured() {
         }
     }
 }
+
+/// Decode a v0 Metadata response into `(topic, partition, error, leader, replicas)`.
+fn decode_partitions_v0(mut body: bytes::Bytes) -> Vec<(String, i32, i16, i32, Vec<i32>)> {
+    let mut decoder = chronik_protocol::parser::Decoder::new(&mut body);
+    let broker_count = decoder.read_i32().unwrap();
+    for _ in 0..broker_count {
+        let _id = decoder.read_i32().unwrap();
+        let _host = decoder.read_string().unwrap();
+        let _port = decoder.read_i32().unwrap();
+    }
+    let mut out = Vec::new();
+    let topic_count = decoder.read_i32().unwrap();
+    for _ in 0..topic_count {
+        let _err = decoder.read_i16().unwrap();
+        let name = decoder.read_string().unwrap().unwrap_or_default();
+        let partition_count = decoder.read_i32().unwrap();
+        for _ in 0..partition_count {
+            let error = decoder.read_i16().unwrap();
+            let index = decoder.read_i32().unwrap();
+            let leader = decoder.read_i32().unwrap();
+            let replica_count = decoder.read_i32().unwrap();
+            let replicas: Vec<i32> = (0..replica_count).map(|_| decoder.read_i32().unwrap()).collect();
+            let isr_count = decoder.read_i32().unwrap();
+            for _ in 0..isr_count {
+                decoder.read_i32().unwrap();
+            }
+            out.push((name.clone(), index, error, leader, replicas));
+        }
+    }
+    out
+}
+
+async fn store_with_brokers(count: i32) -> Arc<InMemoryMetadataStore> {
+    let metadata_store = Arc::new(InMemoryMetadataStore::new());
+    for broker_id in 1..=count {
+        metadata_store
+            .register_broker(chronik_common::metadata::BrokerMetadata {
+                broker_id,
+                host: "localhost".to_string(),
+                port: 9092 + broker_id,
+                rack: None,
+                status: BrokerStatus::Online,
+                created_at: chronik_common::Utc::now(),
+                updated_at: chronik_common::Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+    metadata_store
+}
+
+/// A partition the catalog assigns to nobody has no leader, and Metadata must
+/// say so.
+///
+/// It used to name the answering broker. Each broker answered with itself, so a
+/// producer wrote the partition to whichever node it asked; nothing replicated
+/// it, and on Thunderbird each node ended up holding one partition of the topic
+/// as its only copy. LEADER_NOT_AVAILABLE makes the client retry instead.
+#[tokio::test]
+async fn an_unassigned_partition_is_leader_not_available_not_led_by_whoever_answers() {
+    use chronik_common::metadata::{PartitionAssignment, TopicConfig};
+
+    let metadata_store = store_with_brokers(3).await;
+    let handler = ProtocolHandler::with_metadata_store(metadata_store.clone());
+    // Thunderbird's catalog: the topic says three partitions, only partition 0
+    // is assigned. (The store assigns on create, so grow it afterwards.)
+    metadata_store
+        .create_topic("half-assigned", TopicConfig { partition_count: 1, replication_factor: 3, ..Default::default() })
+        .await
+        .unwrap();
+    metadata_store
+        .update_topic("half-assigned", TopicConfig { partition_count: 3, replication_factor: 3, ..Default::default() })
+        .await
+        .unwrap();
+    metadata_store
+        .assign_partition(PartitionAssignment {
+            topic: "half-assigned".to_string(),
+            partition: 0,
+            broker_id: 1,
+            is_leader: true,
+            replicas: vec![1, 2, 3],
+            leader_id: 1,
+            leader_epoch: 0,
+            isr: vec![1, 2, 3],
+        })
+        .await
+        .unwrap();
+
+    let response = handler.handle_request(&encode_metadata_request_v0()).await.unwrap();
+    let partitions: Vec<_> = decode_partitions_v0(response.body)
+        .into_iter()
+        .filter(|p| p.0 == "half-assigned")
+        .collect();
+
+    assert_eq!(partitions.len(), 3, "every partition is still listed");
+    assert_eq!((partitions[0].2, partitions[0].3), (0, 1), "the assigned partition is served normally");
+    for p in &partitions[1..] {
+        assert_eq!(p.2, 5, "partition {} has no leader: LEADER_NOT_AVAILABLE, got error {}", p.1, p.2);
+        assert_eq!(p.3, -1, "partition {} must not name a leader, named {}", p.1, p.3);
+        assert!(p.4.is_empty(), "partition {} has no replicas, reported {:?}", p.1, p.4);
+    }
+}
+
+/// With a single broker there is nobody else to lead, so an unassigned
+/// partition is still served by it — data written before assignments existed
+/// stays reachable.
+#[tokio::test]
+async fn a_single_broker_still_leads_partitions_it_never_assigned() {
+    use chronik_common::metadata::TopicConfig;
+
+    let metadata_store = store_with_brokers(1).await;
+    let handler = ProtocolHandler::with_metadata_store(metadata_store.clone());
+    // Grown without assignments, like data written before they existed.
+    metadata_store
+        .create_topic("legacy", TopicConfig { partition_count: 1, replication_factor: 1, ..Default::default() })
+        .await
+        .unwrap();
+    metadata_store
+        .update_topic("legacy", TopicConfig { partition_count: 2, replication_factor: 1, ..Default::default() })
+        .await
+        .unwrap();
+
+    let response = handler.handle_request(&encode_metadata_request_v0()).await.unwrap();
+    let partitions: Vec<_> = decode_partitions_v0(response.body)
+        .into_iter()
+        .filter(|p| p.0 == "legacy")
+        .collect();
+    assert_eq!(partitions.len(), 2);
+    for p in partitions {
+        assert_eq!((p.2, p.3), (0, 1), "partition {} is led by the only broker", p.1);
+    }
+}

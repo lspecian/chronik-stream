@@ -366,6 +366,23 @@ pub struct TopicCreationStats {
     pub concurrent_attempts: u64,
 }
 
+/// A partition's offsets as this node's durable state records them. See
+/// `ProduceHandler::persisted_offsets`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedOffsets {
+    /// What the metadata store says.
+    recorded: i64,
+    /// One past the highest offset in this node's archive.
+    archived: i64,
+    log_start_offset: i64,
+}
+
+impl PersistedOffsets {
+    fn high_watermark(&self) -> i64 {
+        self.recorded.max(self.archived)
+    }
+}
+
 /// Enhanced produce request handler
 pub struct ProduceHandler {
     config: ProduceHandlerConfig,
@@ -376,6 +393,9 @@ pub struct ProduceHandler {
     // PERFORMANCE (v2.2.7 - P2): Use DashMap instead of RwLock<HashMap> for lock-free partition access
     // This eliminates lock contention with 128 concurrent producers (10-15% throughput gain)
     pub(crate) partition_states: Arc<DashMap<(String, i32), Arc<PartitionState>>>,
+    /// One past the highest archived offset per partition, and when it was
+    /// read. See `archived_high_watermark`.
+    archived_hwm_cache: Arc<DashMap<(String, i32), (i64, Instant)>>,
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
     metrics: Arc<ProduceMetrics>,
     running: Arc<AtomicBool>,
@@ -889,14 +909,22 @@ impl ProduceHandler {
     /// This caused large batch consumption to stall - consumer saw next_offset
     /// but actual replicated data (high_watermark) lagged behind, causing 60s timeouts.
     pub async fn get_high_watermark(&self, topic: &str, partition: i32) -> Result<i64> {
-        let key = (topic.to_string(), partition);
-
-        if let Some(state) = self.partition_states.get(&key) {
-            let high_watermark = state.value().high_watermark.load(Ordering::SeqCst) as i64;
-            Ok(high_watermark)
-        } else {
-            // Partition doesn't exist yet, high watermark is 0
-            Ok(0)
+        // Read and release the map guard before anything that may insert:
+        // a DashMap `Ref` held across `get_or_create_partition_state` deadlocks.
+        let cached = self
+            .partition_states
+            .get(&(topic.to_string(), partition))
+            .map(|state| state.value().high_watermark.load(Ordering::SeqCst) as i64);
+        match cached {
+            Some(high_watermark) => Ok(high_watermark),
+            // No state since boot: the partition may still hold records — in
+            // the archive, once the indexer reclaimed its WAL. Saying 0 here
+            // tells a follower its log is empty, and it re-fetches all of it.
+            //
+            // Local evidence only. The metadata store carries the LEADER's
+            // watermark; a follower that holds nothing for this partition and
+            // took that as its own log end would skip every record below it.
+            None => Ok(self.archived_high_watermark(topic, partition).await),
         }
     }
 
@@ -1315,6 +1343,7 @@ impl ProduceHandler {
             metadata_store,
             transaction_index: Arc::new(crate::transaction_index::TransactionIndex::new()),
             partition_states: Arc::new(DashMap::new()),  // PERFORMANCE (v2.2.7 - P2): Lock-free concurrent hashmap
+            archived_hwm_cache: Arc::new(DashMap::new()),
             producer_info: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(ProduceMetrics::default()),
             running: Arc::new(AtomicBool::new(true)),
@@ -3193,6 +3222,92 @@ impl ProduceHandler {
         }
     }
 
+    /// Where a partition's log stands when this node holds no in-memory state
+    /// for it: `(high watermark, log start offset)`.
+    ///
+    /// Boot rebuilds state only for partitions the WAL still holds. Once the
+    /// indexer has archived a partition and reclaimed its WAL, nothing on this
+    /// node describes the partition except the archive and the metadata store,
+    /// and the metadata store is not enough: its watermark can lag (a node
+    /// that led a partition it had no assignment for never recorded one), and
+    /// its segment catalog is written only on the metadata leader. Starting
+    /// from either alone hands out offsets the archive already holds — two
+    /// records at one offset, the archived one unreachable.
+    ///
+    /// So the watermark is the highest of the three. The archive never runs
+    /// ahead of the log: a truncation cuts it together with the WAL.
+    async fn persisted_offsets(&self, topic: &str, partition: i32) -> Result<PersistedOffsets> {
+        let archived = self.archived_high_watermark(topic, partition).await;
+
+        let (recorded, log_start_offset) = match self
+            .metadata_store
+            .get_partition_offset(topic, partition as u32)
+            .await?
+        {
+            Some((hw, lso)) => (hw, lso),
+            None => {
+                let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
+                let hw = segments.iter().map(|s| s.end_offset + 1).max().unwrap_or(0);
+                let lso = segments.iter().map(|s| s.start_offset).min().unwrap_or(0);
+                if let Err(e) = self
+                    .metadata_store
+                    .update_partition_offset(topic, partition as u32, hw.max(archived), lso)
+                    .await
+                {
+                    warn!("Failed to persist initial partition offsets: {:?}", e);
+                }
+                (hw, lso)
+            }
+        };
+
+        Ok(PersistedOffsets { recorded, archived, log_start_offset })
+    }
+
+    /// One past the last offset this node holds on disk for a partition: its
+    /// WAL and its archive, nothing it was told. See `assignment_repair`.
+    pub async fn local_log_end_on_disk(&self, topic: &str, partition: i32) -> i64 {
+        let wal_end = match &self.wal_manager {
+            Some(wal) => match wal.get_max_offset_for_partition(topic, partition).await {
+                Ok(Some(max)) => max + 1,
+                _ => 0,
+            },
+            None => 0,
+        };
+        wal_end.max(self.archived_high_watermark(topic, partition).await)
+    }
+
+    /// Drop everything this node remembers about a deleted topic: partition
+    /// offsets, cached archive watermarks, leader-epoch history. A topic
+    /// recreated under the same name is a new log; inheriting the old one's
+    /// next offset or epochs would start it in the middle of a history it
+    /// never had.
+    pub fn forget_topic(&self, topic: &str) {
+        self.partition_states.retain(|key, _| key.0 != topic);
+        self.archived_hwm_cache.retain(|key, _| key.0 != topic);
+        self.leader_epochs.forget_topic(topic);
+    }
+
+    /// One past the highest offset this node's archive holds for a partition.
+    ///
+    /// Cached for a few seconds: the accessors that need it sit on the fetch
+    /// path, which a long poll re-evaluates every 10ms, and the archive can be
+    /// an S3 listing. Staleness is harmless — the archive only grows between
+    /// truncations, and a truncation leaves in-memory state that answers first.
+    async fn archived_high_watermark(&self, topic: &str, partition: i32) -> i64 {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+        let key = (topic.to_string(), partition);
+        let fresh = self
+            .archived_hwm_cache
+            .get(&key)
+            .and_then(|entry| (entry.1.elapsed() < TTL).then_some(entry.0));
+        if let Some(hwm) = fresh {
+            return hwm;
+        }
+        let hwm = chronik_storage::archive::archived_high_watermark(self.storage.as_ref(), topic, partition).await;
+        self.archived_hwm_cache.insert(key, (hwm, Instant::now()));
+        hwm
+    }
+
     /// Get or create partition state
     async fn get_or_create_partition_state(
         &self,
@@ -3227,38 +3342,16 @@ impl ProduceHandler {
             ).await?
         ));
         
-        // Get current offsets from metadata store first
-        let (high_watermark, log_start_offset) = match self.metadata_store
-            .get_partition_offset(topic, partition as u32)
-            .await? 
-        {
-            Some((hw, lso)) => (hw, lso),
-            None => {
-                // Fall back to calculating from segments
-                let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
-                let hw = segments.iter()
-                    .map(|s| s.end_offset + 1)
-                    .max()
-                    .unwrap_or(0);
-                let lso = segments.iter()
-                    .map(|s| s.start_offset)
-                    .min()
-                    .unwrap_or(0);
-                
-                // Persist the calculated offsets
-                if let Err(e) = self.metadata_store.update_partition_offset(
-                    topic, 
-                    partition as u32, 
-                    hw, 
-                    lso
-                ).await {
-                    warn!("Failed to persist initial partition offsets: {:?}", e);
-                }
-                
-                (hw, lso)
-            }
-        };
-        
+        let persisted = self.persisted_offsets(topic, partition).await?;
+        if persisted.archived > persisted.recorded {
+            warn!(
+                "{}-{}: the metadata store records a high watermark of {}, but this node's archive \
+                 holds records through {} — resuming from {} so no archived offset is reused",
+                topic, partition, persisted.recorded, persisted.archived - 1, persisted.archived
+            );
+        }
+        let (high_watermark, log_start_offset) = (persisted.high_watermark(), persisted.log_start_offset);
+
         let now = Instant::now();
         let state = Arc::new(PartitionState {
             next_offset: AtomicU64::new(high_watermark as u64),
@@ -4156,15 +4249,18 @@ impl ProduceHandler {
 
     /// Get the high watermark for a partition (includes in-memory messages)
     pub async fn get_partition_high_watermark(&self, topic: &str, partition: i32) -> i64 {
-        if let Some(state) = self.partition_states.get(&(topic.to_string(), partition)) {
-            state.value().high_watermark.load(Ordering::SeqCst) as i64
-        } else {
-            // If no state exists yet, query metadata store for persisted offsets
-            if let Ok(Some((hw, _))) = self.metadata_store.get_partition_offset(topic, partition as u32).await {
-                hw
-            } else {
-                0
-            }
+        // Guard released before the fallback, which may insert (see get_high_watermark).
+        let cached = self
+            .partition_states
+            .get(&(topic.to_string(), partition))
+            .map(|state| state.value().high_watermark.load(Ordering::SeqCst) as i64);
+        match cached {
+            Some(high_watermark) => high_watermark,
+            None => self
+                .persisted_offsets(topic, partition)
+                .await
+                .map(|p| p.high_watermark())
+                .unwrap_or(0),
         }
     }
 }
@@ -4178,6 +4274,7 @@ impl Clone for ProduceHandler {
             metadata_store: Arc::clone(&self.metadata_store),
             transaction_index: Arc::clone(&self.transaction_index),
             partition_states: Arc::clone(&self.partition_states),
+            archived_hwm_cache: Arc::clone(&self.archived_hwm_cache),
             producer_info: Arc::clone(&self.producer_info),
             metrics: Arc::clone(&self.metrics),
             running: Arc::clone(&self.running),

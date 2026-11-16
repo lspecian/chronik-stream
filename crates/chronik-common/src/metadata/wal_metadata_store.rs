@@ -50,6 +50,12 @@ pub type WalAppendFn = Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = std::r
 /// Returns: Number of subscribers that received the event
 pub type EventBusPublishFn = Arc<dyn Fn(MetadataEvent) -> usize + Send + Sync>;
 
+/// Called with a topic's name when a deletion is applied live on this node —
+/// written here, replicated to here, or pruned by catalog anti-entropy. Never
+/// during WAL replay: replaying a delete that a later create superseded would
+/// destroy the new topic's data, which lives under the same name.
+pub type TopicDeletedFn = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Whether a metadata event should be replicated to followers over the
 /// fire-and-forget event bus.
 ///
@@ -85,6 +91,9 @@ pub struct WalMetadataStore {
     /// Event bus publish callback (v2.2.9 Phase 7 FIX: for metadata replication)
     /// This publishes events to MetadataWalReplicator so followers receive metadata updates
     event_bus_publish: Option<EventBusPublishFn>,
+
+    /// See [`TopicDeletedFn`].
+    topic_deleted_hooks: std::sync::RwLock<Vec<TopicDeletedFn>>,
 }
 
 /// In-memory metadata state (built from events)
@@ -761,6 +770,7 @@ impl WalMetadataStore {
             state: Arc::new(MetadataState::new(node_id)),
             wal_append,
             event_bus_publish: None, // Set later via set_event_bus()
+            topic_deleted_hooks: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -770,6 +780,27 @@ impl WalMetadataStore {
     /// Late binding is necessary to avoid circular dependencies during initialization.
     pub fn set_event_bus(&mut self, event_bus_publish: EventBusPublishFn) {
         self.event_bus_publish = Some(event_bus_publish);
+    }
+
+    /// Run `hook` whenever a topic deletion is applied live on this node.
+    /// See [`TopicDeletedFn`].
+    pub fn on_topic_deleted(&self, hook: TopicDeletedFn) {
+        if let Ok(mut hooks) = self.topic_deleted_hooks.write() {
+            hooks.push(hook);
+        }
+    }
+
+    fn after_live_apply(&self, event: &MetadataEvent) {
+        if let MetadataEventPayload::TopicDeleted { name } = &event.payload {
+            let hooks: Vec<TopicDeletedFn> = self
+                .topic_deleted_hooks
+                .read()
+                .map(|h| h.clone())
+                .unwrap_or_default();
+            for hook in hooks {
+                hook(name.clone());
+            }
+        }
     }
 
     /// Write event to WAL and apply to local state
@@ -784,6 +815,7 @@ impl WalMetadataStore {
 
         // 3. Apply to local state machine (in-memory)
         self.state.apply_event(&event).await?;
+        self.after_live_apply(&event);
 
         // 4. v2.2.9 Phase 7 FIX: Publish event to event bus for replication
         // This allows MetadataWalReplicator to hear the event and replicate to followers.
@@ -959,7 +991,9 @@ impl WalMetadataStore {
         }
 
         // 2. Apply to in-memory state
-        self.state.apply_event(&event).await
+        self.state.apply_event(&event).await?;
+        self.after_live_apply(&event);
+        Ok(())
     }
 
     /// Replay events from WAL (recovery on startup)
@@ -3412,5 +3446,60 @@ mod config_convergence_tests {
             1,
             "only the real topic is re-asserted"
         );
+    }
+}
+
+#[cfg(test)]
+mod topic_deleted_hook_tests {
+    use super::*;
+
+    fn store(node_id: u64) -> WalMetadataStore {
+        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
+        WalMetadataStore::new(node_id, wal_append)
+    }
+
+    fn recorder(store: &WalMetadataStore) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        store.on_topic_deleted(Arc::new(move |name| sink.lock().unwrap().push(name)));
+        seen
+    }
+
+    /// A delete written here, and one replicated here, both reach the hook.
+    #[tokio::test]
+    async fn live_deletions_reach_the_hook_on_every_path() {
+        let leader = store(1);
+        let seen = recorder(&leader);
+        leader.create_topic("gone", TopicConfig::default()).await.unwrap();
+        leader.delete_topic("gone").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["gone".to_string()]);
+
+        let follower = store(2);
+        let seen = recorder(&follower);
+        follower
+            .apply_replicated_event_durable(MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicDeleted { name: "gone-too".to_string() },
+                1,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["gone-too".to_string()]);
+    }
+
+    /// Replay at boot must not: the log may go on to recreate the topic, and
+    /// the hook destroys data stored under its name.
+    #[tokio::test]
+    async fn replaying_a_deletion_does_not_reach_the_hook() {
+        let node = store(1);
+        let seen = recorder(&node);
+        node.replay_events(vec![
+            MetadataEvent::new_with_node(
+                MetadataEventPayload::TopicDeleted { name: "recreated".to_string() },
+                1,
+            ),
+        ])
+        .await
+        .unwrap();
+        assert!(seen.lock().unwrap().is_empty());
     }
 }

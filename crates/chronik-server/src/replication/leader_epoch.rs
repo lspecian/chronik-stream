@@ -78,9 +78,11 @@ impl LeaderEpochCache {
     /// Called on every append with the batch's stamped epoch; cheap and
     /// idempotent for the overwhelmingly common case where the epoch has not
     /// changed since the last batch.
-    pub fn assign(&mut self, epoch: i32, start_offset: i64) {
+    ///
+    /// Returns whether the history changed.
+    pub fn assign(&mut self, epoch: i32, start_offset: i64) -> bool {
         if epoch < 0 {
-            return; // unstamped batch (pre-RP-3 data) — nothing to learn
+            return false; // unstamped batch (pre-RP-3 data) — nothing to learn
         }
 
         if let Some(last) = self.entries.last() {
@@ -88,10 +90,10 @@ impl LeaderEpochCache {
                 // An older epoch appearing after a newer one means the log was
                 // rewritten beneath us. Refusing is safer than recording a
                 // history that is not monotonic; the caller truncates first.
-                return;
+                return false;
             }
             if epoch == last.epoch {
-                return; // same leader, still writing — no new entry
+                return false; // same leader, still writing — no new entry
             }
         }
 
@@ -99,6 +101,7 @@ impl LeaderEpochCache {
         // that entry's records are being replaced by this leader's.
         self.entries.retain(|e| e.start_offset < start_offset);
         self.entries.push(EpochEntry { epoch, start_offset });
+        true
     }
 
     /// The epoch that was in force at `offset`, if known.
@@ -146,11 +149,14 @@ impl LeaderEpochCache {
     }
 
     /// Drop history at or above `end_offset`, after the log was truncated there.
-    pub fn truncate_from_end(&mut self, end_offset: i64) {
+    /// Returns whether the history changed.
+    pub fn truncate_from_end(&mut self, end_offset: i64) -> bool {
         if end_offset < 0 {
-            return;
+            return false;
         }
+        let before = self.entries.len();
         self.entries.retain(|e| e.start_offset < end_offset);
+        self.entries.len() != before
     }
 
     /// Drop history below `start_offset` after retention advanced the log start.
@@ -179,25 +185,124 @@ impl LeaderEpochCache {
 }
 
 /// Per-partition leader epoch histories for this node.
+///
+/// The history is derived from the log, and the log is no longer only the WAL:
+/// the indexer archives sealed segments and reclaims the WAL behind them. A
+/// history rebuilt from the WAL alone at boot therefore lost every epoch whose
+/// records had been archived — a returning node could not place a divergence
+/// it held in its archive, and a leader answered `OffsetForLeaderEpoch`
+/// UNDEFINED for epochs it had led. So, like Kafka's `leader-epoch-checkpoint`,
+/// each partition's history is written to a small file whenever it changes
+/// (a leadership change or a truncation — rare) and read back at boot, before
+/// the WAL adds what is newer.
 #[derive(Debug, Default)]
 pub struct LeaderEpochStore {
     caches: DashMap<(String, i32), LeaderEpochCache>,
+    checkpoint_dir: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 impl LeaderEpochStore {
     pub fn new() -> Self {
-        Self { caches: DashMap::new() }
+        Self { caches: DashMap::new(), checkpoint_dir: std::sync::OnceLock::new() }
     }
 
-    /// Record the epoch stamped on an appended batch. Hot path.
+    /// Persist histories under `dir` from now on, and load what is there.
+    /// Returns how many partitions were loaded. Call once, at boot, before
+    /// anything reads or extends the history.
+    pub fn enable_checkpoints(&self, dir: std::path::PathBuf) -> std::io::Result<usize> {
+        std::fs::create_dir_all(&dir)?;
+        let mut loaded = 0usize;
+        for topic_entry in std::fs::read_dir(&dir)? {
+            let topic_entry = topic_entry?;
+            if !topic_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(topic) = topic_entry.file_name().to_str().map(str::to_string) else { continue };
+            for file in std::fs::read_dir(topic_entry.path())? {
+                let file = file?;
+                let Some(partition) = file
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".epochs"))
+                    .and_then(|n| n.parse::<i32>().ok())
+                else {
+                    continue;
+                };
+                let entries = match std::fs::read_to_string(file.path()) {
+                    Ok(text) => parse_checkpoint(&text),
+                    Err(e) => {
+                        tracing::warn!("leader-epoch checkpoint {:?} unreadable: {}", file.path(), e);
+                        continue;
+                    }
+                };
+                if entries.is_empty() {
+                    continue;
+                }
+                let mut cache = self.caches.entry((topic.clone(), partition)).or_default();
+                for entry in entries {
+                    cache.assign(entry.epoch, entry.start_offset);
+                }
+                loaded += 1;
+            }
+        }
+        let _ = self.checkpoint_dir.set(dir);
+        Ok(loaded)
+    }
+
+    /// Record the epoch stamped on an appended batch. Hot path: writes only
+    /// when the epoch changes, which is once per leadership change.
     pub fn observe_append(&self, topic: &str, partition: i32, epoch: i32, base_offset: i64) {
         if epoch < 0 {
             return;
         }
-        self.caches
-            .entry((topic.to_string(), partition))
-            .or_default()
-            .assign(epoch, base_offset);
+        let snapshot = {
+            let mut cache = self.caches.entry((topic.to_string(), partition)).or_default();
+            cache.assign(epoch, base_offset).then(|| cache.entries().to_vec())
+        };
+        if let Some(entries) = snapshot {
+            self.write_checkpoint(topic, partition, &entries);
+        }
+    }
+
+    /// Forget a deleted topic, in memory and on disk. A topic recreated under
+    /// the same name is a new log and must not inherit the old one's epochs.
+    pub fn forget_topic(&self, topic: &str) {
+        self.caches.retain(|key, _| key.0 != topic);
+        if let Some(dir) = self.checkpoint_dir.get() {
+            let path = dir.join(topic);
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("could not remove leader-epoch checkpoints {:?}: {}", path, e);
+                }
+            }
+        }
+    }
+
+    /// Write one partition's history: temp file, fsync, rename. A torn write
+    /// leaves the previous checkpoint, never half of one.
+    fn write_checkpoint(&self, topic: &str, partition: i32, entries: &[EpochEntry]) {
+        let Some(dir) = self.checkpoint_dir.get() else { return };
+        let topic_dir = dir.join(topic);
+        let path = topic_dir.join(format!("{}.epochs", partition));
+        let tmp = topic_dir.join(format!("{}.epochs.tmp", partition));
+        let body: String = entries.iter().map(|e| format!("{} {}\n", e.epoch, e.start_offset)).collect();
+        let result = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&topic_dir)?;
+            {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(body.as_bytes())?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp, &path)
+        })();
+        if let Err(e) = result {
+            // The in-memory history is still right; only a restart loses it.
+            tracing::warn!(
+                "{}-{}: could not checkpoint leader-epoch history to {:?}: {}",
+                topic, partition, path, e
+            );
+        }
     }
 
     pub fn latest_epoch(&self, topic: &str, partition: i32) -> Option<i32> {
@@ -220,8 +325,12 @@ impl LeaderEpochStore {
     }
 
     pub fn truncate_from_end(&self, topic: &str, partition: i32, end_offset: i64) {
-        if let Some(mut cache) = self.caches.get_mut(&(topic.to_string(), partition)) {
-            cache.truncate_from_end(end_offset);
+        let snapshot = self
+            .caches
+            .get_mut(&(topic.to_string(), partition))
+            .and_then(|mut cache| cache.truncate_from_end(end_offset).then(|| cache.entries().to_vec()));
+        if let Some(entries) = snapshot {
+            self.write_checkpoint(topic, partition, &entries);
         }
     }
 
@@ -238,6 +347,87 @@ impl LeaderEpochStore {
             .iter()
             .filter_map(|e| e.value().latest_epoch().map(|epoch| (e.key().clone(), epoch)))
             .collect()
+    }
+}
+
+/// `epoch start_offset` per line. Anything else is skipped: a checkpoint is a
+/// cache of what the log says, and a line we cannot read is one the WAL
+/// warm-up may still supply.
+fn parse_checkpoint(text: &str) -> Vec<EpochEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let epoch = fields.next()?.parse::<i32>().ok()?;
+            let start_offset = fields.next()?.parse::<i64>().ok()?;
+            (epoch >= 0 && start_offset >= 0).then_some(EpochEntry { epoch, start_offset })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("epoch-ckpt-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The history a node built while its records sat in the WAL must survive
+    /// a restart after the indexer archived them and reclaimed the WAL.
+    #[test]
+    fn a_restarted_node_keeps_the_history_of_records_it_no_longer_has_in_the_wal() {
+        let dir = temp_dir("restart");
+        let live = LeaderEpochStore::new();
+        assert_eq!(live.enable_checkpoints(dir.clone()).unwrap(), 0);
+        live.observe_append("orders", 0, 0, 0);
+        live.observe_append("orders", 0, 0, 50); // same epoch: no new entry
+        live.observe_append("orders", 0, 3, 100);
+
+        // Restart with an empty WAL: nothing to replay.
+        let recovered = LeaderEpochStore::new();
+        assert_eq!(recovered.enable_checkpoints(dir.clone()).unwrap(), 1);
+        assert_eq!(recovered.snapshot("orders", 0), live.snapshot("orders", 0));
+        assert_eq!(recovered.end_offset_for_epoch("orders", 0, 0, 140), (0, 100));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncation_is_checkpointed_too() {
+        let dir = temp_dir("truncate");
+        let live = LeaderEpochStore::new();
+        live.enable_checkpoints(dir.clone()).unwrap();
+        live.observe_append("t", 1, 0, 0);
+        live.observe_append("t", 1, 1, 100);
+        live.truncate_from_end("t", 1, 100);
+
+        let recovered = LeaderEpochStore::new();
+        recovered.enable_checkpoints(dir.clone()).unwrap();
+        assert_eq!(recovered.snapshot("t", 1), vec![EpochEntry { epoch: 0, start_offset: 0 }]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_topic_leaves_no_history_for_its_successor() {
+        let dir = temp_dir("forget");
+        let live = LeaderEpochStore::new();
+        live.enable_checkpoints(dir.clone()).unwrap();
+        live.observe_append("t", 0, 5, 0);
+        live.forget_topic("t");
+        assert!(live.snapshot("t", 0).is_empty());
+
+        let recovered = LeaderEpochStore::new();
+        assert_eq!(recovered.enable_checkpoints(dir.clone()).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_lines_are_skipped_not_fatal() {
+        assert_eq!(
+            parse_checkpoint("0 0\ngarbage\n2 x\n3 100\n-1 5\n"),
+            vec![EpochEntry { epoch: 0, start_offset: 0 }, EpochEntry { epoch: 3, start_offset: 100 }]
+        );
     }
 }
 

@@ -1,5 +1,6 @@
 //! Storage layer for Chronik Stream.
 
+pub mod archive;
 pub mod canonical_record;
 pub mod tantivy_segment;
 pub mod wal_indexer;

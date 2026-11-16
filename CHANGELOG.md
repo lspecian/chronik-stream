@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.10] - 2026-11-16
+
+v2.16.9 turned WAL reclaim on for the first time in v2.x. Archived records
+became the only local copy, and several paths still assumed the WAL was the
+whole log. Each fix below was reproduced against the released v2.16.9 binary
+first.
+
+### Fixed
+
+- **A partition whose records sat only in its leader's archive reported an
+  end offset of 0, and its next record reused offset 0.** Live on Thunderbird:
+  a leader held offsets 0–159 archived, no WAL, and a recorded high watermark
+  of 0; followers copied nothing and showed in sync. A partition with no
+  in-memory state started from the metadata store's watermark alone. Its
+  watermark is now the highest of the metadata store, the segment catalog and
+  this node's archive; a follower's own log end comes from local evidence only
+  (never the leader's watermark, which would make an empty follower skip every
+  record below it).
+- **A follower that truncated a divergent log kept the discarded records in
+  its archive**, where the segment tier served them and a restart read its log
+  end from them. Truncation now cuts the archive too — raw segments and
+  Tantivy/Parquet index entries — under a per-partition lock the indexer holds
+  while archiving; a segment straddling the cut moves the cut to its base and
+  the rest is re-fetched. A truncation that finds the WAL already reclaimed
+  resumes from the end of the archive instead of re-fetching the whole
+  partition from 0.
+- **Leader-epoch history was lost for every archived record on restart.** It
+  was rebuilt from the WAL alone, so once reclaim removed a segment its epochs
+  went with it: a returning node could not place a divergence it held in its
+  archive (it resumed silently with the divergent records in place), and a
+  leader answered `OffsetForLeaderEpoch` UNDEFINED for epochs it had led. Each
+  partition's history is now checkpointed to `<data>/leader-epochs/` when it
+  changes (leadership changes and truncations only) and loaded at boot, as
+  Kafka's `leader-epoch-checkpoint` does.
+- **A deleted topic left its archive and offsets behind, and a topic
+  recreated under the same name inherited them.** Recreated, it reported the
+  old end offset before anything was produced and served the old topic's
+  records. Deletion now purges, on every node as it applies the deletion: the
+  archive, the WAL, in-memory partition offsets, cached watermarks and epoch
+  checkpoints. Replaying a deletion at boot does not — the log may go on to
+  recreate the topic. The indexer no longer archives segments of a topic the
+  catalog does not know (it retries on a later pass), so a pass in flight
+  cannot refill a purged archive.
+- **Metadata named the answering broker as leader of a partition nobody
+  leads.** Each broker named itself, so producers wrote the partition to
+  whichever node they asked and nothing replicated it: on Thunderbird, five
+  topics had each partition's records on a different node, one copy each.
+  Multi-broker clusters now report `LEADER_NOT_AVAILABLE` (leader -1), and the
+  client retries. A single broker still leads unassigned partitions.
+- **Partitions the catalog assigns to nobody are now repaired.** The node that
+  holds a partition's records assigns it to itself with the others as
+  followers, who then copy it — it must be that node, because a follower whose
+  log is ahead of its leader is truncated to match. Claims are staggered by
+  node id so two holders do not both win; a partition no node holds anything
+  for is placed by the Raft leader once every node has had its turn.
+
 ## [2.16.9] - 2026-11-15
 
 ### Fixed

@@ -2656,27 +2656,22 @@ impl FetchHandler {
         // sitting in its own store. On a local cluster, 1,599 archived segments
         // were unreachable through Fetch. The catalog is still consulted when
         // the store lists nothing, for stores that cannot list.
-        let prefix = format!("segments/{}/{}/", topic, partition);
-        let mut infos: Vec<SegmentInfo> = match self.object_store.list(&prefix).await {
-            Ok(objects) => objects
-                .into_iter()
-                .filter_map(|o| {
-                    let name = o.key.rsplit('/').next()?.strip_suffix(".segment")?;
-                    let (lo, hi) = name.split_once('-')?;
-                    let (base, last) = (lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?);
-                    Some(SegmentInfo {
-                        segment_id: name.to_string(),
-                        base_offset: base,
-                        last_offset: last,
-                        object_key: o.key,
+        let mut infos: Vec<SegmentInfo> =
+            match chronik_storage::archive::list_archived_segments(self.object_store.as_ref(), topic, partition).await {
+                Ok(segments) => segments
+                    .into_iter()
+                    .map(|s| SegmentInfo {
+                        segment_id: format!("{}-{}", s.base_offset, s.last_offset),
+                        base_offset: s.base_offset,
+                        last_offset: s.last_offset,
+                        object_key: s.object_key,
                     })
-                })
-                .collect(),
-            Err(e) => {
-                tracing::debug!("SEGMENT→LIST: cannot list {}: {}", prefix, e);
-                Vec::new()
-            }
-        };
+                    .collect(),
+                Err(e) => {
+                    tracing::debug!("SEGMENT→LIST: cannot list the archive of {}-{}: {}", topic, partition, e);
+                    Vec::new()
+                }
+            };
 
         if infos.is_empty() {
             infos = self
@@ -2814,30 +2809,6 @@ impl FetchHandler {
         Ok(combined_bytes)
     }
     
-    /// Get the high watermark and log start offset for a partition (used by ListOffsets)
-    pub async fn get_partition_offsets(&self, topic: &str, partition: i32) -> Result<(i64, i64)> {
-        // Calculate high watermark from segments
-        let segments = self.metadata_store.list_segments(topic, Some(partition as u32)).await?;
-        let segment_high_watermark = segments.iter()
-            .map(|s| s.end_offset + 1)
-            .max()
-            .unwrap_or(0);
-        
-        // Also check buffer for high watermark
-        let buffer_high_watermark = {
-            let state = self.state.read().await;
-            let key = (topic.to_string(), partition);
-            state.buffers.get(&key).map(|b| b.high_watermark).unwrap_or(0)
-        };
-        
-        // Use the maximum of segment and buffer high watermarks
-        let high_watermark = segment_high_watermark.max(buffer_high_watermark);
-        
-        // Log start offset is always 0 for now (we don't do deletion)
-        let log_start_offset = 0;
-        
-        Ok((high_watermark, log_start_offset))
-    }
     
     /// ListOffsets by timestamp: the earliest offset whose record timestamp is
     /// at or after `target_ms`, with that record's timestamp, or `None` when no
