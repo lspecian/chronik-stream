@@ -390,6 +390,12 @@ async fn apply(client: Client, cluster: &ChronikCluster) -> Result<Action, Opera
         let _ = (phase, ready); // used above
     }
 
+    // Which node leads the cluster catalog: each ready pod's unauthenticated
+    // `/admin/health` says whether it is the leader. The status used to carry
+    // `isLeader: false` on every node and no `leaderNodeId`, because this was
+    // never filled in.
+    let leader_node_id = poll_leader(&mut node_statuses, spec.unified_api_port).await;
+
     // Determine cluster phase
     let cluster_phase = if ready_count == spec.replicas {
         "Running"
@@ -422,7 +428,7 @@ async fn apply(client: Client, cluster: &ChronikCluster) -> Result<Action, Opera
         cluster_phase,
         spec.replicas,
         ready_count,
-        None, // leader_node_id — would require health polling
+        leader_node_id,
         node_statuses,
         vec![ready_condition],
         cluster.metadata.generation,
@@ -711,6 +717,54 @@ fn cluster_pod_needs_update(pod: &Pod, spec: &ChronikClusterSpec) -> bool {
 
 /// Update the ChronikCluster status subresource.
 #[allow(clippy::too_many_arguments)]
+/// Ask every ready node with a pod IP whether it leads, in parallel and with a
+/// short timeout, mark it in `nodes`, and return its id. A node that cannot be
+/// reached is simply not the leader for this pass.
+async fn poll_leader(nodes: &mut [ClusterNodeStatus], unified_api_port: i32) -> Option<i64> {
+    let admin = crate::admin_client::AdminClient::new(None);
+    let probes = nodes.iter().map(|n| {
+        let url = match (&n.pod_ip, n.ready) {
+            (Some(ip), true) => Some(format!("http://{ip}:{unified_api_port}")),
+            _ => None,
+        };
+        let admin = &admin;
+        async move {
+            match url {
+                Some(url) => tokio::time::timeout(Duration::from_secs(3), admin.health(&url))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok()),
+                None => None,
+            }
+        }
+    });
+    let answers = futures::future::join_all(probes).await;
+    let reports: Vec<(i64, Option<(u64, bool)>)> = nodes
+        .iter()
+        .zip(answers)
+        .map(|(n, h)| (n.node_id, h.map(|h| (h.node_id, h.is_leader))))
+        .collect();
+    let leader = pick_leader(&reports);
+    for n in nodes.iter_mut() {
+        n.is_leader = Some(n.node_id) == leader;
+    }
+    leader
+}
+
+/// The leader among `(node_id, health)` reports: a node that answered for
+/// itself (its reported id matches) and says it leads. During an election two
+/// nodes can briefly both claim it; the lowest id is taken and the next pass
+/// corrects it.
+fn pick_leader(reports: &[(i64, Option<(u64, bool)>)]) -> Option<i64> {
+    reports
+        .iter()
+        .filter_map(|(id, h)| match h {
+            Some((reported, true)) if *reported as i64 == *id => Some(*id),
+            _ => None,
+        })
+        .min()
+}
+
 async fn update_status(
     client: &Client,
     name: &str,
@@ -817,6 +871,29 @@ fn is_not_found(e: &kube::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_node_that_reports_leading_is_the_leader() {
+        let reports = vec![(1, Some((1, false))), (2, Some((2, false))), (3, Some((3, true)))];
+        assert_eq!(pick_leader(&reports), Some(3));
+    }
+
+    #[test]
+    fn no_leader_when_nobody_claims_it_or_nobody_answers() {
+        assert_eq!(pick_leader(&[(1, Some((1, false))), (2, None), (3, None)]), None);
+        assert_eq!(pick_leader(&[(1, None), (2, None)]), None);
+    }
+
+    #[test]
+    fn a_claim_for_a_different_node_id_is_ignored() {
+        // A pod IP reused by another broker answers with its own id.
+        assert_eq!(pick_leader(&[(1, Some((2, true))), (2, Some((2, false)))]), None);
+    }
+
+    #[test]
+    fn two_claims_during_an_election_take_the_lowest() {
+        assert_eq!(pick_leader(&[(2, Some((2, true))), (3, Some((3, true)))]), Some(2));
+    }
 
     #[test]
     fn test_generate_node_toml() {
