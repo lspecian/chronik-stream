@@ -140,6 +140,7 @@ enum Event {
     Unreachable(u64),
     SnapshotFailed(u64),
     Campaign,
+    SampleLive { within: Duration, reply: oneshot::Sender<Option<Vec<u64>>> },
     Stop,
 }
 
@@ -185,6 +186,15 @@ impl RaftHandle {
     }
 
     /// Start an election now instead of waiting for the election timeout.
+    /// On the leader: this node plus every peer it heard from within
+    /// `within`. `None` on a follower, whose view of liveness is not the
+    /// cluster's. A sample, not a verdict: callers accumulate over a window.
+    pub async fn sample_live(&self, within: Duration) -> Option<Vec<u64>> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(Event::SampleLive { within, reply }).ok()?;
+        rx.await.ok().flatten()
+    }
+
     pub fn campaign(&self) {
         let _ = self.tx.send(Event::Campaign);
     }
@@ -312,6 +322,7 @@ impl RaftDriver {
             snapshot_every: config.snapshot_every,
             status: status_tx,
             leader_contact: leader_contact.clone(),
+            last_heard: HashMap::new(),
             epoch,
         };
         core.publish_status(None);
@@ -361,6 +372,8 @@ struct DriverCore<S: StateMachine, O: Outbox> {
     snapshot_every: u64,
     status: watch::Sender<RaftStatus>,
     leader_contact: Arc<AtomicU64>,
+    /// When each peer was last heard from.
+    last_heard: HashMap<u64, Instant>,
     epoch: Instant,
 }
 
@@ -448,6 +461,9 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
             }
             Event::Step(msg) => {
                 let from = msg.from;
+                if from != 0 {
+                    self.last_heard.insert(from, Instant::now());
+                }
                 let term = msg.term;
                 if let Err(e) = self.node.step(msg) {
                     tracing::debug!("Raft node {}: step: {}", self.id, e);
@@ -458,6 +474,20 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
             }
             Event::Unreachable(peer) => self.node.report_unreachable(peer),
             Event::SnapshotFailed(peer) => self.node.report_snapshot(peer, raft::SnapshotStatus::Failure),
+            Event::SampleLive { within, reply } => {
+                let live = (self.node.raft.state == StateRole::Leader).then(|| {
+                    let mut ids = vec![self.id];
+                    let voters = self.node.raft.prs().conf().voters().ids();
+                    for id in voters.iter() {
+                        if id != self.id && self.last_heard.get(&id).map(|t| t.elapsed() <= within).unwrap_or(false) {
+                            ids.push(id);
+                        }
+                    }
+                    ids.sort_unstable();
+                    ids
+                });
+                let _ = reply.send(live);
+            }
             Event::Campaign => {
                 let _ = self.node.campaign();
             }
@@ -1018,5 +1048,21 @@ mod tests {
         for id in &c.ids {
             assert_eq!(c.sms[id].set().len(), 30, "node {}", id);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leader_samples_live_peers_and_followers_do_not() {
+        let mut c = Cluster::new(&[1, 2, 3], config);
+        let leader = c.leader().await;
+        let window = Duration::from_millis(300);
+        tokio::time::sleep(window).await;
+        assert_eq!(c.h(leader).sample_live(window).await, Some(vec![1, 2, 3]));
+        let follower = *c.ids.iter().find(|&&i| i != leader).unwrap();
+        assert_eq!(c.h(follower).sample_live(window).await, None);
+        c.stop(follower);
+        tokio::time::sleep(window * 2).await;
+        let mut want: Vec<u64> = c.ids.iter().copied().filter(|&i| i != follower).collect();
+        want.sort();
+        assert_eq!(c.h(leader).sample_live(window).await, Some(want));
     }
 }
