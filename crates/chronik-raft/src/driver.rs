@@ -20,7 +20,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -136,6 +138,7 @@ enum Event {
     ConfChange { cc: ConfChangeV2, reply: Reply },
     Step(Message),
     Unreachable(u64),
+    SnapshotFailed(u64),
     Campaign,
     Stop,
 }
@@ -145,6 +148,9 @@ enum Event {
 pub struct RaftHandle {
     tx: Sender<Event>,
     status: watch::Receiver<RaftStatus>,
+    /// Milliseconds since `epoch` when this node last heard from (or was) the leader; 0 = never.
+    leader_contact: Arc<AtomicU64>,
+    epoch: Instant,
 }
 
 impl RaftHandle {
@@ -172,9 +178,24 @@ impl RaftHandle {
         let _ = self.tx.send(Event::Unreachable(peer));
     }
 
+    /// Tell raft a snapshot could not be delivered, so it retries instead of
+    /// waiting on the peer forever.
+    pub fn report_snapshot_failed(&self, peer: u64) {
+        let _ = self.tx.send(Event::SnapshotFailed(peer));
+    }
+
     /// Start an election now instead of waiting for the election timeout.
     pub fn campaign(&self) {
         let _ = self.tx.send(Event::Campaign);
+    }
+
+    /// How long ago this node last heard from the leader, or was leader
+    /// itself. `None` if it never has since starting.
+    pub fn leader_contact_age(&self) -> Option<Duration> {
+        match self.leader_contact.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(self.epoch.elapsed().saturating_sub(Duration::from_millis(ms))),
+        }
     }
 
     pub fn status(&self) -> RaftStatus {
@@ -277,6 +298,8 @@ impl RaftDriver {
 
         let (tx, rx) = mpsc::channel();
         let (status_tx, status_rx) = watch::channel(RaftStatus { id: config.id, applied: snap_index, ..Default::default() });
+        let leader_contact = Arc::new(AtomicU64::new(0));
+        let epoch = Instant::now();
         let mut core = DriverCore {
             id: config.id,
             node,
@@ -288,13 +311,15 @@ impl RaftDriver {
             applied: snap_index,
             snapshot_every: config.snapshot_every,
             status: status_tx,
+            leader_contact: leader_contact.clone(),
+            epoch,
         };
         core.publish_status(None);
         let tick = config.tick_interval;
         let thread = std::thread::Builder::new()
             .name(format!("raft-{}", config.id))
             .spawn(move || core.run(rx, tick))?;
-        Ok(Self { handle: RaftHandle { tx, status: status_rx }, thread: Some(thread) })
+        Ok(Self { handle: RaftHandle { tx, status: status_rx, leader_contact, epoch }, thread: Some(thread) })
     }
 
     pub fn handle(&self) -> RaftHandle {
@@ -335,6 +360,8 @@ struct DriverCore<S: StateMachine, O: Outbox> {
     applied: u64,
     snapshot_every: u64,
     status: watch::Sender<RaftStatus>,
+    leader_contact: Arc<AtomicU64>,
+    epoch: Instant,
 }
 
 /// Fails the driver: raft must not continue on storage it cannot trust.
@@ -375,6 +402,9 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
             if now >= next_tick {
                 self.node.tick();
                 next_tick = now + tick;
+            }
+            if self.node.raft.state == StateRole::Leader {
+                self.touch_leader_contact();
             }
             if let Err(Fatal(msg)) = self.process_ready() {
                 tracing::error!("Raft node {} stopping: {}", self.id, msg);
@@ -417,11 +447,17 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
                 }
             }
             Event::Step(msg) => {
+                let from = msg.from;
+                let term = msg.term;
                 if let Err(e) = self.node.step(msg) {
                     tracing::debug!("Raft node {}: step: {}", self.id, e);
                 }
+                if from != 0 && from == self.node.raft.leader_id && term == self.node.raft.term {
+                    self.touch_leader_contact();
+                }
             }
             Event::Unreachable(peer) => self.node.report_unreachable(peer),
+            Event::SnapshotFailed(peer) => self.node.report_snapshot(peer, raft::SnapshotStatus::Failure),
             Event::Campaign => {
                 let _ = self.node.campaign();
             }
@@ -588,6 +624,11 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
         self.store.create_snapshot(self.applied, cs, self.sm.snapshot())?;
         tracing::debug!("Raft node {}: snapshot at {}, log compacted", self.id, self.applied);
         Ok(())
+    }
+
+    fn touch_leader_contact(&self) {
+        let ms = self.epoch.elapsed().as_millis() as u64;
+        self.leader_contact.store(ms.max(1), Ordering::Relaxed);
     }
 
     fn fail_pending(&mut self, err: ProposeError) {

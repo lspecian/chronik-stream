@@ -15,6 +15,7 @@ pub mod prost_bridge;
 pub mod rpc;
 pub mod driver;
 pub mod log_store;
+pub mod net;
 pub mod storage;
 pub mod transport;
 

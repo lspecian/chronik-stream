@@ -51,6 +51,7 @@ slog-stdlog = { workspace = true }
 tonic-build = { workspace = true }
 
 [dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 criterion = { workspace = true }
