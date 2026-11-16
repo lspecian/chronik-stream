@@ -1802,7 +1802,8 @@ impl WalIndexer {
 
         // Register segment metadata in the metadata store for disaster recovery.
         // This allows high watermarks to be restored on startup.
-        // Only persist on leader — followers don't own __chronik_metadata partition.
+        // Gated by `is_leader` only when a caller passes one; the server passes
+        // none, because segment records live in each node's own metadata WAL.
         if is_leader.load(Ordering::Relaxed) {
             let segment_id = format!("{}-{}", min_offset, max_offset);
             let segment_metadata = MetadataSegmentMetadata {

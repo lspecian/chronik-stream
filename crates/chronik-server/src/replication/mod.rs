@@ -10,11 +10,7 @@
 //! **Refactoring Goal:**
 //! Extract 233-line monolithic `handle_connection()` into focused, testable modules.
 
-pub mod frame_reader;
 pub mod leader_epoch;
-pub mod record_processor;
 pub mod replica_fetcher;
 
 // Re-export key types for convenience
-pub use frame_reader::{FrameReader, FrameReadResult};
-pub use record_processor::RecordProcessor;

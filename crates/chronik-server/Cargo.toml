@@ -93,6 +93,7 @@ toml = "0.8"  # For cluster config parsing
 uuid = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
@@ -143,7 +144,6 @@ minimal = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

@@ -41,7 +41,7 @@ use chronik_common::metadata::PartitionAssignment;
 use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
-use crate::raft_cluster::RaftCluster;
+use crate::cluster_catalog::ClusterCatalog;
 
 /// How often peer liveness is sampled and assignments are checked.
 const DEFAULT_TICK: Duration = Duration::from_secs(2);
@@ -303,7 +303,7 @@ pub fn rejoined_nodes(previous: Option<&[u64]>, current: &[u64]) -> Vec<u64> {
 /// that have not.
 pub struct PartitionFailoverController {
     node_id: u64,
-    raft: Arc<RaftCluster>,
+    raft: Arc<ClusterCatalog>,
     metadata_store: Arc<dyn MetadataStore>,
     /// Last moment each node was observed active by Raft.
     last_active: DashMap<u64, Instant>,
@@ -341,7 +341,7 @@ pub struct PartitionFailoverController {
 impl PartitionFailoverController {
     pub fn new(
         node_id: u64,
-        raft: Arc<RaftCluster>,
+        raft: Arc<ClusterCatalog>,
         metadata_store: Arc<dyn MetadataStore>,
         rejoin_notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Arc<Self> {
@@ -393,7 +393,7 @@ impl PartitionFailoverController {
         while !self.shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(self.tick).await;
 
-            let active = match self.raft.sample_active_peers().await {
+            let active = match self.raft.sample_live_nodes().await {
                 Some(active) => {
                     // Say once that this node has taken over deciding failover.
                     // "Is the controller even sampling?" cost six round trips of

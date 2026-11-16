@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 use crate::admin_api::{create_admin_router, AdminApiState};
 use crate::isr_tracker::IsrTracker;
-use crate::raft_cluster::RaftCluster;
+use crate::cluster_catalog::ClusterCatalog;
 use crate::schema_registry::SchemaRegistry;
 use chronik_common::metadata::traits::MetadataStore;
 
@@ -31,7 +31,7 @@ use chronik_common::metadata::traits::MetadataStore;
 /// This function creates the shared state needed for admin endpoints.
 ///
 /// # Arguments
-/// * `raft_cluster` - The Raft cluster for consensus operations
+/// * `raft_cluster` - The cluster catalog (None in single-node mode)
 /// * `metadata_store` - The metadata store for topic/partition info
 /// * `api_key` - Optional API key (falls back to CHRONIK_ADMIN_API_KEY env var)
 /// * `isr_tracker` - Optional ISR tracker for replica status
@@ -40,7 +40,7 @@ use chronik_common::metadata::traits::MetadataStore;
 /// # Returns
 /// An AdminApiState ready for use with the unified API router
 pub fn create_admin_state(
-    raft_cluster: Option<Arc<RaftCluster>>,
+    raft_cluster: Option<Arc<ClusterCatalog>>,
     metadata_store: Arc<dyn MetadataStore>,
     api_key: Option<String>,
     isr_tracker: Option<Arc<IsrTracker>>,
@@ -86,7 +86,7 @@ pub fn admin_router(state: AdminApiState) -> Router {
 /// Convenience function to create state and router in one call
 ///
 /// # Arguments
-/// * `raft_cluster` - The Raft cluster for consensus operations
+/// * `raft_cluster` - The cluster catalog (None in single-node mode)
 /// * `metadata_store` - The metadata store for topic/partition info
 /// * `api_key` - Optional API key (falls back to CHRONIK_ADMIN_API_KEY env var)
 /// * `isr_tracker` - Optional ISR tracker for replica status
@@ -95,7 +95,7 @@ pub fn admin_router(state: AdminApiState) -> Router {
 /// # Returns
 /// An Axum router ready for merging into the unified API
 pub fn create_admin_router_for_unified_api(
-    raft_cluster: Option<Arc<RaftCluster>>,
+    raft_cluster: Option<Arc<ClusterCatalog>>,
     metadata_store: Arc<dyn MetadataStore>,
     api_key: Option<String>,
     isr_tracker: Option<Arc<IsrTracker>>,

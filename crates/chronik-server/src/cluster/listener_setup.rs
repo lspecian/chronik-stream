@@ -9,7 +9,6 @@ use tracing::info;
 use tokio::task::JoinHandle;
 
 use crate::integrated_server::IntegratedKafkaServer;
-use crate::raft_cluster::RaftCluster;
 use super::config::ClusterInitConfig;
 
 /// Start Kafka protocol listener
@@ -90,7 +89,7 @@ pub async fn start_search_api(
 /// v2.2.22: Added isr_tracker parameter for accurate ISR queries
 /// Phase 5: Added schema_registry parameter for Schema Registry API
 pub async fn start_admin_api(
-    raft_cluster: Arc<RaftCluster>,
+    catalog: Arc<crate::cluster_catalog::ClusterCatalog>,
     metadata_store: Arc<dyn chronik_common::metadata::traits::MetadataStore>,
     node_id: u64,
     bind: &str,
@@ -103,7 +102,7 @@ pub async fn start_admin_api(
     info!("Starting Admin API + Schema Registry on port {}", admin_port);
 
     let admin_api_key = std::env::var("CHRONIK_ADMIN_API_KEY").ok();
-    admin_api::start_admin_api(Some(raft_cluster), metadata_store, admin_port, admin_api_key, isr_tracker, schema_registry).await?;
+    admin_api::start_admin_api(Some(catalog), metadata_store, admin_port, admin_api_key, isr_tracker, schema_registry).await?;
 
     info!("✓ Admin API available at http://{}:{}/admin", bind, admin_port);
     info!("✓ Schema Registry available at http://{}:{}/subjects", bind, admin_port);

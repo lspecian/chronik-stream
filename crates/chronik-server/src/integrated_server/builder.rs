@@ -45,14 +45,15 @@ use std::sync::atomic::Ordering;
 pub struct IntegratedKafkaServerBuilder {
     // Configuration
     config: IntegratedServerConfig,
-    raft_cluster: Option<Arc<crate::raft_cluster::RaftCluster>>,
+    /// The cluster catalog (topics, assignments, brokers, ACLs, SCRAM).
+    cluster_catalog: Option<Arc<crate::cluster_catalog::ClusterCatalog>>,
+    catalog_store: Option<Arc<crate::catalog_metadata_store::CatalogMetadataStore>>,
 
     // Initialized paths (Stage 1)
     data_dir: Option<PathBuf>,
     segments_dir: Option<PathBuf>,
 
     // Raft and metadata (Stage 2)
-    raft_cluster_for_metadata: Option<Arc<crate::raft_cluster::RaftCluster>>,
     metadata_wal: Option<Arc<crate::metadata_wal::MetadataWal>>,
     metadata_event_bus: Option<Arc<crate::metadata_events::MetadataEventBus>>,
     wal_metadata_store: Option<Arc<chronik_common::metadata::WalMetadataStore>>,
@@ -85,8 +86,6 @@ pub struct IntegratedKafkaServerBuilder {
     hot_vector_batcher_slot:
         Option<Arc<std::sync::OnceLock<chronik_columnar::hot_vector_batcher::MicroBatcherHandle>>>,
 
-    // Replication and leader election (Stage 4)
-    wal_replication_manager: Option<Arc<crate::wal_replication::WalReplicationManager>>,
 
     // Metadata DR (Stage 5)
     metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
@@ -102,9 +101,6 @@ pub struct IntegratedKafkaServerBuilder {
     isr_publisher: Option<Arc<crate::isr_publisher::IsrPublisher>>,
     assignment_repair: Option<Arc<crate::assignment_repair::AssignmentRepair>>,
 
-    // RP-6: woken when a node rejoins, so the catalog anti-entropy loop
-    // re-broadcasts immediately instead of up to 5 minutes later.
-    metadata_rejoin_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl IntegratedKafkaServerBuilder {
@@ -112,10 +108,10 @@ impl IntegratedKafkaServerBuilder {
     pub fn new(config: IntegratedServerConfig) -> Self {
         Self {
             config,
-            raft_cluster: None,
+            cluster_catalog: None,
+            catalog_store: None,
             data_dir: None,
             segments_dir: None,
-            raft_cluster_for_metadata: None,
             metadata_wal: None,
             metadata_event_bus: None,
             wal_metadata_store: None,
@@ -137,19 +133,17 @@ impl IntegratedKafkaServerBuilder {
             hot_text_index: None,
             hot_vector_index: None,
             hot_vector_batcher_slot: None,
-            wal_replication_manager: None,
             metadata_uploader: None,
             replica_fetcher: None,
             partition_failover: None,
             isr_publisher: None,
             assignment_repair: None,
-            metadata_rejoin_notify: None,
         }
     }
 
-    /// Set optional Raft cluster for multi-node mode
-    pub fn with_raft_cluster(mut self, cluster: Arc<crate::raft_cluster::RaftCluster>) -> Self {
-        self.raft_cluster = Some(cluster);
+    /// Use a running cluster catalog (cluster mode).
+    pub fn with_cluster_catalog(mut self, catalog: Arc<crate::cluster_catalog::ClusterCatalog>) -> Self {
+        self.cluster_catalog = Some(catalog);
         self
     }
 
@@ -177,36 +171,30 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
-    /// Stage 2: Initialize Raft cluster for metadata coordination
-    /// Complexity: < 15 (conditional Raft setup)
-    async fn init_raft_cluster(&mut self) -> Result<()> {
-        info!("Stage 2: Initializing Raft cluster for metadata coordination");
-
+    /// Stage 2: Start (or adopt) the cluster catalog.
+    ///
+    /// Cluster mode hands in a running catalog; single-node mode starts a
+    /// one-voter catalog with no network: its raft group commits locally.
+    async fn init_cluster_catalog(&mut self) -> Result<()> {
+        info!("Stage 2: Initializing the cluster catalog");
         let data_dir = self.data_dir.as_ref()
             .context("data_dir not initialized - call init_directories() first")?;
-
-        let raft_cluster_for_metadata = if let Some(ref cluster) = self.raft_cluster {
-            // Multi-node mode: use existing RaftCluster
-            info!("Multi-node mode: using existing RaftCluster with {} peers", cluster.peer_count());
-            cluster.clone()
-        } else {
-            // Single-node mode: create RaftCluster with empty peers (zero overhead)
-            info!("Single-node mode: creating RaftCluster with zero-overhead synchronous apply");
-            Arc::new(
-                crate::raft_cluster::RaftCluster::bootstrap(
-                    self.config.node_id as u64,
-                    Vec::new(), // Empty peers = single-node mode
-                    format!("{}:{}", self.config.advertised_host, self.config.advertised_port),
-                    data_dir.clone(),
-                )
-                .await
-                .context("Failed to bootstrap single-node Raft cluster")?
+        if self.cluster_catalog.is_none() {
+            let node_id = self.config.node_id as u64;
+            let config = crate::cluster_catalog::ClusterCatalogConfig::new(
+                node_id,
+                data_dir.join("catalog-raft"),
+                vec![(node_id, "127.0.0.1:0".to_string())],
+                vec![node_id],
+            );
+            let catalog = crate::cluster_catalog::ClusterCatalog::start(
+                config,
+                crate::cluster::catalog_setup::catalog_runtime().handle().clone(),
             )
-        };
-
-        self.raft_cluster_for_metadata = Some(raft_cluster_for_metadata);
-
-        info!("✅ Raft cluster initialized");
+            .context("Failed to start the single-node catalog")?;
+            self.cluster_catalog = Some(Arc::new(catalog));
+        }
+        info!("✅ Cluster catalog ready");
         Ok(())
     }
 
@@ -298,32 +286,14 @@ impl IntegratedKafkaServerBuilder {
         // Wrap in Arc now that recovery is complete
         let wal_metadata_store = Arc::new(wal_metadata_store);
 
-        // Let a peer ask this node what topics it has.
-        //
-        // Raft lends its gRPC channel for the question — metadata replication
-        // itself runs over the WAL transport on 9291 and is push-only, so there
-        // is nowhere else to ask. What Raft gets is a callback, not the store:
-        // topic metadata deliberately lives outside the Raft state machine
-        // (v2.2.9), and it should stay that way.
-        if let Some(ref raft) = self.raft_cluster_for_metadata {
-            let store_for_query = wal_metadata_store.clone();
-            raft.set_catalog_query(Arc::new(move || {
-                let store = store_for_query.clone();
-                Box::pin(async move {
-                    store.list_topics().await.map_err(|e| e.to_string())
-                }) as std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                                Output = Result<Vec<chronik_common::metadata::TopicMetadata>, String>,
-                            > + Send,
-                    >,
-                >
-            }))
-            .await;
-        }
-
         self.wal_metadata_store = Some(wal_metadata_store.clone());
-        self.metadata_store = Some(wal_metadata_store);
+        let catalog = self.cluster_catalog.clone().context("cluster catalog not initialized")?;
+        let catalog_store = Arc::new(crate::catalog_metadata_store::CatalogMetadataStore::new(
+            catalog,
+            wal_metadata_store,
+        ));
+        self.catalog_store = Some(catalog_store.clone());
+        self.metadata_store = Some(catalog_store);
         Ok(())
     }
 
@@ -419,275 +389,106 @@ impl IntegratedKafkaServerBuilder {
         }
     }
 
-    /// Stage 6: Initialize metadata replication
-    /// Complexity: < 20 (replicator creation + event listener)
-    async fn init_metadata_replication(&mut self) -> Result<()> {
-        info!("Stage 6: Initializing metadata replication");
-
-        let metadata_wal = self.metadata_wal.as_ref()
-            .context("metadata_wal not initialized")?;
-        let metadata_event_bus = self.metadata_event_bus.as_ref()
-            .context("metadata_event_bus not initialized")?;
-        let wal_metadata_store = self.wal_metadata_store.as_ref()
-            .context("wal_metadata_store not initialized")?;
-        let metadata_store = self.metadata_store.as_ref()
-            .context("metadata_store not initialized")?;
-        let raft_cluster = self.raft_cluster_for_metadata.as_ref()
-            .context("raft_cluster_for_metadata not initialized")?;
-
-        // Create WAL replication manager for metadata
-        let wal_replication_manager = crate::wal_replication::WalReplicationManager::new_with_dependencies(
-            Vec::new(),  // Empty for auto-discovery
-            Some(raft_cluster.clone()),
-            None,  // No ISR tracker for metadata
-            None,  // No ACK tracker for metadata
-            self.config.cluster_config.clone().map(Arc::new),
-            Some(metadata_store.clone()),
-        );
-
-        // Kept so the catalog can be re-asserted when a follower link comes back
-        // up — see `set_catalog_resync_notify` below.
-        let metadata_transport = wal_replication_manager.clone();
-
-        // Create metadata WAL replicator
-        let metadata_wal_replicator = Arc::new(
-            crate::metadata_wal_replication::MetadataWalReplicator::new(
-                metadata_wal.clone(),
-                wal_replication_manager,
-                metadata_event_bus.clone(),
-                wal_metadata_store.clone(),
-            )
-        );
-
-        // Start event listener
-        metadata_wal_replicator.clone().start_event_listener();
-
-        info!("✅ Metadata replication initialized with event listener");
-
-        // Periodically re-broadcast the catalog to followers.
-        //
-        // This is the catalog anti-entropy loop. It re-publishes TopicCreated
-        // *and* PartitionAssigned events to the event bus so the
-        // MetadataWalReplicator sends them to followers, letting any node that
-        // missed events (down, disconnected, still recovering) converge within
-        // one period.
-        //
-        // Assignments matter as much as topics: they carry the partition leader,
-        // and a follower that does not know who leads a partition cannot fetch it
-        // at all under follower-pull. Healing topics alone left a node knowing
-        // every topic and replicating nothing.
-        //
-        // This MUST be periodic, not a fixed number of startup shots: the old
-        // 45s/120s two-shot was tuned for fast startups and permanently missed
-        // its window on large clusters — a node recovering tens of GB of WAL
-        // takes minutes to establish replication connections, both shots fired
-        // into the void, and the catalog stayed diverged forever (observed
-        // 15 / 4695 / 882 topics across three nodes). The event-bus buffer is
-        // sized for full-catalog bursts (see MetadataEventBus::default), so a
-        // periodic full re-broadcast is safe; at 5min x thousands of topics the
-        // steady-state cost is trivial.
-        let broadcast_store = wal_metadata_store.clone();
-        let rebroadcast_secs = std::env::var("CHRONIK_METADATA_REBROADCAST_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(300);
-
-        // RP-6: a node rejoining is exactly when someone needs the catalog, and
-        // waiting up to `rebroadcast_secs` for it is what made failover recovery
-        // take minutes.
-        //
-        // A node that was leading a partition when it died comes back believing
-        // it still leads: it recovers metadata from its own WAL, which is stale
-        // by precisely the change that demoted it. `plan_assignments` skips
-        // partitions led by this node, so it fetches nothing for them and cannot
-        // run the RP-3.3 handshake for them either — it does not know it is a
-        // follower. It stays that way until the next anti-entropy pass, default
-        // 300s.
-        //
-        // The failover controller already watches liveness and already runs only
-        // on the Raft leader, so it can say "someone just came back". Waking this
-        // loop then is a targeted fix; shortening the interval would trade a
-        // constant broadcast cost against a window that would still exist.
-        let rejoin_notify = Arc::new(tokio::sync::Notify::new());
-        self.metadata_rejoin_notify = Some(rejoin_notify.clone());
-
-        // Liveness is not the right trigger on its own. A returning node is live
-        // ~26ms before its replication connection is re-established, and a
-        // metadata send with no connection is dropped — so the rejoin broadcast
-        // was published into a gap and lost, leaving the returning node with a
-        // stale catalog until the next anti-entropy pass 300s later. Measured: a
-        // restarted node received zero metadata events, still believed it led a
-        // partition that had failed over, and so never replicated it at all.
-        //
-        // Firing on connect as well means the catalog is re-asserted at a moment
-        // the link demonstrably exists.
-        metadata_transport.set_catalog_resync_notify(rejoin_notify.clone());
-
-        // RP-7: only the Raft leader may re-assert the catalog.
-        //
-        // Every node used to run this loop, so every node re-published *its own*
-        // view on a timer. That is gossip with no tiebreak, and it does not
-        // converge: measured after a failover, three nodes held three different
-        // views of one partition — node 2 (which had the data) said `leader:2`,
-        // while nodes 1 and 3 said `leader:1`. Node 1 then served 17,259 fetches
-        // as leader of a partition whose log was empty, and node 3 replicated
-        // from it and stayed empty, while all three reported
-        // `under_replicated: false`.
-        //
-        // The epoch guard in `apply_replicated_event` stops a node *regressing*
-        // to an older assignment, but a guard cannot deliver an update to a node
-        // that never received one, and nothing made any view authoritative.
-        //
-        // Assignments are Raft-managed state, so the Raft leader is the only
-        // node entitled to publish them. Off the leader this loop stays quiet
-        // and the local catalog is a cache to be corrected, not a view to be
-        // broadcast. When there is no Raft cluster at all (single node) there is
-        // nothing to disagree with, so it always runs.
-        let broadcast_authority = self.raft_cluster_for_metadata.clone();
-
+    /// Stage 6: Wire catalog changes into this node.
+    ///
+    /// Every applied catalog change, on every node: local state for deleted
+    /// topics is purged, security caches reload, and the metadata event bus
+    /// carries the change to the listeners that re-plan on it (the replica
+    /// fetcher). Brokers listed in the config are registered once the catalog
+    /// has caught up (cluster mode does this from `main`).
+    async fn init_catalog_bridge(&mut self) -> Result<()> {
+        info!("Stage 6: Wiring catalog changes into this node");
+        let catalog = self.cluster_catalog.clone().context("cluster catalog not initialized")?;
+        let store = self.catalog_store.clone().context("catalog store not initialized")?;
+        let bus = self.metadata_event_bus.clone().context("metadata_event_bus not initialized")?;
+        let mut changes = catalog.subscribe();
         tokio::spawn(async move {
-            // First pass early: covers the common fast-startup case.
-            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-            let mut warned_not_authority = false;
+            use chronik_common::metadata::catalog::CatalogChange;
+            use crate::metadata_events::MetadataEvent as ServerEvent;
             loop {
-                // `is_leader()` (state under the lock), not `am_i_leader()`
-                // (cached atomic): the cache is refreshed only inside the
-                // message loop's has_ready branch, so on a quiet cluster it can
-                // sit stale — and a stale `false` here would mean *no* node
-                // re-asserts the catalog, which is worse than the gossip this
-                // gate replaced.
-                let may_broadcast = match &broadcast_authority {
-                    Some(raft) => raft.is_leader().await,
-                    None => true,
+                let change = match changes.recv().await {
+                    Ok(c) => c,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Missed changes: tell listeners to re-read everything.
+                        warn!("Catalog change listener lagged by {}; re-announcing the catalog", n);
+                        CatalogChange::Reset
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 };
-
-                // Runs on every node, leader or not, and before the gate below.
-                // A config altered on a follower has to travel outward from
-                // there: the leader-only re-broadcast can never carry it,
-                // because the leader is one of the nodes that never heard it.
-                // Bounded to recent changes, so this is normally a no-op.
-                broadcast_store
-                    .rebroadcast_recent_config_changes(chrono::Duration::seconds(
-                        (rebroadcast_secs as i64).saturating_mul(4).max(300),
-                    ))
-                    .await;
-
-                if !may_broadcast {
-                    if !warned_not_authority {
-                        tracing::debug!(
-                            "Not the Raft leader — leaving catalog anti-entropy to the node that is"
-                        );
-                        warned_not_authority = true;
-                    }
-                } else {
-                    warned_not_authority = false;
-
-                    // Before asserting anything, check we are not the
-                    // impoverished one.
-                    //
-                    // Only the leader re-broadcasts, so a leader that came back
-                    // with a thin catalog is a deadlock: the one node entitled
-                    // to state the catalog is the one that knows least, and the
-                    // nodes that still have it are not allowed to speak.
-                    // Measured on a 3-node cluster: node 1 led with 17 of 5,612
-                    // partition assignments while node 2 held all of them, and
-                    // it stayed that way until leadership moved.
-                    //
-                    // So the leader asks its peers first, and adopts rather than
-                    // asserts when one of them clearly knows more. This is a
-                    // recovery path, not gossip: it runs only when a peer holds
-                    // at least twice what we do, and the pass that adopts does
-                    // not also assert.
-                    let mut adopted = false;
-                    let local_topics = broadcast_store
-                        .list_topics()
-                        .await
-                        .map(|t| t.len())
-                        .unwrap_or(0);
-                    if let Some(ref raft) = broadcast_authority {
-                        let richest = raft
-                            .peer_topic_lists()
-                            .await
-                            .into_iter()
-                            .max_by_key(|(_, topics)| topics.len());
-                        if let Some((peer_id, topics)) = richest {
-                            if topics.len() > local_topics.saturating_mul(2)
-                                && topics.len() > local_topics
-                            {
-                                let known: std::collections::HashSet<String> = broadcast_store
-                                    .list_topics()
-                                    .await
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|t| t.name)
-                                    .collect();
-                                let mut learned = 0usize;
-                                for topic in &topics {
-                                    if known.contains(&topic.name) {
-                                        continue;
-                                    }
-                                    if let Err(e) = broadcast_store
-                                        .create_topic(&topic.name, topic.config.clone())
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            topic = %topic.name,
-                                            error = %e,
-                                            "Could not adopt topic from peer"
-                                        );
-                                    } else {
-                                        learned += 1;
-                                    }
-                                }
-                                tracing::warn!(
-                                    from_peer = peer_id,
-                                    local_topics,
-                                    peer_topics = topics.len(),
-                                    learned,
-                                    "Leader had a thin catalog - adopted from a peer instead of \
-                                     asserting its own view"
-                                );
-                                adopted = true;
-                            }
+                store.handle_change(&change).await;
+                let events: Vec<ServerEvent> = {
+                    let state = catalog.read();
+                    let assignment_event = |topic: &str, partition: u32| {
+                        state.assignment(topic, partition).map(|a| ServerEvent::PartitionAssigned {
+                            topic: a.topic.clone(),
+                            partition: a.partition as i32,
+                            replicas: a.replicas.clone(),
+                            leader: a.leader_id,
+                            leader_epoch: a.leader_epoch,
+                            isr: a.isr.clone(),
+                        })
+                    };
+                    let topic_event = |topic: &str| {
+                        state.topic(topic).map(|t| ServerEvent::TopicCreated {
+                            topic: t.name.clone(),
+                            num_partitions: t.config.partition_count as i32,
+                        })
+                    };
+                    match &change {
+                        CatalogChange::TopicCreated(t) | CatalogChange::TopicConfigChanged(t) => {
+                            let mut v: Vec<ServerEvent> = topic_event(t).into_iter().collect();
+                            v.extend(state.assignments_for(t).iter().filter_map(|a| assignment_event(t, a.partition)));
+                            v
                         }
+                        CatalogChange::PartitionsAdded { topic, from, to } => {
+                            let mut v: Vec<ServerEvent> = topic_event(topic).into_iter().collect();
+                            v.extend((*from..*to).filter_map(|p| assignment_event(topic, p)));
+                            v
+                        }
+                        CatalogChange::TopicDeleted(t) => vec![ServerEvent::TopicDeleted { topic: t.clone() }],
+                        CatalogChange::AssignmentChanged { topic, partition } => {
+                            assignment_event(topic, *partition).into_iter().collect()
+                        }
+                        CatalogChange::BrokersChanged => state
+                            .brokers()
+                            .map(|b| ServerEvent::BrokerRegistered {
+                                broker_id: b.broker_id,
+                                host: b.host.clone(),
+                                port: b.port,
+                                rack: b.rack.clone(),
+                            })
+                            .collect(),
+                        CatalogChange::Reset => state.topics().filter_map(|t| topic_event(&t.name)).collect(),
+                        CatalogChange::AclsChanged
+                        | CatalogChange::ScramChanged
+                        | CatalogChange::NodeAddressChanged(_) => Vec::new(),
                     }
-
-                    if !adopted {
-                    let count = broadcast_store.broadcast_all_topics().await;
-                    if count > 0 {
-                        tracing::info!(
-                            topics_broadcast = count,
-                            "Re-broadcast topic metadata for follower sync (anti-entropy)"
-                        );
-                    }
-
-                    // Then state the complete set, so a follower can also drop
-                    // what it should no longer have. The order matters: the
-                    // additive pass above first gives it anything it is missing,
-                    // so the snapshot it prunes against is one it has just been
-                    // brought up to date with.
-                    let snapshot = broadcast_store.broadcast_catalog_snapshot().await;
-                    if snapshot > 0 {
-                        tracing::info!(
-                            topics_in_snapshot = snapshot,
-                            "Published catalog snapshot so followers prune stale topics"
-                        );
-                    }
-                    }
-                }
-
-                // `notify_one` stores a permit, so a rejoin that lands while the
-                // broadcast above is still running is not lost.
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(rebroadcast_secs)) => {}
-                    _ = rejoin_notify.notified() => {
-                        tracing::info!("Node rejoined — re-broadcasting the catalog now rather than waiting for anti-entropy");
-                    }
+                };
+                for e in events {
+                    bus.publish(e);
                 }
             }
         });
-
+        // Single-node mode has no config listing brokers: register this one, so
+        // the catalog can place partitions (it refuses to with no brokers).
+        if self.config.cluster_config.is_none() {
+            let store = self.catalog_store.clone().context("catalog store not initialized")?;
+            let catalog = self.cluster_catalog.clone().context("cluster catalog not initialized")?;
+            let broker = chronik_common::metadata::BrokerMetadata {
+                broker_id: self.config.node_id,
+                host: self.config.advertised_host.clone(),
+                port: self.config.advertised_port,
+                rack: None,
+                status: chronik_common::metadata::BrokerStatus::Online,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            if !catalog.wait_caught_up(std::time::Duration::from_secs(30)).await {
+                anyhow::bail!("single-node catalog did not elect itself within 30s");
+            }
+            store.register_broker(broker).await.context("registering this broker in the catalog")?;
+        }
+        info!("✅ Catalog changes wired");
         Ok(())
     }
 
@@ -1314,15 +1115,9 @@ impl IntegratedKafkaServerBuilder {
         _isr_tracker: &Arc<crate::isr_tracker::IsrTracker>,
         _metadata_store: &Arc<dyn MetadataStore>,
     ) {
-        let raft_cluster = match self.raft_cluster_for_metadata.as_ref() {
-            Some(c) => c,
-            None => {
-                info!("⚠️  Raft clustering disabled - single-node mode");
-                return;
-            }
-        };
-
-        produce_handler.set_raft_cluster(Arc::clone(raft_cluster));
+        if let Some(catalog) = self.cluster_catalog.as_ref() {
+            produce_handler.set_raft_cluster(Arc::clone(catalog));
+        }
         info!("✅ Pull replication: followers fetch from the leader; nothing is pushed");
     }
 
@@ -1800,11 +1595,9 @@ impl IntegratedKafkaServerBuilder {
 
         let wal_manager = wal_handler.wal_manager().clone();
 
-        // Extract leadership flag from RaftCluster for the WalIndexer.
-        // On followers, segment metadata persistence is skipped to prevent deadlock
-        // (writing to __chronik_metadata with acks=1 blocks on non-leader nodes).
-        let is_leader_flag = self.raft_cluster_for_metadata.as_ref()
-            .map(|rc| rc.is_leader_flag());
+        // Segment records are this node's own state (its local metadata WAL), so
+        // every node persists them; nothing is gated on catalog leadership.
+        let is_leader_flag: Option<Arc<std::sync::atomic::AtomicBool>> = None;
 
         let wal_indexer = Arc::new(WalIndexer::new(
             indexer_config,
@@ -1886,67 +1679,6 @@ impl IntegratedKafkaServerBuilder {
         self.metadata_uploader = metadata_uploader;
 
         info!("✅ Metadata Uploader initialization complete");
-        Ok(())
-    }
-
-    /// Stage 15: Initialize and start WalReceiver (cluster mode only)
-    /// Complexity: < 20 (conditional cluster setup)
-    async fn init_wal_receiver(&mut self) -> Result<()> {
-        info!("Stage 15: Initializing WAL Receiver (cluster mode only)");
-
-        // Only start WAL receiver in cluster mode
-        if let Some(ref cluster_config) = self.config.cluster_config {
-            // Get WAL bind address from cluster config
-            let wal_bind_addr = cluster_config.bind.as_ref()
-                .and_then(|bind| Some(bind.wal.clone()))
-                .context("WAL bind address not configured in cluster config")?;
-
-            info!("Starting WAL receiver on {}", wal_bind_addr);
-
-            // Get required dependencies
-            let wal_manager = self.wal_manager.as_ref()
-                .context("wal_manager not initialized")?;
-            let isr_ack_tracker = self.isr_ack_tracker.as_ref()
-                .context("isr_ack_tracker not initialized")?;
-            let raft_cluster = self.raft_cluster_for_metadata.as_ref();
-            let produce_handler = self.produce_handler_base.as_ref()
-                .context("produce_handler not initialized")?;
-            let metadata_store = self.metadata_store.as_ref()
-                .context("metadata_store not initialized")?;
-
-            // Create WalReceiver
-            let mut wal_receiver = crate::wal_replication::WalReceiver::new_with_isr_tracker(
-                wal_bind_addr.clone(),
-                wal_manager.clone(),
-                isr_ack_tracker.clone(),
-                cluster_config.node_id,
-            );
-
-            // Wire up Raft cluster if available
-            if let Some(raft) = raft_cluster {
-                wal_receiver.set_raft_cluster(raft.clone());
-            }
-
-            // Wire up ProduceHandler for watermark updates
-            wal_receiver.set_produce_handler(produce_handler.clone());
-
-            // Wire up MetadataStore for partition offset updates
-            wal_receiver.set_metadata_store(metadata_store.clone());
-
-            // Start WalReceiver in background task
-            let wal_receiver = Arc::new(wal_receiver);
-            let receiver_clone = wal_receiver.clone();
-            tokio::spawn(async move {
-                if let Err(e) = receiver_clone.run().await {
-                    error!("WAL receiver failed: {}", e);
-                }
-            });
-
-            info!("✅ WAL Receiver started on {}", wal_bind_addr);
-        } else {
-            info!("Skipping WAL Receiver initialization (standalone mode - no clustering)");
-        }
-
         Ok(())
     }
 
@@ -2060,9 +1792,9 @@ impl IntegratedKafkaServerBuilder {
             return Ok(());
         };
 
-        let Some(raft) = self.raft_cluster_for_metadata.as_ref() else {
+        let Some(raft) = self.cluster_catalog.as_ref() else {
             warn!(
-                "Stage 17: cluster mode without a Raft cluster — partition leader failover is \
+                "Stage 17: cluster mode without a cluster catalog — partition leader failover is \
                  DISABLED. A partition whose leader dies will stay unavailable."
             );
             return Ok(());
@@ -2075,7 +1807,7 @@ impl IntegratedKafkaServerBuilder {
             cluster_config.node_id,
             raft.clone(),
             metadata_store.clone(),
-            self.metadata_rejoin_notify.clone(),
+            None,
         );
         controller.start();
         self.partition_failover = Some(controller);
@@ -2205,8 +1937,8 @@ impl IntegratedKafkaServerBuilder {
             debug!("Stage 19: single-node mode, every partition is led here");
             return Ok(());
         };
-        let Some(raft) = self.raft_cluster_for_metadata.as_ref() else {
-            warn!("Stage 19: cluster mode without a Raft cluster — unassigned partitions will not be repaired");
+        let Some(raft) = self.cluster_catalog.as_ref() else {
+            warn!("Stage 19: cluster mode without a cluster catalog — unassigned partitions will not be repaired");
             return Ok(());
         };
         let metadata_store = self.metadata_store.as_ref()
@@ -2241,8 +1973,8 @@ impl IntegratedKafkaServerBuilder {
             .context("Stage 1 failed: directory initialization")?;
 
         // Stage 2: Raft cluster
-        self.init_raft_cluster().await
-            .context("Stage 2 failed: Raft cluster initialization")?;
+        self.init_cluster_catalog().await
+            .context("Stage 2 failed: cluster catalog")?;
 
         // Stage 3: Metadata WAL
         self.init_metadata_wal().await
@@ -2257,8 +1989,8 @@ impl IntegratedKafkaServerBuilder {
             .context("Stage 5 failed: Metadata store initialization")?;
 
         // Stage 6: Metadata replication
-        self.init_metadata_replication().await
-            .context("Stage 6 failed: Metadata replication initialization")?;
+        self.init_catalog_bridge().await
+            .context("Stage 6 failed: catalog change wiring")?;
 
         // Stage 7: Storage layer
         self.init_storage().await
@@ -2294,10 +2026,6 @@ impl IntegratedKafkaServerBuilder {
         // Stage 14: MetadataUploader
         self.init_metadata_uploader().await
             .context("Stage 14 failed: MetadataUploader initialization")?;
-
-        // Stage 15: WalReceiver (cluster mode only)
-        self.init_wal_receiver().await
-            .context("Stage 15 failed: WAL Receiver initialization")?;
 
         // RP-3: the leader-epoch history is derived from the log and therefore
         // empty after a restart. Rebuild it before serving, or this node answers
@@ -2389,7 +2117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_builder_init_raft_single_node() {
+    async fn test_builder_init_catalog_single_node() {
         let temp_dir = TempDir::new().unwrap();
         let config = IntegratedServerConfig {
             node_id: 1,
@@ -2399,10 +2127,10 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
-        builder.init_raft_cluster().await.unwrap();
+        builder.init_cluster_catalog().await.unwrap();
 
         // Verify Raft cluster created
-        assert!(builder.raft_cluster_for_metadata.is_some());
+        assert!(builder.cluster_catalog.is_some());
     }
 
     #[tokio::test]
@@ -2415,6 +2143,7 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
+        builder.init_cluster_catalog().await.unwrap();
         builder.init_metadata_wal().await.unwrap();
 
         // Verify metadata WAL created
@@ -2446,6 +2175,7 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
+        builder.init_cluster_catalog().await.unwrap();
         builder.init_metadata_wal().await.unwrap();
         builder.init_event_bus().await.unwrap();
         builder.init_metadata_store().await.unwrap();
@@ -2465,14 +2195,14 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
-        builder.init_raft_cluster().await.unwrap();
+        builder.init_cluster_catalog().await.unwrap();
         builder.init_metadata_wal().await.unwrap();
         builder.init_event_bus().await.unwrap();
         builder.init_metadata_store().await.unwrap();
 
         // Metadata replication creates background tasks but doesn't store state
         // Just verify it completes without error
-        builder.init_metadata_replication().await.unwrap();
+        builder.init_catalog_bridge().await.unwrap();
     }
 
     #[tokio::test]
@@ -2520,7 +2250,7 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
-        builder.init_raft_cluster().await.unwrap();
+        builder.init_cluster_catalog().await.unwrap();
         builder.init_metadata_wal().await.unwrap();
         builder.init_event_bus().await.unwrap();
         builder.init_metadata_store().await.unwrap();
@@ -2545,7 +2275,7 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
-        builder.init_raft_cluster().await.unwrap();
+        builder.init_cluster_catalog().await.unwrap();
         builder.init_metadata_wal().await.unwrap();
         builder.init_event_bus().await.unwrap();
         builder.init_metadata_store().await.unwrap();
@@ -2568,7 +2298,7 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
-        builder.init_raft_cluster().await.unwrap();
+        builder.init_cluster_catalog().await.unwrap();
         builder.init_metadata_wal().await.unwrap();
         builder.init_event_bus().await.unwrap();
         builder.init_metadata_store().await.unwrap();
@@ -2592,7 +2322,7 @@ mod tests {
 
         let mut builder = IntegratedKafkaServerBuilder::new(config);
         builder.init_directories().await.unwrap();
-        builder.init_raft_cluster().await.unwrap();
+        builder.init_cluster_catalog().await.unwrap();
         builder.init_metadata_wal().await.unwrap();
         builder.init_event_bus().await.unwrap();
         builder.init_metadata_store().await.unwrap();

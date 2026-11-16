@@ -10,7 +10,7 @@
 
 use crate::storage::{StorageConfig, StorageService};
 use crate::fetch_handler::FetchHandler;
-use crate::raft_cluster::RaftCluster;  // NEW: v2.2.7 Phase 3
+use crate::cluster_catalog::ClusterCatalog;
 use chronik_common::{Result, Error};
 use chronik_monitoring::MetricsRecorder;
 use chronik_protocol::{
@@ -42,8 +42,6 @@ use futures::stream::{self, StreamExt};
 use dashmap::DashMap;
 use crossbeam::queue::SegQueue;
 
-/// Re-export WalReplicationManager from wal_replication module (v2.2.0 Phase 3.1)
-pub use crate::wal_replication::WalReplicationManager;
 
 /// v2.2.9: Async pipelined connection for leader forwarding (eliminates 168x slowdown)
 use crate::pipelined_connection::{PipelinedConnection, PipelinedConnectionPool};
@@ -423,7 +421,7 @@ pub struct ProduceHandler {
     /// Raft cluster for metadata coordination (v2.2.7 Phase 3)
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Used to query partition replicas and ISR for replication decisions
-    raft_cluster: Option<Arc<RaftCluster>>,
+    raft_cluster: Option<Arc<ClusterCatalog>>,
     /// WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Fire-and-forget async replication, never blocks produce path
@@ -670,7 +668,7 @@ impl ProduceHandler {
     }
 
     /// Get reference to Raft cluster (for request forwarding)
-    pub fn get_raft_cluster(&self) -> &Option<Arc<RaftCluster>> {
+    pub fn get_raft_cluster(&self) -> &Option<Arc<ClusterCatalog>> {
         &self.raft_cluster
     }
 
@@ -716,115 +714,6 @@ impl ProduceHandler {
                 false  // On error, assume not searchable (safe default)
             }
         }
-    }
-
-    /// Assign a partition to replica nodes (writes to metadata WAL)
-    ///
-    /// v2.2.9 Phase 1: Direct metadata writes bypass Raft consensus.
-    /// This method writes partition assignment metadata directly to the __chronik_metadata WAL,
-    /// which then replicates to followers via WAL replication (microsecond latency).
-    pub async fn assign_partition(
-        &self,
-        topic: &str,
-        partition: i32,
-        replicas: Vec<u64>,
-    ) -> Result<()> {
-        // Assume first replica is the leader by default
-        let leader_id = replicas.first().copied().unwrap_or(self.config.node_id as u64);
-
-        let assignment = PartitionAssignment {
-            topic: topic.to_string(),
-            partition: partition as u32,
-            broker_id: -1,  // Deprecated field
-            is_leader: false,  // Deprecated field
-            replicas,
-            leader_id,
-            leader_epoch: 0, // assigned by the metadata store
-            isr: Vec::new(), // placement only — the leader publishes the in-sync set
-        };
-
-        // Write AssignPartition event to metadata_store
-        // metadata_store will persist to __chronik_metadata WAL
-        // WAL replication will propagate to followers
-        self.metadata_store.assign_partition(assignment).await?;
-        Ok(())
-    }
-
-    /// Set partition leader (writes to metadata WAL)
-    ///
-    /// v2.2.9 Phase 1: Updates the leader for a partition by writing to metadata WAL.
-    /// This preserves the existing replicas but changes which node is the leader.
-    pub async fn set_partition_leader(
-        &self,
-        topic: &str,
-        partition: i32,
-        leader: u64,
-    ) -> Result<()> {
-        // Get current assignment to preserve replicas
-        let assignments = self.metadata_store
-            .get_partition_assignments(topic)
-            .await?;
-
-        let current = assignments.iter()
-            .find(|a| a.partition == partition as u32)
-            .ok_or_else(|| Error::Storage(format!("Partition not found: {}-{}", topic, partition)))?;
-
-        let assignment = PartitionAssignment {
-            topic: topic.to_string(),
-            partition: partition as u32,
-            broker_id: -1,  // Deprecated field
-            is_leader: false,  // Deprecated field
-            replicas: current.replicas.clone(),
-            leader_id: leader,
-            leader_epoch: 0, // assigned by the metadata store
-            isr: Vec::new(), // leadership only — leaves the published set intact
-        };
-
-        self.metadata_store.assign_partition(assignment).await?;
-        Ok(())
-    }
-
-    /// Update in-sync replica set (writes to metadata WAL)
-    ///
-    /// v2.2.9 Phase 1: Updates the ISR (in-sync replicas) for a partition via metadata WAL.
-    /// This preserves the existing leader but changes which nodes are in-sync.
-    pub async fn update_isr(
-        &self,
-        topic: &str,
-        partition: i32,
-        isr: Vec<u64>,
-    ) -> Result<()> {
-        // Get current assignment to preserve leader
-        let assignments = self.metadata_store
-            .get_partition_assignments(topic)
-            .await?;
-
-        let current = assignments.iter()
-            .find(|a| a.partition == partition as u32)
-            .ok_or_else(|| Error::Storage(format!("Partition not found: {}-{}", topic, partition)))?;
-
-        // The in-sync set goes in `isr`; `replicas` is the assignment and does
-        // not change because a follower fell behind.
-        //
-        // This used to write the in-sync set into `replicas`, which permanently
-        // shrank the replica set every time a follower lagged: a partition at
-        // RF=3 whose follower dropped out became RF=2 in metadata, and the
-        // follower was no longer a replica to catch up to. Same shape as the bug
-        // that made failover shrink RF, in a second place — there was nowhere
-        // else to put the value until `PartitionAssignment::isr` existed.
-        let assignment = PartitionAssignment {
-            topic: topic.to_string(),
-            partition: partition as u32,
-            broker_id: -1,  // Deprecated field
-            is_leader: false,  // Deprecated field
-            replicas: current.replicas.clone(),
-            leader_id: current.leader_id,
-            leader_epoch: 0, // assigned by the metadata store
-            isr,
-        };
-
-        self.metadata_store.assign_partition(assignment).await?;
-        Ok(())
     }
 
     /// Ensure a partition exists with the specified starting offset (for WAL recovery)
@@ -1411,8 +1300,8 @@ impl ProduceHandler {
     }
 
     /// Set the Raft cluster for metadata coordination (v2.2.7 Phase 3)
-    pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
-        info!("Setting RaftCluster for ProduceHandler - enables partition replication routing");
+    pub fn set_raft_cluster(&mut self, raft_cluster: Arc<ClusterCatalog>) {
+        info!("ProduceHandler attached to the cluster catalog");
         self.raft_cluster = Some(raft_cluster);
     }
 
@@ -3856,19 +3745,17 @@ impl ProduceHandler {
             return Err(Error::Protocol(format!("Cannot auto-create reserved topic: '{}'", topic_name)));
         }
 
-        // P0 FIX (v2.2.7 Phase 1): Let RaftMetadataStore handle leader-forwarding automatically
-        // The metadata store already has Phase 1 forwarding logic built in:
-        // - Followers forward create_topic to leader via RPC
-        // - Leader processes create via metadata WAL (Phase 2)
-        // - Followers wait for replication with exponential backoff
-        // DO NOT reject here - let the abstraction layer handle it properly!
-        if let Some(ref raft) = self.raft_cluster {
-            if raft.am_i_leader().await {
-                debug!("Leader node (id={}) processing topic auto-creation for '{}'",
-                    raft.node_id(), topic_name);
-            } else {
-                debug!("Follower node (id={}) will forward topic auto-creation for '{}' to leader via Phase 1 RPC",
-                    raft.node_id(), topic_name);
+        // A node that is booting, or has lost touch with the catalog leader,
+        // has not seen everything: "I do not have this topic" is not "this
+        // topic does not exist". Clients retry; by then the catalog has
+        // caught up and either has the topic or creates it once.
+        if let Some(ref catalog) = self.raft_cluster {
+            if !catalog.is_caught_up() {
+                debug!("Not auto-creating '{}': catalog not caught up", topic_name);
+                return Err(Error::Internal(format!(
+                    "cluster catalog not caught up; '{}' cannot be auto-created yet",
+                    topic_name
+                )));
             }
         }
 
@@ -3925,87 +3812,7 @@ impl ProduceHandler {
         // with `--partitions 1`.
         let result = match self.metadata_store.auto_create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
-                // v2.2.7 FIX: Partition initialization happens through PartitionAssignment module below
-                // which has proper metadata WAL writes and replication (in raft_metadata_store.rs)
-                // The broken initialize_raft_partitions() method has been removed.
-
-                // Create partition assignments
-                // For clustered mode, use round-robin assignment across nodes
-                // For standalone mode, assign all partitions to this node
-                if let Some(ref raft_cluster) = self.raft_cluster {
-                    // Clustered mode: Use round-robin assignment
-                    use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
-
-                    let nodes = raft_cluster.get_all_nodes().await;
-                    info!("Auto-creating topic '{}' in cluster mode with {} nodes", topic_name, nodes.len());
-
-                    // Convert node IDs from u64 to u32 for partition_assignment module
-                    let node_ids: Vec<u32> = nodes.iter().map(|&id| id as u32).collect();
-
-                    let mut assignment_mgr = AssignmentManager::new();
-                    if let Err(e) = assignment_mgr.add_topic(
-                        topic_name,
-                        self.config.num_partitions as i32,
-                        self.config.default_replication_factor.min(nodes.len() as u32) as i32,
-                        &node_ids,
-                    ) {
-                        warn!("Failed to create partition assignment plan for topic '{}': {:?}", topic_name, e);
-                    } else {
-                        // v2.2.9 PERFORMANCE OPTIMIZATION: Batch all partition operations into single Raft proposal
-                        // OLD: 3 separate proposals per partition (assignment, leader, ISR) × N partitions = 3N Raft rounds
-                        // NEW: 1 batched proposal for all partitions = 1 Raft round
-                        // Result: 3x faster for N partitions (600ms → 200ms for 3 partitions)
-
-                        let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
-
-                        // v2.2.9 Phase 3: Option 4 - Use metadata_store directly (WAL-only, no Raft proposal)
-                        // Instead of batching into a Raft command, call assign_partition() for each partition
-                        // This writes to __chronik_metadata WAL which replicates to followers automatically
-                        for (partition_id, partition_info) in topic_assignments {
-                            let replicas: Vec<u64> = partition_info.replicas.iter().map(|&id| id as u64).collect();
-
-                            // assign_partition() sets leader (first replica) and ISR (all replicas) automatically
-                            if let Err(e) = self.assign_partition(topic_name, partition_id as i32, replicas.clone()).await {
-                                warn!("Failed to assign partition {}/{}: {:?}", topic_name, partition_id, e);
-                            } else {
-                                info!("  ✓ Assigned partition {}/{} with replica list: {:?} (leader: {})",
-                                    topic_name, partition_id, partition_info.replicas, partition_info.leader);
-                            }
-                        }
-
-                        info!("✅ Assigned all partitions for topic '{}' via metadata_store (WAL-only)", topic_name);
-                    }
-                } else {
-                    // Standalone mode: partitions will be assigned on-demand during first produce
-                    debug!("Standalone mode: topic '{}' created with {} partitions",
-                        topic_name, self.config.num_partitions);
-                }
-
-                // v2.2.7 FIX: Runtime check instead of compile-time cfg
-                // Standalone mode ONLY (when raft_cluster is None) assign partitions via metadata WAL
-                if self.raft_cluster.is_none() {
-                    for partition in 0..self.config.num_partitions {
-                        let assignment = chronik_common::metadata::PartitionAssignment {
-                            topic: topic_name.to_string(),
-                            partition,
-                            broker_id: self.config.node_id,
-                            is_leader: true,
-                            replicas: vec![self.config.node_id as u64],
-                            leader_id: self.config.node_id as u64,
-                            leader_epoch: 0, // assigned by the metadata store
-                            // Sole replica: trivially in sync with itself.
-                            isr: vec![self.config.node_id as u64],
-                        };
-
-                        if let Err(e) = self.metadata_store.assign_partition(assignment).await {
-                            warn!("Failed to assign partition {} for topic '{}': {:?}",
-                                partition, topic_name, e);
-                        }
-                    }
-                    debug!("Standalone mode: assigned {} partitions for topic '{}'",
-                        self.config.num_partitions, topic_name);
-                }
-
+                // The catalog placed the replicas when it applied the create.
                 let elapsed = start_time.elapsed();
                 self.metrics.topics_auto_created.fetch_add(1, Ordering::Relaxed);
                 
@@ -4081,90 +3888,6 @@ impl ProduceHandler {
         };
         
         result
-    }
-
-    /// Initialize partition metadata for an existing topic (WAL-ONLY, no Raft propose)
-    ///
-    /// This method is called by CreateTopics API handler to ensure partition
-    /// assignments are written to metadata WAL and replicated to followers.
-    ///
-    /// **CRITICAL**: Uses ONLY WAL-based metadata replication, NOT Raft propose().
-    /// This eliminates the race condition where Raft and WAL have different replica lists.
-    ///
-    /// # Arguments
-    /// - `topic_name`: Name of the topic
-    /// - `num_partitions`: Number of partitions in the topic
-    ///
-    /// # Returns
-    /// Ok(()) if partition metadata was successfully initialized, or if Raft is not enabled
-    pub async fn initialize_raft_partitions(&self, topic_name: &str, num_partitions: u32) -> Result<()> {
-        // Only initialize if Raft is enabled
-        if let Some(ref raft) = self.raft_cluster {
-            // v2.2.7 CRITICAL FIX: This method should ONLY be called by the Raft leader
-            // The caller (auto_create_topic) must check am_i_leader() before calling this method.
-            // We assert this condition to catch programming errors.
-            if !raft.am_i_leader().await {
-                error!(
-                    "PROGRAMMING ERROR: initialize_raft_partitions called on Raft follower for topic '{}'",
-                    topic_name
-                );
-                return Err(Error::Internal(
-                    "Cannot initialize partitions on Raft follower - this is a programming error".into()
-                ));
-            }
-
-            info!("Initializing partition metadata for topic '{}' ({} partitions) - WAL-ONLY (no Raft propose)",
-                  topic_name, num_partitions);
-
-            // Get the ACTUAL cluster node IDs from Raft membership.
-            //
-            // CRITICAL (single-node correctness): this must NOT be a hardcoded
-            // vec![1, 2, 3]. A single-node deployment still runs a 1-voter Raft, so
-            // this method executes with `raft` = Some and `am_i_leader` = true. The
-            // old hardcoded list round-robined partitions onto nonexistent nodes 2
-            // and 3, leaving those partitions with a leader_id the broker list never
-            // advertises. Clients then could not route produce/fetch to partitions
-            // 1..N — every multi-partition topic hung on acks=1/all produce because
-            // the Java client can't find a leader for those partitions.
-            //
-            // get_all_nodes() returns the Raft voter set: [1] on single-node,
-            // [1, 2, 3] on a real 3-node cluster. Fall back to just this node if the
-            // membership somehow comes back empty (a bootstrapped Raft always has
-            // self as a voter, so this is only a safety net).
-            let mut all_nodes = raft.get_all_nodes().await;
-            all_nodes.sort_unstable();
-            all_nodes.dedup();
-            if all_nodes.is_empty() {
-                all_nodes.push(raft.node_id());
-            }
-            let replication_factor = self.config.default_replication_factor.min(all_nodes.len() as u32).max(1);
-
-            for partition in 0..num_partitions {
-                // Assign replicas (round-robin across nodes)
-                let mut replicas = Vec::new();
-                for i in 0..replication_factor {
-                    let node_idx = (partition as usize + i as usize) % all_nodes.len();
-                    replicas.push(all_nodes[node_idx]);
-                }
-
-                // v2.2.9 Phase 2: Option 4 - Use metadata_store methods (WAL-only, no Raft commands)
-                // assign_partition sets both leader (replicas[0]) and ISR (replicas) in one call
-                if let Err(e) = self.assign_partition(topic_name, partition as i32, replicas.clone()).await {
-                    warn!("Failed to assign partition {}-{} via metadata_store: {:?}", topic_name, partition, e);
-                    continue;  // Skip this partition, try next one
-                }
-
-                let leader = replicas[0];
-                info!("✓ Initialized partition metadata for {}-{}: replicas={:?}, leader={} (metadata_store)",
-                      topic_name, partition, replicas, leader);
-            }
-
-            info!("✓ Completed partition metadata initialization for topic '{}' using WAL-ONLY approach", topic_name);
-        } else {
-            debug!("Raft not enabled, skipping partition metadata initialization for '{}'", topic_name);
-        }
-
-        Ok(())
     }
 
     /// Validate topic name according to Kafka rules

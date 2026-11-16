@@ -30,16 +30,12 @@ mod offset_storage;
 mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
-mod wal_replication;  // v2.2.0: PostgreSQL-style WAL streaming
 mod replication;  // Phase 2.3: Extracted replication modules (frame_reader, record_processor)
 // v2.2.7 Phase 2: Raft for metadata coordination only (NOT data replication)
-mod raft_metadata;
-mod raft_cluster;
 // v2.2.9 Option A: REMOVED raft_metadata_store (replaced by WalMetadataStore in chronik-common)
 // mod raft_metadata_store;  // v2.2.7 Phase 3: OLD Raft-based metadata store (1-N nodes)
 // v2.2.7 Phase 2: WAL-based metadata writes (fast path, bypasses Raft consensus)
 mod metadata_wal;          // Fast local WAL for metadata operations (1-2ms vs 10-50ms Raft)
-mod metadata_wal_replication;  // Async replication using existing WalReplicationManager
 mod metadata_events;       // Event-based architecture for metadata WAL replication
 // v2.2.7 Phase 3: ISR tracking for partition replication
 mod isr_tracker;
@@ -49,9 +45,9 @@ mod partition_failover;
 // Publishes each partition's in-sync set into metadata, so it outlives the
 // leader that measured it and failover can elect from it.
 mod isr_publisher;
-mod assignment_repair;
-mod cluster_catalog;
-mod catalog_metadata_store;  // gives unassigned partitions a leader (the node holding their records)
+mod assignment_repair;  // gives unassigned partitions a leader (the node holding their records)
+mod cluster_catalog;  // the cluster catalog's raft group
+mod catalog_metadata_store;  // MetadataStore over the Raft catalog
 // v2.2.7: HTTP Admin API for cluster management
 mod admin_api;
 // v2.2.22: Unified API (SQL, Vector Search, Admin on single port)
@@ -59,13 +55,9 @@ mod unified_api;
 // v2.2.7 Priority 2 Step 3: Automatic partition rebalancing
 mod partition_rebalancer;
 // v2.2.7 Phase 1: Leader-forwarding RPC for metadata queries
-mod metadata_rpc;
 // v2.2.7 Phase 3: Leader leases for fast follower reads
-mod leader_lease;
-mod leader_heartbeat;
 
 // v2.2.7 Phase 2.5: Automatic quorum recovery
-mod quorum_recovery;
 
 mod cli;
 mod cluster;  // Phase 1.2: Cluster mode refactoring (complexity reduction from 288 → <25)
@@ -1365,29 +1357,21 @@ async fn run_cluster_mode(
     // Phase 1: Configuration parsing and validation
     let init_config = ClusterInitConfig::from_cli_and_config(cli, config.clone(), &bind, advertise.as_deref())?;
 
-    // Phase 2: Bootstrap Raft cluster
-    let raft_cluster = bootstrap_raft_cluster(&init_config).await?;
+    // Phase 2: Start the cluster catalog (its raft node) and its endpoint
+    let catalog = start_cluster_catalog(&init_config)?;
 
-    // Phase 3: Start Raft gRPC server
-    start_raft_grpc_server(raft_cluster.clone(), &init_config.raft_bind_addr).await?;
+    start_catalog_grpc_server(catalog.clone(), &init_config.raft_bind_addr).await?;
 
     // Phase 4: Create IntegratedKafkaServer with builder pattern
-    let server = create_integrated_server(&init_config, raft_cluster.clone(), object_store_config).await?;
+    let server = create_integrated_server(&init_config, catalog.clone(), object_store_config).await?;
 
     // Phase 5: Start Kafka protocol listener BEFORE leader election
     // CRITICAL FIX v2.2.9: Avoid cold-start deadlock
     let server_task = start_kafka_listener(server.clone(), init_config.kafka_bind_addr.clone()).await?;
     log_listener_status(&init_config);
 
-    // Phase 5.5: Start Raft message processing loop
-    // CRITICAL FIX: Required for leader election to occur
-    // Without this, all nodes remain followers with leader_id=INVALID_ID
-    info!("Starting Raft message processing loop...");
-    raft_cluster.clone().start_message_loop();
-    info!("✓ Raft message loop started - leader election can now occur");
-
-    // Phase 6: Broker registration and partition assignment (leader only)
-    register_brokers_and_assign_partitions(server.clone(), raft_cluster.clone(), &init_config).await?;
+    // Phase 6: Register the configured brokers in the catalog (any node; idempotent)
+    register_configured_brokers(server.metadata_store().clone(), catalog.clone(), &init_config)?;
 
     // Phase 7: Initialize monitoring
     let metrics_port = 13000 + (init_config.node_id as u16);
@@ -1405,7 +1389,7 @@ async fn run_cluster_mode(
         schema_registry::SchemaRegistryConfig::from_env()
     ));
     start_admin_api(
-        raft_cluster.clone(),
+        catalog.clone(),
         server.metadata_store().clone(),
         init_config.node_id,
         &bind,
@@ -1454,7 +1438,7 @@ async fn run_cluster_mode(
 
     // Create admin router for unified API (cluster management + Schema Registry)
     let admin_router = unified_api::create_admin_router_for_unified_api(
-        Some(raft_cluster.clone()),
+        Some(catalog.clone()),
         server.metadata_store().clone(),
         None, // Uses CHRONIK_ADMIN_API_KEY env var
         server.isr_tracker(),
@@ -1619,7 +1603,7 @@ async fn run_cluster_mode(
     // Phase 10: Start Partition Rebalancer
     info!("Starting Partition Rebalancer (RF={})", init_config.replication_factor);
     let _rebalancer = partition_rebalancer::PartitionRebalancer::new(
-        raft_cluster.clone(),
+        catalog.clone(),
         server.metadata_store().clone(),
         init_config.replication_factor as usize,
     ).await;
@@ -2567,7 +2551,6 @@ async fn handle_compaction_command(cli: &Cli, action: CompactAction) -> Result<(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod port_tests {

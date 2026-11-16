@@ -61,11 +61,21 @@ struct CatalogStateMachine {
     state: Arc<RwLock<CatalogState>>,
     changes: broadcast::Sender<CatalogChange>,
     conf_state: Arc<RwLock<ConfState>>,
+    /// Kept in step with node addresses recorded in the catalog.
+    directory: PeerDirectory,
 }
 
 impl StateMachine for CatalogStateMachine {
     fn apply(&mut self, index: u64, term: u64, command: &[u8]) -> Vec<u8> {
         let (result, changes) = self.state.write().apply_entry(index, term, command);
+        for c in &changes {
+            if let CatalogChange::NodeAddressChanged(id) = c {
+                match self.state.read().node_addresses().get(id) {
+                    Some(addr) => self.directory.set(*id, addr.clone()),
+                    None => self.directory.remove(*id),
+                }
+            }
+        }
         for c in changes {
             let _ = self.changes.send(c);
         }
@@ -79,6 +89,9 @@ impl StateMachine for CatalogStateMachine {
     fn restore(&mut self, _index: u64, data: &[u8]) -> Result<(), String> {
         let restored = CatalogState::from_snapshot(data)?;
         *self.state.write() = restored;
+        for (id, addr) in self.state.read().node_addresses() {
+            self.directory.set(*id, addr.clone());
+        }
         let _ = self.changes.send(CatalogChange::Reset);
         Ok(())
     }
@@ -139,6 +152,7 @@ pub struct ClusterCatalog {
     /// Set once this node has applied everything the leader had committed
     /// when it first heard from it after boot.
     booted: AtomicBool,
+    leader_flag: Arc<AtomicBool>,
 }
 
 impl ClusterCatalog {
@@ -149,8 +163,14 @@ impl ClusterCatalog {
         let state = Arc::new(RwLock::new(CatalogState::default()));
         let conf_state = Arc::new(RwLock::new(ConfState::default()));
         let (changes, _) = broadcast::channel(4096);
-        let sm = CatalogStateMachine { state: state.clone(), changes: changes.clone(), conf_state: conf_state.clone() };
         let directory = PeerDirectory::new(config.peers.clone());
+        let sm = CatalogStateMachine {
+            state: state.clone(),
+            changes: changes.clone(),
+            conf_state: conf_state.clone(),
+            directory: directory.clone(),
+        };
+        let runtime_for_watch = runtime.clone();
         let outbox = PeerOutbox::new(config.node_id, directory.clone(), runtime);
         let binder = outbox.binder();
         let driver_config = DriverConfig {
@@ -164,6 +184,20 @@ impl ClusterCatalog {
         let driver = RaftDriver::start(&config.data_dir, driver_config, &config.initial_voters, sm, outbox)?;
         let handle = driver.handle();
         binder.bind(handle.clone());
+        let leader_flag = Arc::new(AtomicBool::new(handle.status().is_leader));
+        {
+            let flag = leader_flag.clone();
+            let mut status = handle.subscribe();
+            runtime_for_watch.spawn(async move {
+                loop {
+                    flag.store(status.borrow_and_update().is_leader, Ordering::Relaxed);
+                    if status.changed().await.is_err() {
+                        flag.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            });
+        }
         Ok(Self {
             node_id: config.node_id,
             driver,
@@ -175,6 +209,7 @@ impl ClusterCatalog {
             propose_timeout: config.propose_timeout,
             election_timeout: config.election_timeout(),
             booted: AtomicBool::new(false),
+            leader_flag,
         })
     }
 
@@ -339,8 +374,165 @@ impl ClusterCatalog {
         }
     }
 
+    // ---- cluster-role queries used across the server ----------------------
+
+    /// Whether this node leads the catalog (and therefore runs the
+    /// cluster-wide controllers: failover, preferred-leader return,
+    /// rebalancing, repair of unassigned partitions).
+    pub fn am_i_leader(&self) -> bool {
+        self.handle.status().is_leader
+    }
+
+    /// A flag that follows catalog leadership, for components that check it
+    /// on hot or synchronous paths.
+    pub fn is_leader_flag(&self) -> Arc<AtomicBool> {
+        self.leader_flag.clone()
+    }
+
+    /// `(a leader is known, leader id or 0, this node's role)`.
+    pub fn is_leader_ready(&self) -> (bool, u64, &'static str) {
+        let s = self.handle.status();
+        let role = if s.is_leader { "leader" } else if s.leader_id.is_some() { "follower" } else { "candidate" };
+        (s.leader_id.is_some(), s.leader_id.unwrap_or(0), role)
+    }
+
+    /// Voting members of the catalog group, sorted.
+    pub fn voters(&self) -> Vec<u64> {
+        let mut v = self.conf_state.read().voters.clone();
+        if v.is_empty() {
+            v = self.handle.status().voters;
+        }
+        v.sort_unstable();
+        v
+    }
+
+    /// Raft gRPC address of every node this one knows.
+    pub fn node_addresses(&self) -> Vec<(u64, String)> {
+        let mut v: Vec<_> = self.directory.all().into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// On the leader, the nodes heard from within an election timeout; `None`
+    /// elsewhere. A sample, not a verdict.
+    pub async fn sample_live_nodes(&self) -> Option<Vec<u64>> {
+        self.handle.sample_live(self.election_timeout).await
+    }
+
+    // ---- membership --------------------------------------------------------
+
+    /// Add a node: record its raft address and broker endpoint in the catalog,
+    /// then make it a voter. The new node must be started with
+    /// `CHRONIK_CLUSTER_JOIN=true` so it does not found a cluster of its own;
+    /// it starts blank and the leader brings it up to date by snapshot.
+    pub async fn add_node(&self, node_id: u64, kafka_addr: &str, raft_addr: &str) -> Result<ConfState, String> {
+        use chronik_common::metadata::{BrokerMetadata, BrokerStatus};
+        if self.voters().contains(&node_id) {
+            return Err(format!("node {} is already a member", node_id));
+        }
+        let (host, port) = split_host_port(kafka_addr)?;
+        self.expect_ok(CatalogCommand::SetNodeAddress { node_id, raft_addr: raft_addr.to_string() }).await?;
+        let now = chrono::Utc::now();
+        let broker = BrokerMetadata {
+            broker_id: node_id as i32,
+            host,
+            port,
+            rack: None,
+            status: BrokerStatus::Online,
+            created_at: now,
+            updated_at: now,
+        };
+        self.expect_ok(CatalogCommand::RegisterBroker { broker }).await?;
+        let mut cc = ConfChangeV2::default();
+        let mut single = raft::eraftpb::ConfChangeSingle::default();
+        single.set_change_type(raft::eraftpb::ConfChangeType::AddNode);
+        single.node_id = node_id;
+        cc.changes = vec![single];
+        self.change_membership(cc).await.map_err(|e| e.to_string())
+    }
+
+    /// Remove a node. Unless `force`, every partition replica it holds is
+    /// moved to another broker first (the catalog leader decides, fenced by
+    /// leader epoch). Refuses to go below three voters, and refuses to remove
+    /// this node without `force`.
+    pub async fn remove_node(&self, node_id: u64, force: bool) -> Result<ConfState, String> {
+        let voters = self.voters();
+        if !voters.contains(&node_id) {
+            return Err(format!("node {} is not a member", node_id));
+        }
+        if voters.len() <= 3 && !force {
+            return Err(format!("removing node {} would leave {} voters; a cluster needs at least 3", node_id, voters.len() - 1));
+        }
+        if node_id == self.node_id && !force {
+            return Err("refusing to remove this node without --force".into());
+        }
+        if !force {
+            self.move_replicas_off(node_id).await?;
+        }
+        let mut cc = ConfChangeV2::default();
+        let mut single = raft::eraftpb::ConfChangeSingle::default();
+        single.set_change_type(raft::eraftpb::ConfChangeType::RemoveNode);
+        single.node_id = node_id;
+        cc.changes = vec![single];
+        let cs = self.change_membership(cc).await.map_err(|e| e.to_string())?;
+        self.expect_ok(CatalogCommand::UnregisterBroker { broker_id: node_id as i32 }).await.ok();
+        self.expect_ok(CatalogCommand::RemoveNodeAddress { node_id }).await?;
+        Ok(cs)
+    }
+
+    async fn move_replicas_off(&self, node_id: u64) -> Result<(), String> {
+        use chronik_common::metadata::catalog::AssignmentChange;
+        let changes: Vec<AssignmentChange> = {
+            let state = self.read();
+            let others: Vec<u64> =
+                state.brokers().map(|b| b.broker_id as u64).filter(|&b| b != node_id).collect();
+            state
+                .all_assignments()
+                .filter(|a| a.replicas.contains(&node_id))
+                .map(|a| {
+                    let mut replicas: Vec<u64> = a.replicas.iter().copied().filter(|&r| r != node_id).collect();
+                    if let Some(spare) = others.iter().find(|b| !replicas.contains(b)) {
+                        replicas.push(*spare);
+                    }
+                    AssignmentChange {
+                        topic: a.topic.clone(),
+                        partition: a.partition,
+                        leader: (a.leader_id == node_id).then(|| replicas[0]),
+                        replicas: Some(replicas),
+                        isr: None,
+                        expected_epoch: Some(a.leader_epoch),
+                    }
+                })
+                .collect()
+        };
+        for chunk in changes.chunks(500) {
+            match self.execute(CatalogCommand::SetAssignments { changes: chunk.to_vec() }).await.map_err(|e| e.to_string())? {
+                CatalogResult::Items(items) => {
+                    if let Some((i, Err(e))) = items.iter().enumerate().find(|(_, r)| r.is_err()) {
+                        return Err(format!("moving {}-{} off node {}: {}", chunk[i].topic, chunk[i].partition, node_id, e));
+                    }
+                }
+                other => return Err(format!("unexpected result {:?}", other)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn expect_ok(&self, cmd: CatalogCommand) -> Result<(), String> {
+        match self.execute(cmd).await.map_err(|e| e.to_string())? {
+            CatalogResult::Err(e) => Err(e.to_string()),
+            _ => Ok(()),
+        }
+    }
+
     /// Stop the raft node.
     pub fn stop(self) {
         self.driver.stop();
     }
+}
+
+fn split_host_port(addr: &str) -> Result<(String, i32), String> {
+    let (host, port) = addr.rsplit_once(':').ok_or_else(|| format!("{} is not host:port", addr))?;
+    let port = port.parse::<i32>().map_err(|_| format!("{} has no valid port", addr))?;
+    Ok((host.to_string(), port))
 }

@@ -3547,8 +3547,6 @@ impl ProtocolHandler {
         existing: &chronik_common::metadata::TopicMetadata,
         new_count: i32,
     ) -> Result<()> {
-        use chronik_common::metadata::{PartitionAssignment, BrokerStatus};
-
         let current = existing.config.partition_count as i32;
 
         // 1) Bump the topic's partition count.
@@ -3558,38 +3556,8 @@ impl ProtocolHandler {
             .map_err(|e| Error::Internal(format!("update_topic failed: {:?}", e)))?;
 
         // 2) Assign + initialise offsets for each newly-added partition.
-        let brokers = metadata_store.list_brokers().await
-            .map_err(|e| Error::Internal(format!("list_brokers failed: {:?}", e)))?;
-        let online: Vec<_> = brokers.iter()
-            .filter(|b| b.status == BrokerStatus::Online)
-            .collect();
-        let broker_count = if online.is_empty() { 1 } else { online.len() };
-        let all_replicas: Vec<u64> = if online.is_empty() {
-            vec![self.broker_id as u64]
-        } else {
-            online.iter().map(|b| b.broker_id as u64).collect()
-        };
-
+        // The catalog places the new partitions when it applies the growth.
         for partition in current..new_count {
-            let broker_id = if online.is_empty() {
-                self.broker_id
-            } else {
-                online[(partition as usize) % broker_count].broker_id
-            };
-            metadata_store.assign_partition(PartitionAssignment {
-                topic: existing.name.clone(),
-                partition: partition as u32,
-                broker_id,
-                is_leader: true, // deprecated field, kept for compatibility
-                replicas: all_replicas.clone(),
-                leader_id: broker_id as u64,
-                leader_epoch: 0, // assigned by the metadata store
-                // Placement only: this caller has not measured who is caught up.
-                // Empty means "unknown" and leaves any published set intact.
-                isr: Vec::new(),
-            }).await
-                .map_err(|e| Error::Internal(format!("assign_partition failed: {:?}", e)))?;
-
             metadata_store.update_partition_offset(&existing.name, partition as u32, 0, 0).await
                 .map_err(|e| Error::Internal(format!("update_partition_offset failed: {:?}", e)))?;
         }
@@ -5831,173 +5799,79 @@ impl ProtocolHandler {
         Ok(())
     }
     
-    /// Create a topic in the metadata store
+    /// Create a topic in the metadata store.
+    ///
+    /// Replica lists are passed only when the client gave an explicit
+    /// assignment; otherwise the store places the partitions (round-robin over
+    /// the registered brokers, honouring the replication factor). In cluster
+    /// mode creation is decided once, in order, by the catalog: a topic that
+    /// already exists — including one auto-created moments earlier — is
+    /// reported as TOPIC_ALREADY_EXISTS, never silently widened.
     pub async fn create_topic_in_metadata(&self, topic: &crate::create_topics_types::CreateTopicRequest) -> Result<()> {
-        if let Some(metadata_store) = &self.metadata_store {
-            use chronik_common::metadata::traits::{TopicConfig, PartitionAssignment};
-            
-            // Parse configurations - validation already done in handle_create_topics
-            let retention_ms = topic.configs.get("retention.ms")
-                .and_then(|v| v.parse().ok());
-            let segment_bytes = topic.configs.get("segment.bytes")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1024 * 1024 * 1024); // 1GB default
-            
-            let config = TopicConfig {
-                partition_count: topic.num_partitions as u32,
-                replication_factor: topic.replication_factor as u32,
-                retention_ms,
-                segment_bytes,
-                config: topic.configs.clone(),
-            };
-            
-            // Get available brokers for partition assignment
-            let brokers = metadata_store.list_brokers().await
-                .map_err(|e| Error::Internal(format!("Failed to list brokers: {:?}", e)))?;
-            
-            let online_brokers: Vec<_> = brokers.iter()
-                .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
-                .collect();
-            
-            // Handle case where no brokers are registered
-            if online_brokers.is_empty() {
-                tracing::warn!("No online brokers found, using default broker ID {}", self.broker_id);
-                // Register this broker if not already registered
-                if metadata_store.get_broker(self.broker_id).await
-                    .map_err(|e| Error::Internal(format!("Failed to get broker: {:?}", e)))?
-                    .is_none() {
-                    let broker_metadata = chronik_common::metadata::BrokerMetadata {
-                        broker_id: self.broker_id,
-                        host: self.advertised_host.clone(),
-                        port: self.advertised_port,
-                        rack: None,
-                        status: chronik_common::metadata::BrokerStatus::Online,
-                        created_at: chronik_common::Utc::now(),
-                        updated_at: chronik_common::Utc::now(),
-                    };
-                    metadata_store.register_broker(broker_metadata).await
-                        .map_err(|e| Error::Internal(format!("Failed to register broker: {:?}", e)))?;
-                }
-            }
-            
-            // Create partition assignments using round-robin assignment
-            let mut assignments = Vec::new();
-            let broker_count = if online_brokers.is_empty() { 1 } else { online_brokers.len() };
-
-            // Build list of all replica node IDs (for cluster mode)
-            let all_replicas: Vec<u64> = if online_brokers.is_empty() {
-                vec![self.broker_id as u64]  // Standalone mode: single broker
-            } else {
-                online_brokers.iter().map(|b| b.broker_id as u64).collect()  // Cluster mode: all brokers
-            };
-
-            for partition in 0..topic.num_partitions {
-                let broker_index = (partition as usize) % broker_count;
-                let broker_id = if online_brokers.is_empty() {
-                    self.broker_id
-                } else {
-                    online_brokers[broker_index].broker_id
-                };
-
-                assignments.push(PartitionAssignment {
-                    topic: topic.name.clone(),
-                    partition: partition as u32,
-                    broker_id,
-                    is_leader: true, // Deprecated field
-                    replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
-                    leader_id: broker_id as u64,
-                    leader_epoch: 0, // assigned by the metadata store
-                    isr: Vec::new(), // placement only — the leader publishes this
-                });
-            }
-            
-            // Prepare offset initialization data
-            let mut offsets = Vec::new();
-            for partition in 0..topic.num_partitions {
-                offsets.push((
-                    partition as u32,
-                    0i64, // high_watermark
-                    0i64, // log_start_offset
-                ));
-            }
-            
-            // Create topic atomically with all assignments and offsets
-            match metadata_store.create_topic_with_assignments(
-                &topic.name,
-                config.clone(),
-                assignments.clone(),
-                offsets.clone(),
-            ).await {
-                Ok(topic_metadata) => {
-                    tracing::info!("Successfully created topic '{}' with ID {} and {} partitions atomically across {} brokers",
-                        topic.name, topic_metadata.id, topic.num_partitions, broker_count);
-                }
-                Err(e) => {
-                    let err_msg = format!("{:?}", e);
-                    if err_msg.contains("already exists") || err_msg.contains("AlreadyExists") {
-                        // v2.3.2 CRITICAL FIX: Topic may have been auto-created with default
-                        // partition count (e.g., 3) by a Metadata request before the explicit
-                        // CreateTopics request arrived. Check if we need to expand partitions.
-                        if let Ok(Some(existing)) = metadata_store.get_topic(&topic.name).await {
-                            let existing_count = existing.config.partition_count;
-                            let requested_count = topic.num_partitions as u32;
-                            if existing_count < requested_count {
-                                tracing::info!(
-                                    "Topic '{}' exists with {} partitions, expanding to {} (explicit CreateTopics overrides auto-create)",
-                                    topic.name, existing_count, requested_count
-                                );
-                                // Update topic config with new partition count and configs
-                                if let Err(update_err) = metadata_store.update_topic(&topic.name, config).await {
-                                    tracing::warn!("Failed to update topic config: {:?}", update_err);
-                                }
-                                // Add partition assignments for the new partitions
-                                for assignment in &assignments {
-                                    if assignment.partition >= existing_count {
-                                        if let Err(assign_err) = metadata_store.assign_partition(assignment.clone()).await {
-                                            tracing::warn!("Failed to assign partition {}: {:?}", assignment.partition, assign_err);
-                                        }
-                                    }
-                                }
-                                // Initialize offsets for new partitions
-                                for &(partition, hwm, lso) in &offsets {
-                                    if partition >= existing_count {
-                                        if let Err(offset_err) = metadata_store.update_partition_offset(&topic.name, partition, hwm, lso).await {
-                                            tracing::warn!("Failed to init offset for partition {}: {:?}", partition, offset_err);
-                                        }
-                                    }
-                                }
-                                tracing::info!("✅ Expanded topic '{}' from {} to {} partitions",
-                                    topic.name, existing_count, requested_count);
-                            } else {
-                                // Genuine duplicate: the topic already exists with at
-                                // least the requested partition count (nothing to
-                                // expand). Kafka returns TOPIC_ALREADY_EXISTS here — the
-                                // caller maps this "already exists" error to error code
-                                // 36. (The expansion branch above still returns Ok, so
-                                // an explicit CreateTopics that grows an auto-created
-                                // topic keeps working.)
-                                tracing::info!("Topic '{}' already exists with {} partitions (requested {})",
-                                    topic.name, existing_count, requested_count);
-                                return Err(Error::Internal(format!("Topic '{}' already exists", topic.name)));
-                            }
-                        } else {
-                            // Reported as existing but not retrievable — surface it.
-                            return Err(Error::Internal(format!("Topic '{}' already exists", topic.name)));
-                        }
-                    } else {
-                        return Err(Error::Internal(format!("Failed to create topic: {:?}", e)));
-                    }
-                }
-            }
-            
-            Ok(())
-        } else {
-            // No metadata store, just log
+        let Some(metadata_store) = &self.metadata_store else {
             tracing::warn!("No metadata store configured, topic creation not persisted");
-            Ok(())
+            return Ok(());
+        };
+        use chronik_common::metadata::traits::{PartitionAssignment, TopicConfig};
+
+        // Validation already done in handle_create_topics.
+        let retention_ms = topic.configs.get("retention.ms").and_then(|v| v.parse().ok());
+        let segment_bytes = topic
+            .configs
+            .get("segment.bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024 * 1024 * 1024);
+
+        let mut explicit = topic.replica_assignments.clone();
+        explicit.sort_by_key(|a| a.partition_index);
+        let (partition_count, replication_factor) = if explicit.is_empty() {
+            (topic.num_partitions as u32, topic.replication_factor.max(1) as u32)
+        } else {
+            let rf = explicit.iter().map(|a| a.broker_ids.len()).max().unwrap_or(1);
+            (explicit.len() as u32, rf as u32)
+        };
+        let config = TopicConfig {
+            partition_count,
+            replication_factor,
+            retention_ms,
+            segment_bytes,
+            config: topic.configs.clone(),
+        };
+        let assignments: Vec<PartitionAssignment> = explicit
+            .iter()
+            .map(|a| {
+                let replicas: Vec<u64> = a.broker_ids.iter().map(|&b| b as u64).collect();
+                let leader = replicas.first().copied().unwrap_or(self.broker_id as u64);
+                PartitionAssignment {
+                    topic: topic.name.clone(),
+                    partition: a.partition_index as u32,
+                    broker_id: leader as i32,
+                    is_leader: true,
+                    replicas,
+                    leader_id: leader,
+                    leader_epoch: 0,
+                    isr: Vec::new(),
+                }
+            })
+            .collect();
+        let offsets: Vec<(u32, i64, i64)> = (0..partition_count).map(|p| (p, 0, 0)).collect();
+
+        match metadata_store.create_topic_with_assignments(&topic.name, config, assignments, offsets).await {
+            Ok(created) => {
+                tracing::info!(
+                    "Created topic '{}' (id {}) with {} partitions",
+                    topic.name, created.id, partition_count
+                );
+                Ok(())
+            }
+            Err(chronik_common::metadata::MetadataError::AlreadyExists(_)) => {
+                // The caller maps "already exists" to TOPIC_ALREADY_EXISTS (36).
+                Err(Error::Internal(format!("Topic '{}' already exists", topic.name)))
+            }
+            Err(e) => Err(Error::Internal(format!("Failed to create topic: {:?}", e))),
         }
     }
-    
+
     /// Validate topic name according to Kafka rules
     fn is_valid_topic_name(name: &str) -> bool {
         // Topic name must:
@@ -6483,27 +6357,8 @@ impl ProtocolHandler {
                     }
 
                     // Build list of all replica node IDs (for cluster mode)
-                    let all_replicas: Vec<u64> = online_broker_ids.iter().map(|&id| id as u64).collect();
-
-                    // Create assignments for all partitions
-                    let mut assignments = Vec::new();
-                    for partition in 0..default_num_partitions {
-                        let broker_index = (partition as usize) % online_broker_ids.len();
-                        let broker_id = online_broker_ids[broker_index];
-
-                        assignments.push(chronik_common::metadata::PartitionAssignment {
-                            topic: topic_name.clone(),
-                            partition,
-                            broker_id,
-                            is_leader: true,  // Deprecated field
-                            replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
-                            leader_id: broker_id as u64,
-                            leader_epoch: 0, // assigned by the metadata store
-                            isr: Vec::new(), // placement only — the leader publishes this
-                        });
-                    }
-                    
-                    // Create initial offsets
+                    // No replica lists: the catalog places the partitions.
+                    let assignments = Vec::new();
                     let mut offsets = Vec::new();
                     for partition in 0..default_num_partitions {
                         offsets.push((partition, 0i64, 0i64)); // partition, high_watermark, log_start_offset

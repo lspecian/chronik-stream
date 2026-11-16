@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::integrated_server::{IntegratedKafkaServerBuilder, IntegratedServerConfig, IntegratedKafkaServer};
-use crate::raft_cluster::RaftCluster;
+use crate::cluster_catalog::ClusterCatalog;
 use super::config::ClusterInitConfig;
 use chronik_storage::ObjectStoreConfig;
 
@@ -18,7 +18,7 @@ use chronik_storage::ObjectStoreConfig;
 /// Complexity: < 20 (config creation and builder invocation)
 pub async fn create_integrated_server(
     init_config: &ClusterInitConfig,
-    raft_cluster: Arc<RaftCluster>,
+    catalog: Arc<ClusterCatalog>,
     object_store_config: Option<ObjectStoreConfig>,
 ) -> Result<Arc<IntegratedKafkaServer>> {
     info!("Creating IntegratedServerConfig for cluster mode...");
@@ -47,7 +47,7 @@ pub async fn create_integrated_server(
 
     info!("Initializing IntegratedKafkaServer with builder (14-stage initialization)...");
     let server = IntegratedKafkaServerBuilder::new(server_config)
-        .with_raft_cluster(raft_cluster)
+        .with_cluster_catalog(catalog)
         .build()
         .await?;
 

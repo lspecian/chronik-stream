@@ -96,6 +96,10 @@ pub enum CatalogCommand {
     DeleteAcl { binding: AclBindingRecord },
     UpsertScram { credential: ScramCredentialRecord },
     DeleteScram { username: String, mechanism: i8 },
+    /// Where a node's catalog raft endpoint is, so every member (and every
+    /// later snapshot) knows how to reach a node added at runtime.
+    SetNodeAddress { node_id: u64, raft_addr: String },
+    RemoveNodeAddress { node_id: u64 },
 }
 
 impl CatalogCommand {
@@ -183,6 +187,7 @@ pub enum CatalogChange {
     PartitionsAdded { topic: String, from: u32, to: u32 },
     AssignmentChanged { topic: String, partition: u32 },
     BrokersChanged,
+    NodeAddressChanged(u64),
     AclsChanged,
     ScramChanged,
     /// The whole catalog was replaced (a snapshot was installed): re-read everything.
@@ -197,6 +202,7 @@ pub struct CatalogState {
     brokers: BTreeMap<i32, BrokerMetadata>,
     acls: BTreeSet<AclKey>,
     scram: BTreeMap<(String, i8), ScramCredentialRecord>,
+    node_addresses: BTreeMap<u64, String>,
     /// Rotates the first replica of newly placed topics across brokers, so
     /// single-partition topics do not all lead on the lowest broker id.
     placement_cursor: u64,
@@ -289,6 +295,11 @@ impl CatalogState {
 
     pub fn acls(&self) -> Vec<AclBindingRecord> {
         self.acls.iter().map(AclBindingRecord::from).collect()
+    }
+
+    /// Raft endpoint of each node recorded in the catalog.
+    pub fn node_addresses(&self) -> &BTreeMap<u64, String> {
+        &self.node_addresses
     }
 
     pub fn scram_credentials(&self) -> Vec<ScramCredentialRecord> {
@@ -390,6 +401,19 @@ impl CatalogState {
             CatalogCommand::UpsertScram { credential } => {
                 self.scram.insert((credential.username.clone(), credential.mechanism), credential);
                 changes.push(CatalogChange::ScramChanged);
+                CatalogResult::Ok
+            }
+            CatalogCommand::SetNodeAddress { node_id, raft_addr } => {
+                if self.node_addresses.get(&node_id) != Some(&raft_addr) {
+                    self.node_addresses.insert(node_id, raft_addr);
+                    changes.push(CatalogChange::NodeAddressChanged(node_id));
+                }
+                CatalogResult::Ok
+            }
+            CatalogCommand::RemoveNodeAddress { node_id } => {
+                if self.node_addresses.remove(&node_id).is_some() {
+                    changes.push(CatalogChange::NodeAddressChanged(node_id));
+                }
                 CatalogResult::Ok
             }
             CatalogCommand::DeleteScram { username, mechanism } => {

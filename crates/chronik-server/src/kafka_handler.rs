@@ -2239,112 +2239,21 @@ impl KafkaProtocolHandler {
 
     /// Handle CreateTopics API request
     ///
-    /// Creates topics with Raft forwarding and partition initialization.
-    /// Forwards to Raft leader if this node is a follower.
-    /// Complexity: < 50 (Raft forwarding + partition initialization)
-    #[instrument(skip(self, buf, request_bytes))]
+    /// Any node may serve it: the metadata store turns each creation into a
+    /// catalog command, forwards it to the catalog leader, and returns once it
+    /// is applied here. The catalog places the replicas, once, so there is no
+    /// separate partition-initialization step and no leader-only path.
+    #[instrument(skip(self, _buf, request_bytes))]
     async fn handle_create_topics_request(
         &self,
         header: chronik_protocol::parser::RequestHeader,
-        mut buf: Bytes,
+        _buf: Bytes,
         request_bytes: &[u8],
     ) -> Result<Response> {
         tracing::info!("Processing CreateTopics v{} request", header.api_version);
-
-        // CRITICAL FIX v2.2.9: Forward CreateTopics requests from followers to Raft leader
-        // This follows the same pattern as Produce request forwarding (existing implementation)
-        // Without this, followers try to process CreateTopics locally and fail with
-        // "PROGRAMMING ERROR: initialize_raft_partitions called on Raft follower"
-
-        // Check if we're in Raft cluster mode
-        if let Some(ref raft_cluster) = self.produce_handler.get_raft_cluster() {
-            // Check if this node is the Raft leader
-            let is_leader: bool = raft_cluster.am_i_leader().await;
-            if !is_leader {
-                tracing::info!("This node is not Raft leader - forwarding CreateTopics request to leader");
-
-                // Get the Raft leader ID
-                match raft_cluster.get_leader_id().await {
-                    Some(leader_id) => {
-                        // Forward the entire request to the leader and return the response
-                        match self.forward_request_to_leader(leader_id, &request_bytes, header.correlation_id).await {
-                            Ok(response) => {
-                                tracing::info!("✅ CreateTopics request forwarded to leader {} successfully", leader_id);
-                                return Ok(response);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to forward CreateTopics to leader {}: {}", leader_id, e);
-                                // Fall through to process locally (best effort)
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::warn!("No Raft leader found - cannot forward CreateTopics request");
-                        // Fall through to process locally (best effort)
-                    }
-                }
-            } else {
-                tracing::debug!("This node IS the Raft leader - processing CreateTopics locally");
-            }
-        } else {
-            tracing::debug!("Single-node mode (no Raft cluster) - processing CreateTopics locally");
-        }
-
-        // Process locally (either we're the leader, or forwarding failed, or single-node mode)
-        // First, let protocol handler create the topics in metadata store
-        let response = self.protocol_handler.handle_request(request_bytes).await?;
-
-        // Phase 3: Initialize Raft partition metadata for created topics
-        // CRITICAL FIX v2.2.14: Only initialize partitions if we're the leader or in single-node mode
-        // If forwarding failed above, we should NOT initialize partitions on a follower
-        let should_initialize_partitions = if let Some(ref raft_cluster) = self.produce_handler.get_raft_cluster() {
-            // In Raft mode: only initialize if we're the leader
-            raft_cluster.am_i_leader().await
-        } else {
-            // Single-node mode: always initialize
-            true
-        };
-
-        if should_initialize_partitions {
-            // Fully parse the request with the same parser the protocol handler
-            // uses, so we initialize Raft partition metadata for EVERY topic in a
-            // batched CreateTopics — not just the first. The previous hand-rolled
-            // parse couldn't advance past a topic's replica assignments/configs, so
-            // it bailed after topic #1, leaving the rest of a multi-topic request
-            // without Raft partition metadata in cluster mode.
-            use chronik_protocol::create_topics::request_parser::RequestParser;
-            use chronik_protocol::parser::Decoder;
-
-            let mut decoder = Decoder::new(&mut buf);
-            match RequestParser::parse(&mut decoder, header.api_version) {
-                Ok(create_req) => {
-                    for topic in &create_req.topics {
-                        if topic.num_partitions > 0 {
-                            // Proposes AssignPartition, SetPartitionLeader, and UpdateISR.
-                            if let Err(e) = self.produce_handler.initialize_raft_partitions(
-                                &topic.name,
-                                topic.num_partitions as u32,
-                            ).await {
-                                tracing::warn!("Failed to initialize Raft partition metadata for '{}': {:?}",
-                                             topic.name, e);
-                                // Continue anyway - topic is already created in metadata store
-                            } else {
-                                tracing::info!("✓ Phase 3: Initialized Raft partition metadata for topic '{}' ({} partitions)",
-                                             topic.name, topic.num_partitions);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Could not parse CreateTopics for Raft partition init: {:?} - topics still created in metadata store", e);
-                }
-            }
-        } else {
-            tracing::debug!("Skipping partition initialization (not Raft leader) - will be handled by leader");
-        }
-
-        Ok(response)
+        self.protocol_handler.handle_request(request_bytes).await
     }
+
 
     // ========================================================================
     // Phase 2.15: handle_list_offsets_request() Helper Methods
@@ -2805,101 +2714,6 @@ impl KafkaProtocolHandler {
 
         // Phase 5: Encode and return
         self.encode_list_offsets_response_wrapper(response, &header)
-    }
-
-    /// Forward a generic Kafka request to the Raft leader
-    ///
-    /// This is a simplified version of ProduceHandler::forward_produce_to_leader()
-    /// that forwards the entire request bytes without parsing. This is suitable for
-    /// admin requests like CreateTopics where we don't need to extract/modify the payload.
-    ///
-    /// # Arguments
-    /// - `leader_id`: The Raft leader's node ID
-    /// - `request_bytes`: The complete Kafka request frame (including header)
-    /// - `correlation_id`: The original correlation ID from the request
-    ///
-    /// # Returns
-    /// The response from the leader, ready to send back to the client
-    async fn forward_request_to_leader(
-        &self,
-        leader_id: u64,
-        request_bytes: &[u8],
-        correlation_id: i32,
-    ) -> Result<Response> {
-        use tokio::net::TcpStream;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        // Get leader's Kafka address from metadata store
-        let leader_addr = match self.metadata_store.get_broker(leader_id as i32).await {
-            Ok(Some(broker)) => {
-                format!("{}:{}", broker.host, broker.port)
-            }
-            Ok(None) => {
-                error!("Leader node {} not found in metadata store", leader_id);
-                return Err(Error::Internal(format!("Leader node {} not found", leader_id)));
-            }
-            Err(e) => {
-                error!("Failed to get leader {} address: {}", leader_id, e);
-                return Err(Error::Internal(format!("Metadata error: {}", e)));
-            }
-        };
-
-        tracing::info!("Forwarding request to Raft leader {} at {}", leader_id, leader_addr);
-
-        // Connect to leader via TCP
-        let mut stream = TcpStream::connect(&leader_addr).await
-            .map_err(|e| Error::Internal(format!("Failed to connect to leader at {}: {}", leader_addr, e)))?;
-
-        // Build Kafka frame: 4-byte length prefix + request bytes
-        let frame_size = request_bytes.len() as i32;
-        let mut frame = BytesMut::with_capacity(4 + request_bytes.len());
-        frame.put_i32(frame_size);
-        frame.extend_from_slice(request_bytes);
-
-        // Send request to leader
-        stream.write_all(&frame).await
-            .map_err(|e| Error::Internal(format!("Failed to write request to leader: {}", e)))?;
-
-        // Read response length (4 bytes)
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await
-            .map_err(|e| Error::Internal(format!("Failed to read response length from leader: {}", e)))?;
-        let response_len = i32::from_be_bytes(len_buf) as usize;
-
-        // Read response data
-        let mut response_data = vec![0u8; response_len];
-        stream.read_exact(&mut response_data).await
-            .map_err(|e| Error::Internal(format!("Failed to read response from leader: {}", e)))?;
-
-        tracing::info!("✅ Received response from leader {} ({} bytes)", leader_id, response_len);
-
-        // Parse the response data to extract header and body
-        // Kafka response format: correlation_id (4 bytes) + body
-        use chronik_protocol::parser::ResponseHeader;
-
-        if response_data.len() < 4 {
-            return Err(Error::Internal("Response too short to contain header".to_string()));
-        }
-
-        // Extract correlation_id from first 4 bytes (big-endian i32)
-        let correlation_id = i32::from_be_bytes([
-            response_data[0],
-            response_data[1],
-            response_data[2],
-            response_data[3],
-        ]);
-
-        // Rest of the data is the body
-        let body = bytes::Bytes::from(response_data[4..].to_vec());
-
-        // Return the parsed response
-        Ok(Response {
-            header: ResponseHeader { correlation_id },
-            body,
-            is_flexible: false,  // We don't know the exact version, but basic response works
-            api_key: ApiKey::CreateTopics,
-            throttle_time_ms: None,
-        })
     }
 
     // ========================================================================
