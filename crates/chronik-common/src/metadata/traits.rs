@@ -25,7 +25,7 @@ pub enum MetadataError {
 pub type Result<T> = std::result::Result<T, MetadataError>;
 
 /// Topic configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicConfig {
     pub partition_count: u32,
     pub replication_factor: u32,
@@ -239,7 +239,7 @@ impl TopicConfig {
 }
 
 /// Topic metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicMetadata {
     pub id: Uuid,
     pub name: String,
@@ -311,7 +311,7 @@ pub struct ParquetSegmentMetadata {
 }
 
 /// Broker metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrokerMetadata {
     pub broker_id: i32,
     pub host: String,
@@ -330,7 +330,7 @@ pub enum BrokerStatus {
 }
 
 /// Partition assignment
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartitionAssignment {
     pub topic: String,
     pub partition: u32,
