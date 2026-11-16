@@ -234,6 +234,61 @@ enum SequenceCheck {
     AdvanceNow,
 }
 
+/// Sequenced batches currently inside `produce_to_partition`, keyed by
+/// (producer id, topic, partition), each entry a base sequence.
+///
+/// The connection handler runs a producer's pipelined requests concurrently,
+/// so batch N+1 can reach the sequence check while batch N is still being
+/// processed. N is usually a few milliseconds behind, but not always: the
+/// first write to a new partition builds its state (segment writer, a
+/// metadata-WAL fsync), and on a busy disk that took over two seconds on the
+/// Dells. A fixed wait then rejected N+1..N+4 as out of order — measured, 77
+/// of 15,000 idempotent acks=all records failed on a fresh topic, on v2.16.11
+/// as well. With this registry the check keeps waiting exactly as long as an
+/// earlier batch of the same producer is known to be in progress.
+type InFlightSequences = Arc<DashMap<(i64, String, i32), Vec<i32>>>;
+
+/// Registration of one batch in [`InFlightSequences`]; removed on drop, so
+/// every exit path — success, error, early return — unregisters it.
+struct InFlightGuard {
+    map: InFlightSequences,
+    key: (i64, String, i32),
+    sequence: i32,
+}
+
+impl InFlightGuard {
+    /// Register `records` if it is a sequenced (idempotent, non-control) v2
+    /// batch. Reads the fixed header fields directly so it can run before
+    /// anything else in the produce path.
+    fn register(map: &InFlightSequences, topic: &str, partition: i32, records: &[u8]) -> Option<Self> {
+        if records.len() < 61 || records[16] != 2 {
+            return None;
+        }
+        let attributes = i16::from_be_bytes([records[21], records[22]]);
+        let producer_id = i64::from_be_bytes(records[43..51].try_into().ok()?);
+        let sequence = i32::from_be_bytes(records[53..57].try_into().ok()?);
+        if producer_id < 0 || attributes & 0x20 != 0 {
+            return None;
+        }
+        let key = (producer_id, topic.to_string(), partition);
+        map.entry(key.clone()).or_default().push(sequence);
+        Some(Self { map: Arc::clone(map), key, sequence })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut e) = self.map.entry(self.key.clone()) {
+            if let Some(i) = e.get().iter().position(|s| *s == self.sequence) {
+                e.get_mut().swap_remove(i);
+            }
+            if e.get().is_empty() {
+                e.remove();
+            }
+        }
+    }
+}
+
 /// Producer information for idempotence tracking
 #[derive(Debug, Clone)]
 struct ProducerInfo {
@@ -395,6 +450,8 @@ pub struct ProduceHandler {
     /// read. See `archived_high_watermark`.
     archived_hwm_cache: Arc<DashMap<(String, i32), (i64, Instant)>>,
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
+    /// See [`InFlightSequences`].
+    in_flight_sequences: InFlightSequences,
     metrics: Arc<ProduceMetrics>,
     running: Arc<AtomicBool>,
     /// P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking with AtomicU64
@@ -1234,6 +1291,7 @@ impl ProduceHandler {
             partition_states: Arc::new(DashMap::new()),  // PERFORMANCE (v2.2.7 - P2): Lock-free concurrent hashmap
             archived_hwm_cache: Arc::new(DashMap::new()),
             producer_info: Arc::new(RwLock::new(HashMap::new())),
+            in_flight_sequences: Arc::new(DashMap::new()),
             metrics: Arc::new(ProduceMetrics::default()),
             running: Arc::new(AtomicBool::new(true)),
             memory_used_bytes,
@@ -2166,6 +2224,10 @@ impl ProduceHandler {
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         debug!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
 
+        // Before any await: later batches of this producer wait while this
+        // one is in progress (see `InFlightSequences`).
+        let _in_flight = InFlightGuard::register(&self.in_flight_sequences, topic, partition, records_data);
+
         // acks=all: refuse BEFORE writing when the in-sync set is already too
         // small, as Kafka does. Refusing after the write (the old behaviour,
         // via the 30s quorum timeout) left the batch in the leader's log, so the
@@ -2276,6 +2338,8 @@ impl ProduceHandler {
         let is_control_batch = (temp_batch.header.attributes & 0x20) != 0;
         let sequenced = temp_batch.header.producer_id >= 0 && !is_control_batch;
         if sequenced {
+            #[cfg(test)]
+            tests::pause_before_sequence_check(temp_batch.header.producer_id, temp_batch.header.base_sequence).await;
             // Phase 1, outside the append lock: wait until this batch is next
             // in its producer's sequence. Duplicates are rejected here, so a
             // retry never reserves offsets.
@@ -3260,6 +3324,27 @@ impl ProduceHandler {
     }
     
     /// Validate producer sequence for idempotence
+    /// Whether a batch of the same producer with a lower sequence is still in
+    /// `produce_to_partition` for this partition, and `hard_deadline` has not
+    /// passed. Such a batch either advances the sequence or fails; waiting for
+    /// it is what Kafka's one-request-at-a-time connections give for free.
+    fn earlier_batch_in_flight(
+        &self,
+        batch: &KafkaRecordBatch,
+        topic: &str,
+        partition: i32,
+        hard_deadline: Instant,
+    ) -> bool {
+        if Instant::now() >= hard_deadline {
+            return false;
+        }
+        let key = (batch.header.producer_id, topic.to_string(), partition);
+        self.in_flight_sequences
+            .get(&key)
+            .map(|seqs| seqs.iter().any(|s| *s < batch.header.base_sequence))
+            .unwrap_or(false)
+    }
+
     async fn validate_producer_sequence(
         &self,
         batch: &KafkaRecordBatch,
@@ -3289,7 +3374,12 @@ impl ProduceHandler {
         // validate + advance happen in ONE write-lock critical section so they are
         // atomic (a separate advance call was a second race window).
         let key = (topic.to_string(), partition);
+        // The grace window covers an earlier batch that has not reached
+        // `produce_to_partition` yet; past it, waiting continues only while
+        // an earlier batch is known to be in progress, and never beyond what a
+        // request may take.
         let deadline = Instant::now() + std::time::Duration::from_millis(500);
+        let hard_deadline = Instant::now() + std::time::Duration::from_millis(self.config.request_timeout_ms.max(1000));
         loop {
             {
                 let mut producers = self.producer_info.write().await;
@@ -3364,9 +3454,10 @@ impl ProduceHandler {
                 )));
             }
 
-            if Instant::now() >= deadline {
-                // The earlier batch never arrived within the window — genuinely out
-                // of order. This is the correct terminal error.
+            if Instant::now() >= deadline && !self.earlier_batch_in_flight(batch, topic, partition, hard_deadline) {
+                // No earlier batch of this producer is in progress (or one has
+                // been for longer than a request may take) — genuinely out of
+                // order. This is the correct terminal error.
                 return Err(Error::OutOfOrderSequenceNumber(format!(
                     "Out of order sequence after wait: producer={}, topic={}, partition={}, got={}",
                     batch.header.producer_id, topic, partition, batch.header.base_sequence
@@ -3999,6 +4090,7 @@ impl Clone for ProduceHandler {
             partition_states: Arc::clone(&self.partition_states),
             archived_hwm_cache: Arc::clone(&self.archived_hwm_cache),
             producer_info: Arc::clone(&self.producer_info),
+            in_flight_sequences: Arc::clone(&self.in_flight_sequences),
             metrics: Arc::clone(&self.metrics),
             running: Arc::clone(&self.running),
             memory_used_bytes: Arc::clone(&self.memory_used_bytes),
@@ -4436,6 +4528,61 @@ pub(crate) mod tests {
         if hit {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// `(producer_id, base_sequence)` to hold just before its sequence check,
+    /// longer than the 500 ms grace window. Production never pauses.
+    static PAUSE_BEFORE_SEQUENCE: std::sync::Mutex<Option<(i64, i32)>> = std::sync::Mutex::new(None);
+
+    pub(super) async fn pause_before_sequence_check(producer_id: i64, base_sequence: i32) {
+        let hit = *PAUSE_BEFORE_SEQUENCE.lock().unwrap() == Some((producer_id, base_sequence));
+        if hit {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+    }
+
+    /// A pipelined batch waits for an earlier one that is slow, however long
+    /// that takes within a request.
+    ///
+    /// On the Dells the first write to a new partition took over two seconds
+    /// (state creation on a busy disk); the batches pipelined behind it gave
+    /// up after the fixed 500 ms wait and failed OUT_OF_ORDER_SEQUENCE — 77
+    /// of 15,000 idempotent records, on v2.16.11 too. Batch 0 is held 1.5 s
+    /// here; batch 1 must still land after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_batch_waits_for_a_slow_earlier_batch_of_its_producer() {
+        let (handler, _temp) = create_test_handler().await;
+        let handler = Arc::new(handler);
+        let produce = |records: Vec<u8>| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        };
+
+        let pid = 5151;
+        *PAUSE_BEFORE_SEQUENCE.lock().unwrap() = Some((pid, 0));
+        let first = create_test_record_batch(pid, 0, vec![("a", "1"), ("b", "2"), ("c", "3")]);
+        let second = create_test_record_batch(pid, 3, vec![("d", "4"), ("e", "5")]);
+        let h = Arc::clone(&handler);
+        let req = produce(first);
+        let early = tokio::spawn(async move { h.handle_produce(req, 1).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let late = handler.handle_produce(produce(second), 2).await.unwrap();
+        let early = early.await.unwrap().unwrap();
+        *PAUSE_BEFORE_SEQUENCE.lock().unwrap() = None;
+
+        let (e, l) = (&early.topics[0].partitions[0], &late.topics[0].partitions[0]);
+        assert_eq!(
+            (e.error_code, l.error_code),
+            (0, 0),
+            "the batch behind a slow one was rejected (error {})",
+            l.error_code
+        );
+        assert_eq!((e.base_offset, l.base_offset), (0, 3));
     }
 
     /// A producer's batches take offsets in sequence order.

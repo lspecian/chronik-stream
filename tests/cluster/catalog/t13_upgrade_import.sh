@@ -9,7 +9,9 @@ source "$(dirname "$0")/lib.sh"
 OLD="${OLD_BIN:?set OLD_BIN to a pre-catalog release binary}"
 export EXTRA_ENV="CHRONIK_SASL_ENABLED=optional CHRONIK_SASL_USERS=admin:admin-secret CHRONIK_INTER_BROKER_SECRET=t13-inter-broker-secret-value CHRONIK_ACL_ENABLED=true"
 NEW="$BIN"
-BIN="$OLD" cluster_start || { fail "old cluster did not start"; finish T13; }
+# The whole first phase, node restarts included, runs the old release.
+BIN="$OLD"
+cluster_start || { fail "old cluster did not start"; finish T13; }
 kt() { "$K/kafka-topics.sh" --bootstrap-server localhost:9092 "$@" >/dev/null 2>&1; }
 kt --create --topic u-one --partitions 1 --replication-factor 3
 kt --create --topic u-six --partitions 6 --replication-factor 3
@@ -31,9 +33,17 @@ done
 sleep 5
 before=$(for t in u-one u-six u-rf1; do "$K/kafka-get-offsets.sh" --bootstrap-server "$BOOTS" --topic "$t" 2>/dev/null; done | sort)
 say "before upgrade:"; echo "$before" | sed 's/^/  /'
-"$DIR/stop.sh" >/dev/null 2>&1; sleep 2
+"$DIR/stop.sh" >/dev/null 2>&1
+# stop.sh only SIGKILLs nodes it has a pid file for; the others got SIGTERM,
+# and a pre-catalog release runs a full indexing pass before exiting. The new
+# binary must not start while they still hold the ports.
+for _ in $(seq 1 30); do pgrep -f "$OLD start" >/dev/null || break; sleep 1; done
+pkill -9 -f "$OLD start" 2>/dev/null
+for _ in $(seq 1 30); do pgrep -f "$OLD start" >/dev/null || break; sleep 1; done
+pgrep -f "$OLD start" >/dev/null && { fail "old nodes would not exit"; finish T13; }
 
 # Upgrade: same data directories, new binary.
+BIN="$NEW"
 CHRONIK_BIN="$NEW" env $(node_env) $EXTRA_ENV "$DIR/restart.sh" >/dev/null 2>&1
 for n in 1 2 3; do wait_port "$(port_of $n)" || fail "node $n did not start on the new binary"; done
 for _ in $(seq 1 60); do grep -q 'Catalog import complete' "$DIR/logs/node1.log" && break; sleep 1; done
