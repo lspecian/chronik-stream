@@ -469,6 +469,15 @@ impl IntegratedKafkaServerBuilder {
                 }
             }
         });
+        // First boot after upgrading from the pre-catalog metadata: import what
+        // this node's metadata WAL holds, once.
+        {
+            let catalog = self.cluster_catalog.clone().context("cluster catalog not initialized")?;
+            let local = self.wal_metadata_store.clone().context("wal_metadata_store not initialized")?;
+            let dir = self.data_dir.as_ref().context("data_dir not initialized")?.join("catalog-raft");
+            crate::catalog_import::spawn(catalog, local, dir);
+        }
+
         // Single-node mode has no config listing brokers: register this one, so
         // the catalog can place partitions (it refuses to with no brokers).
         if self.config.cluster_config.is_none() {
@@ -483,7 +492,7 @@ impl IntegratedKafkaServerBuilder {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
-            if !catalog.wait_caught_up(std::time::Duration::from_secs(30)).await {
+            if !catalog.wait_raft_caught_up(std::time::Duration::from_secs(30)).await {
                 anyhow::bail!("single-node catalog did not elect itself within 30s");
             }
             store.register_broker(broker).await.context("registering this broker in the catalog")?;

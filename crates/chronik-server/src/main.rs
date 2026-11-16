@@ -48,6 +48,7 @@ mod isr_publisher;
 mod assignment_repair;  // gives unassigned partitions a leader (the node holding their records)
 mod cluster_catalog;  // the cluster catalog's raft group
 mod catalog_metadata_store;  // MetadataStore over the Raft catalog
+mod catalog_import;  // one-time import of pre-catalog metadata
 // v2.2.7: HTTP Admin API for cluster management
 mod admin_api;
 // v2.2.22: Unified API (SQL, Vector Search, Admin on single port)

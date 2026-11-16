@@ -157,6 +157,9 @@ pub struct ClusterCatalog {
     /// when it first heard from it after boot.
     booted: AtomicBool,
     leader_flag: Arc<AtomicBool>,
+    /// Set while this node imports its pre-catalog metadata (first boot after
+    /// upgrading); the node does not count as caught up until it is done.
+    import_pending: AtomicBool,
     faults: NetFaults,
     forwarder: Forwarder,
 }
@@ -217,6 +220,7 @@ impl ClusterCatalog {
             election_timeout: config.election_timeout(),
             booted: AtomicBool::new(false),
             leader_flag,
+            import_pending: AtomicBool::new(false),
             faults,
             forwarder: Forwarder::new(),
         })
@@ -271,6 +275,12 @@ impl ClusterCatalog {
     /// heard from a leader within an election timeout (or is the leader) and,
     /// since boot, has applied everything that leader had committed.
     pub fn is_caught_up(&self) -> bool {
+        !self.import_pending.load(Ordering::Relaxed) && self.raft_caught_up()
+    }
+
+    /// The raft half of `is_caught_up`: leader contact within an election
+    /// timeout and, since boot, everything the leader had committed applied.
+    pub fn raft_caught_up(&self) -> bool {
         let s = self.handle.status();
         if s.failed.is_some() || s.leader_id.is_none() {
             return false;
@@ -289,12 +299,26 @@ impl ClusterCatalog {
         false
     }
 
+    /// Mark the pre-catalog import as running or finished.
+    pub fn set_import_pending(&self, pending: bool) {
+        self.import_pending.store(pending, Ordering::Relaxed);
+    }
+
     /// Resolve once the node is caught up, or false at the deadline.
     pub async fn wait_caught_up(&self, timeout: Duration) -> bool {
+        self.wait_until(timeout, || self.is_caught_up()).await
+    }
+
+    /// Resolve once raft has caught up (the import may still be running).
+    pub async fn wait_raft_caught_up(&self, timeout: Duration) -> bool {
+        self.wait_until(timeout, || self.raft_caught_up()).await
+    }
+
+    async fn wait_until(&self, timeout: Duration, ready: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         let mut status = self.handle.subscribe();
         loop {
-            if self.is_caught_up() {
+            if ready() {
                 return true;
             }
             let now = Instant::now();

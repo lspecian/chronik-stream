@@ -56,6 +56,18 @@ pub struct AssignmentChange {
     pub expected_epoch: Option<i32>,
 }
 
+/// A topic as a node's pre-catalog metadata held it, for the one-time import
+/// when a cluster upgrades to the Raft catalog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportedTopic {
+    pub name: String,
+    pub config: TopicConfig,
+    pub auto_created: bool,
+    pub created_at_ms: i64,
+    /// Assignments exactly as held, leader epochs included.
+    pub assignments: Vec<PartitionAssignment>,
+}
+
 /// An ISR report from a partition leader, fenced by its leader epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IsrUpdate {
@@ -100,6 +112,11 @@ pub enum CatalogCommand {
     /// later snapshot) knows how to reach a node added at runtime.
     SetNodeAddress { node_id: u64, raft_addr: String },
     RemoveNodeAddress { node_id: u64 },
+    /// One-time import of pre-catalog metadata (see `ImportedTopic`). A topic
+    /// not yet in the catalog is added with its assignments as given; for one
+    /// that is, each partition takes the assignment with the higher leader
+    /// epoch, so several nodes' views merge and no epoch ever goes back.
+    ImportTopics { topics: Vec<ImportedTopic> },
 }
 
 impl CatalogCommand {
@@ -410,6 +427,9 @@ impl CatalogState {
                 }
                 CatalogResult::Ok
             }
+            CatalogCommand::ImportTopics { topics } => {
+                CatalogResult::Items(topics.into_iter().map(|t| self.import_topic(index, term, t, &mut changes)).collect())
+            }
             CatalogCommand::RemoveNodeAddress { node_id } => {
                 if self.node_addresses.remove(&node_id).is_some() {
                     changes.push(CatalogChange::NodeAddressChanged(node_id));
@@ -665,6 +685,73 @@ impl CatalogState {
         if current.as_ref() != Some(&next) {
             self.assignments.insert(key, next);
             changes.push(CatalogChange::AssignmentChanged { topic: c.topic, partition: c.partition });
+        }
+        Ok(())
+    }
+
+    fn import_topic(
+        &mut self,
+        index: u64,
+        term: u64,
+        t: ImportedTopic,
+        changes: &mut Vec<CatalogChange>,
+    ) -> Result<(), CatalogError> {
+        if t.name.is_empty() || t.config.partition_count == 0 {
+            return Err(CatalogError::InvalidConfig(format!("cannot import '{}'", t.name)));
+        }
+        // Assignments are trusted as held — their replicas may name brokers
+        // not yet registered — but kept self-consistent: a known partition,
+        // a non-empty replica list, the leader a replica, the ISR within it.
+        let sane = |a: &PartitionAssignment| -> Option<PartitionAssignment> {
+            if a.topic != t.name || a.partition >= t.config.partition_count || a.replicas.is_empty() {
+                return None;
+            }
+            let leader = if a.replicas.contains(&a.leader_id) { a.leader_id } else { a.replicas[0] };
+            let mut isr: Vec<u64> = a.replicas.iter().copied().filter(|r| a.isr.contains(r)).collect();
+            if !isr.contains(&leader) {
+                isr.insert(0, leader);
+            }
+            Some(PartitionAssignment {
+                topic: a.topic.clone(),
+                partition: a.partition,
+                broker_id: leader as i32,
+                is_leader: true,
+                replicas: a.replicas.clone(),
+                leader_id: leader,
+                leader_epoch: a.leader_epoch.max(0),
+                isr,
+            })
+        };
+
+        if !self.topics.contains_key(&t.name) {
+            let now = timestamp(t.created_at_ms);
+            self.topics.insert(
+                t.name.clone(),
+                TopicMetadata {
+                    id: topic_id(term, index),
+                    name: t.name.clone(),
+                    config: t.config.clone(),
+                    created_at: now,
+                    updated_at: now,
+                    auto_created: t.auto_created,
+                },
+            );
+            changes.push(CatalogChange::TopicCreated(t.name.clone()));
+        }
+        let partition_count = self.topics[&t.name].config.partition_count;
+        for a in t.assignments.iter().filter_map(sane) {
+            if a.partition >= partition_count {
+                continue;
+            }
+            let key = (t.name.clone(), a.partition);
+            let newer = match self.assignments.get(&key) {
+                None => true,
+                Some(cur) => a.leader_epoch > cur.leader_epoch,
+            };
+            if newer {
+                changes.push(CatalogChange::AssignmentChanged { topic: t.name.clone(), partition: a.partition });
+                self.assignments.insert(key, a);
+            }
         }
         Ok(())
     }
@@ -1071,5 +1158,65 @@ mod tests {
         assert_eq!(a, c);
         assert_eq!(CatalogState::from_snapshot(&a.to_snapshot()).unwrap(), a);
         assert!(CatalogState::from_snapshot(&[42]).is_err());
+    }
+
+    fn imported(name: &str, partitions: u32, assignments: Vec<(u32, Vec<u64>, u64, i32, Vec<u64>)>) -> ImportedTopic {
+        ImportedTopic {
+            name: name.into(),
+            config: config(partitions, 3),
+            auto_created: false,
+            created_at_ms: 1_000,
+            assignments: assignments
+                .into_iter()
+                .map(|(p, replicas, leader, epoch, isr)| PartitionAssignment {
+                    topic: name.into(),
+                    partition: p,
+                    broker_id: leader as i32,
+                    is_leader: true,
+                    replicas,
+                    leader_id: leader,
+                    leader_epoch: epoch,
+                    isr,
+                })
+                .collect(),
+        }
+    }
+
+    /// Two nodes' pre-catalog views merge: unknown topics are added with their
+    /// epochs; for known partitions the higher epoch wins; nothing goes back.
+    #[test]
+    fn import_merges_views_by_leader_epoch() {
+        let mut s = CatalogState::default();
+        let mut i = 0;
+        // No broker registered: imported replicas are trusted as held.
+        let r = run(&mut s, &mut i, CatalogCommand::ImportTopics { topics: vec![
+            imported("a", 2, vec![(0, vec![1, 2, 3], 1, 4, vec![1, 2]), (1, vec![2, 3, 1], 9, 2, vec![2, 3])]),
+            imported("bad", 0, vec![]),
+        ]});
+        match r {
+            CatalogResult::Items(items) => {
+                assert_eq!(items[0], Ok(()));
+                assert!(items[1].is_err());
+            }
+            other => panic!("{:?}", other),
+        }
+        let p0 = s.assignment("a", 0).unwrap().clone();
+        assert_eq!((p0.leader_id, p0.leader_epoch, p0.isr.clone()), (1, 4, vec![1, 2]));
+        // A leader outside the replicas is repaired to the first replica.
+        assert_eq!(s.assignment("a", 1).unwrap().leader_id, 2);
+
+        // Node 2's view: p0 at an older epoch (ignored), p1 newer (taken).
+        run(&mut s, &mut i, CatalogCommand::ImportTopics { topics: vec![
+            imported("a", 2, vec![(0, vec![1, 2, 3], 3, 3, vec![3]), (1, vec![2, 3, 1], 3, 7, vec![3, 1])]),
+        ]});
+        assert_eq!(s.assignment("a", 0).unwrap().leader_epoch, 4);
+        let p1 = s.assignment("a", 1).unwrap();
+        assert_eq!((p1.leader_id, p1.leader_epoch, p1.isr.clone()), (3, 7, vec![3, 1]));
+        // Normal operation continues from the imported epoch.
+        run(&mut s, &mut i, CatalogCommand::RegisterBroker { broker: broker(1) });
+        run(&mut s, &mut i, CatalogCommand::RegisterBroker { broker: broker(2) });
+        run(&mut s, &mut i, CatalogCommand::RegisterBroker { broker: broker(3) });
+        run(&mut s, &mut i, CatalogCommand::SetAssignments { changes: vec![AssignmentChange { leader: Some(2), ..change("a", 0) }] });
+        assert_eq!(s.assignment("a", 0).unwrap().leader_epoch, 5);
     }
 }
