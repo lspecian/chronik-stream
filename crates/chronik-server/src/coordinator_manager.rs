@@ -608,11 +608,6 @@ mod tests {
         async fn delete_parquet_segment(&self, _topic: &str, _partition: i32, _segment_id: &str) -> chronik_common::metadata::traits::Result<()> {
             Ok(())
         }
-
-        // Replicated event application
-        async fn apply_replicated_event(&self, _event: chronik_common::metadata::events::MetadataEvent) -> chronik_common::metadata::traits::Result<()> {
-            Ok(())
-        }
     }
     
     #[test]

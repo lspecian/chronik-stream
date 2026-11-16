@@ -98,6 +98,9 @@ pub struct Failover {
     /// What legitimately shrinks on failure is ISR, and `IsrTracker` already
     /// does that from its own liveness (RP-2.1).
     pub replicas: Vec<u64>,
+    /// The leader epoch the plan was made at. The move is refused if the
+    /// partition has changed leader since, instead of undoing that change.
+    pub from_epoch: i32,
     /// Replicas currently alive. Reported, not written — diagnostics only.
     pub live_replicas: Vec<u64>,
 }
@@ -194,6 +197,7 @@ pub fn plan_failover(
                 topic: assignment.topic.clone(),
                 partition: assignment.partition,
                 from: assignment.leader_id,
+                from_epoch: assignment.leader_epoch,
                 to,
                 replicas: assignment.replicas.clone(),
                 live_replicas,
@@ -267,6 +271,7 @@ pub fn plan_preferred_leaders(
             topic: assignment.topic.clone(),
             partition: assignment.partition,
             from: assignment.leader_id,
+            from_epoch: assignment.leader_epoch,
             to: preferred,
             replicas: assignment.replicas.clone(),
             live_replicas: assignment
@@ -532,9 +537,7 @@ impl PartitionFailoverController {
             );
         }
 
-        for failover in &plan.failovers {
-            self.apply(failover, MoveReason::LeaderUnreachable).await;
-        }
+        self.apply_all(&plan.failovers, MoveReason::LeaderUnreachable).await;
         if !plan.failovers.is_empty() {
             *self.last_leadership_change.lock() = Some(now);
             // Never rebalance in a pass that failed something over.
@@ -543,9 +546,7 @@ impl PartitionFailoverController {
 
         if self.rebalance_due(now) {
             let moves = plan_preferred_leaders(&assignments, &live, self.rebalance_max_moves);
-            for m in &moves {
-                self.apply(m, MoveReason::PreferredReplicaInSync).await;
-            }
+            self.apply_all(&moves, MoveReason::PreferredReplicaInSync).await;
             if !moves.is_empty() {
                 *self.last_leadership_change.lock() = Some(now);
             }
@@ -579,56 +580,59 @@ impl PartitionFailoverController {
         self.rebalances_performed.load(Ordering::Relaxed)
     }
 
-    /// Move one partition to its new leader.
+    /// Move partitions to their new leaders, in batches of catalog commands.
     ///
-    /// Persisted through `assign_partition`, which is what makes this real: it
-    /// derives the leader epoch, so a genuine leader change bumps it exactly
-    /// once. That bump is what tells followers to re-run the RP-3.3 epoch
-    /// handshake and truncate anything the old leader never committed.
-    async fn apply(&self, failover: &Failover, reason: MoveReason) {
-        let assignment = PartitionAssignment {
-            topic: failover.topic.clone(),
-            partition: failover.partition,
-            broker_id: failover.to as i32,
-            is_leader: true,
-            // Unchanged — see `Failover::replicas`.
-            replicas: failover.replicas.clone(),
-            leader_id: failover.to,
-            // Derived by the store, never by callers.
-            leader_epoch: 0,
-            // Empty means "unknown", which the store reads as "leave what is
-            // published". The set this election was made FROM must survive the
-            // election: the new leader republishes from its own measurements
-            // shortly, and until then the old set is the only evidence anyone
-            // has about who holds the data.
-            isr: Vec::new(),
-        };
-
-        match self.metadata_store.assign_partition(assignment).await {
-            Ok(()) => match reason {
-                MoveReason::LeaderUnreachable => {
-                    self.failovers_performed.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        "{}-{}: leader {} is unreachable — failed over to {} (live replicas {:?})",
-                        failover.topic,
-                        failover.partition,
-                        failover.from,
-                        failover.to,
-                        failover.live_replicas
-                    );
+    /// Each move is fenced by the epoch its plan was made at: the catalog bumps
+    /// the epoch exactly once for a genuine leader change (which tells
+    /// followers to re-run the RP-3.3 handshake and truncate anything the old
+    /// leader never committed), and refuses a move whose partition changed
+    /// leader since the plan. The replica set is unchanged — see
+    /// `Failover::replicas` — and the published ISR is kept: the new leader
+    /// republishes from its own measurements shortly, and until then the set
+    /// this election was made from is the only evidence of who holds the data.
+    ///
+    /// Batched because a dead node can lead thousands of partitions, and one
+    /// command per move would leave them offline for many round trips.
+    async fn apply_all(&self, moves: &[Failover], reason: MoveReason) {
+        const BATCH: usize = 1000;
+        for chunk in moves.chunks(BATCH) {
+            let changes: Vec<chronik_common::metadata::catalog::AssignmentChange> = chunk
+                .iter()
+                .map(|m| chronik_common::metadata::catalog::AssignmentChange {
+                    topic: m.topic.clone(),
+                    partition: m.partition,
+                    replicas: None,
+                    leader: Some(m.to),
+                    isr: None,
+                    expected_epoch: Some(m.from_epoch),
+                })
+                .collect();
+            let outcomes = match self.metadata_store.set_assignments(changes).await {
+                Ok(items) => items.into_iter().map(|r| r.map_err(|e| e.to_string())).collect::<Vec<_>>(),
+                Err(e) => vec![Err(e.to_string()); chunk.len()],
+            };
+            for (m, outcome) in chunk.iter().zip(outcomes) {
+                match (outcome, reason) {
+                    (Ok(()), MoveReason::LeaderUnreachable) => {
+                        self.failovers_performed.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "{}-{}: leader {} is unreachable — failed over to {} (live replicas {:?})",
+                            m.topic, m.partition, m.from, m.to, m.live_replicas
+                        );
+                    }
+                    (Ok(()), MoveReason::PreferredReplicaInSync) => {
+                        self.rebalances_performed.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "{}-{}: preferred replica {} is in sync — leadership returned to it from {}",
+                            m.topic, m.partition, m.to, m.from
+                        );
+                    }
+                    (Err(e), _) => error!(
+                        "{}-{}: could not move leadership from {} to {} ({:?}): {}",
+                        m.topic, m.partition, m.from, m.to, reason, e
+                    ),
                 }
-                MoveReason::PreferredReplicaInSync => {
-                    self.rebalances_performed.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        "{}-{}: preferred replica {} is in sync — leadership returned to it from {}",
-                        failover.topic, failover.partition, failover.to, failover.from
-                    );
-                }
-            },
-            Err(e) => error!(
-                "{}-{}: could not move leadership from {} to {} ({:?}): {}",
-                failover.topic, failover.partition, failover.from, failover.to, reason, e
-            ),
+            }
         }
     }
 

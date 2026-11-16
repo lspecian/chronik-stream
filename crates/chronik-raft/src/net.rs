@@ -37,6 +37,74 @@ const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Fault injection for the acceptance suite, off unless `CHRONIK_FAULT_FILE`
+/// names a file. The file is re-read every 200 ms; each line is one of:
+///
+/// ```text
+/// drop <peer-id>      # no catalog traffic to or from that peer (a partition)
+/// delay <millis>      # hold every inbound message batch this long
+/// ```
+///
+/// Removing a line (or the file) heals it.
+#[derive(Clone, Default)]
+pub struct NetFaults(Option<Arc<RwLock<FaultState>>>);
+
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct FaultState {
+    dropped: std::collections::HashSet<u64>,
+    delay_ms: u64,
+}
+
+impl NetFaults {
+    /// Faults from `CHRONIK_FAULT_FILE` (`%n` is replaced by this node's id, so
+    /// one environment can give each node its own file), watched on `runtime`;
+    /// inert when unset.
+    pub fn from_env(runtime: &Handle, node_id: u64) -> Self {
+        let Ok(path) = std::env::var("CHRONIK_FAULT_FILE").map(|p| p.replace("%n", &node_id.to_string())) else {
+            return Self(None);
+        };
+        tracing::warn!("Catalog fault injection enabled from {}", path);
+        let state = Arc::new(RwLock::new(FaultState::default()));
+        let watched = state.clone();
+        runtime.spawn(async move {
+            loop {
+                let next = std::fs::read_to_string(&path).map(|s| parse_faults(&s)).unwrap_or_default();
+                let changed = *watched.read().unwrap() != next;
+                if changed {
+                    tracing::warn!("Catalog faults now: {:?}", next);
+                    *watched.write().unwrap() = next;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+        Self(Some(state))
+    }
+
+    pub fn is_dropped(&self, peer: u64) -> bool {
+        self.0.as_ref().map(|s| s.read().unwrap().dropped.contains(&peer)).unwrap_or(false)
+    }
+
+    fn inbound_delay(&self) -> Option<Duration> {
+        let ms = self.0.as_ref().map(|s| s.read().unwrap().delay_ms).unwrap_or(0);
+        (ms > 0).then(|| Duration::from_millis(ms))
+    }
+}
+
+fn parse_faults(text: &str) -> FaultState {
+    let mut state = FaultState::default();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        match (words.next(), words.next().and_then(|w| w.parse::<u64>().ok())) {
+            (Some("drop"), Some(peer)) => {
+                state.dropped.insert(peer);
+            }
+            (Some("delay"), Some(ms)) => state.delay_ms = ms,
+            _ => {}
+        }
+    }
+    state
+}
+
 /// Node id → gRPC address (`host:port`, no scheme).
 #[derive(Clone, Default)]
 pub struct PeerDirectory(Arc<RwLock<HashMap<u64, String>>>);
@@ -84,11 +152,18 @@ fn client(channel: Channel) -> CatalogRaftClient<Channel> {
 #[derive(Clone)]
 pub struct CatalogRaftServer {
     handle: RaftHandle,
+    faults: NetFaults,
 }
 
 impl CatalogRaftServer {
     pub fn new(handle: RaftHandle) -> Self {
-        Self { handle }
+        Self { handle, faults: NetFaults::default() }
+    }
+
+    /// Apply injected faults (acceptance tests) to inbound traffic.
+    pub fn with_faults(mut self, faults: NetFaults) -> Self {
+        self.faults = faults;
+        self
     }
 
     /// The tonic service, ready to add to a router.
@@ -103,6 +178,12 @@ impl CatalogRaftServer {
 impl CatalogRaft for CatalogRaftServer {
     async fn send(&self, request: Request<proto::MessageBatch>) -> Result<Response<proto::SendAck>, Status> {
         let batch = request.into_inner();
+        if self.faults.is_dropped(batch.from) {
+            return Err(Status::unavailable("partitioned (fault injection)"));
+        }
+        if let Some(delay) = self.faults.inbound_delay() {
+            tokio::time::sleep(delay).await;
+        }
         for bytes in batch.messages {
             match Message::decode(bytes.as_slice()) {
                 Ok(msg) => self.handle.step(msg),
@@ -186,11 +267,25 @@ pub struct PeerOutbox {
     runtime: Handle,
     queues: HashMap<u64, mpsc::UnboundedSender<Message>>,
     handle: Arc<OnceLock<RaftHandle>>,
+    faults: NetFaults,
 }
 
 impl PeerOutbox {
     pub fn new(from: u64, directory: PeerDirectory, runtime: Handle) -> Self {
-        Self { from, directory, runtime, queues: HashMap::new(), handle: Arc::new(OnceLock::new()) }
+        Self {
+            from,
+            directory,
+            runtime,
+            queues: HashMap::new(),
+            handle: Arc::new(OnceLock::new()),
+            faults: NetFaults::default(),
+        }
+    }
+
+    /// Apply injected faults (acceptance tests) to outbound traffic.
+    pub fn with_faults(mut self, faults: NetFaults) -> Self {
+        self.faults = faults;
+        self
     }
 
     /// A binder to call once the driver is running.
@@ -208,6 +303,7 @@ impl PeerOutbox {
                 handle: self.handle.clone(),
                 client: None,
                 client_addr: None,
+                faults: self.faults.clone(),
             };
             self.runtime.spawn(task.run(rx));
             self.queues.insert(to, tx);
@@ -245,6 +341,7 @@ struct PeerTask {
     handle: Arc<OnceLock<RaftHandle>>,
     client: Option<CatalogRaftClient<Channel>>,
     client_addr: Option<String>,
+    faults: NetFaults,
 }
 
 impl PeerTask {
@@ -257,6 +354,9 @@ impl PeerTask {
             }
             let had_snapshot = batch.iter().any(|m| m.get_msg_type() == MessageType::MsgSnapshot);
             let messages: Vec<Vec<u8>> = batch.drain(..).map(|m| m.encode_to_vec()).collect();
+            if self.faults.is_dropped(self.to) {
+                continue;
+            }
             if let Err(e) = self.deliver(messages).await {
                 tracing::debug!("Raft {} → {}: send failed: {}", self.from, self.to, e);
                 self.client = None;
@@ -403,5 +503,13 @@ mod tests {
     async fn unreachable_leader_is_reported() {
         let r = forward_propose("127.0.0.1:1", b"x".to_vec(), false, Duration::from_millis(500)).await;
         assert!(matches!(r, Err(ForwardError::Unreachable(_))), "{:?}", r);
+    }
+
+    #[test]
+    fn fault_file_lines() {
+        let s = parse_faults("drop 2\n# comment\ndelay 1500\ndrop 3\nbogus\ndrop x\n");
+        assert_eq!(s.dropped, std::collections::HashSet::from([2, 3]));
+        assert_eq!(s.delay_ms, 1500);
+        assert_eq!(parse_faults(""), FaultState::default());
     }
 }

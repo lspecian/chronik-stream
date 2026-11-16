@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use chronik_common::metadata::catalog::{CatalogChange, CatalogCommand, CatalogResult, CatalogState};
 use chronik_raft::driver::{DriverConfig, ProposeError, RaftDriver, RaftHandle, RaftStatus, StateMachine};
-use chronik_raft::net::{forward_propose, CatalogRaftServer, ForwardError, PeerDirectory, PeerOutbox};
+use chronik_raft::net::{forward_propose, CatalogRaftServer, ForwardError, NetFaults, PeerDirectory, PeerOutbox};
 use chronik_raft::LogStoreOptions;
 use parking_lot::{RwLock, RwLockReadGuard};
 use raft::eraftpb::{ConfChangeV2, ConfState};
@@ -129,7 +129,11 @@ impl ClusterCatalogConfig {
             tick_interval: Duration::from_millis(100),
             election_tick: 20,
             heartbeat_tick: 3,
-            snapshot_every: 10_000,
+            snapshot_every: std::env::var("CHRONIK_CATALOG_SNAPSHOT_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n: &u64| n > 0)
+                .unwrap_or(10_000),
             propose_timeout: Duration::from_secs(30),
         }
     }
@@ -153,6 +157,7 @@ pub struct ClusterCatalog {
     /// when it first heard from it after boot.
     booted: AtomicBool,
     leader_flag: Arc<AtomicBool>,
+    faults: NetFaults,
 }
 
 impl ClusterCatalog {
@@ -171,7 +176,8 @@ impl ClusterCatalog {
             directory: directory.clone(),
         };
         let runtime_for_watch = runtime.clone();
-        let outbox = PeerOutbox::new(config.node_id, directory.clone(), runtime);
+        let faults = NetFaults::from_env(&runtime, config.node_id);
+        let outbox = PeerOutbox::new(config.node_id, directory.clone(), runtime).with_faults(faults.clone());
         let binder = outbox.binder();
         let driver_config = DriverConfig {
             id: config.node_id,
@@ -210,12 +216,13 @@ impl ClusterCatalog {
             election_timeout: config.election_timeout(),
             booted: AtomicBool::new(false),
             leader_flag,
+            faults,
         })
     }
 
     /// The gRPC service peers use to reach this node's raft endpoint.
     pub fn service(&self) -> chronik_raft::net::proto::catalog_raft_server::CatalogRaftServer<CatalogRaftServer> {
-        CatalogRaftServer::new(self.handle.clone()).into_service()
+        CatalogRaftServer::new(self.handle.clone()).with_faults(self.faults.clone()).into_service()
     }
 
     pub fn node_id(&self) -> u64 {
@@ -337,7 +344,7 @@ impl ClusterCatalog {
                     return Err(CatalogUnavailable::Stopped(why));
                 }
                 Err(ProposeError::NotLeader { leader: Some(leader) }) if leader != self.node_id => {
-                    if let Some(addr) = self.directory.get(leader) {
+                    if let Some(addr) = self.directory.get(leader).filter(|_| !self.faults.is_dropped(leader)) {
                         let remaining = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100));
                         match forward_propose(&addr, bytes.clone(), conf_change, remaining).await {
                             Ok(a) => {

@@ -1201,15 +1201,15 @@ mod implication_tests {
     }
 }
 
-/// A rule created or revoked on one broker must take effect on every broker,
-/// without a restart. These drive a follower's store exactly as replication
-/// does (`apply_replicated_event`) and observe the authorizer, not the store:
-/// the store always had the rule, it was the authorizer that never heard.
+/// A rule created or revoked through the store must take effect without a
+/// restart: the store signals `acl_changes` and the authorizer reloads. In a
+/// cluster every node's catalog applies the change, so every node's
+/// authorizer reloads. These observe the authorizer, not the store.
 #[cfg(test)]
 mod replication_tests {
     use super::*;
     use chronik_common::metadata::{
-        MetadataEvent, MetadataEventPayload, WalAppendFn, WalMetadataStore,
+        WalAppendFn, WalMetadataStore,
     };
     use std::time::Duration;
 
@@ -1247,7 +1247,7 @@ mod replication_tests {
     }
 
     #[tokio::test]
-    async fn replicated_create_and_delete_are_enforced() {
+    async fn store_create_and_delete_are_enforced() {
         let store = follower_store();
         // Strict mode, so "no rule" is a denial and a missed revoke is visible.
         let acls = Arc::new(AclStore::with_config(true, false, Vec::new()));
@@ -1257,19 +1257,13 @@ mod replication_tests {
         assert!(!may_write(&acls, "User:alice").await);
 
         store
-            .apply_replicated_event(MetadataEvent::new_with_node(
-                MetadataEventPayload::AclCreated { binding: write_orders("User:alice").to_record() },
-                1,
-            ))
+            .create_acl(write_orders("User:alice").to_record())
             .await
             .unwrap();
         eventually(&acls, "User:alice", true).await;
 
         store
-            .apply_replicated_event(MetadataEvent::new_with_node(
-                MetadataEventPayload::AclDeleted { binding: write_orders("User:alice").to_record() },
-                1,
-            ))
+            .delete_acl(write_orders("User:alice").to_record())
             .await
             .unwrap();
         eventually(&acls, "User:alice", false).await;
@@ -1282,13 +1276,10 @@ mod replication_tests {
         acls.load_bootstrap_acls("User:bob,Topic,orders,Write,Allow").await;
         acls.clone().spawn_reload_on_change(store.clone());
 
-        // A replicated change triggers a full rebuild from the store, which
+        // A store change triggers a full rebuild from the store, which
         // never held bob's rule. It must survive.
         store
-            .apply_replicated_event(MetadataEvent::new_with_node(
-                MetadataEventPayload::AclCreated { binding: write_orders("User:alice").to_record() },
-                1,
-            ))
+            .create_acl(write_orders("User:alice").to_record())
             .await
             .unwrap();
         eventually(&acls, "User:alice", true).await;

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chronik_common::metadata::catalog::{
-    AssignmentChange, CatalogChange, CatalogCommand, CatalogError, CatalogResult, ConfigChange,
+    AssignmentChange, CatalogChange, CatalogCommand, CatalogError, CatalogResult, ConfigChange, IsrUpdate,
 };
 use chronik_common::metadata::{
     AclBindingRecord, BrokerMetadata, BrokerStatus, ConsumerGroupMetadata, ConsumerOffset, MetadataError,
@@ -67,15 +67,6 @@ impl CatalogMetadataStore {
         match self.catalog.execute(cmd).await? {
             CatalogResult::Err(e) => Err(to_metadata_error(e, subject)),
             ok => Ok(ok),
-        }
-    }
-
-    /// Apply a batch of assignment changes; the first refused item fails.
-    pub async fn set_assignments(&self, changes: Vec<AssignmentChange>) -> Result<Vec<std::result::Result<(), CatalogError>>> {
-        match self.catalog.execute(CatalogCommand::SetAssignments { changes }).await? {
-            CatalogResult::Items(items) => Ok(items),
-            CatalogResult::Err(e) => Err(to_metadata_error(e, "assignments")),
-            other => Err(MetadataError::StorageError(format!("unexpected result {:?}", other))),
         }
     }
 
@@ -282,6 +273,28 @@ impl MetadataStore for CatalogMetadataStore {
         }
     }
 
+    async fn set_assignments(&self, changes: Vec<AssignmentChange>) -> Result<Vec<std::result::Result<(), CatalogError>>> {
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.catalog.execute(CatalogCommand::SetAssignments { changes }).await? {
+            CatalogResult::Items(items) => Ok(items),
+            CatalogResult::Err(e) => Err(to_metadata_error(e, "assignments")),
+            other => Err(MetadataError::StorageError(format!("unexpected result {:?}", other))),
+        }
+    }
+
+    async fn update_isr(&self, updates: Vec<IsrUpdate>) -> Result<Vec<std::result::Result<(), CatalogError>>> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.catalog.execute(CatalogCommand::UpdateIsr { updates }).await? {
+            CatalogResult::Items(items) => Ok(items),
+            CatalogResult::Err(e) => Err(to_metadata_error(e, "isr")),
+            other => Err(MetadataError::StorageError(format!("unexpected result {:?}", other))),
+        }
+    }
+
     async fn get_partition_assignments(&self, topic: &str) -> Result<Vec<PartitionAssignment>> {
         Ok(self.catalog.read().assignments_for(topic))
     }
@@ -334,12 +347,6 @@ impl MetadataStore for CatalogMetadataStore {
 
     async fn list_scram_credentials(&self) -> Result<Vec<ScramCredentialRecord>> {
         Ok(self.catalog.read().scram_credentials())
-    }
-
-    async fn apply_replicated_event(&self, _event: MetadataEvent) -> Result<()> {
-        Err(MetadataError::StorageError(
-            "metadata events are no longer replicated; the catalog travels in its raft log".into(),
-        ))
     }
 
     // ---- local state ---------------------------------------------------------
@@ -653,6 +660,24 @@ mod tests {
         }
         assert_eq!(created.len(), 10);
         assert!(created.values().all(|&c| c == 1), "{:?}", created);
+
+        // A rule created through one node reaches every node's store, and each
+        // node's security watch fires (its authorizer reloads).
+        let mut watches: Vec<_> = nodes.iter().map(|n| n.store.acl_changes().unwrap()).collect();
+        let acl = AclBindingRecord {
+            resource_type: 2,
+            resource_name: "orders".into(),
+            pattern_type: 3,
+            principal: "User:alice".into(),
+            host: "*".into(),
+            operation: 3,
+            permission_type: 3,
+        };
+        follower.store.create_acl(acl.clone()).await.unwrap();
+        for (i, w) in watches.iter_mut().enumerate() {
+            tokio::time::timeout(Duration::from_secs(10), w.changed()).await.unwrap_or_else(|_| panic!("node {} not told", i + 1)).unwrap();
+            assert_eq!(nodes[i].store.list_acls().await.unwrap(), vec![acl.clone()], "node {}", i + 1);
+        }
 
         // Same catalog, ids included, on every node.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
