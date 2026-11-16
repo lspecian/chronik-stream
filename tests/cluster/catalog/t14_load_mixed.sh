@@ -19,13 +19,14 @@ lat() { "$K/kafka-producer-perf-test.sh" --topic load-lat --num-records "$1" --r
   --producer-props bootstrap.servers="$BOOTS" acks=all 2>/dev/null | tail -1; }
 say "quiet baseline: $(lat 15000)"
 
-# Load.
+# Load. Client pids are collected so the end waits for them, not for brokers.
+clients=""
 for t in load-a load-b; do
   "$K/kafka-verifiable-producer.sh" --bootstrap-server "$BOOTS" --topic "$t" --max-messages "$N" --throughput "$RATE" \
-    --acks -1 --producer.config /dev/null > "$work/$t.prod" 2>/dev/null &
+    --acks -1 --producer.config /dev/null > "$work/$t.prod" 2>/dev/null & clients="$clients $!"
 done
-lat $((500 * SECS)) > "$work/lat.out" &
-timeout $((SECS + 60)) "$K/kafka-console-consumer.sh" --bootstrap-server "$BOOTS" --topic load-a --group t14-live >/dev/null 2>&1 &
+lat $((500 * SECS)) > "$work/lat.out" & clients="$clients $!"
+timeout $((SECS + 60)) "$K/kafka-console-consumer.sh" --bootstrap-server "$BOOTS" --topic load-a --group t14-live >/dev/null 2>&1 & clients="$clients $!"
 
 # Catalog storm: creates, then deletes of half of them.
 ( tool burst "$BOOTS" storm- "$STORM" 3 "$work/storm-acked.txt" > "$work/storm.out"
@@ -41,7 +42,8 @@ D=$(( (L % 3) + 1 )); [ "$D" = "$(current_leader)" ] && D=$(( (D % 3) + 1 ))
 say "t+70s: killing data node $D"; node_kill "$D"
 sleep 30; say "t+100s: restarting node $D"; node_start "$D"
 wait "$storm"
-wait
+# Not a bare `wait`: it would also wait for the brokers node_start launched.
+wait $clients
 say "under load:     $(cat "$work/lat.out")"
 cat "$work/storm.out"
 
