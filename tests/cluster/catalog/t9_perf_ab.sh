@@ -7,7 +7,10 @@
 source "$(dirname "$0")/lib.sh"
 BASE="${BASE_BIN:?set BASE_BIN to the baseline binary}"
 ROUNDS="${T9_ROUNDS:-5}"; TOL="${T9_TOL:-10}"
-export PERF_RECORDS="${PERF_RECORDS:-100000}"
+# 1M records per measurement: at 100K a run lasts ~0.13 s and mostly times
+# connection setup; T9 then read a -10% acks=1 gap that 3M-record runs and a
+# profile of both binaries showed does not exist.
+export PERF_RECORDS="${PERF_RECORDS:-1000000}"
 out="$DIR/data/t9"; rm -rf "$out"; mkdir -p "$out"
 run() { # $1 label $2 binary $3 round
   CHRONIK_BIN="$2" "$DIR/perf_replication.sh" > "$out/$1-$3.txt" 2>&1
