@@ -367,6 +367,11 @@ mod tests {
         assert_eq!(a.result, b"created");
 
         let follower = (li + 1) % 3;
+        // A follower learns the leader from its first append or heartbeat.
+        tokio::time::timeout(Duration::from_secs(10), nodes[follower].driver.handle().wait_for_leader())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             nodes[follower].driver.handle().propose(b"b".to_vec()).await,
             Err(ProposeError::NotLeader { leader: Some(leader) })
