@@ -161,29 +161,157 @@ impl MetadataState {
     async fn apply_event(&self, event: &MetadataEvent) -> Result<()> {
         match &event.payload {
             MetadataEventPayload::TopicCreated { name, config, auto_created } => {
-                // Creation order is decided by whoever writes this store (the
-                // cluster catalog decides it in a cluster): a create for a
-                // name that exists is a duplicate and changes nothing.
+                // The cluster catalog now decides creation order. These rules
+                // remain because a metadata WAL written before the catalog
+                // still holds racing and repeated creates, and the one-time
+                // import (catalog_import.rs) must read it exactly as the
+                // pre-catalog release served it — measured on a real WAL, a
+                // plain insert-if-absent turned two `--partitions 1` topics
+                // into 3-partition topics during the import.
                 let mut topics = self.topics.write().await;
-                if topics.contains_key(name) {
+                if let Some(existing) = topics.get_mut(name) {
+                    // Provenance settles this, not size.
+                    //
+                    // An auto-create must never change a config someone asked
+                    // for. Comparing partition counts and keeping the larger got
+                    // this right in one direction only: `TopicConfig::default()`
+                    // carries 3 partitions, so an auto-create racing a topic
+                    // created with `--partitions 1` silently widened it to 3.
+                    // Measured on a cluster — `/admin/status` reported three
+                    // partitions with real leaders and ISRs while every record
+                    // sat in partition 0, because the producer had seen one
+                    // partition when it wrote. A consumer then subscribes to
+                    // partitions the producer never knew about.
+                    //
+                    // The config-key merge below still runs, so an auto-create
+                    // can still contribute keys the explicit config never set.
+                    if *auto_created && !existing.auto_created {
+                        tracing::debug!(
+                            topic = %name,
+                            existing_partitions = existing.config.partition_count,
+                            incoming_partitions = config.partition_count,
+                            "Ignoring auto-create for a topic that was created explicitly"
+                        );
+                    } else if !*auto_created && existing.auto_created {
+                        // The other direction: what is here was guessed, and this
+                        // was asked for. It wins whatever the counts say — which
+                        // is the point of tracking provenance, because an
+                        // explicit `--partitions 1` landing on an auto-created 3
+                        // must be able to narrow it.
+                        let old_count = existing.config.partition_count;
+                        tracing::info!(
+                            topic = %name,
+                            auto_created_partitions = old_count,
+                            explicit_partitions = config.partition_count,
+                            "Explicit topic config replaces the auto-created one"
+                        );
+                        existing.config = config.clone();
+                        existing.auto_created = false;
+                        existing.updated_at = event.timestamp;
+                        drop(topics);
+
+                        let mut offsets = self.partition_offsets.write().await;
+                        for partition in 0..config.partition_count {
+                            offsets.entry((name.clone(), partition)).or_insert((0, 0));
+                        }
+                        return Ok(());
+                    } else if config.partition_count > existing.config.partition_count {
+                        let old_count = existing.config.partition_count;
+                        tracing::info!(
+                            topic = %name,
+                            old_partitions = old_count,
+                            new_partitions = config.partition_count,
+                            "Topic partition count expanded - updating metadata"
+                        );
+                        existing.config = config.clone();
+                        existing.updated_at = event.timestamp;
+                        drop(topics);
+
+                        // Add partition offsets for new partitions only
+                        let mut offsets = self.partition_offsets.write().await;
+                        for partition in old_count..config.partition_count {
+                            let key = (name.clone(), partition);
+                            offsets.entry(key).or_insert((0, 0));
+                        }
+                        return Ok(());
+                    }
+
+                    // A strictly newer assertion replaces the config outright.
+                    // Pre-catalog releases re-broadcast `TopicCreated` with the
+                    // full config, stamped with the topic's own `updated_at`, so
+                    // a legacy WAL carries config changes this way; the additive
+                    // merge below could never carry a changed or removed key.
+                    //
+                    // Provenance still outranks recency. An auto-create carries
+                    // a *guessed* config — `TopicConfig::default()`, three
+                    // partitions — and arrives after the explicit create it
+                    // raced. The arm above deliberately only logs and falls
+                    // through to the key merge for exactly this case, so
+                    // adopting the config here would re-open the bug that arm
+                    // exists to prevent: a topic asked for with
+                    // `--partitions 1` silently becoming 3.
+                    let shape_is_guessed = *auto_created && !existing.auto_created;
+                    if !shape_is_guessed && event.timestamp > existing.updated_at {
+                        tracing::debug!(
+                            topic = %name,
+                            keys = config.config.len(),
+                            "Adopting a newer topic config"
+                        );
+                        existing.config = config.clone();
+                        existing.updated_at = event.timestamp;
+                        return Ok(());
+                    }
+
+                    // Adopt keys the existing config lacks (an auto-create
+                    // that raced the real CreateTopics has a bare config).
+                    // Adding a key cannot lose information, so an older event
+                    // may still fill a gap.
+                    let mut merged = false;
+                    for (key, value) in &config.config {
+                        if !existing.config.config.contains_key(key) {
+                            existing.config.config.insert(key.clone(), value.clone());
+                            merged = true;
+                        }
+                    }
+                    if merged {
+                        tracing::debug!(
+                            topic = %name,
+                            "Merged config keys from duplicate TopicCreated event"
+                        );
+                    }
                     return Ok(());
                 }
-                topics.insert(
-                    name.clone(),
-                    TopicMetadata {
-                        name: name.clone(),
-                        id: event.event_id,
-                        config: config.clone(),
-                        created_at: event.timestamp,
-                        updated_at: event.timestamp,
-                        auto_created: *auto_created,
-                    },
-                );
+
+                let metadata = TopicMetadata {
+                    name: name.clone(),
+                    id: event.event_id,
+                    config: config.clone(),
+                    created_at: event.timestamp,
+                    updated_at: event.timestamp,
+                    auto_created: *auto_created,
+                };
+
+                topics.insert(name.clone(), metadata);
                 drop(topics);
+
+                // v2.2.9 Phase 7 FIX #3: Do NOT create partition assignments here!
+                // Partition assignments should be created via separate PartitionAssigned events
+                // from assign_partitions_to_nodes() which has proper replica information from cluster config.
+                // Creating assignments here with only creator node as replica caused replication to break.
+                //
+                // OLD CODE (REMOVED - caused single-replica assignments):
+                // for partition in 0..config.partition_count {
+                //     let assignment = PartitionAssignment { ... replicas: vec![event.created_by_node] };
+                //     assignments.insert(key, assignment);
+                // }
+
+                // Initialize partition offsets only (assignments come from PartitionAssigned events)
                 let mut offsets = self.partition_offsets.write().await;
                 for partition in 0..config.partition_count {
-                    offsets.insert((name.clone(), partition), (0, 0));
+                    let key = (name.clone(), partition);
+                    offsets.insert(key, (0, 0));
                 }
+
                 Ok(())
             }
 
@@ -1827,6 +1955,62 @@ mod topic_provenance_tests {
 
     async fn partitions_of(store: &WalMetadataStore, topic: &str) -> u32 {
         store.get_topic(topic).await.unwrap().expect("topic exists").config.partition_count
+    }
+
+    fn created(name: &str, partitions: u32, auto_created: bool, age_s: i64) -> MetadataEvent {
+        let mut e = MetadataEvent::new_with_node(
+            MetadataEventPayload::TopicCreated {
+                name: name.to_string(),
+                config: config_with(partitions),
+                auto_created,
+            },
+            2,
+        );
+        e.timestamp = e.timestamp + chrono::Duration::seconds(age_s);
+        e
+    }
+
+    /// The sequence found in Thunderbird's metadata WAL (v2.16.1 create
+    /// crossover): an auto-create with the default 3 partitions, then the
+    /// explicit `--partitions 1`. The pre-catalog release served 1; replaying
+    /// the WAL for the catalog import must read 1, or the import widens the
+    /// topic under its producers and consumers.
+    #[tokio::test]
+    async fn replay_explicit_after_auto_create_narrows() {
+        let store = store();
+        store
+            .replay_events(vec![created("v2161order", 3, true, 0), created("v2161order", 1, false, 1)])
+            .await
+            .unwrap();
+        assert_eq!(partitions_of(&store, "v2161order").await, 1);
+        assert!(!store.get_topic("v2161order").await.unwrap().unwrap().auto_created);
+    }
+
+    /// The other order: an auto-create landing after an explicit create never
+    /// widens it, even though it is newer.
+    #[tokio::test]
+    async fn replay_auto_create_after_explicit_does_not_widen() {
+        let store = store();
+        store
+            .replay_events(vec![created("orders", 1, false, 0), created("orders", 3, true, 5)])
+            .await
+            .unwrap();
+        assert_eq!(partitions_of(&store, "orders").await, 1);
+    }
+
+    /// Two explicit creates still ratchet upward (a genuine expansion), and a
+    /// repeated create never resets a partition that holds data.
+    #[tokio::test]
+    async fn replay_explicit_expansion_applies_and_keeps_offsets() {
+        let store = store();
+        store.replay_events(vec![created("events", 1, false, 0)]).await.unwrap();
+        store.update_partition_offset("events", 0, 841_582, 0).await.unwrap();
+        store
+            .replay_events(vec![created("events", 6, false, 1), created("events", 6, false, -1)])
+            .await
+            .unwrap();
+        assert_eq!(partitions_of(&store, "events").await, 6);
+        assert_eq!(store.get_partition_offset("events", 0).await.unwrap(), Some((841_582, 0)));
     }
 
     /// Provenance is recorded, so a follower applying the replicated event

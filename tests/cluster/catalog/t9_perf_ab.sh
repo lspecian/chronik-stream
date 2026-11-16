@@ -17,6 +17,8 @@ for r in $(seq 1 "$ROUNDS"); do
   if [ $((r % 2)) = 1 ]; then run new "$BIN" "$r"; run base "$BASE" "$r"; else run base "$BASE" "$r"; run new "$BIN" "$r"; fi
 done > "$out/rates.txt"
 cat "$out/rates.txt"
+grep -l '^FAIL' "$out"/*-*.txt >/dev/null 2>&1 && fail "a run did not start cleanly: $(grep -h '^FAIL' "$out"/*-*.txt | head -3 | tr '\n' ' ')"
+[ "$(wc -l < "$out/rates.txt")" -eq $((ROUNDS * 4)) ] || fail "expected $((ROUNDS * 4)) rates, got $(wc -l < "$out/rates.txt")"
 for a in 1 all; do
   n=$(awk -v a="$a" '$1=="new" && $2==a {s+=$3; c++} END{print (c? s/c : 0)}' "$out/rates.txt")
   b=$(awk -v a="$a" '$1=="base" && $2==a {s+=$3; c++} END{print (c? s/c : 0)}' "$out/rates.txt")
