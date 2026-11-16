@@ -139,9 +139,12 @@ impl CatalogRaft for CatalogRaftServer {
 pub enum ForwardError {
     /// The leader answered; this is its verdict.
     Raft(ProposeError),
-    /// The leader could not be reached. The command may or may not have been
-    /// received; commands are validated at apply time, so retrying is safe.
+    /// No connection could be made: the command was never sent, so
+    /// retrying cannot apply it twice.
     Unreachable(String),
+    /// The request was sent but no answer came back. The leader may have
+    /// applied it; the outcome is unknown.
+    Lost(String),
 }
 
 impl std::fmt::Display for ForwardError {
@@ -149,6 +152,7 @@ impl std::fmt::Display for ForwardError {
         match self {
             ForwardError::Raft(e) => write!(f, "{}", e),
             ForwardError::Unreachable(m) => write!(f, "leader unreachable: {}", m),
+            ForwardError::Lost(m) => write!(f, "forwarded proposal lost: {}", m),
         }
     }
 }
@@ -160,7 +164,7 @@ pub async fn forward_propose(addr: &str, data: Vec<u8>, conf_change: bool, timeo
     let resp = client(channel)
         .propose(proto::ProposeRequest { data, conf_change })
         .await
-        .map_err(|s| ForwardError::Unreachable(s.to_string()))?
+        .map_err(|s| ForwardError::Lost(s.to_string()))?
         .into_inner();
     match resp.outcome {
         Some(Outcome::Applied(a)) => Ok(Applied { index: a.index, term: a.term, result: a.result }),

@@ -185,6 +185,8 @@ pub enum CatalogChange {
     BrokersChanged,
     AclsChanged,
     ScramChanged,
+    /// The whole catalog was replaced (a snapshot was installed): re-read everything.
+    Reset,
 }
 
 /// The applied catalog.
