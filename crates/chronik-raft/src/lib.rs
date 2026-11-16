@@ -13,12 +13,14 @@ pub mod config;
 pub mod error;
 pub mod prost_bridge;
 pub mod rpc;
+pub mod driver;
 pub mod log_store;
 pub mod storage;
 pub mod transport;
 
 pub use config::RaftConfig;
 pub use error::{RaftError, Result};
+pub use driver::{Applied, DriverConfig, Outbox, ProposeError, RaftDriver, RaftHandle, RaftStatus, StateMachine};
 pub use log_store::{LogStoreOptions, RaftLogStore};
 pub use storage::{RaftEntry, RaftLogStorage, MemoryLogStorage, RAFT_TOPIC, RAFT_PARTITION};
 pub use transport::{Transport, GrpcTransport, InMemoryTransport, InMemoryRouter};
