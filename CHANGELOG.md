@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.16.11] - 2026-11-16
+
+### Fixed
+
+- **ListOffsets for a large catalog never finished on local storage.** Found
+  rolling v2.16.10 to Thunderbird (5,897 partitions): every partition led by
+  one node timed out, each taking 0.3–2 s. The local object store's `list`
+  walked the entire storage tree for every prefix and filtered afterwards, and
+  v2.16.10 lists a partition's archive wherever it has no in-memory state —
+  ListOffsets, produce-state creation, assignment repair — so each lookup cost
+  every segment and index file on the node. Archive reads in the fetch path
+  (v2.16.9) paid the same price. Listing now starts at the directory the
+  prefix names and returns the same keys; a prefix whose directory does not
+  exist lists nothing instead of scanning.
+
 ## [2.16.10] - 2026-11-16
 
 v2.16.9 turned WAL reclaim on for the first time in v2.x. Archived records

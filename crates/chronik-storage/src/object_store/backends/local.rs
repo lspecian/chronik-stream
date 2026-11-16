@@ -274,9 +274,31 @@ impl ObjectStore for LocalBackend {
         options: ListOptions,
     ) -> ObjectStoreResult<Vec<ObjectMetadata>> {
         let mut objects = Vec::new();
-        
-        // Start from root path and search recursively
-        self.list_recursive(&self.root_path, prefix, &options, &mut objects).await?;
+
+        // Walk only the directory the prefix names. Every key under `prefix`
+        // lives below the path of its directory part (up to the last '/'), so
+        // nothing outside it can match. Walking from the root instead made each
+        // listing cost every file in the store: per-partition archive lookups
+        // on a 5,900-partition node took 0.3–2 s each, and ListOffsets for the
+        // whole catalog never finished.
+        let dir_part = match prefix.rfind('/') {
+            Some(i) => &prefix[..i],
+            None => "",
+        };
+        let start = self.build_path(dir_part);
+        match fs::metadata(&start).await {
+            Ok(meta) if meta.is_dir() => {}
+            // Nothing stored under this prefix yet.
+            Ok(_) => return Ok(objects),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(objects),
+            Err(e) => {
+                return Err(ObjectStoreError::Other(format!(
+                    "Failed to read directory {:?}: {}",
+                    start, e
+                )))
+            }
+        }
+        self.list_recursive(&start, prefix, &options, &mut objects).await?;
 
         debug!("Listed {} objects with prefix: {}", objects.len(), prefix);
         Ok(objects)
@@ -575,5 +597,77 @@ mod tests {
         // Check that the file was actually created in the prefixed path
         let expected_path = temp_dir.path().join("prefix").join("file.txt");
         assert!(expected_path.exists());
+    }
+
+    async fn listed(backend: &LocalBackend, prefix: &str) -> Vec<String> {
+        let mut keys: Vec<String> = backend
+            .list_with_options(prefix, ListOptions::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    async fn backend_with(temp_dir: &TempDir, store_prefix: Option<&str>) -> LocalBackend {
+        let config = ObjectStoreConfig {
+            backend: StorageBackend::Local {
+                path: temp_dir.path().to_string_lossy().to_string(),
+            },
+            bucket: "test".to_string(),
+            prefix: store_prefix.map(str::to_string),
+            ..ObjectStoreConfig::default()
+        };
+        let backend = LocalBackend::new(config).await.unwrap();
+        for key in ["segments/t/0/0-9.segment", "segments/t/0/10-19.segment", "segments/t/1/0-4.segment",
+            "segments/tx/0/0-1.segment", "segments/top.txt", "tantivy/t/0/meta.json", "root.txt"]
+        {
+            backend.put_with_options(key, Bytes::from("x"), PutOptions::default()).await.unwrap();
+        }
+        backend
+    }
+
+    /// Listing walks only the prefix's directory but returns exactly what a
+    /// whole-store scan filtered by `starts_with` returned, including prefixes
+    /// that end mid-name.
+    #[tokio::test]
+    async fn test_list_matches_prefix_semantics() {
+        for store_prefix in [None, Some("chronik")] {
+            let temp_dir = TempDir::new().unwrap();
+            let backend = backend_with(&temp_dir, store_prefix).await;
+
+            assert_eq!(listed(&backend, "segments/t/0/").await,
+                vec!["segments/t/0/0-9.segment", "segments/t/0/10-19.segment"]);
+            assert_eq!(listed(&backend, "segments/t/").await,
+                vec!["segments/t/0/0-9.segment", "segments/t/0/10-19.segment", "segments/t/1/0-4.segment"]);
+            // Ends mid-name: matches siblings sharing the stem.
+            assert_eq!(listed(&backend, "segments/t").await,
+                vec!["segments/t/0/0-9.segment", "segments/t/0/10-19.segment", "segments/t/1/0-4.segment",
+                    "segments/top.txt", "segments/tx/0/0-1.segment"]);
+            assert_eq!(listed(&backend, "segments/t/0/1").await, vec!["segments/t/0/10-19.segment"]);
+            assert_eq!(listed(&backend, "ro").await, vec!["root.txt"]);
+            assert_eq!(listed(&backend, "").await.len(), 7);
+            // Nothing stored there: empty, not an error.
+            assert!(listed(&backend, "segments/missing/0/").await.is_empty());
+            assert!(listed(&backend, "nope/").await.is_empty());
+            // A prefix naming a file's directory part that is itself a file.
+            assert!(listed(&backend, "root.txt/x").await.is_empty());
+        }
+    }
+
+    /// Directories outside the prefix are never opened.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_list_does_not_walk_outside_prefix() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().unwrap();
+        let backend = backend_with(&temp_dir, None).await;
+        let other = temp_dir.path().join("tantivy");
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = backend.list_with_options("segments/t/0/", ListOptions::default()).await;
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap().len(), 2);
     }
 }
