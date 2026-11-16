@@ -23,7 +23,7 @@ pub use traits::*;
 pub use transaction::{TransactionMetadata, TransactionState};
 pub use memory::InMemoryMetadataStore;
 pub use events::{MetadataEvent, MetadataEventPayload, EventLog, EventApplicator};
-pub use wal_metadata_store::{WalMetadataStore, WalAppendFn, EventBusPublishFn};
+pub use wal_metadata_store::{WalMetadataStore, WalAppendFn, EventBusPublishFn, TopicDeletedFn};
 // v2.2.7 Phase 5: Removed ChronikMetaLogStore exports (deleted file)
 // v2.2.9: Added WalMetadataStore (Option A - WAL-based metadata, Raft-free)
 // v2.2.9 Phase 7: Added EventBusPublishFn for metadata replication

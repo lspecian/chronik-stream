@@ -37,6 +37,12 @@ pub struct WalManager {
     /// segments instead of scanning them (RP-9). Built as the log grows and
     /// rebuilt whenever a file shrinks under it.
     read_index: dashmap::DashMap<(String, i32), Arc<tokio::sync::Mutex<PartitionIndex>>>,
+    /// One per partition, held by whoever moves records between the WAL and
+    /// the archive or cuts either: the indexer while it archives a segment, a
+    /// follower while it truncates a divergent log. Without it the indexer can
+    /// read a segment, lose it to a truncation, and upload it after the
+    /// truncation cleaned the archive — leaving the discarded records servable.
+    archive_locks: dashmap::DashMap<(String, i32), Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl WalManager {
@@ -83,6 +89,7 @@ impl WalManager {
             fsync_batcher,
             group_commit_wal,
             read_index: dashmap::DashMap::new(),
+            archive_locks: dashmap::DashMap::new(),
         })
     }
     
@@ -603,6 +610,15 @@ impl WalManager {
     /// `target_offset` when the target fell inside a batch — resume from the
     /// returned offset, not the requested one. See
     /// [`GroupCommitWal::truncate_to`] for the full contract.
+    /// The lock serialising archive moves and truncations for one partition.
+    /// See the `archive_locks` field.
+    pub fn archive_lock(&self, topic: &str, partition: i32) -> Arc<tokio::sync::Mutex<()>> {
+        self.archive_locks
+            .entry((topic.to_string(), partition))
+            .or_default()
+            .clone()
+    }
+
     pub async fn truncate_to(
         &self,
         topic: &str,

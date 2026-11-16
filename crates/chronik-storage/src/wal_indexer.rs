@@ -1100,6 +1100,16 @@ impl WalIndexer {
                     !orphan_topics.contains(segment_id.split(':').next().unwrap_or(""))
                 });
             }
+
+            // Absent but not yet confirmed: leave it for a later pass rather
+            // than archive it. Either the topic was just deleted — and its
+            // deletion purges the archive, which this pass would refill — or
+            // this node has not heard of it yet, and will index it with its
+            // real configuration once it has. Not a failure: no backoff.
+            segments_to_index.retain(|segment_id| {
+                let topic = segment_id.split(':').next().unwrap_or("");
+                checked.get(topic).copied().unwrap_or(true)
+            });
         }
         if segments_to_index.is_empty() {
             debug!("All pending segments were orphaned (topics deleted) — reclaimed, nothing to index");
@@ -1219,6 +1229,16 @@ impl WalIndexer {
         delete_after_index && errors_now == errors_at_start
     }
 
+    /// `(topic, partition)` of a WAL segment id `topic:partition:id`. Kafka topic
+    /// names cannot contain `:`, so splitting from the right is exact.
+    fn segment_partition(segment_id: &str) -> Option<(String, i32)> {
+        let mut parts = segment_id.rsplitn(3, ':');
+        let _id = parts.next()?;
+        let partition = parts.next()?.parse::<i32>().ok()?;
+        let topic = parts.next()?;
+        (!topic.is_empty()).then(|| (topic.to_string(), partition))
+    }
+
     /// Highest offset already written to a cold Parquet segment for this
     /// partition, or `None` if it has no cold segments yet.
     ///
@@ -1336,6 +1356,27 @@ impl WalIndexer {
         // the WAL copy until the pass is clean is what makes that retry able to
         // re-upload it.
         let errors_at_start = stats.errors;
+
+        // Hold the partition's archive lock from reading the segment until its
+        // raw, Tantivy and Parquet copies are published, so a follower cannot
+        // truncate the log in between and leave this pass re-archiving records
+        // it discarded. Released before embedding, which can take minutes and
+        // feeds only vector search.
+        let archive_guard = match Self::segment_partition(segment_id) {
+            Some((topic, partition)) => {
+                let guard = wal_manager.archive_lock(&topic, partition).lock_owned().await;
+                // Deleted while this pass waited for the lock: its purge has
+                // run or is queued behind us. Archiving now would put the
+                // records back under a name a new topic may take.
+                if metadata_store.get_topic(&topic).await.ok().flatten().is_none() {
+                    debug!(segment = %segment_id, "Topic no longer in the catalog — not archiving");
+                    stats.segments_processed += 1;
+                    return Ok(());
+                }
+                Some(guard)
+            }
+            None => None,
+        };
 
         // Read all records from the segment (v1.3.47+: direct call)
         let records = wal_manager.read_segment(segment_id).await
@@ -1570,6 +1611,8 @@ impl WalIndexer {
             }
         }
 
+        drop(archive_guard);
+
         // STEP 3: Process all vector embeddings concurrently across partitions
         // v2.4.0: Up to 3 partitions embed in parallel, reducing total wall-clock time
         if !vector_work_items.is_empty() {
@@ -1741,13 +1784,7 @@ impl WalIndexer {
         let data_size = serialized_data.len() as u64;
 
         // Upload to S3 with path: segments/{topic}/{partition}/{min_offset}-{max_offset}.segment
-        let object_key = format!(
-            "segments/{}/{}/{}-{}.segment",
-            tp.topic,
-            tp.partition,
-            min_offset,
-            max_offset
-        );
+        let object_key = crate::archive::archived_segment_key(&tp.topic, tp.partition, min_offset, max_offset);
 
         let data_bytes = bytes::Bytes::from(serialized_data);
         object_store.put(&object_key, data_bytes).await
@@ -2908,6 +2945,14 @@ mod tests {
 
         let both = stub(&[("orders", 0, Some(100)), ("orders", 1, Some(50))]);
         assert!(WalIndexer::fully_replicated(Some(&both), &[(a, 100), (b, 50)]).is_ok());
+    }
+
+    #[test]
+    fn segment_partition_parses_the_id_from_the_right() {
+        assert_eq!(WalIndexer::segment_partition("default-traces:0:7770"), Some(("default-traces".to_string(), 0)));
+        assert_eq!(WalIndexer::segment_partition("a.b-c:12:1"), Some(("a.b-c".to_string(), 12)));
+        assert_eq!(WalIndexer::segment_partition("nopartition"), None);
+        assert_eq!(WalIndexer::segment_partition(":1:2"), None);
     }
 
     #[test]

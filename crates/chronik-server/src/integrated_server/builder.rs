@@ -100,6 +100,7 @@ pub struct IntegratedKafkaServerBuilder {
 
     // Publishes the in-sync set that Stage 17 elects from (Stage 18).
     isr_publisher: Option<Arc<crate::isr_publisher::IsrPublisher>>,
+    assignment_repair: Option<Arc<crate::assignment_repair::AssignmentRepair>>,
 
     // RP-6: woken when a node rejoins, so the catalog anti-entropy loop
     // re-broadcasts immediately instead of up to 5 minutes later.
@@ -141,6 +142,7 @@ impl IntegratedKafkaServerBuilder {
             replica_fetcher: None,
             partition_failover: None,
             isr_publisher: None,
+            assignment_repair: None,
             metadata_rejoin_notify: None,
         }
     }
@@ -1413,6 +1415,19 @@ impl IntegratedKafkaServerBuilder {
         let metadata_store = self.metadata_store.as_ref()
             .context("metadata_store not initialized")?;
 
+        // Leader-epoch history first: the WAL warm-up later adds only what the
+        // WAL still holds, and records the indexer archived took their epochs
+        // with them. The checkpoint is what remembers those.
+        let epoch_dir = PathBuf::from(format!("{}/leader-epochs", self.config.data_dir));
+        match produce_handler_base.leader_epochs().enable_checkpoints(epoch_dir.clone()) {
+            Ok(loaded) => info!("Leader-epoch checkpoints loaded for {} partition(s) from {:?}", loaded, epoch_dir),
+            Err(e) => warn!(
+                "Leader-epoch checkpoints unavailable at {:?}: {}. Epoch history will be rebuilt from \
+                 the WAL only, and lost for archived records on every restart.",
+                epoch_dir, e
+            ),
+        }
+
         // CRITICAL FIX (v1.3.52): Clear all partition buffers before WAL recovery
         info!("Clearing all partition buffers before WAL recovery...");
         if let Err(e) = produce_handler_base.clear_all_buffers().await {
@@ -1993,6 +2008,21 @@ impl IntegratedKafkaServerBuilder {
         )
         .with_produce_handler(produce_handler.clone());
 
+        // A truncation must cut what the indexer archived, not only the WAL.
+        let fetcher = match self.object_store.as_ref() {
+            Some(store) => fetcher.with_archive(crate::replication::replica_fetcher::LocalArchive {
+                store: store.clone(),
+                index: self.wal_indexer.as_ref().map(|indexer| indexer.segment_index().clone()),
+            }),
+            None => {
+                warn!(
+                    "No object store: a follower truncation will cut only the WAL, and archived \
+                     records above the cut stay servable"
+                );
+                fetcher
+            }
+        };
+
         // Learn about new and reassigned partitions when they happen, not on the
         // next 10s tick. A follower that has not yet heard of a partition cannot
         // acknowledge writes to it, and `acks=all` blocks until it does.
@@ -2093,6 +2123,112 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
+    /// Purge what this node holds for a topic once its deletion is applied
+    /// here — on every node, not only the one that served DeleteTopics.
+    ///
+    /// The archive matters most: the fetch tier serves it, and the watermark
+    /// is read from it, so a topic recreated under the same name would start
+    /// at the old topic's end and serve the old topic's records. Before this,
+    /// nothing removed it at all; only the WAL was cleaned, and on other nodes
+    /// only after several indexer passes.
+    fn init_topic_deletion_cleanup(&self) {
+        let (Some(metadata), Some(store), Some(wal_manager), Some(produce_handler)) = (
+            self.wal_metadata_store.clone(),
+            self.object_store.clone(),
+            self.wal_manager.clone(),
+            self.produce_handler_base.clone(),
+        ) else {
+            warn!("Topic deletion cleanup not wired: a deleted topic's archive will outlive it");
+            return;
+        };
+        let index = self.wal_indexer.as_ref().map(|indexer| indexer.segment_index().clone());
+        let runtime = tokio::runtime::Handle::current();
+
+        metadata.on_topic_deleted(Arc::new(move |topic: String| {
+            let (store, index, wal_manager, produce_handler) =
+                (store.clone(), index.clone(), wal_manager.clone(), produce_handler.clone());
+            runtime.spawn(async move {
+                produce_handler.forget_topic(&topic);
+                wal_manager.cleanup_topic(&topic).await;
+
+                let partitions = match chronik_storage::archive::archived_partitions(
+                    store.as_ref(),
+                    index.as_ref(),
+                    &topic,
+                )
+                .await
+                {
+                    Ok(partitions) => partitions,
+                    Err(e) => {
+                        warn!("Deleted topic {}: cannot list its archive to remove it: {}", topic, e);
+                        return;
+                    }
+                };
+                let mut removed = 0usize;
+                for partition in &partitions {
+                    // The indexer holds this while it archives; without it a
+                    // pass in flight re-archives what this removes.
+                    let lock = wal_manager.archive_lock(&topic, *partition);
+                    let _archiving = lock.lock().await;
+                    match chronik_storage::archive::truncate_archive(
+                        store.as_ref(),
+                        index.as_ref(),
+                        &topic,
+                        *partition,
+                        0,
+                    )
+                    .await
+                    {
+                        Ok(cut) => removed += cut.removed,
+                        Err(e) => warn!(
+                            "Deleted topic {}: could not remove the archive of partition {}: {}",
+                            topic, partition, e
+                        ),
+                    }
+                }
+                info!(
+                    "Deleted topic {}: removed its WAL, local state and {} archived segment(s) across {} partition(s)",
+                    topic, removed, partitions.len()
+                );
+            });
+        }));
+        info!("✅ Topic deletion cleanup wired (archive, WAL, offsets, epochs)");
+    }
+
+    /// Stage 19: repair partitions the catalog assigns to nobody.
+    ///
+    /// See `assignment_repair`: a partition without a leader is unreachable
+    /// and can never be written, and the node that holds its records must be
+    /// the one to lead it.
+    async fn init_assignment_repair(&mut self) -> Result<()> {
+        let Some(ref cluster_config) = self.config.cluster_config else {
+            debug!("Stage 19: single-node mode, every partition is led here");
+            return Ok(());
+        };
+        let Some(raft) = self.raft_cluster_for_metadata.as_ref() else {
+            warn!("Stage 19: cluster mode without a Raft cluster — unassigned partitions will not be repaired");
+            return Ok(());
+        };
+        let metadata_store = self.metadata_store.as_ref()
+            .context("metadata_store not initialized")?;
+        let produce_handler = self.produce_handler_base.as_ref()
+            .context("produce_handler not initialized")?;
+
+        let repair = crate::assignment_repair::AssignmentRepair::new(
+            cluster_config.node_id,
+            cluster_config.peers.iter().map(|peer| peer.id).collect(),
+            cluster_config.replication_factor,
+            metadata_store.clone(),
+            produce_handler.clone() as Arc<dyn crate::assignment_repair::LocalLog>,
+            raft.is_leader_flag(),
+        );
+        repair.start();
+        self.assignment_repair = Some(repair);
+
+        info!("✅ Assignment repair active (node {})", cluster_config.node_id);
+        Ok(())
+    }
+
     /// Build the IntegratedKafkaServer
     ///
     /// This orchestrates all initialization stages in order.
@@ -2152,6 +2288,9 @@ impl IntegratedKafkaServerBuilder {
         self.init_wal_indexer().await
             .context("Stage 13 failed: WalIndexer initialization")?;
 
+        // A deleted topic leaves nothing behind on this node
+        self.init_topic_deletion_cleanup();
+
         // Stage 14: MetadataUploader
         self.init_metadata_uploader().await
             .context("Stage 14 failed: MetadataUploader initialization")?;
@@ -2186,6 +2325,10 @@ impl IntegratedKafkaServerBuilder {
         // Stage 18: publish the in-sync set that Stage 17 elects from
         self.init_isr_publisher().await
             .context("Stage 18 failed: ISR publisher")?;
+
+        // Stage 19: give every partition a leader
+        self.init_assignment_repair().await
+            .context("Stage 19 failed: assignment repair")?;
 
         info!("✅ All 17 stages complete - assembling IntegratedKafkaServer");
 
