@@ -50,7 +50,8 @@ mod partition_failover;
 // leader that measured it and failover can elect from it.
 mod isr_publisher;
 mod assignment_repair;
-mod cluster_catalog;  // gives unassigned partitions a leader (the node holding their records)
+mod cluster_catalog;
+mod catalog_metadata_store;  // gives unassigned partitions a leader (the node holding their records)
 // v2.2.7: HTTP Admin API for cluster management
 mod admin_api;
 // v2.2.22: Unified API (SQL, Vector Search, Admin on single port)

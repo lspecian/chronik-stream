@@ -143,6 +143,7 @@ minimal = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

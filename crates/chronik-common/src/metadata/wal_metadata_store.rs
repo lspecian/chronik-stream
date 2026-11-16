@@ -790,6 +790,18 @@ impl WalMetadataStore {
         }
     }
 
+    /// Drop this node's local state for a topic the cluster catalog deleted:
+    /// partition offsets, consumer offsets, segment and Parquet records. Runs
+    /// the topic-deleted hooks (data purge). Written to the local metadata WAL
+    /// so a restart does not resurrect the offsets.
+    pub async fn purge_topic_local(&self, name: &str) -> Result<()> {
+        let event = MetadataEvent::new_with_node(
+            MetadataEventPayload::TopicDeleted { name: name.to_string() },
+            self.node_id,
+        );
+        self.write_and_apply(event).await
+    }
+
     fn after_live_apply(&self, event: &MetadataEvent) {
         if let MetadataEventPayload::TopicDeleted { name } = &event.payload {
             let hooks: Vec<TopicDeletedFn> = self
