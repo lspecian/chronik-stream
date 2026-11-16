@@ -131,7 +131,7 @@ impl KafkaProtocolHandler {
     /// pre-authentication gate applies.
     pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
         let ctx = ConnectionContext::internal();
-        self.handle_request_with_context(&ctx, request_bytes).await
+        self.handle_request_with_context(&ctx, request_bytes, None).await
     }
 
     /// Handle a Kafka protocol request on behalf of a specific connection.
@@ -140,11 +140,15 @@ impl KafkaProtocolHandler {
     /// gated on it *before* routing: when SASL is enabled and the connection has
     /// not authenticated, only `ApiVersions`, `SaslHandshake` and
     /// `SaslAuthenticate` reach a handler.
-    #[instrument(skip(self, request_bytes))]
+    ///
+    /// `produce_ticket` is the request's place in its connection's write order
+    /// when it is a Produce read from a client connection (see `produce_order`).
+    #[instrument(skip(self, request_bytes, produce_ticket))]
     pub async fn handle_request_with_context(
         &self,
         ctx: &ConnectionContext,
         request_bytes: &[u8],
+        produce_ticket: Option<Arc<crate::produce_order::ProduceTicket>>,
     ) -> Result<Response> {
         // Helper to detect if we should pre-create a test topic for kafka-python clients
         self.infer_expected_topics_from_context().await;
@@ -183,7 +187,7 @@ impl KafkaProtocolHandler {
         // Route to specific handler methods (all extracted for maintainability)
         match header.api_key {
             ApiKey::Metadata => self.handle_metadata_request(ctx, header, buf).await,
-            ApiKey::Produce => self.handle_produce_request(ctx, header, buf).await,
+            ApiKey::Produce => self.handle_produce_request(ctx, header, buf, produce_ticket).await,
             ApiKey::Fetch => self.handle_fetch_request(ctx, header, buf).await,
             ApiKey::ListOffsets => self.handle_list_offsets_request(header, buf).await,
             ApiKey::FindCoordinator => self.handle_find_coordinator_request(header, buf).await,
@@ -444,12 +448,13 @@ impl KafkaProtocolHandler {
     ///
     /// Parses produce request, auto-creates topics, delegates to WAL handler.
     /// Complexity: < 25 (auto-creation + WAL delegation)
-    #[instrument(skip(self, buf))]
+    #[instrument(skip(self, buf, produce_ticket))]
     async fn handle_produce_request(
         &self,
         ctx: &ConnectionContext,
         header: chronik_protocol::parser::RequestHeader,
         mut buf: Bytes,
+        produce_ticket: Option<Arc<crate::produce_order::ProduceTicket>>,
     ) -> Result<Response> {
         tracing::debug!("Produce handler called: version={}, correlation_id={}", header.api_version, header.correlation_id);
 
@@ -491,7 +496,7 @@ impl KafkaProtocolHandler {
         let forwarded = header.client_id.as_deref() == Some(crate::produce_handler::FORWARD_CLIENT_ID);
         let response = self
             .wal_handler
-            .handle_produce_from(request, header.correlation_id, forwarded)
+            .handle_produce_ordered(request, header.correlation_id, forwarded, produce_ticket)
             .await?;
 
         // Encode the response

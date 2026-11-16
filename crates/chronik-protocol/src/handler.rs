@@ -6409,3 +6409,159 @@ impl Default for ProtocolHandler {
         Self::new()
     }
 }
+
+/// The (topic, partition) pairs a Produce request body writes to, in request
+/// order, without copying any record data.
+///
+/// The connection handler calls this as it reads each Produce request, before
+/// the request is handed to a concurrent task, so that a connection's writes
+/// to one partition take offsets in the order the client sent them (see
+/// `ProduceOrder` in chronik-server). It walks the same layout as
+/// [`ProtocolHandler::parse_produce_request`] and skips the record bytes.
+pub fn produce_request_partitions(api_version: i16, body: &mut Bytes) -> Result<Vec<(String, i32)>> {
+    use crate::parser::Decoder;
+
+    let flexible = api_version >= 9;
+    let mut decoder = Decoder::new(body);
+
+    fn skip_tagged_fields(decoder: &mut Decoder<'_>) -> Result<()> {
+        for _ in 0..decoder.read_unsigned_varint()? {
+            decoder.read_unsigned_varint()?;
+            let size = decoder.read_unsigned_varint()? as usize;
+            decoder.advance(size)?;
+        }
+        Ok(())
+    }
+    fn read_count(decoder: &mut Decoder<'_>, flexible: bool) -> Result<usize> {
+        Ok(if flexible {
+            (decoder.read_unsigned_varint()? as usize).saturating_sub(1)
+        } else {
+            decoder.read_i32()?.max(0) as usize
+        })
+    }
+
+    if api_version >= 3 {
+        if flexible {
+            decoder.read_compact_string()?;
+        } else {
+            decoder.read_string()?;
+        }
+    }
+    decoder.read_i16()?; // acks
+    decoder.read_i32()?; // timeout_ms
+
+    let mut out = Vec::new();
+    for _ in 0..read_count(&mut decoder, flexible)? {
+        let topic = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }
+        .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+        for _ in 0..read_count(&mut decoder, flexible)? {
+            let partition = decoder.read_i32()?;
+            if flexible {
+                decoder.read_compact_bytes()?;
+                skip_tagged_fields(&mut decoder)?;
+            } else {
+                decoder.read_bytes()?;
+            }
+            out.push((topic.clone(), partition));
+        }
+        if flexible {
+            skip_tagged_fields(&mut decoder)?;
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod produce_partitions_tests {
+    use super::*;
+    use crate::parser::{ApiKey, RequestHeader};
+
+    /// Encode a Produce body by hand for `version`: topics of (name, partitions).
+    fn body(version: i16, topics: &[(&str, &[i32])]) -> Bytes {
+        let flexible = version >= 9;
+        let mut b = BytesMut::new();
+        let put_str = |b: &mut BytesMut, s: &str| {
+            if flexible {
+                b.extend_from_slice(&[(s.len() + 1) as u8]);
+            } else {
+                b.extend_from_slice(&(s.len() as i16).to_be_bytes());
+            }
+            b.extend_from_slice(s.as_bytes());
+        };
+        let put_count = |b: &mut BytesMut, n: usize| {
+            if flexible {
+                b.extend_from_slice(&[(n + 1) as u8]);
+            } else {
+                b.extend_from_slice(&(n as i32).to_be_bytes());
+            }
+        };
+        if version >= 3 {
+            put_str(&mut b, "txn");
+        }
+        b.extend_from_slice(&(-1i16).to_be_bytes());
+        b.extend_from_slice(&30_000i32.to_be_bytes());
+        put_count(&mut b, topics.len());
+        for (name, parts) in topics {
+            put_str(&mut b, name);
+            put_count(&mut b, parts.len());
+            for p in *parts {
+                b.extend_from_slice(&p.to_be_bytes());
+                let records = vec![7u8; 40 + *p as usize];
+                if flexible {
+                    b.extend_from_slice(&[(records.len() + 1) as u8]);
+                } else {
+                    b.extend_from_slice(&(records.len() as i32).to_be_bytes());
+                }
+                b.extend_from_slice(&records);
+                if flexible {
+                    b.extend_from_slice(&[0]);
+                }
+            }
+            if flexible {
+                b.extend_from_slice(&[0]);
+            }
+        }
+        if flexible {
+            b.extend_from_slice(&[0]);
+        }
+        b.freeze()
+    }
+
+    #[test]
+    fn agrees_with_the_full_parser_on_every_layout() {
+        let topics: &[(&str, &[i32])] = &[("orders", &[2, 0]), ("audit", &[5])];
+        for version in [2i16, 3, 8, 9] {
+            let got = produce_request_partitions(version, &mut body(version, topics)).unwrap();
+            let header = RequestHeader {
+                api_key: ApiKey::Produce,
+                api_version: version,
+                correlation_id: 1,
+                client_id: None,
+            };
+            let parsed = ProtocolHandler::new()
+                .parse_produce_request(&header, &mut body(version, topics))
+                .unwrap();
+            let expected: Vec<(String, i32)> = parsed
+                .topics
+                .iter()
+                .flat_map(|t| t.partitions.iter().map(move |p| (t.name.clone(), p.index)))
+                .collect();
+            assert_eq!(got, expected, "v{version}");
+            assert_eq!(
+                got,
+                vec![("orders".into(), 2), ("orders".into(), 0), ("audit".into(), 5)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_body_is_an_error_not_a_partial_list() {
+        let full = body(9, &[("orders", &[1, 2])]);
+        let mut cut = full.slice(..full.len() - 10);
+        assert!(produce_request_partitions(9, &mut cut).is_err());
+    }
+}

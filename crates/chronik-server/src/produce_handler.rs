@@ -1684,6 +1684,19 @@ impl ProduceHandler {
         correlation_id: i32,
         forwarded: bool,
     ) -> Result<ProduceResponse> {
+        self.handle_produce_ordered(request, correlation_id, forwarded, None).await
+    }
+
+    /// Like [`Self::handle_produce_from`], for a request read from a client
+    /// connection: `ticket` keeps its writes in the connection's order (see
+    /// `produce_order`).
+    pub async fn handle_produce_ordered(
+        &self,
+        request: ProduceRequest,
+        correlation_id: i32,
+        forwarded: bool,
+        ticket: Option<Arc<crate::produce_order::ProduceTicket>>,
+    ) -> Result<ProduceResponse> {
         let start_time = Instant::now();
         let mut response_topics = Vec::new();
         let acks = request.acks;
@@ -1717,7 +1730,7 @@ impl ProduceHandler {
         // Handle request with timeout
         let result = timeout(
             Duration::from_millis(timeout_ms.max(self.config.request_timeout_ms)),
-            self.process_produce_request(request, acks, forwarded),
+            self.process_produce_request(request, acks, forwarded, ticket),
         ).await;
         
         match result {
@@ -1797,10 +1810,18 @@ impl ProduceHandler {
         request: ProduceRequest,
         acks: i16,
         forwarded: bool,
+        ticket: Option<Arc<crate::produce_order::ProduceTicket>>,
     ) -> Result<Vec<ProduceResponseTopic>> {
         let mut response_topics = Vec::new();
         let transactional_id = request.transactional_id.clone();
-        
+        // A topic this request will not write releases the connection's
+        // later requests on it now, not when the whole request is answered.
+        let pass_topic = |name: &str| {
+            if let Some(ticket) = &ticket {
+                ticket.pass_topic(name);
+            }
+        };
+
         for topic_data in request.topics {
             // Validate topic exists or auto-create if enabled
             let topic_metadata = match self.metadata_store.get_topic(&topic_data.name).await? {
@@ -1830,6 +1851,7 @@ impl ProduceHandler {
                                     }
                                 }).collect();
                                 
+                                pass_topic(&topic_data.name);
                                 response_topics.push(ProduceResponseTopic {
                                     name: topic_data.name,
                                     partitions: error_partitions,
@@ -1849,6 +1871,7 @@ impl ProduceHandler {
                             }
                         }).collect();
                         
+                        pass_topic(&topic_data.name);
                         response_topics.push(ProduceResponseTopic {
                             name: topic_data.name,
                             partitions: error_partitions,
@@ -1870,6 +1893,7 @@ impl ProduceHandler {
                     let node_id = self.config.node_id;
                     let transactional_id = transactional_id.clone();
                     let metrics = self.metrics.clone();
+                    let turn = ticket.as_ref().and_then(|t| t.partition(&topic_name, partition_data.index));
 
                     async move {
                         // Validate partition exists
@@ -1942,6 +1966,13 @@ impl ProduceHandler {
                                     topic_name, partition_data.index, leader_id
                                 );
 
+                                // Forwarded in the connection's order, holding
+                                // the turn until the leader answers: the leader
+                                // orders by arrival, so sending later requests
+                                // first would reorder them there.
+                                if let Some(turn) = &turn {
+                                    turn.wait().await;
+                                }
                                 match self.forward_produce_to_leader(
                                     leader_id,
                                     &topic_name,
@@ -1998,6 +2029,7 @@ impl ProduceHandler {
                             &partition_data.records,
                             transactional_id.as_deref(),
                             acks,
+                            turn,
                         ).await {
                             Ok(response) => response,
                             Err(e) => {
@@ -2208,7 +2240,7 @@ impl ProduceHandler {
     }
 
     /// Produce records to a specific partition
-    #[instrument(skip(self, records_data), fields(topic, partition, acks, bytes = records_data.len()))]
+    #[instrument(skip(self, records_data, turn), fields(topic, partition, acks, bytes = records_data.len()))]
     async fn produce_to_partition(
         &self,
         topic: &str,
@@ -2216,6 +2248,7 @@ impl ProduceHandler {
         records_data: &[u8],  // This contains the original wire-format bytes with correct CRC!
         transactional_id: Option<&str>,
         acks: i16,
+        turn: Option<crate::produce_order::PartitionTurn>,
     ) -> Result<ProduceResponsePartition> {
         use std::time::Instant;
         let start_time = Instant::now();
@@ -2223,6 +2256,12 @@ impl ProduceHandler {
 
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         debug!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
+
+        // A connection's earlier requests enter this partition first (see
+        // `produce_order`). The turn passes once the append lock is held.
+        if let Some(turn) = &turn {
+            turn.wait().await;
+        }
 
         // Before any await: later batches of this producer wait while this
         // one is in progress (see `InFlightSequences`).
@@ -2379,9 +2418,12 @@ impl ProduceHandler {
         // the fsync and the acks=all ISR wait happen outside it and concurrent
         // requests still share a group commit.
         #[cfg(test)]
-        tests::pause_before_append_lock(temp_batch.header.producer_id, temp_batch.header.base_sequence).await;
+        tests::pause_before_append_lock(temp_batch.header.producer_id, temp_batch.header.base_sequence, records_data.len()).await;
 
         let append_guard = partition_state.append_lock.lock().await;
+        // The lock is FIFO: this batch's offsets now precede any later
+        // request's, so the connection's next request may queue for it.
+        drop(turn);
 
         // Phase 2, under the append lock: record the sequence and, right below,
         // reserve the offsets — together, so a producer's batches take offsets
@@ -4523,8 +4565,13 @@ pub(crate) mod tests {
     /// sequence but not yet reserved its offsets. Production never pauses.
     static PAUSE_BEFORE_LOCK: std::sync::Mutex<Option<(i64, i32)>> = std::sync::Mutex::new(None);
 
-    pub(super) async fn pause_before_append_lock(producer_id: i64, base_sequence: i32) {
-        let hit = *PAUSE_BEFORE_LOCK.lock().unwrap() == Some((producer_id, base_sequence));
+    /// The same pause for an unsequenced batch, picked by its size in bytes
+    /// (unsequenced batches all carry producer id -1).
+    static PAUSE_BEFORE_LOCK_BYTES: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+    pub(super) async fn pause_before_append_lock(producer_id: i64, base_sequence: i32, bytes: usize) {
+        let hit = *PAUSE_BEFORE_LOCK.lock().unwrap() == Some((producer_id, base_sequence))
+            || *PAUSE_BEFORE_LOCK_BYTES.lock().unwrap() == Some(bytes);
         if hit {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -4630,6 +4677,65 @@ pub(crate) mod tests {
             e.base_offset,
             l.base_offset
         );
+    }
+
+    /// A connection's pipelined non-idempotent requests take offsets in the
+    /// order they were read.
+    ///
+    /// Each request runs in its own task, so request 2 could reach the append
+    /// lock while request 1 was still on its way and take the lower offsets.
+    /// A non-idempotent producer has no sequence numbers to catch that: its
+    /// records were simply stored out of the order it sent them, with no
+    /// retry involved (seen with librdkafka). The hook holds request 1 in that
+    /// window; without tickets request 2 overtakes it, which this test also
+    /// asserts so that it keeps proving the window is real.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connections_requests_take_offsets_in_read_order() {
+        use crate::produce_order::ProduceOrder;
+
+        let (handler, _temp) = create_test_handler().await;
+        let handler = Arc::new(handler);
+        let produce = |records: Vec<u8>| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        };
+        // Returns the base offsets of (request 1, request 2).
+        let race = |ordered: bool| {
+            let handler = Arc::clone(&handler);
+            async move {
+                let first = create_test_record_batch(-1, -1, vec![("a", "1"), ("b", "2"), ("c", "3")]);
+                let second = create_test_record_batch(-1, -1, vec![("d", "4"), ("e", "5")]);
+                *PAUSE_BEFORE_LOCK_BYTES.lock().unwrap() = Some(first.len());
+                let order = ProduceOrder::new();
+                let key = || vec![("test-topic".to_string(), 0)];
+                let (t1, t2) = if ordered {
+                    (Some(Arc::new(order.issue(key()))), Some(Arc::new(order.issue(key()))))
+                } else {
+                    (None, None)
+                };
+                let h = Arc::clone(&handler);
+                let req = produce(first);
+                let early = tokio::spawn(async move { h.handle_produce_ordered(req, 1, false, t1).await });
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let late = handler.handle_produce_ordered(produce(second), 2, false, t2).await.unwrap();
+                let early = early.await.unwrap().unwrap();
+                *PAUSE_BEFORE_LOCK_BYTES.lock().unwrap() = None;
+                let (e, l) = (&early.topics[0].partitions[0], &late.topics[0].partitions[0]);
+                assert_eq!((e.error_code, l.error_code), (0, 0));
+                (e.base_offset, l.base_offset)
+            }
+        };
+
+        let (e, l) = race(false).await;
+        assert!(l < e, "the window did not open: request 2 did not overtake ({e}, {l})");
+
+        let (e, l) = race(true).await;
+        assert!(e < l, "request 2 took offset {l} before request 1's {e}");
     }
 
     #[tokio::test]

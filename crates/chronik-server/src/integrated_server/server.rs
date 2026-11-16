@@ -654,7 +654,10 @@ impl IntegratedKafkaServer {
                                 break;
                             }
 
-                            let request_data = request_buffer[..request_size].to_vec();
+                            let request_data = bytes::Bytes::copy_from_slice(&request_buffer[..request_size]);
+                            // A Produce takes its place in the connection's write order here,
+                            // on the read loop, so places follow read order (see produce_order).
+                            let produce_ticket = (api_key == 0).then(|| conn_ctx.issue_produce_ticket(&request_data));
 
                             // Reserve this request's response slot IN READ ORDER
                             // before spawning the handler; the ordered writer
@@ -681,6 +684,11 @@ impl IntegratedKafkaServer {
                                 );
 
                                 // Acquire semaphore to limit concurrent handlers
+                                // Permits in read order too: a Produce waiting for an earlier
+                                // one must never hold the permit that earlier one needs.
+                                if let Some(ticket) = &produce_ticket {
+                                    ticket.permit_order().await;
+                                }
                                 let _permit = match semaphore_clone.acquire_owned().await {
                                     Ok(p) => p,
                                     Err(_) => {
@@ -689,12 +697,15 @@ impl IntegratedKafkaServer {
                                         return;
                                     }
                                 };
+                                if let Some(ticket) = &produce_ticket {
+                                    ticket.permit_held();
+                                }
 
                                 // Handle request; produce response bytes (or None).
                                 // Encoding runs here (concurrent); only the WRITE
                                 // is ordered, via resp_tx → ordered writer.
                                 let bytes = match handler_clone
-                                    .handle_request_with_context(&conn_ctx_clone, &request_data)
+                                    .handle_request_with_context(&conn_ctx_clone, &request_data, produce_ticket)
                                     .await
                                 {
                                     Ok(response) => Some(Self::encode_response(response)),
@@ -809,7 +820,10 @@ impl IntegratedKafkaServer {
                                 break;
                             }
 
-                            let request_data = request_buffer[..request_size].to_vec();
+                            let request_data = bytes::Bytes::copy_from_slice(&request_buffer[..request_size]);
+                            // A Produce takes its place in the connection's write order here,
+                            // on the read loop, so places follow read order (see produce_order).
+                            let produce_ticket = (api_key == 0).then(|| conn_ctx.issue_produce_ticket(&request_data));
 
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
                             if resp_order_tx.send(resp_rx).is_err() {
@@ -830,6 +844,11 @@ impl IntegratedKafkaServer {
                                     &control_sem_clone
                                 );
 
+                                // Permits in read order too: a Produce waiting for an earlier
+                                // one must never hold the permit that earlier one needs.
+                                if let Some(ticket) = &produce_ticket {
+                                    ticket.permit_order().await;
+                                }
                                 let _permit = match semaphore_clone.acquire_owned().await {
                                     Ok(p) => p,
                                     Err(_) => {
@@ -838,9 +857,12 @@ impl IntegratedKafkaServer {
                                         return;
                                     }
                                 };
+                                if let Some(ticket) = &produce_ticket {
+                                    ticket.permit_held();
+                                }
 
                                 let bytes = match handler_clone
-                                    .handle_request_with_context(&conn_ctx_clone, &request_data)
+                                    .handle_request_with_context(&conn_ctx_clone, &request_data, produce_ticket)
                                     .await
                                 {
                                     Ok(response) => Some(Self::encode_response(response)),

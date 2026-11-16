@@ -243,15 +243,18 @@ impl WalProduceHandler {
         self.inner_handler.handle_produce(request, correlation_id).await
     }
 
-    /// Passthrough for a request whose origin is known; see
-    /// [`ProduceHandler::handle_produce_from`].
-    pub async fn handle_produce_from(
+    /// Passthrough for a request whose origin and connection order are known;
+    /// see [`ProduceHandler::handle_produce_ordered`].
+    pub async fn handle_produce_ordered(
         &self,
         request: ProduceRequest,
         correlation_id: i32,
         forwarded: bool,
+        ticket: Option<Arc<crate::produce_order::ProduceTicket>>,
     ) -> Result<ProduceResponse> {
-        self.inner_handler.handle_produce_from(request, correlation_id, forwarded).await
+        self.inner_handler
+            .handle_produce_ordered(request, correlation_id, forwarded, ticket)
+            .await
     }
     
     /// Truncate WAL after successful flush to segments

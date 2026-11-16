@@ -64,6 +64,7 @@ mod cli;
 mod cluster;  // Phase 1.2: Cluster mode refactoring (complexity reduction from 288 → <25)
 mod tls;  // Phase 5: TLS encryption for Kafka protocol connections
 mod acl;  // Phase 5: Access Control Lists for authorization
+mod produce_order;  // Per-connection write order for pipelined Produce requests
 mod connection;  // Security Phase 0: per-connection identity + SASL enforcement
 mod inter_broker;  // Broker-to-broker SASL as __chronik_broker
 mod authorizer;  // Security Phase 3: maps Kafka requests onto ACL checks

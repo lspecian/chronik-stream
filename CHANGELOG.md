@@ -81,6 +81,16 @@ about a topic, a leader or an epoch.
   (`CHRONIK_REPLICA_LAG_TIME_MAX_MS`) is the bound, as in Kafka since 0.9.
 - **Operator: `isLeader` / `leaderNodeId` were never set** in ChronikCluster
   status. The operator now asks each ready pod's `/admin/health`.
+- **A producer without idempotence could have its records stored out of the
+  order it sent them, with no retry involved.** Each request on a connection
+  runs in its own task, and a later request could reach a partition's append
+  lock first and take the lower offsets. Kafka handles a connection's requests
+  one at a time, so clients rely on that order. With librdkafka (kcat) sending
+  1M numbered records to one partition, v2.16.11 stored them with 0–5
+  inversions per run (5 of 6 runs) and no duplicates; now 0 in every run. Each
+  Produce request now queues on its partitions as it is read and enters them
+  in that order; the turn passes once the append lock is held, so fsync and
+  replication waits still overlap and other partitions never wait.
 
 ## [2.16.11] - 2026-11-16
 
