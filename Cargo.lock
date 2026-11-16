@@ -2075,6 +2075,7 @@ dependencies = [
  "chronik-common",
  "chronik-monitoring",
  "chronik-raft-bridge",
+ "crc32fast",
  "criterion",
  "dashmap 5.5.3",
  "futures",
