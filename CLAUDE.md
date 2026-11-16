@@ -1004,7 +1004,7 @@ Key environment variables:
 - `CHRONIK_WAL_ROTATION_SIZE` - Segment seal threshold: `100KB`, `250MB` (default), `1GB`, or raw bytes `268435456`
 - `CHRONIK_METRICS_PORT` - Prometheus `/metrics` port, single-node mode (default: 13092). Set it when running more than one broker on a host, or the second logs a bind failure for a listener it cannot move.
 - `CHRONIK_REPLICA_LAG_TIME_MAX_MS` - How long a replica may stay measurably behind before leaving ISR (default: 10000). Kafka's `replica.lag.time.max.ms` equivalent; Kafka defaults to 30s, this is deliberately tighter so under-replication surfaces sooner. Cluster mode only.
-- `CHRONIK_REPLICA_LAG_MAX_ENTRIES` - Secondary record-count bound on follower lag (default: 10000). Time is the primary bound.
+- `CHRONIK_REPLICA_LAG_MAX_ENTRIES` - Optional record-count bound on follower lag. **Off unless set** (v2.17.0; it defaulted to 10000, which at high throughput ejected healthy followers and cut sustained acks=all throughput ~3.5x). Time (`CHRONIK_REPLICA_LAG_TIME_MAX_MS`) is the bound, as in Kafka since 0.9.
 - `CHRONIK_AUTO_LEADER_REBALANCE` - Return partition leadership to the preferred replica (first in the replica list) once it is alive and in sync (default: `true`). Kafka's `auto.leader.rebalance.enable`. Before v2.16.2 failover was one-way. Cluster mode only.
 - `CHRONIK_LEADER_REBALANCE_INTERVAL_SECS` - How often the preferred-leader check runs, and how long it waits after any leadership change (default: 300).
 - `CHRONIK_LEADER_REBALANCE_MAX_PER_PASS` - Cap on preferred-leader moves per check (default: 50), so a skewed catalog is rebalanced in steps.

@@ -65,6 +65,22 @@ about a topic, a leader or an epoch.
   progress, bounded by the request timeout. Twelve probe runs on the same
   hardware, stalls up to 62 s: no failures (v2.16.11 alternating with it:
   failures in 8 of 24 runs).
+- **An acks=1 producer without idempotence could have a batch written
+  twice.** When a partition's pending-response bucket emptied, the key was
+  removed after its lock was released; a response registered in between was
+  dropped, and the client got a retriable KAFKA_STORAGE_ERROR for a batch
+  already in the log and sent it again. Found as 2,000,985 records stored for
+  2,000,000 sent: exactly one 985-record batch, identical values, 1,970
+  offsets apart. Present in v2.16.11.
+- **Sustained acks=all throughput was capped ~3.5× low by ISR churn.** A
+  follower more than 10,000 records behind left the in-sync set at once —
+  77 ms of ordinary fetch lag on a busy partition — and the producer backed
+  off on NOT_ENOUGH_REPLICAS. On a 3-node cluster, 1–3M-record runs managed
+  110–133K msg/s (v2.16.11 the same); they now sustain ~450–460K with a stable
+  ISR. `CHRONIK_REPLICA_LAG_MAX_ENTRIES` is off unless set; time
+  (`CHRONIK_REPLICA_LAG_TIME_MAX_MS`) is the bound, as in Kafka since 0.9.
+- **Operator: `isLeader` / `leaderNodeId` were never set** in ChronikCluster
+  status. The operator now asks each ready pod's `/admin/health`.
 
 ## [2.16.11] - 2026-11-16
 
