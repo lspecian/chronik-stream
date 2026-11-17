@@ -474,27 +474,27 @@ pub async fn search_index(
     // Tantivy index as a nested `{topic}/partition-N/segment-*.tar.gz` archive
     // THROUGH the object store (not to the on-disk `index_base_path`), so
     // Kafka-produced searchable topics were served only by the decaying hot
-    // index (regression 0e37747). Consulted when the on-disk sources yielded
-    // nothing for this topic, so legacy topics that still have a `{data}/index`
-    // dir keep their existing single-source behavior and don't double-count.
+    // index (regression 0e37747). Always consulted: a leftover `{data}/index`
+    // directory (RealtimeIndexer, removed in 08b1c58) is frozen at the day that
+    // indexer stopped, and skipping the archives whenever it answered served
+    // the topic from that stale copy. Records found in both are deduplicated
+    // when the page is cut (`crate::ranking::page`).
     let mut timed_out = false;
-    if cold_hits.is_empty() {
-        if let Some(wal_indexer) = api.wal_indexer() {
-            match wal_indexer.segment_index().get_segments_for_topic(&index).await {
-                Ok(segments) => {
-                    let cold = search_cold_segments(&api, segments, &request, deadline).await;
-                    // Archived segments exist: the topic is known even when
-                    // none of them matches. Counting it only when it returned
-                    // hits turned every no-match query on an archived topic
-                    // into "no such index" once the hot index was off.
-                    if cold.segments > 0 {
-                        have_any_cold_source = true;
-                    }
-                    timed_out = cold.timed_out;
-                    cold_hits.extend(cold.hits);
+    if let Some(wal_indexer) = api.wal_indexer() {
+        match wal_indexer.segment_index().get_segments_for_topic(&index).await {
+            Ok(segments) => {
+                let cold = search_cold_segments(&api, segments, &request, deadline).await;
+                // Archived segments exist: the topic is known even when none
+                // of them matches. Counting it only when it returned hits
+                // turned every no-match query on an archived topic into "no
+                // such index" once the hot index was off.
+                if cold.segments > 0 {
+                    have_any_cold_source = true;
                 }
-                Err(e) => debug!(topic = %index, "segment lookup for the cold search failed: {}", e),
+                timed_out = cold.timed_out;
+                cold_hits.extend(cold.hits);
             }
+            Err(e) => debug!(topic = %index, "segment lookup for the cold search failed: {}", e),
         }
     }
 
@@ -733,11 +733,11 @@ fn can_stop_unranked(hits: &[Hit], window: usize, next_newest: Option<&i64>) -> 
     };
     let mut stamps: Vec<i64> = hits
         .iter()
-        .map(|h| h._source.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(i64::MIN))
+        .map(|h| crate::ranking::rank_second(h).unwrap_or(i64::MIN))
         .collect();
-    // The window-th newest timestamp.
+    // The window-th newest, in the seconds the order compares (rank_second).
     let (_, kth, _) = stamps.select_nth_unstable_by(window - 1, |a, b| b.cmp(a));
-    next_newest < *kth
+    next_newest.div_euclid(1000) < *kth
 }
 
 /// What a cold search found.
@@ -941,7 +941,7 @@ fn search_tantivy_index(
     // Execute search
     // The source's top `from + size`, unskipped: the merge pages once
     // (crate::ranking). Skipping `from` here skipped it once per segment.
-    let top_docs = crate::ranking::top_docs(searcher, &*query, request.from.saturating_add(request.size), crate::ranking::RankFields::Archive)
+    let top_docs = crate::ranking::top_docs(searcher, &*query, request.from.saturating_add(request.size))
         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
 
     // Collect results
@@ -955,14 +955,21 @@ fn search_tantivy_index(
         // a record a different `_source` once it was archived — `_value` as a
         // list of byte numbers, no `offset` or `timestamp`. Present it the way
         // the hot index does.
-        if let Some(source) = archived_record_source(index_name, &schema, &doc) {
+        if let Some(source) = archived_record_source(index_name, &schema, &doc)
+            .or_else(|| legacy_record_source(index_name, &schema, &doc))
+        {
             let id = format!(
                 "{}-{}",
                 source.get("partition").and_then(|v| v.as_i64()).unwrap_or(0),
                 source.get("offset").and_then(|v| v.as_i64()).unwrap_or(0)
             );
+            let topic = source
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .unwrap_or(index_name)
+                .to_string();
             hits.push(Hit {
-                _index: index_name.to_string(),
+                _index: topic,
                 _id: id,
                 _score: Some(score),
                 _source: serde_json::Value::Object(source),
@@ -1072,6 +1079,59 @@ fn archived_record_source(
             "value".to_string(),
             serde_json::Value::String(String::from_utf8_lossy(value).into_owned()),
         );
+    }
+    Some(source)
+}
+
+/// `_source` for a document of a leftover `{data_dir}/index/{topic}` index,
+/// written by the RealtimeIndexer removed in 08b1c58 (`_topic`, `_partition`,
+/// `_offset`, `_timestamp`, `_key`/`_value` as text), in the same shape as a
+/// hot or archived hit. Those indexes are still read, and their raw documents
+/// carried no `partition`/`offset`/`timestamp`, so they could neither be
+/// ordered nor deduplicated against the same record from an archive — paging
+/// a topic with one of them repeated and dropped records. `None` for any other
+/// schema.
+fn legacy_record_source(
+    index_name: &str,
+    schema: &tantivy::schema::Schema,
+    doc: &tantivy::TantivyDocument,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let partition_field = schema.get_field("_partition").ok()?;
+    let offset_field = schema.get_field("_offset").ok()?;
+    let ts_field = schema.get_field("_timestamp").ok()?;
+    let offset = doc.get_first(offset_field).and_then(|v| v.as_i64())?;
+    let partition = doc.get_first(partition_field).and_then(|v| v.as_i64())?;
+
+    let text = |name: &str| {
+        schema
+            .get_field(name)
+            .ok()
+            .and_then(|f| doc.get_first(f).and_then(|v| v.as_str().map(str::to_string)))
+    };
+    let mut source = serde_json::Map::new();
+    let topic = text("_topic").unwrap_or_else(|| index_name.to_string());
+    source.insert("topic".to_string(), serde_json::Value::String(topic));
+    source.insert("partition".to_string(), partition.into());
+    source.insert("offset".to_string(), offset.into());
+    if let Some(ts) = doc.get_first(ts_field).and_then(|v| v.as_datetime()) {
+        source.insert("timestamp".to_string(), ts.into_timestamp_millis().into());
+    }
+    if let Some(key) = text("_key") {
+        source.insert("key".to_string(), serde_json::Value::String(key));
+    }
+    // The body went to `_value`, or — for JSON records — only to the
+    // `_json_content` object (what thunderbird's leftover indexes hold).
+    let value = text("_value").or_else(|| {
+        let field = schema.get_field("_json_content").ok()?;
+        let owned: tantivy::schema::OwnedValue = doc.get_first(field)?.into();
+        match owned {
+            // Stored as the record's JSON text: already the value.
+            tantivy::schema::OwnedValue::Str(s) => Some(s),
+            other => serde_json::to_string(&other).ok(),
+        }
+    });
+    if let Some(value) = value {
+        source.insert("value".to_string(), serde_json::Value::String(value));
     }
     Some(source)
 }
@@ -2566,7 +2626,7 @@ mod unranked_stop_tests {
             _index: "t".into(),
             _id: format!("0-{ts}"),
             _score: Some(1.0),
-            _source: serde_json::json!({"timestamp": ts, "partition": 0, "offset": ts}),
+            _source: serde_json::json!({"timestamp": ts * 1000, "partition": 0, "offset": ts}),
             highlight: None,
         }
     }
@@ -2575,14 +2635,152 @@ mod unranked_stop_tests {
     fn stops_only_when_nothing_unsearched_can_rank_higher() {
         let hits: Vec<Hit> = [100, 90, 80, 70].into_iter().map(at).collect();
         // Not a full window yet.
-        assert!(!can_stop_unranked(&hits[..2], 3, Some(&10)));
+        assert!(!can_stop_unranked(&hits[..2], 3, Some(&10_000)));
         // The 3rd newest is 80; the next segment's newest is older: done.
-        assert!(can_stop_unranked(&hits, 3, Some(&79)));
+        assert!(can_stop_unranked(&hits, 3, Some(&79_999)));
         // A tie at 80 could still win the tie-break: keep going.
-        assert!(!can_stop_unranked(&hits, 3, Some(&80)));
+        assert!(!can_stop_unranked(&hits, 3, Some(&80_000)));
         // A newer record could be in the next segment.
-        assert!(!can_stop_unranked(&hits, 3, Some(&95)));
+        assert!(!can_stop_unranked(&hits, 3, Some(&95_000)));
         // Nothing left.
         assert!(can_stop_unranked(&hits, 3, None));
+    }
+}
+
+#[cfg(test)]
+mod legacy_index_tests {
+    use super::*;
+    use chronik_storage::canonical_record::{
+        CanonicalRecord, CanonicalRecordEntry, CompressionType, TimestampType,
+    };
+    use chronik_storage::tantivy_segment::TantivySegmentWriter;
+    use tantivy::schema::{DateOptions, NumericOptions, Schema, STORED, STRING, TEXT};
+
+    const PER_PARTITION: i64 = 40;
+
+    /// Same timestamp for every record of a batch, as producers send them —
+    /// so ties are broken by partition and offset.
+    fn ts(offset: i64) -> i64 {
+        1_700_000_000_000 + offset / 10
+    }
+
+    /// The index the removed RealtimeIndexer wrote: one per topic, every
+    /// partition in it (schema copied from 08b1c58^).
+    fn legacy_index() -> tantivy::Index {
+        let mut b = Schema::builder();
+        let id = b.add_text_field("_id", STRING | STORED);
+        let topic = b.add_text_field("_topic", STRING | STORED | tantivy::schema::FAST);
+        let fast_i64 = || NumericOptions::default().set_indexed().set_stored().set_fast();
+        let partition = b.add_i64_field("_partition", fast_i64());
+        let offset = b.add_i64_field("_offset", fast_i64());
+        let timestamp = b.add_date_field("_timestamp", DateOptions::default().set_indexed().set_stored().set_fast());
+        let key = b.add_text_field("_key", STRING | STORED);
+        let value = b.add_text_field("_value", TEXT | STORED);
+        let index = tantivy::Index::create_in_ram(b.build());
+        let mut w: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+        for p in 0..3i64 {
+            for o in 0..PER_PARTITION {
+                let mut doc = tantivy::TantivyDocument::default();
+                doc.add_text(id, format!("orders-{p}-{o}"));
+                doc.add_text(topic, "orders");
+                doc.add_i64(partition, p);
+                doc.add_i64(offset, o);
+                doc.add_date(timestamp, tantivy::DateTime::from_timestamp_millis(ts(o)));
+                doc.add_text(key, format!("k{o}"));
+                doc.add_text(value, format!("{{\"n\":{o}}}"));
+                w.add_document(doc).unwrap();
+            }
+        }
+        w.commit().unwrap();
+        index
+    }
+
+    /// The same records, archived by the WalIndexer: one index per partition.
+    fn archives() -> Vec<tantivy::Index> {
+        (0..3i32)
+            .map(|p| {
+                let records = (0..PER_PARTITION)
+                    .map(|o| CanonicalRecordEntry {
+                        offset: o,
+                        timestamp: ts(o),
+                        key: Some(format!("k{o}").into_bytes()),
+                        value: Some(format!("{{\"n\":{o}}}").into_bytes()),
+                        headers: vec![],
+                        attributes: 0,
+                    })
+                    .collect();
+                let batch = CanonicalRecord {
+                    base_offset: 0,
+                    partition_leader_epoch: 0,
+                    producer_id: -1,
+                    producer_epoch: -1,
+                    base_sequence: -1,
+                    is_transactional: false,
+                    is_control: false,
+                    compression: CompressionType::None,
+                    timestamp_type: TimestampType::CreateTime,
+                    base_timestamp: ts(0),
+                    max_timestamp: ts(PER_PARTITION - 1),
+                    records,
+                    compressed_records_wire_bytes: None,
+                    original_v1_wire_format: None,
+                    original_v2_wire_format: None,
+                };
+                let mut w = TantivySegmentWriter::new("orders".to_string(), p, 0).unwrap();
+                w.write_batch(&batch).unwrap();
+                w.commit().unwrap().0
+            })
+            .collect()
+    }
+
+    /// One page across `sources`, the way search_index assembles it: each
+    /// source's top `from + size`, then one cut.
+    fn page_of(sources: &[tantivy::Index], from: usize, size: usize) -> Vec<String> {
+        let window: SearchRequest =
+            serde_json::from_value(serde_json::json!({"from": 0, "size": from + size})).unwrap();
+        let mut hits = Vec::new();
+        for idx in sources {
+            hits.extend(search_tantivy_index("orders", idx, &query_searcher(idx).unwrap(), &window).unwrap());
+        }
+        crate::ranking::page(hits, from, size).0.into_iter().map(|h| h._id).collect()
+    }
+
+    #[test]
+    fn legacy_hits_have_the_common_shape() {
+        let idx = legacy_index();
+        let r: SearchRequest = serde_json::from_value(serde_json::json!({"size": 1})).unwrap();
+        let hit = &search_tantivy_index("orders-dir", &idx, &query_searcher(&idx).unwrap(), &r).unwrap()[0];
+        assert_eq!(hit._index, "orders", "the topic, not the directory name");
+        let s = &hit._source;
+        for k in ["topic", "partition", "offset", "timestamp", "key", "value"] {
+            assert!(s.get(k).is_some(), "{k} missing from {s}");
+        }
+        assert_eq!(
+            hit._id,
+            format!("{}-{}", s["partition"].as_i64().unwrap(), s["offset"].as_i64().unwrap())
+        );
+    }
+
+    #[test]
+    fn pages_over_a_legacy_index_and_archives_tile_every_record_once() {
+        let mut sources = vec![legacy_index()];
+        sources.extend(archives());
+        let total = (3 * PER_PARTITION) as usize;
+        let all = page_of(&sources, 0, total + 10);
+        assert_eq!(all.len(), total, "each record once, though two sources hold it");
+        let mut paged = Vec::new();
+        for from in (0..total + 10).step_by(17) {
+            paged.extend(page_of(&sources, from, 17));
+        }
+        assert_eq!(paged, all, "pages in order equal one search");
+        // The legacy index alone pages the same way (nodes without archives).
+        let legacy = [legacy_index()];
+        let alone = page_of(&legacy, 0, total);
+        let mut paged = Vec::new();
+        for from in (0..total).step_by(13) {
+            paged.extend(page_of(&legacy, from, 13));
+        }
+        assert_eq!(paged, alone);
+        assert_eq!(alone, all, "and in the same order as with the archives");
     }
 }

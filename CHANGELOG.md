@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Paging is correct on real clusters, including topics with an index left by
+the removed RealtimeIndexer. v2.17.3's pagination fix passed its tests but
+failed on thunderbird: paging 500 `match_all` hits of `amazon-grocery` 50 at a
+time reached 195 distinct records, 82 of them on two pages.
+
+### Fixed
+- **Topics with a leftover `{data_dir}/index/{topic}` were served from it.**
+  The RealtimeIndexer was removed in 08b1c58 on the belief that nothing read
+  its output, but `/_search` still did — and skipped the archives whenever that
+  index answered. Those indexes are frozen at the day the indexer stopped
+  (26, 87 and 92 topics on thunderbird's three nodes), so a node served those
+  topics from a stale copy. The archives are now always searched as well.
+- **Hits from those indexes had another shape.** Their documents carry
+  `_topic`, `_partition`, `_offset`, `_timestamp` and text `_key`/`_value`;
+  hits now have the same `_source` (topic, partition, offset, timestamp, key,
+  value) and `_id` (`{partition}-{offset}`) as hot and archived hits, so they
+  are ordered and deduplicated with them. `_index` is the topic, not the
+  directory name.
+- **Records were ranked by the second inside an index and by the millisecond
+  in the merge.** Tantivy date fast fields store seconds. Inside an archived
+  segment (one partition, timestamps rising with offsets) both orders agree,
+  but inside a source that spans partitions — a leftover RealtimeIndexer index
+  — records sharing a second were cut differently by the source and by the
+  merge, and pages overlapped. Everything now ranks by the timestamp's second,
+  then partition, then offset (`ranking::rank_second`). No current binary
+  writes such an index, so the local e2e cannot reproduce it; a unit test
+  builds one with the removed indexer's schema (fails before, passes after).
+  `search_pagination.sh` also pages a 6,000-record topic now, so every source
+  holds more records than the page window.
+- **A record held by two sources could appear twice, and the copy kept from
+  RF replicas depended on which node answered first.** The page is cut after
+  one deduplication by `_index`/`_id` that keeps the best-ranked copy.
+
 ## [2.17.3] - 2026-11-17
 
 Paging through a search returns every match exactly once.

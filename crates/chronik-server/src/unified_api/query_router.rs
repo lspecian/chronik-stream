@@ -28,7 +28,7 @@ use super::vector_handler::{
 };
 
 // Re-export for use in handlers
-pub use chronik_search::api::{Hit, HitsInfo, SearchResponse, ShardInfo, TotalHits};
+pub use chronik_search::api::{HitsInfo, SearchResponse, ShardInfo, TotalHits};
 
 /// HTTP header for loop prevention. Forwarded requests include this header.
 /// Receiving nodes with depth >= 1 execute locally only (no further fan-out).
@@ -3743,22 +3743,9 @@ pub fn merge_search_responses(
         all_hits.extend(peer_resp.hits.hits);
     }
 
-    // Deduplicate by (_index, _id), keeping highest score.
-    // With RF=N, the same document exists on multiple nodes and would
-    // otherwise appear N times in merged results, crowding out unique hits.
-    let mut best: HashMap<(String, String), Hit> = HashMap::new();
-    for hit in all_hits {
-        let key = (hit._index.clone(), hit._id.clone());
-        let score = hit._score.unwrap_or(0.0);
-        match best.get(&key) {
-            Some(existing) if existing._score.unwrap_or(0.0) >= score => {}
-            _ => {
-                best.insert(key, hit);
-            }
-        }
-    }
-    let all_hits: Vec<Hit> = best.into_values().collect();
-
+    // With RF=N the same document comes back from N nodes; `page` keeps one
+    // copy of each (_index, _id) — the best-ranked, so the choice does not
+    // depend on which node answered first.
     // The total is the number of DISTINCT documents. Summing each node's
     // total counted every replica: with RF=3 a topic holding one match
     // reported `"total": 3`. Every source returns at most `from + size` hits,

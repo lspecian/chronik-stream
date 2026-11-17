@@ -21,82 +21,120 @@ use tantivy::query::Query;
 use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader};
 
 /// The per-document rank inside one Tantivy index; compared field by field,
-/// highest wins (TopDocs keeps the largest keys).
+/// highest wins (TopDocs keeps the largest keys). `neg_partition` puts lower
+/// partitions first among equal timestamps, as [`hit_order`] does.
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
 struct RankKey {
     score: Score,
-    timestamp_ms: i64,
+    timestamp_s: i64,
+    neg_partition: i64,
     offset: i64,
 }
 
-/// Where an index keeps the fast fields the rank needs.
+/// The fast fields an index keeps the rank in, found from its schema.
 #[derive(Clone, Copy)]
-pub enum RankFields {
-    /// An archived segment: `_ts` (date) and `_offset`.
-    Archive,
-    /// The hot index: `timestamp` (i64 ms) and `offset`.
-    Hot,
+struct RankFields {
+    timestamp: &'static str,
+    /// `timestamp` is a date field (else i64 milliseconds).
+    timestamp_is_date: bool,
+    offset: &'static str,
+    /// Absent when the index holds a single partition.
+    partition: Option<&'static str>,
+}
+
+impl RankFields {
+    /// The layouts written by Chronik, newest first: an archived segment
+    /// (`_ts`, `_offset`, one partition), a hot partition index (`timestamp`,
+    /// `offset`, one partition), and a leftover RealtimeIndexer index
+    /// (`_timestamp`, `_offset`, `_partition` — all partitions of a topic).
+    fn detect(schema: &tantivy::schema::Schema) -> Option<Self> {
+        let fast = |name: &str| {
+            schema.get_field(name).map(|f| schema.get_field_entry(f).is_fast()).unwrap_or(false)
+        };
+        let candidates = [
+            RankFields { timestamp: "_ts", timestamp_is_date: true, offset: "_offset", partition: None },
+            RankFields {
+                timestamp: "_timestamp",
+                timestamp_is_date: true,
+                offset: "_offset",
+                partition: Some("_partition"),
+            },
+            RankFields { timestamp: "timestamp", timestamp_is_date: false, offset: "offset", partition: None },
+        ];
+        candidates.into_iter().find(|c| {
+            fast(c.timestamp) && fast(c.offset) && c.partition.map_or(true, |p| fast(p))
+        })
+    }
 }
 
 /// The top `limit` documents of `query` in the order of [`hit_order`].
 ///
-/// Falls back to plain relevance when the index lacks the fast fields (an
-/// index of another shape), which is still deterministic per index.
+/// Falls back to plain relevance when the index is of no layout Chronik
+/// writes (a REST-created index), which is still deterministic per index.
 pub fn top_docs(
     searcher: &Searcher,
     query: &dyn Query,
     limit: usize,
-    fields: RankFields,
 ) -> tantivy::Result<Vec<(Score, DocAddress)>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let schema = searcher.schema();
-    let (ts_name, off_name) = match fields {
-        RankFields::Archive => ("_ts", "_offset"),
-        RankFields::Hot => ("timestamp", "offset"),
-    };
-    let fast = |name: &str| {
-        schema
-            .get_field(name)
-            .map(|f| schema.get_field_entry(f).is_fast())
-            .unwrap_or(false)
-    };
-    if !(fast(ts_name) && fast(off_name)) {
+    let Some(fields) = RankFields::detect(searcher.schema()) else {
         return searcher.search(query, &TopDocs::with_limit(limit));
-    }
-    let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
-        let ff = segment.fast_fields();
-        let ts: Box<dyn Fn(DocId) -> i64 + Send + Sync> = match fields {
-            RankFields::Archive => match ff.date(ts_name) {
-                Ok(col) => {
-                    let col = col.first_or_default_col(tantivy::DateTime::from_timestamp_millis(0));
-                    Box::new(move |doc| col.get_val(doc).into_timestamp_millis())
-                }
-                Err(_) => Box::new(|_| 0),
-            },
-            RankFields::Hot => match ff.i64(ts_name) {
-                Ok(col) => {
-                    let col = col.first_or_default_col(0);
-                    Box::new(move |doc| col.get_val(doc))
-                }
-                Err(_) => Box::new(|_| 0),
-            },
-        };
-        let off: Box<dyn Fn(DocId) -> i64 + Send + Sync> = match ff.i64(off_name) {
+    };
+    type Getter = Box<dyn Fn(DocId) -> i64 + Send + Sync>;
+    let i64_col = |ff: &tantivy::fastfield::FastFieldReaders, name: &str| -> Getter {
+        match ff.i64(name) {
             Ok(col) => {
                 let col = col.first_or_default_col(0);
                 Box::new(move |doc| col.get_val(doc))
             }
             Err(_) => Box::new(|_| 0),
+        }
+    };
+    let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
+        let ff = segment.fast_fields();
+        let ts: Getter = if fields.timestamp_is_date {
+            match ff.date(fields.timestamp) {
+                Ok(col) => {
+                    let col = col.first_or_default_col(tantivy::DateTime::from_timestamp_millis(0));
+                    Box::new(move |doc| col.get_val(doc).into_timestamp_secs())
+                }
+                Err(_) => Box::new(|_| 0),
+            }
+        } else {
+            let ms = i64_col(ff, fields.timestamp);
+            Box::new(move |doc| ms(doc).div_euclid(1000))
         };
-        move |doc: DocId, score: Score| RankKey { score, timestamp_ms: ts(doc), offset: off(doc) }
+        let off = i64_col(ff, fields.offset);
+        let part: Getter = match fields.partition {
+            Some(p) => i64_col(ff, p),
+            None => Box::new(|_| 0),
+        };
+        move |doc: DocId, score: Score| RankKey {
+            score,
+            timestamp_s: ts(doc),
+            neg_partition: -part(doc),
+            offset: off(doc),
+        }
     });
     Ok(searcher
         .search(query, &collector)?
         .into_iter()
         .map(|(key, addr)| (key.score, addr))
         .collect())
+}
+
+/// A hit's timestamp in whole seconds, the granularity the order uses.
+///
+/// Archived and RealtimeIndexer indexes keep their timestamps in Tantivy date
+/// fast fields, which store seconds; ranking inside them by the second while
+/// the merge compared milliseconds made the two orders disagree whenever
+/// records shared a second (every producer batch), and pages overlapped. So
+/// every source and the merge rank by the second, and partition and offset
+/// break the tie. `_source.timestamp` itself stays in milliseconds.
+pub fn rank_second(hit: &Hit) -> Option<i64> {
+    hit._source.get("timestamp").and_then(|v| v.as_i64()).map(|ms| ms.div_euclid(1000))
 }
 
 /// The order of hits across sources: see the module docs. Hits whose
@@ -109,7 +147,7 @@ pub fn hit_order(a: &Hit, b: &Hit) -> Ordering {
     let score = |h: &Hit| h._score.unwrap_or(0.0);
     score(b)
         .total_cmp(&score(a))
-        .then_with(|| num(b, "timestamp").cmp(&num(a, "timestamp")))
+        .then_with(|| rank_second(b).cmp(&rank_second(a)))
         .then_with(|| a._index.cmp(&b._index))
         .then_with(|| num(a, "partition").cmp(&num(b, "partition")))
         .then_with(|| num(b, "offset").cmp(&num(a, "offset")))
@@ -145,10 +183,14 @@ pub fn check_result_window(from: usize, size: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// One page of `hits`: sorted by [`hit_order`], `from` skipped, `size` kept.
-/// Returns the page and how many distinct candidates there were.
+/// One page of `hits`: sorted by [`hit_order`], each record once (by `_index`
+/// and `_id`, keeping its best-ranked copy — a record can come from both a
+/// leftover RealtimeIndexer index and an archive), `from` skipped, `size`
+/// kept. Returns the page and how many distinct candidates there were.
 pub fn page(mut hits: Vec<Hit>, from: usize, size: usize) -> (Vec<Hit>, usize) {
     hits.sort_by(hit_order);
+    let mut seen = std::collections::HashSet::with_capacity(hits.len());
+    hits.retain(|h| seen.insert((h._index.clone(), h._id.clone())));
     let found = hits.len();
     (hits.into_iter().skip(from).take(size).collect(), found)
 }
@@ -162,7 +204,7 @@ mod tests {
             _index: index.to_string(),
             _id: format!("{p}-{off}"),
             _score: Some(score),
-            _source: serde_json::json!({"timestamp": ts, "partition": p, "offset": off}),
+            _source: serde_json::json!({"timestamp": ts * 1000, "partition": p, "offset": off}),
             highlight: None,
         }
     }

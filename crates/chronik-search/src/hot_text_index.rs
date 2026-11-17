@@ -86,7 +86,7 @@ pub struct HotHit {
 fn hot_hit_order(a: &HotHit, b: &HotHit) -> std::cmp::Ordering {
     b.score
         .total_cmp(&a.score)
-        .then(b.timestamp.cmp(&a.timestamp))
+        .then(b.timestamp.div_euclid(1000).cmp(&a.timestamp.div_euclid(1000)))
         .then(a.partition.cmp(&b.partition))
         .then(b.offset.cmp(&a.offset))
 }
@@ -348,7 +348,7 @@ impl HotPartitionIndex {
         let query = parser
             .parse_query(sanitized)
             .map_err(|e| anyhow!("parse hot query `{}`: {}", sanitized, e))?;
-        let top_docs = crate::ranking::top_docs(&searcher, &query, top_k, crate::ranking::RankFields::Hot)
+        let top_docs = crate::ranking::top_docs(&searcher, &query, top_k)
             .map_err(|e| anyhow!("hot search: {}", e))?;
 
         let mut hits = Vec::with_capacity(top_docs.len());
@@ -370,7 +370,7 @@ impl HotPartitionIndex {
         top_k: usize,
     ) -> Result<Vec<HotHit>> {
         let searcher = self.reader.searcher();
-        let top_docs = crate::ranking::top_docs(&searcher, query, top_k, crate::ranking::RankFields::Hot)
+        let top_docs = crate::ranking::top_docs(&searcher, query, top_k)
             .map_err(|e| anyhow!("hot structured search: {}", e))?;
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_addr) in top_docs {
