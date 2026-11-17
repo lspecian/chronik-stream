@@ -14,7 +14,8 @@
 #   - match_all across every topic answers with a full page;
 #   - a term in one record of one topic is found by a search naming no topic;
 #   - the cache lives in each node's data dir and stays within
-#     CHRONIK_SEARCH_CACHE_BYTES.
+#     CHRONIK_SEARCH_CACHE_BYTES; local plain-tar archives (v2.17.4+) are
+#     searched in place, so nothing is copied into it.
 #
 # Usage: search_many_segments.sh <binary> <label>
 # Needs: KAFKA_HOME, kcat.
@@ -61,11 +62,11 @@ for t in $(seq 1 $TOPICS); do
 done
 echo "produced $TOPICS topics x 300 records; waiting for every node to archive them"
 for _ in $(seq 72); do
-  n=$(find $C/data -path "*/$P-*" -name '*.tar.gz' 2>/dev/null | wc -l)
+  n=$(find $C/data -path "*/$P-*" \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null | wc -l)
   [ "$n" -ge $((TOPICS * 3)) ] && break
   sleep 5
 done
-n=$(find $C/data -path "*/$P-*" -name '*.tar.gz' 2>/dev/null | wc -l)
+n=$(find $C/data -path "*/$P-*" \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null | wc -l)
 echo "archives on disk: $n"
 [ "$n" -ge $((TOPICS * 3)) ] || { echo "  FAIL: fewer than $((TOPICS * 3)) archives after 6 minutes"; fail=1; }
 
@@ -75,7 +76,10 @@ up || { echo "FAIL: cluster did not restart"; exit 1; }
 sleep 15
 
 echo "time limit:"
-r=$(search '{"query":{"match":{"marker":"zephyrquandary"}},"size":10,"timeout":"1ms"}')
+# A word in every archive, so none can be skipped and all 30 per node must
+# be searched: the 1ms limit cannot be met (a rare word now finishes in
+# under 1ms — term filters skip all but its 3 archives).
+r=$(search '{"query":{"match":{"marker":"ordinary"}},"size":10,"timeout":"1ms"}')
 echo "  ($r)"
 expect "1ms timeout answers 200 with timed_out" "$(cut -d' ' -f1-2 <<<"$r")" "200 true"
 expect "and at once" "$(awk '{print ($4 < 5) ? "under 5s" : $4 "s"}' <<<"$r")" "under 5s"
@@ -118,10 +122,10 @@ for node in 1 2 3; do
     sz=$(du -sb "$d" | cut -f1)
     # One segment may be in use past the budget while the next is unpacked.
     expect "node$node cache within budget" "$([ "$sz" -le $((BUDGET * 2)) ] && echo within || echo "$sz bytes")" "within"
-    # The term search read all $TOPICS of this node's segments, which do not
-    # fit in the budget: some must have been evicted.
-    kept=$(find "$d" -mindepth 1 -maxdepth 1 -type d ! -name '.evicted-*' | wc -l)
-    expect "node$node evicted to fit" "$([ "$kept" -lt $TOPICS ] && echo evicted || echo "kept all $kept")" "evicted"
+    # Archives are plain tars on local disk (v2.17.4+): searched in place,
+    # nothing unpacked or copied into the cache.
+    copies=$(find "$d" -mindepth 1 -maxdepth 1 -type d ! -name '.evicted-*' | wc -l)
+    expect "node$node archives searched in place, no copies" "$copies" "0"
   else
     expect "node$node cache in its data dir" "missing" "present"
   fi

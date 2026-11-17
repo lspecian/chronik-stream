@@ -1639,6 +1639,10 @@ impl IntegratedKafkaServerBuilder {
             );
         }
 
+        // Merge runs of small archives into larger ones, in the background
+        // (CHRONIK_ARCHIVE_MERGE=false turns it off).
+        chronik_storage::archive_merge::spawn(wal_indexer.object_store(), wal_indexer.segment_index().clone());
+
         self.wal_indexer = Some(wal_indexer);
 
         info!("✅ WAL Indexer initialized");

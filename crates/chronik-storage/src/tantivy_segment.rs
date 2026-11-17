@@ -331,7 +331,7 @@ impl TantivySegmentWriter {
         //
         // Consuming the writer joins those threads and drops the write lock, so
         // from here the directory is stable. This is the fix; the retry inside
-        // `write_tar_gz` is belt-and-braces, not the cure.
+        // `write_archive` is belt-and-braces, not the cure.
         disk_writer.wait_merging_threads()
             .map_err(|e| Error::Internal(format!("Failed to join Tantivy merge threads: {}", e)))?;
 
@@ -346,11 +346,11 @@ impl TantivySegmentWriter {
         fs::create_dir_all(output_dir)
             .map_err(|e| Error::Internal(format!("Failed to create output dir: {}", e)))?;
 
-        let segment_filename = format!("segment_{}_{}_{}_{}.tar.gz",
+        let segment_filename = format!("segment_{}_{}_{}_{}.tar",
             self.metadata.topic, self.metadata.partition, self.metadata.base_offset, self.metadata.last_offset);
         let output_path = output_dir.join(&segment_filename);
 
-        Self::write_tar_gz(&output_path, &index_dir, &metadata_path)?;
+        Self::write_archive(&output_path, &index_dir, &metadata_path)?;
 
         // The archive's term filter, beside it (`<archive>.terms`), so a search
         // can skip this archive without opening it. Optional: an archive
@@ -382,11 +382,11 @@ impl TantivySegmentWriter {
     ///
     /// Any other error is returned immediately: retrying a full disk or a
     /// permission problem just burns I/O on the indexer's thread.
-    fn write_tar_gz(output_path: &Path, index_dir: &Path, metadata_path: &Path) -> Result<()> {
+    pub(crate) fn write_archive(output_path: &Path, index_dir: &Path, metadata_path: &Path) -> Result<()> {
         let mut last: Option<std::io::Error> = None;
 
         for attempt in 1..=Self::TAR_ATTEMPTS {
-            match Self::try_write_tar_gz(output_path, index_dir, metadata_path) {
+            match Self::try_write_archive(output_path, index_dir, metadata_path) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     tracing::warn!(
@@ -426,26 +426,26 @@ impl TantivySegmentWriter {
 
     /// One attempt at the archive. Returns the raw `io::Error` so the caller can
     /// tell a vanished file from a full disk.
-    fn try_write_tar_gz(
+    fn try_write_archive(
         output_path: &Path,
         index_dir: &Path,
         metadata_path: &Path,
     ) -> std::io::Result<()> {
-        let tar_file = File::create(output_path)?;
-        let enc = GzEncoder::new(tar_file, Compression::default());
-        let mut tar = tar::Builder::new(enc);
+        // A plain tar, not gzip: readers open it in place (`TarDirectory`)
+        // instead of unpacking it. Tantivy's files are compressed already.
+        let tar_file = std::io::BufWriter::new(File::create(output_path)?);
+        let mut tar = tar::Builder::new(tar_file);
 
         tar.append_dir_all("index", index_dir)?;
 
         let mut metadata_file = File::open(metadata_path)?;
         tar.append_file("metadata.json", &mut metadata_file)?;
 
-        // Finish the tar trailer AND the gzip stream. The previous code called
-        // `tar.finish()` and let the encoder drop, which flushes on a
-        // best-effort basis and swallows the error — a truncated archive would
-        // only surface later, as a corrupt segment on read.
-        let enc = tar.into_inner()?;
-        enc.finish()?;
+        // Finish the tar trailer and flush, surfacing any error: letting the
+        // writer drop flushes on a best-effort basis and swallows it, so a
+        // truncated archive would only surface later, as a corrupt segment.
+        let file = tar.into_inner()?.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
 
         Ok(())
     }
@@ -516,7 +516,7 @@ impl TantivySegmentWriter {
         .map_err(|e| Error::Internal(format!("Task join error: {}", e)))??;
 
         // Generate object store key
-        let object_key = format!("{}/segment_{}_{}_{}_{}.tar.gz",
+        let object_key = format!("{}/segment_{}_{}_{}_{}.tar",
             key_prefix,
             metadata.topic,
             metadata.partition,
@@ -651,6 +651,58 @@ impl TantivySegmentReader {
         Ok(Self { index, reader, schema_fields, metadata })
     }
 
+    /// Open an archive written as a plain tar, in place: the index files are
+    /// slices of `bytes` (a memory-mapped file or a downloaded object), with
+    /// nothing unpacked.
+    pub fn open_tar(bytes: tantivy::directory::OwnedBytes) -> Result<Self> {
+        use crate::tar_directory::TarDirectory;
+        let metadata_bytes = TarDirectory::read_entry(&bytes, "metadata.json")
+            .map_err(|e| Error::Internal(format!("Failed to read archive: {}", e)))?
+            .ok_or_else(|| Error::Internal("archive has no metadata.json".to_string()))?;
+        let metadata: SegmentMetadata = serde_json::from_slice(metadata_bytes.as_slice())
+            .map_err(|e| Error::Internal(format!("Failed to parse metadata: {}", e)))?;
+        let directory = TarDirectory::open(bytes, "index")
+            .map_err(|e| Error::Internal(format!("Failed to read archive: {}", e)))?;
+        let index = Index::open(directory)
+            .map_err(|e| Error::Internal(format!("Failed to open index: {}", e)))?;
+        text_analysis::register_analyzer(&index);
+        let reader = archived_reader(&index)
+            .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
+        let (_schema, schema_fields) = SchemaFields::build_schema();
+        Ok(Self { index, reader, schema_fields, metadata })
+    }
+
+    /// Open an archive from its downloaded bytes, whichever format it is in: a
+    /// plain tar opens in place; a `.tar.gz` written by an earlier version is
+    /// unpacked as before.
+    pub fn from_archive_bytes(bytes: bytes::Bytes) -> Result<Self> {
+        if crate::tar_directory::is_gzip(&bytes) {
+            Self::from_tar_gz_bytes(&bytes)
+        } else {
+            Self::open_tar(crate::tar_directory::owned(bytes))
+        }
+    }
+
+    /// Open a plain-tar archive on local disk in place (memory-mapped).
+    /// `Ok(None)` for a `.tar.gz`, which has to be unpacked to be read.
+    pub fn open_tar_file(path: &Path) -> Result<Option<Self>> {
+        let bytes = crate::tar_directory::map_file(path)
+            .map_err(|e| Error::Internal(format!("Failed to map {}: {}", path.display(), e)))?;
+        if crate::tar_directory::is_gzip(bytes.as_slice()) {
+            return Ok(None);
+        }
+        Self::open_tar(bytes).map(Some)
+    }
+
+    /// Open a local archive in either format: a plain tar in place, a
+    /// `.tar.gz` by unpacking it.
+    pub fn open_archive_file(path: &Path) -> Result<Self> {
+        match Self::open_tar_file(path)? {
+            Some(reader) => Ok(reader),
+            None => Self::from_tar_gz(path),
+        }
+    }
+
     /// Download segment from object store and open
     pub async fn from_object_store(
         object_store: Arc<dyn ObjectStore>,
@@ -661,16 +713,9 @@ impl TantivySegmentReader {
             .await
             .map_err(|e| Error::Internal(format!("Failed to download from object store: {}", e)))?;
 
-        // Write to temp file
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
-        let tar_gz_path = temp_dir.path().join("segment.tar.gz");
-
-        fs::write(&tar_gz_path, data.as_ref())
-            .map_err(|e| Error::Internal(format!("Failed to write temp file: {}", e)))?;
-
-        // Deserialize from tar.gz
-        Self::from_tar_gz(&tar_gz_path)
+        // Either format: a plain tar is read from the downloaded bytes in
+        // place, a .tar.gz (an earlier version's) is unpacked.
+        Self::from_archive_bytes(data)
     }
 
     /// Download a segment from the object store and extract it into `dest_dir`
@@ -1184,10 +1229,10 @@ mod tests {
 
         // Verify tar.gz file exists
         assert!(tar_gz_path.exists());
-        assert!(tar_gz_path.to_str().unwrap().ends_with(".tar.gz"));
+        assert!(tar_gz_path.to_str().unwrap().ends_with(".tar"));
 
         // Deserialize
-        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        let reader = TantivySegmentReader::open_archive_file(&tar_gz_path).unwrap();
 
         // Verify metadata
         assert_eq!(reader.metadata.topic, "test-topic");
@@ -1224,7 +1269,7 @@ mod tests {
         writer.write_batch(&canonical).unwrap();
         let (tar_gz_path, _) = writer.commit_and_serialize(&temp_dir.path().join("out")).unwrap();
 
-        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        let reader = TantivySegmentReader::open_archive_file(&tar_gz_path).unwrap();
         let index = reader.index();
         let json = index.schema().get_field(crate::json_index::JSON_FIELD).unwrap();
 
@@ -1291,7 +1336,7 @@ mod tests {
         assert!(file_size > 0);
 
         // Deserialize and query
-        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        let reader = TantivySegmentReader::open_archive_file(&tar_gz_path).unwrap();
         let results = reader.query_by_offset_range(1000, 1500).unwrap();
         assert_eq!(results.len(), 500);
     }
@@ -1308,7 +1353,7 @@ mod tests {
         let (tar_gz_path, _metadata) = writer.commit_and_serialize(&output_dir).unwrap();
 
         // Deserialize and verify all records
-        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        let reader = TantivySegmentReader::open_archive_file(&tar_gz_path).unwrap();
         let results = reader.query_by_offset_range(0, 20).unwrap();
 
         assert_eq!(results.len(), 20);
@@ -1346,7 +1391,7 @@ mod archive_tests {
         let metadata_path = metadata_file(temp.path());
         let missing = temp.path().join("index-that-was-never-created");
 
-        let err = TantivySegmentWriter::write_tar_gz(
+        let err = TantivySegmentWriter::write_archive(
             &temp.path().join("out.tar.gz"),
             &missing,
             &metadata_path,
@@ -1389,7 +1434,7 @@ mod archive_tests {
     /// flushes best-effort and discards the error, so a truncated archive would
     /// have surfaced later as a corrupt cold segment rather than here.
     #[test]
-    fn the_archive_is_a_complete_gzip_stream_holding_the_whole_index() {
+    fn the_archive_is_a_complete_tar_holding_the_whole_index() {
         let temp = tempfile::tempdir().unwrap();
         let output_dir = temp.path().join("segments");
 
@@ -1399,10 +1444,11 @@ mod archive_tests {
             .unwrap();
         let (tar_gz_path, metadata) = writer.commit_and_serialize(&output_dir).unwrap();
 
-        // Decompress the whole stream and list it. A stream cut short by an
-        // unfinished encoder fails here.
+        // A plain tar now (opened in place, not unpacked). List it whole: an
+        // archive cut short by an unflushed writer fails here.
         let file = File::open(&tar_gz_path).unwrap();
-        let mut archive = tar::Archive::new(GzDecoder::new(file));
+        assert!(!crate::tar_directory::is_gzip(&std::fs::read(&tar_gz_path).unwrap()), "no longer gzip");
+        let mut archive = tar::Archive::new(file);
         let entries: Vec<String> = archive
             .entries()
             .unwrap()
@@ -1420,10 +1466,38 @@ mod archive_tests {
 
         // And the index must still open and answer from the archive, which is
         // what the cold read path does.
-        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        let reader = TantivySegmentReader::open_archive_file(&tar_gz_path).unwrap();
         assert_eq!(reader.metadata().record_count, 250);
         assert_eq!(metadata.record_count, 250);
         assert_eq!(reader.query_by_offset_range(0, 250).unwrap().len(), 250);
+    }
+
+    /// Archives written by earlier versions are `.tar.gz`; they still open,
+    /// from a file and from downloaded bytes (the fetch path), and a plain tar
+    /// opens from bytes too.
+    #[test]
+    fn archives_of_either_format_open() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let mut writer = TantivySegmentWriter::new("logs".to_string(), 0, 0).unwrap();
+        writer.write_batch(&tests::create_test_canonical_record(0, 40)).unwrap();
+        let (tar_path, _) = writer.commit_and_serialize(&temp.path().join("out")).unwrap();
+        let tar = std::fs::read(&tar_path).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar).unwrap();
+        let gz = gz.finish().unwrap();
+        let gz_path = temp.path().join("old.tar.gz");
+        std::fs::write(&gz_path, &gz).unwrap();
+
+        for reader in [
+            TantivySegmentReader::open_archive_file(&tar_path).unwrap(),
+            TantivySegmentReader::open_archive_file(&gz_path).unwrap(),
+            TantivySegmentReader::from_archive_bytes(bytes::Bytes::from(tar)).unwrap(),
+            TantivySegmentReader::from_archive_bytes(bytes::Bytes::from(gz)).unwrap(),
+        ] {
+            assert_eq!(reader.query_by_offset_range(0, 40).unwrap().len(), 40);
+        }
+        assert!(TantivySegmentReader::open_tar_file(&gz_path).unwrap().is_none(), "gzip is not opened in place");
     }
 
     /// The same path driven through enough batches to make Tantivy flush more
@@ -1454,7 +1528,7 @@ mod archive_tests {
 
         assert_eq!(metadata.record_count, batches * per_batch);
 
-        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        let reader = TantivySegmentReader::open_archive_file(&tar_gz_path).unwrap();
         assert_eq!(
             reader
                 .query_by_offset_range(0, (batches * per_batch) as i64)

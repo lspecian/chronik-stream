@@ -150,14 +150,14 @@ fi
 # directory is still changing and the archive is either absent or short. Reading
 # it back proves it is complete, without depending on the cold-search read path
 # (a separate pipeline with its own history).
-# This topic's archive specifically. Falling back to "any recent .tar.gz" would
+# This topic's archive specifically (.tar since v2.17.4, .tar.gz before). Falling back to "any recent archive" would
 # let another topic's healthy archive vouch for this one, which is how the
 # original report came to look topic-specific in the first place.
 # The topic is a directory in the object key (…/tantivy_indexes/<topic>/partition-N/segment-a-b.tar.gz),
 # not part of the filename.
-archive=$(find "$CLUSTER"/data -path "*/${TOPIC}/*" -name "*.tar.gz" 2>/dev/null | head -1)
+archive=$(find "$CLUSTER"/data -path "*/${TOPIC}/*" \( -name "*.tar" -o -name "*.tar.gz" \) 2>/dev/null | head -1)
 if [ -n "$archive" ] && [ -s "$archive" ]; then
-    listing=$(tar -tzf "$archive" 2>&1)
+    listing=$(tar -tf "$archive" 2>&1)
     if [ $? -eq 0 ]; then
         ok "the archive decompresses cleanly ($(wc -l <<<"$listing") entries)"
         grep -q "index/meta.json" <<<"$listing" \

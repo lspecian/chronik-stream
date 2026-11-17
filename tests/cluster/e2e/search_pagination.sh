@@ -106,10 +106,10 @@ sleep 5
 round "hot"
 
 for _ in $(seq 60); do
-  [ "$(find $C/data -path "*/$T/*" -name '*.tar.gz' 2>/dev/null | wc -l)" -ge 9 ] && [ "$(find $C/data -path "*/$D/*" -name '*.tar.gz' 2>/dev/null | wc -l)" -ge 9 ] && break
+  [ "$(find $C/data -path "*/$T/*" \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null | wc -l)" -ge 9 ] && [ "$(find $C/data -path "*/$D/*" \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null | wc -l)" -ge 9 ] && break
   sleep 5
 done
-echo "archives on disk: $(find $C/data -path "*/$T/*" -name '*.tar.gz' 2>/dev/null | wc -l) + $(find $C/data -path "*/$D/*" -name '*.tar.gz' 2>/dev/null | wc -l)"
+echo "archives on disk: $(find $C/data -path "*/$T/*" \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null | wc -l) + $(find $C/data -path "*/$D/*" \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null | wc -l)"
 sleep 10
 round "archived, hot index on"
 

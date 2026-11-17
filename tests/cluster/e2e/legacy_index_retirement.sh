@@ -36,7 +36,7 @@ total() { # topic query -> "<http code> <total>"
     -H 'Content-Type: application/json' -d "{\"query\":$2,\"size\":50}")
   echo "${out##*$'\n'} $(grep -o '"total":{"value":[0-9]*' <<<"${out%$'\n'*}" | grep -o '[0-9]*$')"
 }
-archives() { find $C/data -path "*/$R/*" -name '*.tar.gz' 2>/dev/null | wc -l; }
+archives() { find $C/data -path "*/$R/*" \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null | wc -l; }
 produce() { # first last
   seq "$1" "$2" | awk '{ w = ($1 == 151) ? "gapword" : "plain"; printf "{\"id\":%d,\"w\":\"%s\"}\n", $1, w }' \
     | kcat -P -b $B -t $R -p 0 -X acks=all 2>/dev/null

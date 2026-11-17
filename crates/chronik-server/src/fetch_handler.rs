@@ -2468,7 +2468,7 @@ impl FetchHandler {
             };
 
             // Deserialize Tantivy segment
-            let reader = match TantivySegmentReader::from_tar_gz_bytes(segment_data.as_ref()) {
+            let reader = match TantivySegmentReader::from_archive_bytes(segment_data.clone()) {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
@@ -2506,8 +2506,11 @@ impl FetchHandler {
             return Ok(vec![]);
         }
 
-        // Sort entries by offset
+        // Sort entries by offset, each offset once: two archives must never
+        // cover one offset (merges swap atomically), but a consumer must not
+        // receive a record twice if they ever did.
         all_entries.sort_by_key(|e| e.offset);
+        all_entries.dedup_by_key(|e| e.offset);
 
         // Convert entries to chronik_storage::Record
         let records: Vec<chronik_storage::Record> = all_entries.into_iter()
@@ -2578,7 +2581,7 @@ impl FetchHandler {
             };
 
             // Deserialize Tantivy segment
-            let reader = match TantivySegmentReader::from_tar_gz_bytes(segment_data.as_ref()) {
+            let reader = match TantivySegmentReader::from_archive_bytes(segment_data.clone()) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(
@@ -2617,6 +2620,7 @@ impl FetchHandler {
 
         // Sort entries by offset (should already be sorted, but ensure correctness)
         all_entries.sort_by_key(|e| e.offset);
+        all_entries.dedup_by_key(|e| e.offset);
 
         // Reconstruct CanonicalRecord from entries
         // Note: We use default compression (None) since we're serving the data uncompressed

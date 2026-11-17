@@ -13,6 +13,31 @@ failed on thunderbird: paging 500 `match_all` hits of `amazon-grocery` 50 at a
 time reached 195 distinct records, 82 of them on two pages.
 
 ### Added
+- **Archives are plain tars, read in place.** An archived index segment was a
+  `.tar.gz`, decompressed and unpacked into a directory before every search
+  or archive-tier fetch that did not find it cached — and the cache could not
+  hold a node's archives. New archives are uncompressed `.tar` files, opened
+  where they are: each file inside is a zero-copy slice of the archive (a
+  memory map on local disk, `TarDirectory`), so nothing is unpacked and a
+  local archive uses no cache space. Remote stores (S3, GCS, Azure) download
+  an archive once into the cache, as one file. Fetch reads plain tars from the
+  downloaded bytes directly. `.tar.gz` archives written by earlier versions
+  still open as before. Tantivy's files are compressed already: on 453
+  archives sampled from thunderbird, dropping gzip costs 27% more disk for
+  large archives and 47% for small ones.
+- **Small archives are merged.** The indexer archives what each run found, so
+  bursty topics pile up small archives (thunderbird: 6,000–13,000 a node,
+  median 26–263 KB), each one an index to open per search. A background pass
+  merges contiguous runs of at least four small archives of a partition
+  (Tantivy's segment merge: no re-tokenizing) into one of up to 64MB, merging
+  archives of different versions' schemas separately. The catalogue swaps the
+  sources for the merge in one locked step and only if every source is still
+  registered (`SegmentIndex::replace_segments`), so a truncation or topic
+  delete during a merge wins and no offset is ever covered twice; the archive
+  tier of fetch also drops duplicate offsets as a backstop. A crash after the
+  upload or after the swap leaves only unreferenced files, swept by the next
+  pass (`tests/cluster/e2e/archive_merge_crash.sh` aborts every node at each
+  point). `CHRONIK_ARCHIVE_MERGE=false` turns it off.
 - **Old indexes in `{data_dir}/index` are retired.** The RealtimeIndexer
   (removed in 08b1c58) and an early archiver left frozen indexes there that
   searches still read (thunderbird: 26 / 87 / 92 per node). Measured against

@@ -171,6 +171,10 @@ impl LocalBackend {
 
 #[async_trait]
 impl ObjectStore for LocalBackend {
+    fn local_path(&self, key: &str) -> Option<PathBuf> {
+        Some(self.build_path(key))
+    }
+
     #[instrument(skip(self, data))]
     async fn put_with_options(
         &self,
