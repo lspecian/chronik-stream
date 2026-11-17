@@ -5,12 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.18.0] - 2026-11-18
 
-Paging is correct on real clusters, including topics with an index left by
-the removed RealtimeIndexer. v2.17.3's pagination fix passed its tests but
-failed on thunderbird: paging 500 `match_all` hits of `amazon-grocery` 50 at a
-time reached 195 distinct records, 82 of them on two pages.
+Search over archived data, at the scale of a real cluster: word searches skip
+archives that cannot match (term filters), archives are read in place instead
+of unpacked, small archives are merged, the frozen indexes earlier versions
+left in `{data_dir}/index` are retired, and paging is correct on real data.
+
+**Upgrade / rollback.** New archives are written as plain `.tar` (earlier
+versions wrote `.tar.gz`); v2.18.0 reads both. A node rolled back to v2.17.x
+cannot read the `.tar` archives v2.18.0 wrote: searches skip them, and
+records held only in them cannot be fetched from that node, until it is
+upgraded again. Roll forward rather than back. The first boot also retires
+`{data_dir}/index` (two
+minutes in), which cannot be undone; `CHRONIK_LEGACY_INDEX_RETIREMENT=false`
+postpones it.
+
+v2.17.3's pagination fix passed its tests but failed on thunderbird: paging
+500 `match_all` hits of `amazon-grocery` 50 at a time reached 195 distinct
+records, 82 of them on two pages (fixed below).
 
 ### Added
 - **Archives are plain tars, read in place.** An archived index segment was a

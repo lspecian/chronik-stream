@@ -786,7 +786,7 @@ impl ColdSearch {
 }
 
 /// Whether archives' term filters are consulted (`CHRONIK_SEARCH_TERM_FILTERS`,
-/// default on; `false` opens every archive, as before v2.17.4).
+/// default on; `false` opens every archive, as before v2.18.0).
 fn term_filters_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
