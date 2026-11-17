@@ -169,6 +169,18 @@ fn empty_search_response() -> chronik_search::api::SearchResponse {
     }
 }
 
+/// What each node (this one included) is asked for: its top `from + size`
+/// hits, unpaged. Each node paging on its own skipped `from` hits per node, so
+/// page 2 of a cluster search lost the records that belonged on it; the
+/// coordinator pages the merged list once instead.
+#[cfg(feature = "search")]
+fn shard_request(request: &chronik_search::api::SearchRequest) -> chronik_search::api::SearchRequest {
+    let mut shard = request.clone();
+    shard.size = request.from.saturating_add(request.size);
+    shard.from = 0;
+    shard
+}
+
 /// Search this node and every peer at the same time, and merge.
 ///
 /// The local search and the fan-out used to run one after the other, so a
@@ -187,7 +199,8 @@ where
 {
     use axum::response::IntoResponse;
 
-    let size = request.size;
+    let (from, size) = (request.from, request.size);
+    let shard = shard_request(&request);
     let peers = state.query_router.all_peers();
     let (local, fan_out) = tokio::join!(local_search_response_of(local), async {
         if peers.is_empty() {
@@ -196,15 +209,17 @@ where
             Some(
                 state
                     .query_router
-                    .fan_out_post::<_, chronik_search::api::SearchResponse>(&path, &request, &peers)
+                    .fan_out_post::<_, chronik_search::api::SearchResponse>(&path, &shard, &peers)
                     .await,
             )
         }
     });
 
     let Some(fan_out) = fan_out else {
+        // The local search answered the whole window: page it here too.
         return match local {
-            Ok(resp) => axum::Json(resp).into_response(),
+            Ok(resp) => axum::Json(super::query_router::merge_search_responses(resp, Vec::new(), from, size))
+                .into_response(),
             Err(error_response) => error_response,
         };
     };
@@ -221,7 +236,7 @@ where
     match local {
         Ok(local_resp) => {
             let mut merged =
-                super::query_router::merge_search_responses(local_resp, fan_out.responses, size);
+                super::query_router::merge_search_responses(local_resp, fan_out.responses, from, size);
             // Hits are ranked, so a partial answer is still worth serving — but
             // `_shards.failed` has to say so, or a search that missed a node is
             // indistinguishable from one where that node held no match (issue #57).
@@ -233,6 +248,7 @@ where
             let mut merged = super::query_router::merge_search_responses(
                 empty_search_response(),
                 fan_out.responses,
+                from,
                 size,
             );
             // The local search failed, so this answer is short by this node
@@ -263,14 +279,17 @@ async fn search_all_fanout(
     use axum::response::IntoResponse;
 
     let api = state.search_api.clone();
-    let local_request = request.clone();
+    // A forwarded request is a peer's share of a fan-out and already asks for
+    // the whole window; otherwise this node is one shard of its own fan-out.
+    let forwarded = super::query_router::is_forwarded_request(&headers);
+    let local_request = if forwarded { request.clone() } else { shard_request(&request) };
     let local = async move {
         chronik_search::handlers::search_all(axum::extract::State(api), axum::Json(local_request))
             .await
             .into_response()
     };
     // A forwarded request is a peer's share of a fan-out: answer locally only.
-    if super::query_router::is_forwarded_request(&headers) {
+    if forwarded {
         return local.await;
     }
     search_everywhere(state, "/_search".to_string(), request, local, "_search").await
@@ -287,7 +306,10 @@ async fn search_index_fanout(
     use axum::response::IntoResponse;
 
     let api = state.search_api.clone();
-    let local_request = request.clone();
+    // A forwarded request is a peer's share of a fan-out and already asks for
+    // the whole window; otherwise this node is one shard of its own fan-out.
+    let forwarded = super::query_router::is_forwarded_request(&headers);
+    let local_request = if forwarded { request.clone() } else { shard_request(&request) };
     let local_index = index.clone();
     let local = async move {
         chronik_search::handlers::search_index(
@@ -298,7 +320,7 @@ async fn search_index_fanout(
         .await
         .into_response()
     };
-    if super::query_router::is_forwarded_request(&headers) {
+    if forwarded {
         return local.await;
     }
     search_everywhere(state, format!("/{}/_search", index), request, local, "index _search").await

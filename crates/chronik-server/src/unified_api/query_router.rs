@@ -3718,9 +3718,14 @@ fn combine_numbers(
 /// Merge Elasticsearch-compatible SearchResponse results from multiple nodes.
 ///
 /// Strategy: merge hits by _score, sum total hits and shard counts.
+///
+/// Each response must hold its node's top `from + size` hits, unpaged (the
+/// fan-out asks every node for `from: 0, size: from + size`); this merges
+/// them in [`chronik_search::ranking::hit_order`] and pages once.
 pub fn merge_search_responses(
     local: SearchResponse,
     peers: Vec<SearchResponse>,
+    from: usize,
     size: usize,
 ) -> SearchResponse {
     let mut all_hits = local.hits.hits;
@@ -3752,23 +3757,17 @@ pub fn merge_search_responses(
             }
         }
     }
-    let mut all_hits: Vec<Hit> = best.into_values().collect();
+    let all_hits: Vec<Hit> = best.into_values().collect();
 
     // The total is the number of DISTINCT documents. Summing each node's
     // total counted every replica: with RF=3 a topic holding one match
-    // reported `"total": 3`. Every source returns at most `size` hits, so
-    // fewer than `size` distinct hits means none was cut off and the count
+    // reported `"total": 3`. Every source returns at most `from + size` hits,
+    // so fewer distinct hits than that means none was cut off and the count
     // is exact; otherwise it is a lower bound, which ES reports as "gte".
-    let total_value = all_hits.len() as u64;
-    let total_relation = if all_hits.len() < size && !timed_out { "eq" } else { "gte" };
-
-    // Sort by score descending
-    all_hits.sort_by(|a, b| {
-        let sa = a._score.unwrap_or(0.0);
-        let sb = b._score.unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    all_hits.truncate(size);
+    let window = from.saturating_add(size);
+    let (all_hits, found) = chronik_search::ranking::page(all_hits, from, size);
+    let total_value = found as u64;
+    let total_relation = if found < window && !timed_out { "eq" } else { "gte" };
 
     let max_score = all_hits.first().and_then(|h| h._score);
 
@@ -4747,17 +4746,17 @@ mod fan_out_completeness_tests {
             }
         }
 
-        let merged = merge_search_responses(resp(&["0-42"]), vec![resp(&["0-42"]), resp(&["0-42"])], 10);
+        let merged = merge_search_responses(resp(&["0-42"]), vec![resp(&["0-42"]), resp(&["0-42"])], 0, 10);
         assert_eq!(merged.hits.hits.len(), 1);
         assert_eq!(merged.hits.total.value, 1, "one record, three replicas");
         assert_eq!(merged.hits.total.relation, "eq");
 
         // Disjoint partitions led by different nodes still add up.
-        let merged = merge_search_responses(resp(&["0-1"]), vec![resp(&["1-1"]), resp(&["2-1", "0-1"])], 10);
+        let merged = merge_search_responses(resp(&["0-1"]), vec![resp(&["1-1"]), resp(&["2-1", "0-1"])], 0, 10);
         assert_eq!(merged.hits.total.value, 3);
 
         // Hitting `size` means a source may have been cut off: a lower bound.
-        let merged = merge_search_responses(resp(&["0-1", "0-2"]), vec![resp(&["0-3"])], 2);
+        let merged = merge_search_responses(resp(&["0-1", "0-2"]), vec![resp(&["0-3"])], 0, 2);
         assert_eq!(merged.hits.hits.len(), 2);
         assert_eq!(merged.hits.total.value, 3);
 
@@ -4765,13 +4764,35 @@ mod fan_out_completeness_tests {
         // and its count a lower bound, however few hits came back.
         let mut slow = resp(&["1-7"]);
         slow.timed_out = true;
-        let merged = merge_search_responses(resp(&["0-1"]), vec![slow], 10);
+        let merged = merge_search_responses(resp(&["0-1"]), vec![slow], 0, 10);
         assert!(merged.timed_out, "a peer's timed_out must survive the merge");
         assert_eq!(merged.hits.total.value, 2);
         assert_eq!(merged.hits.total.relation, "gte");
+        // Paging happens once, on the merged list: three nodes each hold their
+        // top `from + size`; page 2 is the merged list's hits 3-4, and pages
+        // tile it with no repeats. (Each node skipping `from` itself lost them.)
+        let nodes = || {
+            (
+                resp(&["0-1", "0-4", "0-7"]),
+                vec![resp(&["1-2", "1-5", "1-8"]), resp(&["2-3", "2-6", "0-1"])],
+            )
+        };
+        let mut seen = Vec::new();
+        for from in [0, 2, 4, 6, 8] {
+            let (l, p) = nodes();
+            let page = merge_search_responses(l, p, from, 2);
+            assert!(page.hits.hits.len() <= 2);
+            seen.extend(page.hits.hits.into_iter().map(|h| h._id));
+        }
+        let (l, p) = nodes();
+        let all: Vec<String> =
+            merge_search_responses(l, p, 0, 100).hits.hits.into_iter().map(|h| h._id).collect();
+        assert_eq!(all.len(), 8, "eight distinct records");
+        assert_eq!(seen, all, "pages tile the merged list exactly");
+
         let mut slow_local = resp(&[]);
         slow_local.timed_out = true;
-        assert!(merge_search_responses(slow_local, vec![resp(&["0-1"])], 10).timed_out);
+        assert!(merge_search_responses(slow_local, vec![resp(&["0-1"])], 0, 10).timed_out);
         assert_eq!(merged.hits.total.relation, "gte");
     }
 }
