@@ -7,12 +7,19 @@
 # of match_all) were broken differently by each source. Page 2 repeated page 1
 # and records that belonged on later pages never appeared on any.
 #
-# Here: 600 JSON records over 3 partitions, RF3 (every node holds them all).
+# Topic 2 holds more records per source than the page window, so each source
+# has to cut its top from + size in the order the merge uses. (The v2.17.3
+# failure on thunderbird came from leftover RealtimeIndexer indexes, which no
+# current binary writes; a unit test in chronik-search covers those.)
+#
+# Topic 1: 600 JSON records over 3 partitions, RF3 (every node holds them all).
 # For match_all and for a query matching half the records, page through with
 # from = 0, s, 2s, ... and check the pages hold no duplicate, cover every
 # match, equal one search for all of them, and come back the same when asked
-# twice — while the records are hot, once archived, and after a restart with
-# the hot index off. Plus the result window limit (from + size <= 10,000).
+# twice. Topic 2: 6,000 records (2,000 a partition); page through the first
+# 500 and compare with one search of 500. Each while the records are hot, once
+# archived, and after a restart with the hot index off. Plus the result window
+# limit (from + size <= 10,000).
 #
 # Usage: search_pagination.sh <binary> <label>
 # Needs: KAFKA_HOME, kcat.
@@ -52,10 +59,28 @@ check() {
   expect "$what: a page asked twice is the same" "$(cmp -s "$tmp/p2a" "$tmp/p2b" && echo same || echo differ)" "same"
   rm -rf "$tmp"
 }
+# deep <label> <topic> <query> <page size> <depth>: the first <depth> hits of a
+# topic holding many more, paged vs one search — each source must cut its top
+# from + size the way the merge orders them.
+deep() {
+  local what=$1 t=$2 q=$3 s=$4 depth=$5 tmp
+  tmp=$(mktemp -d)
+  ids "$t" "$q" 0 "$depth" > "$tmp/all"
+  : > "$tmp/paged"
+  for from in $(seq 0 "$s" $((depth - s))); do
+    ids "$t" "$q" "$from" "$s" >> "$tmp/paged"
+  done
+  expect "$what: one search returns $depth" "$(sort -u "$tmp/all" | wc -l)" "$depth"
+  expect "$what: no record on two pages" "$(sort "$tmp/paged" | uniq -d | wc -l)" "0"
+  expect "$what: pages in order = one search" "$(cmp -s "$tmp/all" "$tmp/paged" && echo same || echo differ)" "same"
+  rm -rf "$tmp"
+}
 round() { # label
   echo "$1:"
   check "match_all" $T '{"match_all":{}}' 50 $N
   check "half the records" $T '{"match":{"parity":"even"}}' 37 $((N / 2))
+  deep "deep match_all" $D '{"match_all":{}}' 50 500
+  deep "deep half the records" $D '{"match":{"parity":"even"}}' 50 500
 }
 
 echo "=== $LABEL ($TEST_BIN)"
@@ -65,19 +90,26 @@ up || { echo "FAIL: cluster did not start"; exit 1; }
 T=pg-$LABEL
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $T --partitions 3 --replication-factor 3 >/dev/null 2>&1
 sleep 5
-for p in 0 1 2; do
-  seq $((p * 200 + 1)) $((p * 200 + 200)) | awk '{
+D=pgd-$LABEL
+$K/kafka-topics.sh --bootstrap-server $B --create --topic $D --partitions 3 --replication-factor 3 >/dev/null 2>&1
+sleep 5
+produce() { # topic first last partition
+  seq "$2" "$3" | awk '{
       printf "{\"id\":%d,\"parity\":\"%s\"}\n", $1, ($1 % 2 == 0) ? "even" : "odd" }' \
-    | kcat -P -b $B -t $T -p $p -X acks=all 2>/dev/null
+    | kcat -P -b $B -t "$1" -p "$4" -X acks=all 2>/dev/null
+}
+for p in 0 1 2; do
+  produce $T $((p * 200 + 1)) $((p * 200 + 200)) $p
+  produce $D $((p * 2000 + 1)) $((p * 2000 + 2000)) $p
 done
 sleep 5
 round "hot"
 
 for _ in $(seq 60); do
-  [ "$(find $C/data -path "*/$T/*" -name '*.tar.gz' 2>/dev/null | wc -l)" -ge 9 ] && break
+  [ "$(find $C/data -path "*/$T/*" -name '*.tar.gz' 2>/dev/null | wc -l)" -ge 9 ] && [ "$(find $C/data -path "*/$D/*" -name '*.tar.gz' 2>/dev/null | wc -l)" -ge 9 ] && break
   sleep 5
 done
-echo "archives on disk: $(find $C/data -path "*/$T/*" -name '*.tar.gz' 2>/dev/null | wc -l)"
+echo "archives on disk: $(find $C/data -path "*/$T/*" -name '*.tar.gz' 2>/dev/null | wc -l) + $(find $C/data -path "*/$D/*" -name '*.tar.gz' 2>/dev/null | wc -l)"
 sleep 10
 round "archived, hot index on"
 
