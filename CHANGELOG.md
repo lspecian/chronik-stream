@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.17.2] - 2026-11-17
 
 A search naming no topic answers on a node with thousands of archived
 segments, and the unpacked copies it keeps no longer grow without limit.
@@ -53,7 +53,7 @@ segments, and the unpacked copies it keeps no longer grow without limit.
   now found by their config path, `start.sh`/`restart.sh` refuse to launch
   while the cluster's ports are held (`tests/cluster/ports_free.sh`) and exit
   non-zero when a node does not come up, and the e2e checks stop when a
-  (re)start fails. The v2.17.1 e2e results were re-run under the fixed scripts.
+  (re)start fails. The full e2e suite was re-run under the fixed scripts (17/17).
 
 ## [2.17.1] - 2026-11-17
 
