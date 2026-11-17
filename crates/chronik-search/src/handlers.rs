@@ -61,19 +61,30 @@ pub async fn metrics_handler() -> impl IntoResponse {
 /// silently dropping the AND.
 fn extract_simple_query_text(dsl: &QueryDsl) -> Option<String> {
     match dsl {
-        QueryDsl::MatchAll(_) => Some("*".to_string()),
-        QueryDsl::Match(m) => m
-            .field_value
-            .values()
-            .next()
-            .and_then(|v| match v {
+        // match_all is structured (AllQuery): the simple path sanitizes its
+        // text to a bag of words, which turned "*" into nothing and made
+        // match_all return 0 hits on a hot topic (#65).
+        // Only a match on the whole record text may take the simple path: it
+        // searches value/key/headers and drops the field name. A match on a
+        // named field (`marker`, `user.name`) used to come here too, so it
+        // matched the term in ANY field — while the archived index, which
+        // honours the field, did not. Field matches go structured.
+        QueryDsl::Match(m)
+            if m
+                .field_value
+                .keys()
+                .next()
+                .is_some_and(|f| matches!(f.as_str(), "value" | "_value" | "_all")) =>
+        {
+            m.field_value.values().next().and_then(|v| match v {
                 serde_json::Value::String(s) => Some(s.clone()),
                 serde_json::Value::Object(obj) => obj
                     .get("query")
                     .and_then(|q| q.as_str())
                     .map(|s| s.to_string()),
                 _ => None,
-            }),
+            })
+        }
         _ => None, // Bool/Term/Range/etc. go through the structured path.
     }
 }
@@ -115,7 +126,7 @@ fn hot_hit_to_es_hit(hit: crate::hot_text_index::HotHit) -> Hit {
 /// Empty Vec if hot index absent or topic unknown.
 ///
 /// Routing:
-///   - `MatchAll` / flat `Match` → flat QueryParser path (fastest, common case)
+///   - `Match` on the whole record (`value`, `_all`) → flat QueryParser path
 ///   - Anything else (including `Bool`, Term, Range) → structured path that
 ///     builds a real Tantivy query per partition, preserving bool semantics
 ///     (issue #2).
@@ -127,9 +138,9 @@ async fn search_hot_topic(
     let Some(hot_idx) = api.hot_text_index.as_ref() else {
         return Vec::new();
     };
-    let Some(dsl) = request.query.as_ref() else {
-        return Vec::new();
-    };
+    // No query means match_all, as in Elasticsearch and on the cold path.
+    let match_all = QueryDsl::MatchAll(crate::api::MatchAllQuery {});
+    let dsl = request.query.as_ref().unwrap_or(&match_all);
     let k = request.size.max(10);
 
     if let Some(query_text) = extract_simple_query_text(dsl) {
@@ -169,9 +180,9 @@ async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest) -> Vec<Hi
     let Some(hot_idx) = api.hot_text_index.as_ref() else {
         return Vec::new();
     };
-    let Some(dsl) = request.query.as_ref() else {
-        return Vec::new();
-    };
+    // No query means match_all, as in Elasticsearch and on the cold path.
+    let match_all = QueryDsl::MatchAll(crate::api::MatchAllQuery {});
+    let dsl = request.query.as_ref().unwrap_or(&match_all);
 
     let mut topics: Vec<String> = hot_idx
         .partition_keys()
@@ -335,7 +346,8 @@ pub async fn search_all(
         };
         for topic in topics {
             match search_object_store_segments(wal_indexer, &topic, &request).await {
-                Ok(mut hits) => all_hits.append(&mut hits),
+                Ok(Some(mut hits)) => all_hits.append(&mut hits),
+                Ok(None) => {}
                 Err(e) => debug!(topic = %topic, "object-store cold search error: {}", e),
             }
         }
@@ -472,12 +484,15 @@ pub async fn search_index(
     if cold_hits.is_empty() {
         if let Some(wal_indexer) = api.wal_indexer() {
             match search_object_store_segments(wal_indexer, &index, &request).await {
-                Ok(hits) => {
-                    if !hits.is_empty() {
-                        have_any_cold_source = true;
-                    }
+                // Archived segments exist: the topic is known even when none
+                // of them matches. Counting it only when it returned hits
+                // turned every no-match query on an archived topic into
+                // "no such index" once the hot index was off.
+                Ok(Some(hits)) => {
+                    have_any_cold_source = true;
                     cold_hits.extend(hits);
                 }
+                Ok(None) => {}
                 Err(e) => debug!(topic = %index, "object-store cold search error: {}", e),
             }
         }
@@ -611,7 +626,7 @@ async fn search_object_store_segments(
     wal_indexer: &std::sync::Arc<chronik_storage::WalIndexer>,
     topic: &str,
     request: &SearchRequest,
-) -> Result<Vec<Hit>> {
+) -> Result<Option<Vec<Hit>>> {
     use chronik_storage::tantivy_segment::TantivySegmentReader;
 
     let segments = wal_indexer
@@ -620,7 +635,7 @@ async fn search_object_store_segments(
         .await
         .map_err(|e| Error::Internal(format!("segment lookup for {}: {}", topic, e)))?;
     if segments.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let object_store = wal_indexer.object_store();
@@ -656,7 +671,7 @@ async fn search_object_store_segments(
             ),
         }
     }
-    Ok(all_hits)
+    Ok(Some(all_hits))
 }
 
 async fn search_wal_indices(base_path: &str, request: &SearchRequest) -> Result<Vec<Hit>> {
@@ -770,6 +785,27 @@ async fn search_tantivy_index(
         let doc: tantivy::TantivyDocument = searcher.doc(doc_address)
             .map_err(|e| Error::Internal(format!("Failed to retrieve document: {}", e)))?;
 
+        // An archived segment's document holds Chronik's internal columns
+        // (raw `_value` bytes, producer ids, sequences...). Dumping them gave
+        // a record a different `_source` once it was archived — `_value` as a
+        // list of byte numbers, no `offset` or `timestamp`. Present it the way
+        // the hot index does.
+        if let Some(source) = archived_record_source(index_name, &schema, &doc) {
+            let id = format!(
+                "{}-{}",
+                source.get("partition").and_then(|v| v.as_i64()).unwrap_or(0),
+                source.get("offset").and_then(|v| v.as_i64()).unwrap_or(0)
+            );
+            hits.push(Hit {
+                _index: index_name.to_string(),
+                _id: id,
+                _score: Some(score),
+                _source: serde_json::Value::Object(source),
+                highlight: None,
+            });
+            continue;
+        }
+
         // Convert Tantivy document to JSON
         let mut source = serde_json::Map::new();
         for field in schema.fields() {
@@ -826,6 +862,53 @@ async fn search_tantivy_index(
     }
 
     Ok(hits)
+}
+
+/// `_source` for a document of an archived segment, in the shape a hot hit
+/// has (`hot_hit_to_es_hit`): topic, partition, offset, timestamp, key, value.
+/// `None` when the schema is not an archive segment's.
+fn archived_record_source(
+    topic: &str,
+    schema: &tantivy::schema::Schema,
+    doc: &tantivy::TantivyDocument,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let offset_field = schema.get_field("_offset").ok()?;
+    let ts_field = schema.get_field("_ts").ok()?;
+    let raw_value_field = schema.get_field("_value").ok()?;
+    if !matches!(schema.get_field_entry(raw_value_field).field_type(), FieldType::Bytes(_)) {
+        return None;
+    }
+    let offset = doc.get_first(offset_field).and_then(|v| v.as_i64())?;
+
+    let mut source = serde_json::Map::new();
+    source.insert("topic".to_string(), serde_json::Value::String(topic.to_string()));
+    let partition = schema
+        .get_field("partition")
+        .ok()
+        .and_then(|f| doc.get_first(f).and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    source.insert("partition".to_string(), partition.into());
+    source.insert("offset".to_string(), offset.into());
+    if let Some(ts) = doc.get_first(ts_field).and_then(|v| v.as_datetime()) {
+        source.insert("timestamp".to_string(), ts.into_timestamp_millis().into());
+    }
+    if let Some(key) = schema
+        .get_field("_key")
+        .ok()
+        .and_then(|f| doc.get_first(f).and_then(|v| v.as_bytes()))
+    {
+        source.insert(
+            "key".to_string(),
+            serde_json::Value::String(String::from_utf8_lossy(key).into_owned()),
+        );
+    }
+    if let Some(value) = doc.get_first(raw_value_field).and_then(|v| v.as_bytes()) {
+        source.insert(
+            "value".to_string(),
+            serde_json::Value::String(String::from_utf8_lossy(value).into_owned()),
+        );
+    }
+    Some(source)
 }
 
 /// Helper function to search within a single index
@@ -941,6 +1024,260 @@ fn resolve_field(
     Err(())
 }
 
+/// What a field name in a query refers to in one particular index.
+#[derive(Debug, Clone)]
+enum FieldTarget {
+    /// A field of the schema itself (`value`, `key`, `offset`, ...).
+    Schema(tantivy::schema::Field),
+    /// A field inside the record's JSON value, e.g. `marker` or `user.name`,
+    /// reached through the schema's JSON field.
+    JsonPath(tantivy::schema::Field, String),
+    /// An index written before JSON values were indexed by field (archives
+    /// from v2.17.0 and earlier). The field cannot be told apart there, so the
+    /// query runs as full text over the whole value — the same documents the
+    /// hot index used to return for any field name.
+    LegacyFullText(tantivy::schema::Field),
+}
+
+/// Resolve a query's field name against one index's schema.
+///
+/// Order: an exact (or underscore-aliased) schema field wins, so `value`,
+/// `key`, `offset`, `partition` keep their meaning; any other name is a path
+/// into the JSON value when the schema indexes one; failing that, legacy
+/// indexes fall back to full text on the value.
+fn resolve_target(
+    schema: &tantivy::schema::Schema,
+    field_name: &str,
+) -> Result<FieldTarget> {
+    if let Ok(field) = resolve_field(schema, field_name) {
+        return Ok(FieldTarget::Schema(field));
+    }
+    if let Ok(json) = schema.get_field(chronik_storage::json_index::JSON_FIELD) {
+        return Ok(FieldTarget::JsonPath(json, field_name.to_string()));
+    }
+    if let Ok(value) = resolve_field(schema, "value") {
+        if matches!(schema.get_field_entry(value).field_type(), FieldType::Str(_)) {
+            return Ok(FieldTarget::LegacyFullText(value));
+        }
+    }
+    Err(Error::InvalidInput(format!("Field {} not found", field_name)))
+}
+
+/// Analyze `text` with the tokenizer `field` is indexed with.
+fn analyzed_tokens(
+    index: &tantivy::Index,
+    field: tantivy::schema::Field,
+    text: &str,
+) -> Result<Vec<String>> {
+    let mut analyzer = index
+        .tokenizer_for_field(field)
+        .map_err(|e| Error::Internal(format!("tokenizer for field: {}", e)))?;
+    let mut stream = analyzer.token_stream(text);
+    let mut tokens = Vec::new();
+    while let Some(token) = stream.next() {
+        tokens.push(token.text.clone());
+    }
+    Ok(tokens)
+}
+
+/// One query term per analyzed token of `text` at `path` in a JSON field.
+fn json_text_terms(
+    index: &tantivy::Index,
+    json_field: tantivy::schema::Field,
+    path: &str,
+    text: &str,
+) -> Result<Vec<Term>> {
+    Ok(analyzed_tokens(index, json_field, text)?
+        .into_iter()
+        .map(|token| {
+            let mut term = Term::from_field_json_path(json_field, path, true);
+            term.append_type_and_str(&token);
+            term
+        })
+        .collect())
+}
+
+/// A typed numeric term at `path` in a JSON field. Tantivy indexes JSON
+/// integers as i64 (u64 only above i64::MAX) and other numbers as f64.
+fn json_number_term(
+    json_field: tantivy::schema::Field,
+    path: &str,
+    number: &serde_json::Number,
+) -> Result<Term> {
+    let mut term = Term::from_field_json_path(json_field, path, true);
+    if let Some(i) = number.as_i64() {
+        term.append_type_and_fast_value(i);
+    } else if let Some(u) = number.as_u64() {
+        term.append_type_and_fast_value(u);
+    } else if let Some(f) = number.as_f64() {
+        term.append_type_and_fast_value(f);
+    } else {
+        return Err(Error::InvalidInput(format!("Invalid number {}", number)));
+    }
+    Ok(term)
+}
+
+/// Combine terms into one query: a single term stands alone, several are
+/// joined with `occur` (Should for match's OR semantics, Must for all-of).
+fn terms_query(terms: Vec<Term>, occur: Occur) -> Box<dyn TantivyQuery> {
+    let mut queries: Vec<(Occur, Box<dyn TantivyQuery>)> = terms
+        .into_iter()
+        .map(|t| {
+            (
+                occur,
+                Box::new(TermQuery::new(t, tantivy::schema::IndexRecordOption::WithFreqs))
+                    as Box<dyn TantivyQuery>,
+            )
+        })
+        .collect();
+    if queries.len() == 1 {
+        queries.pop().map(|(_, q)| q).expect("one query")
+    } else {
+        Box::new(BooleanQuery::new(queries))
+    }
+}
+
+/// Lower and upper bounds of a range clause, built by `make` from each bound
+/// value. `gt`/`lt` are exclusive, `gte`/`lte` inclusive; a missing side is
+/// unbounded.
+fn range_bounds(
+    clause: &crate::api::RangeClause,
+    mut make: impl FnMut(&serde_json::Value) -> Result<Term>,
+) -> Result<(std::ops::Bound<Term>, std::ops::Bound<Term>)> {
+    use std::ops::Bound;
+    let lower = match (&clause.gte, &clause.gt) {
+        (Some(v), _) => Bound::Included(make(v)?),
+        (None, Some(v)) => Bound::Excluded(make(v)?),
+        (None, None) => Bound::Unbounded,
+    };
+    let upper = match (&clause.lte, &clause.lt) {
+        (Some(v), _) => Bound::Included(make(v)?),
+        (None, Some(v)) => Bound::Excluded(make(v)?),
+        (None, None) => Bound::Unbounded,
+    };
+    if matches!((&lower, &upper), (Bound::Unbounded, Bound::Unbounded)) {
+        return Err(Error::InvalidInput("Range query must specify a bound".to_string()));
+    }
+    Ok((lower, upper))
+}
+
+/// Run `f` with the index to analyze against: the real one when the caller
+/// has it, else a throwaway in-RAM index of the same schema with the Chronik
+/// analyzer registered (tokenizers are not persisted with a schema).
+fn with_query_index<T>(
+    schema: &tantivy::schema::Schema,
+    index: Option<&tantivy::Index>,
+    f: impl FnOnce(&tantivy::Index) -> Result<T>,
+) -> Result<T> {
+    match index {
+        Some(idx) => f(idx),
+        None => {
+            let tmp = tantivy::Index::create_in_ram(schema.clone());
+            chronik_storage::register_analyzer(&tmp);
+            f(&tmp)
+        }
+    }
+}
+
+/// A typed boolean term at `path` in a JSON field.
+fn json_bool_term(json_field: tantivy::schema::Field, path: &str, b: bool) -> Term {
+    let mut term = Term::from_field_json_path(json_field, path, true);
+    term.append_type_and_fast_value(b);
+    term
+}
+
+/// `match` on a field of the JSON value: any analyzed token of the query at
+/// that path (Elasticsearch's default OR operator). A number or boolean
+/// matches the typed value, and a number also matches the same digits held
+/// as a string.
+fn json_match_query(
+    schema: &tantivy::schema::Schema,
+    index: Option<&tantivy::Index>,
+    json: tantivy::schema::Field,
+    path: &str,
+    value: &serde_json::Value,
+) -> Result<Box<dyn TantivyQuery>> {
+    with_query_index(schema, index, |idx| {
+        let mut terms = Vec::new();
+        let text = match value {
+            serde_json::Value::Number(n) => {
+                terms.push(json_number_term(json, path, n)?);
+                n.to_string()
+            }
+            serde_json::Value::Bool(b) => {
+                terms.push(json_bool_term(json, path, *b));
+                b.to_string()
+            }
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let text_terms = json_text_terms(idx, json, path, &text)?;
+        if text_terms.is_empty() && terms.is_empty() {
+            // Stop-word-only query: same fallback as a match on a schema field.
+            debug!("Query '{}' on {} has only stop words, matching all", text, path);
+            return Ok(Box::new(AllQuery) as Box<dyn TantivyQuery>);
+        }
+        terms.extend(text_terms);
+        Ok(terms_query(terms, Occur::Should))
+    })
+}
+
+/// `term` on a field of the JSON value. JSON strings are indexed as analyzed
+/// text, so an exact string term is all of its analyzed tokens at that path;
+/// numbers and booleans match the typed value exactly.
+fn json_term_query(
+    schema: &tantivy::schema::Schema,
+    index: Option<&tantivy::Index>,
+    json: tantivy::schema::Field,
+    path: &str,
+    value: &serde_json::Value,
+) -> Result<Box<dyn TantivyQuery>> {
+    match value {
+        serde_json::Value::Number(n) => Ok(Box::new(TermQuery::new(
+            json_number_term(json, path, n)?,
+            tantivy::schema::IndexRecordOption::Basic,
+        ))),
+        serde_json::Value::Bool(b) => Ok(Box::new(TermQuery::new(
+            json_bool_term(json, path, *b),
+            tantivy::schema::IndexRecordOption::Basic,
+        ))),
+        serde_json::Value::String(s) => with_query_index(schema, index, |idx| {
+            let terms = json_text_terms(idx, json, path, s)?;
+            if terms.is_empty() {
+                return Ok(Box::new(tantivy::query::EmptyQuery) as Box<dyn TantivyQuery>);
+            }
+            Ok(terms_query(terms, Occur::Must))
+        }),
+        _ => Err(Error::InvalidInput("Term query value must be string, number or boolean".to_string())),
+    }
+}
+
+/// `term` on a field name an index from before field-level JSON indexing
+/// cannot resolve: every analyzed token of the value somewhere in the
+/// record's text.
+fn legacy_term_query(
+    schema: &tantivy::schema::Schema,
+    index: Option<&tantivy::Index>,
+    value_field: tantivy::schema::Field,
+    value: &serde_json::Value,
+) -> Result<Box<dyn TantivyQuery>> {
+    let text = match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.to_string(),
+        _ => return Err(Error::InvalidInput("Term query value must be string, number or boolean".to_string())),
+    };
+    with_query_index(schema, index, |idx| {
+        let terms: Vec<Term> = analyzed_tokens(idx, value_field, &text)?
+            .into_iter()
+            .map(|t| Term::from_field_text(value_field, &t))
+            .collect();
+        if terms.is_empty() {
+            return Ok(Box::new(tantivy::query::EmptyQuery) as Box<dyn TantivyQuery>);
+        }
+        Ok(terms_query(terms, Occur::Must))
+    })
+}
+
 /// Build Tantivy query from Elasticsearch query DSL.
 ///
 /// Exposed crate-wide so the hot text index can build structured queries
@@ -958,6 +1295,13 @@ pub(crate) fn build_tantivy_query(
             // Get the field and value from the match query
             let (field_name, value) = match_query.field_value.iter().next()
                 .ok_or_else(|| Error::InvalidInput("Match query must specify a field".to_string()))?;
+            // Long form `{"field": {"query": "text", ...}}` means the same as
+            // `{"field": "text"}`; without this the object's JSON text was
+            // searched for literally.
+            let value = match value {
+                serde_json::Value::Object(o) => o.get("query").unwrap_or(value),
+                _ => value,
+            };
 
             // Handle _all meta-field: search across all TEXT and JSON fields
             let fields = if field_name == "_all" {
@@ -972,10 +1316,14 @@ pub(crate) fn build_tantivy_query(
             } else {
                 // v2.5.5: resolve `value` against `_value` too (and vice versa)
                 // so the same query works against hot, WAL-archived, and realtime
-                // schemas without the caller knowing which is live.
-                let field = resolve_field(schema, field_name)
-                    .map_err(|_| Error::InvalidInput(format!("Field {} not found", field_name)))?;
-                vec![field]
+                // schemas without the caller knowing which is live. Other names
+                // are fields of the record's JSON value.
+                match resolve_target(schema, field_name)? {
+                    FieldTarget::Schema(field) | FieldTarget::LegacyFullText(field) => vec![field],
+                    FieldTarget::JsonPath(json, path) => {
+                        return json_match_query(schema, index, json, &path, value);
+                    }
+                }
             };
 
             if fields.is_empty() {
@@ -1040,8 +1388,17 @@ pub(crate) fn build_tantivy_query(
             let (field_name, value) = term_query.field_value.iter().next()
                 .ok_or_else(|| Error::InvalidInput("Term query must specify a field".to_string()))?;
             
-            let field = resolve_field(schema, field_name)
-                .map_err(|_| Error::InvalidInput(format!("Field {} not found", field_name)))?;
+            let field = match resolve_target(schema, field_name)? {
+                FieldTarget::Schema(field) => field,
+                // A JSON string field is analyzed text, so an exact term is
+                // every analyzed token of the value present at that path.
+                FieldTarget::JsonPath(json, path) => {
+                    return json_term_query(schema, index, json, &path, value);
+                }
+                FieldTarget::LegacyFullText(field) => {
+                    return legacy_term_query(schema, index, field, value);
+                }
+            };
 
             let term = match value {
                 serde_json::Value::String(s) => Term::from_field_text(field, s),
@@ -1064,35 +1421,44 @@ pub(crate) fn build_tantivy_query(
             let (field_name, range_clause) = range_query.field_range.iter().next()
                 .ok_or_else(|| Error::InvalidInput("Range query must specify a field".to_string()))?;
 
-            let field = resolve_field(schema, field_name)
-                .map_err(|_| Error::InvalidInput(format!("Field {} not found", field_name)))?;
-            
-            // For now, we'll create a simple numeric range query
-            // In a full implementation, this would handle dates and other types
+            let field = match resolve_target(schema, field_name)? {
+                FieldTarget::Schema(field) => field,
+                // Tantivy 0.24 runs a range over a JSON path only when the JSON
+                // field is a fast (columnar) field, which would add a column
+                // per JSON path per document to every hot and archived index.
+                // Refused here rather than failing inside the search.
+                FieldTarget::JsonPath(_, path) => {
+                    return Err(Error::InvalidInput(format!(
+                        "Range queries on JSON fields ({}) are not supported",
+                        path
+                    )));
+                }
+                FieldTarget::LegacyFullText(_) => {
+                    return Err(Error::InvalidInput(format!(
+                        "Field {} is not indexed by field in this index",
+                        field_name
+                    )));
+                }
+            };
+
             let field_type = schema.get_field_entry(field).field_type();
-            
             match field_type {
-                FieldType::I64(_) | FieldType::U64(_) => {
-                    // Extract bounds
-                    let lower_bound = range_clause.gte.as_ref()
-                        .or(range_clause.gt.as_ref())
-                        .and_then(|v| v.as_i64());
-                    
-                    let upper_bound = range_clause.lte.as_ref()
-                        .or(range_clause.lt.as_ref())
-                        .and_then(|v| v.as_i64());
-                    
-                    if let (Some(lower), Some(upper)) = (lower_bound, upper_bound) {
-                        let lower_term = Term::from_field_i64(field, lower);
-                        let upper_term = Term::from_field_i64(field, upper);
-                        Ok(Box::new(RangeQuery::new(
-                            std::ops::Bound::Included(lower_term),
-                            std::ops::Bound::Included(upper_term)
-                        )))
-                    } else {
-                        Err(Error::InvalidInput("Range query must specify bounds".to_string()))
-                    }
-                },
+                FieldType::I64(_) => {
+                    let (lower, upper) = range_bounds(range_clause, |v| {
+                        v.as_i64()
+                            .map(|i| Term::from_field_i64(field, i))
+                            .ok_or_else(|| Error::InvalidInput("Range bound must be an integer".to_string()))
+                    })?;
+                    Ok(Box::new(RangeQuery::new(lower, upper)))
+                }
+                FieldType::U64(_) => {
+                    let (lower, upper) = range_bounds(range_clause, |v| {
+                        v.as_u64()
+                            .map(|u| Term::from_field_u64(field, u))
+                            .ok_or_else(|| Error::InvalidInput("Range bound must be a non-negative integer".to_string()))
+                    })?;
+                    Ok(Box::new(RangeQuery::new(lower, upper)))
+                }
                 _ => Err(Error::InvalidInput("Range queries only supported for numeric fields".to_string())),
             }
         },
@@ -1609,9 +1975,10 @@ mod hot_merge_tests {
     }
 
     #[test]
-    fn extract_match_all_returns_star() {
+    fn extract_match_all_takes_the_structured_path() {
+        // The simple path sanitized "*" to nothing: match_all found 0 hot docs (#65).
         let q = QueryDsl::MatchAll(crate::api::MatchAllQuery {});
-        assert_eq!(extract_simple_query_text(&q), Some("*".to_string()));
+        assert_eq!(extract_simple_query_text(&q), None);
     }
 
     #[test]
@@ -1750,6 +2117,226 @@ mod hot_merge_tests {
         assert_eq!(
             src.get("value").and_then(|v| v.as_str()),
             Some("payload text")
+        );
+    }
+}
+/// Field queries on JSON record values: the hot index and archived segments
+/// both index a JSON-object value into `_json`, and a query on a field the
+/// schema does not define is a path into it.
+#[cfg(test)]
+mod json_field_tests {
+    use super::*;
+    use tantivy::schema::{Schema, INDEXED, STORED, TEXT};
+
+    const DOCS: &[&str] = &[
+        r#"{"marker":"quixoticbellwether","n":3,"user":{"name":"Ada Lovelace"},"ok":true}"#,
+        r#"{"marker":"ordinary","note":"the quixoticbellwether was mentioned","n":10,"ok":false}"#,
+        "quixoticbellwether in plain text",
+        r#"{"user.name":"Grace Hopper","n":2.5}"#,
+    ];
+
+    /// An index shaped like the hot/archive schemas: whole value as text,
+    /// offset, and (unless `legacy`) the JSON field.
+    fn index(legacy: bool) -> tantivy::Index {
+        let mut b = Schema::builder();
+        let value = b.add_text_field("value", TEXT | STORED);
+        let offset = b.add_i64_field("offset", INDEXED | STORED);
+        let json = (!legacy).then(|| {
+            b.add_json_field(
+                chronik_storage::json_index::JSON_FIELD,
+                chronik_storage::json_index::json_field_options(),
+            )
+        });
+        let index = tantivy::Index::create_in_ram(b.build());
+        chronik_storage::register_analyzer(&index);
+        let mut writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+        for (i, raw) in DOCS.iter().enumerate() {
+            let mut doc = tantivy::TantivyDocument::default();
+            doc.add_text(value, raw);
+            doc.add_i64(offset, i as i64);
+            if let (Some(json), Some(obj)) =
+                (json, chronik_storage::json_index::json_object(str::as_bytes(raw)))
+            {
+                doc.add_object(json, obj.into_iter().map(|(k, v)| (k, v.into())).collect());
+            }
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        index
+    }
+
+    /// Offsets matched by an Elasticsearch query DSL, sorted.
+    fn hits(index: &tantivy::Index, dsl: serde_json::Value) -> Vec<i64> {
+        let dsl: QueryDsl = serde_json::from_value(dsl).unwrap();
+        let schema = index.schema();
+        let query = build_tantivy_query(&dsl, &schema, Some(index)).unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let offset = schema.get_field("offset").unwrap();
+        let mut out: Vec<i64> = searcher
+            .search(&*query, &TopDocs::with_limit(100))
+            .unwrap()
+            .into_iter()
+            .map(|(_, addr)| {
+                let doc: tantivy::TantivyDocument = searcher.doc(addr).unwrap();
+                doc.get_first(offset).and_then(|v| v.as_i64()).unwrap()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn match_on_a_json_field_honours_the_field() {
+        let idx = index(false);
+        // The term is in doc 0's `marker`, in doc 1's `note`, in doc 2's text.
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"marker": "quixoticbellwether"}})), vec![0]);
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"note": "quixoticbellwether"}})), vec![1]);
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"value": "quixoticbellwether"}})), vec![0, 1, 2]);
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"nosuchfield": "quixoticbellwether"}})), Vec::<i64>::new());
+        // Long form.
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"marker": {"query": "ordinary"}}})), vec![1]);
+    }
+
+    #[test]
+    fn nested_and_dotted_keys_share_one_path() {
+        let idx = index(false);
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"user.name": "lovelace"}})), vec![0]);
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"user.name": "hopper"}})), vec![3]);
+    }
+
+    #[test]
+    fn numbers_and_booleans_match_typed_values() {
+        let idx = index(false);
+        assert_eq!(hits(&idx, serde_json::json!({"term": {"n": 3}})), vec![0]);
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"n": 10}})), vec![1]);
+        assert_eq!(hits(&idx, serde_json::json!({"term": {"n": 2.5}})), vec![3]);
+        assert_eq!(hits(&idx, serde_json::json!({"term": {"ok": true}})), vec![0]);
+        assert_eq!(hits(&idx, serde_json::json!({"term": {"ok": false}})), vec![1]);
+    }
+
+    /// Tantivy 0.24 cannot range over a JSON path without a fast field; the
+    /// query is refused up front instead of failing inside the search.
+    #[test]
+    fn ranges_on_json_fields_are_refused() {
+        let idx = index(false);
+        let dsl: QueryDsl =
+            serde_json::from_value(serde_json::json!({"range": {"n": {"gte": 3}}})).unwrap();
+        assert!(build_tantivy_query(&dsl, &idx.schema(), Some(&idx)).is_err());
+    }
+
+    #[test]
+    fn schema_field_ranges_respect_exclusive_bounds() {
+        let idx = index(false);
+        // `gt`/`lt` used to be treated as inclusive, and one-sided ranges failed.
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"offset": {"gt": 0, "lt": 3}}})), vec![1, 2]);
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"offset": {"gte": 2}}})), vec![2, 3]);
+    }
+
+    #[test]
+    fn bool_must_combines_json_fields() {
+        let idx = index(false);
+        let q = serde_json::json!({"bool": {"must": [
+            {"match": {"marker": "ordinary"}},
+            {"match": {"note": "mentioned"}}
+        ]}});
+        assert_eq!(hits(&idx, q), vec![1]);
+        let q = serde_json::json!({"bool": {"must": [
+            {"match": {"marker": "quixoticbellwether"}},
+            {"match": {"note": "mentioned"}}
+        ]}});
+        assert_eq!(hits(&idx, q), Vec::<i64>::new());
+    }
+
+    /// Archives written before field-level indexing have no `_json`: a field
+    /// query there searches the whole value instead of matching nothing.
+    #[test]
+    fn indexes_without_a_json_field_fall_back_to_full_text() {
+        let idx = index(true);
+        assert_eq!(hits(&idx, serde_json::json!({"match": {"marker": "quixoticbellwether"}})), vec![0, 1, 2]);
+        assert_eq!(hits(&idx, serde_json::json!({"term": {"marker": "ordinary"}})), vec![1]);
+        let dsl: QueryDsl = serde_json::from_value(serde_json::json!({"range": {"n": {"gte": 1}}})).unwrap();
+        assert!(build_tantivy_query(&dsl, &idx.schema(), Some(&idx)).is_err());
+    }
+
+    #[test]
+    fn only_whole_record_matches_take_the_hot_simple_path() {
+        let q: QueryDsl = serde_json::from_value(serde_json::json!({"match": {"marker": "x"}})).unwrap();
+        assert_eq!(extract_simple_query_text(&q), None);
+        let q: QueryDsl = serde_json::from_value(serde_json::json!({"match": {"value": "x"}})).unwrap();
+        assert_eq!(extract_simple_query_text(&q), Some("x".to_string()));
+    }
+}
+
+/// A record found in an archived segment must look the same as when the hot
+/// index found it, and field queries must reach it.
+#[cfg(test)]
+mod archived_hit_tests {
+    use super::*;
+    use chronik_storage::canonical_record::{
+        CanonicalRecord, CanonicalRecordEntry, CompressionType, TimestampType,
+    };
+    use chronik_storage::tantivy_segment::TantivySegmentWriter;
+
+    fn archive() -> tantivy::Index {
+        let records = (0..10)
+            .map(|i| CanonicalRecordEntry {
+                offset: 100 + i,
+                timestamp: 1_700_000_000_000 + i,
+                key: Some(format!("k{}", i).into_bytes()),
+                value: Some(
+                    format!(
+                        r#"{{"marker":"{}"}}"#,
+                        if i == 4 { "quixoticbellwether" } else { "ordinary" }
+                    )
+                    .into_bytes(),
+                ),
+                headers: vec![],
+                attributes: 0,
+            })
+            .collect();
+        let canonical = CanonicalRecord {
+            base_offset: 100,
+            partition_leader_epoch: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            is_transactional: false,
+            is_control: false,
+            compression: CompressionType::None,
+            timestamp_type: TimestampType::CreateTime,
+            base_timestamp: 1_700_000_000_000,
+            max_timestamp: 1_700_000_000_009,
+            records,
+            compressed_records_wire_bytes: None,
+            original_v1_wire_format: None,
+            original_v2_wire_format: None,
+        };
+        let mut writer = TantivySegmentWriter::new("orders".to_string(), 2, 100).unwrap();
+        writer.write_batch(&canonical).unwrap();
+        writer.commit().unwrap().0
+    }
+
+    #[tokio::test]
+    async fn archived_hits_have_the_hot_shape() {
+        let index = archive();
+        let request: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": {"match": {"marker": "quixoticbellwether"}}
+        }))
+        .unwrap();
+        let hits = search_tantivy_index("orders", &index, &request).await.unwrap();
+        assert_eq!(hits.len(), 1, "the field query reaches the archive");
+        let hit = &hits[0];
+        assert_eq!(hit._id, "2-104", "same id format as hot hits, for dedup");
+        assert_eq!(
+            hit._source,
+            serde_json::json!({
+                "topic": "orders",
+                "partition": 2,
+                "offset": 104,
+                "timestamp": 1_700_000_000_004i64,
+                "key": "k4",
+                "value": r#"{"marker":"quixoticbellwether"}"#,
+            })
         );
     }
 }

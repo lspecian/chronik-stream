@@ -75,6 +75,11 @@ pub enum Error {
     #[error("Invalid transaction state: {0}")]
     InvalidTransactionState(String),
 
+    /// Not ready yet - the node has not caught up with the cluster and the
+    /// caller should retry; expected while booting, not a failure.
+    #[error("Not ready: {0}")]
+    NotReady(String),
+
     /// Queue full - back-pressure signaling
     #[error("Queue full: {0}")]
     QueueFull(String),

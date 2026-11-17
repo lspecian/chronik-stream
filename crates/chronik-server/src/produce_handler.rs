@@ -1838,8 +1838,13 @@ impl ProduceHandler {
                                 meta
                             }
                             Err(e) => {
-                                warn!("Failed to auto-create topic '{}': {:?} - produce request will fail", 
-                                    topic_data.name, e);
+                                if matches!(e, Error::NotReady(_)) {
+                                    debug!("Not auto-creating '{}' yet: {} - client will retry",
+                                        topic_data.name, e);
+                                } else {
+                                    warn!("Failed to auto-create topic '{}': {:?} - produce request will fail",
+                                        topic_data.name, e);
+                                }
                                 // Return error for all partitions
                                 let error_partitions = topic_data.partitions.into_iter().map(|p| {
                                     ProduceResponsePartition {
@@ -3885,7 +3890,7 @@ impl ProduceHandler {
         if let Some(ref catalog) = self.raft_cluster {
             if !catalog.is_caught_up() {
                 debug!("Not auto-creating '{}': catalog not caught up", topic_name);
-                return Err(Error::Internal(format!(
+                return Err(Error::NotReady(format!(
                     "cluster catalog not caught up; '{}' cannot be auto-created yet",
                     topic_name
                 )));

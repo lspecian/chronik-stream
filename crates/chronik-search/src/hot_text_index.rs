@@ -135,6 +135,9 @@ struct HotPartitionIndex {
     key_field: Field,
     value_field: Field,
     headers_field: Field,
+    /// Field-level index of JSON-object values; same field and options as the
+    /// archived segments, so a field query means the same thing hot and cold.
+    json_field: Field,
     doc_count: usize,
     min_offset: Option<i64>,
     max_offset: Option<i64>,
@@ -171,6 +174,10 @@ impl HotPartitionIndex {
         let key_field = schema_builder.add_text_field("key", STRING | STORED);
         let value_field = schema_builder.add_text_field("value", TEXT | STORED);
         let headers_field = schema_builder.add_text_field("headers", TEXT | STORED);
+        let json_field = schema_builder.add_json_field(
+            chronik_storage::json_index::JSON_FIELD,
+            chronik_storage::json_index::json_field_options(),
+        );
         let schema = schema_builder.build();
 
         let index = Index::create_in_ram(schema);
@@ -201,6 +208,7 @@ impl HotPartitionIndex {
             key_field,
             value_field,
             headers_field,
+            json_field,
             doc_count: 0,
             min_offset: None,
             max_offset: None,
@@ -248,6 +256,12 @@ impl HotPartitionIndex {
                 doc.add_text(self.key_field, k);
             }
             doc.add_text(self.value_field, &d.value);
+            if let Some(object) = chronik_storage::json_index::json_object(d.value.as_bytes()) {
+                doc.add_object(
+                    self.json_field,
+                    object.into_iter().map(|(k, v)| (k, v.into())).collect(),
+                );
+            }
             if let Some(h) = &d.headers {
                 doc.add_text(self.headers_field, h);
             }
