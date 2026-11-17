@@ -80,6 +80,17 @@ pub struct HotHit {
     pub value: String,
 }
 
+/// Hot hits in [`crate::ranking::hit_order`]'s order (one topic, so: score,
+/// newest, partition, highest offset), so the top `top_k` across partitions is
+/// the same slice the final merge would pick.
+fn hot_hit_order(a: &HotHit, b: &HotHit) -> std::cmp::Ordering {
+    b.score
+        .total_cmp(&a.score)
+        .then(b.timestamp.cmp(&a.timestamp))
+        .then(a.partition.cmp(&b.partition))
+        .then(b.offset.cmp(&a.offset))
+}
+
 /// Configuration for the hot text index.
 #[derive(Debug, Clone)]
 pub struct HotTextConfig {
@@ -159,11 +170,11 @@ impl HotPartitionIndex {
         );
         let offset_field = schema_builder.add_i64_field(
             "offset",
-            NumericOptions::default().set_indexed().set_stored(),
+            NumericOptions::default().set_indexed().set_stored().set_fast(),
         );
         let timestamp_field = schema_builder.add_i64_field(
             "timestamp",
-            NumericOptions::default().set_indexed().set_stored(),
+            NumericOptions::default().set_indexed().set_stored().set_fast(),
         );
         // `key` is STRING â Kafka keys are opaque identifiers, not prose. Indexing
         // them through the English analyzer drops stopword-shaped keys (e.g. "A",
@@ -337,8 +348,7 @@ impl HotPartitionIndex {
         let query = parser
             .parse_query(sanitized)
             .map_err(|e| anyhow!("parse hot query `{}`: {}", sanitized, e))?;
-        let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(top_k))
+        let top_docs = crate::ranking::top_docs(&searcher, &query, top_k, crate::ranking::RankFields::Hot)
             .map_err(|e| anyhow!("hot search: {}", e))?;
 
         let mut hits = Vec::with_capacity(top_docs.len());
@@ -360,8 +370,7 @@ impl HotPartitionIndex {
         top_k: usize,
     ) -> Result<Vec<HotHit>> {
         let searcher = self.reader.searcher();
-        let top_docs = searcher
-            .search(query, &TopDocs::with_limit(top_k))
+        let top_docs = crate::ranking::top_docs(&searcher, query, top_k, crate::ranking::RankFields::Hot)
             .map_err(|e| anyhow!("hot structured search: {}", e))?;
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, doc_addr) in top_docs {
@@ -730,7 +739,7 @@ impl HotTextIndex {
                 .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
         });
         all.dedup_by(|a, b| a.partition == b.partition && a.offset == b.offset);
-        all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all.sort_by(hot_hit_order);
         all.truncate(top_k);
         Ok(all)
     }
@@ -796,7 +805,7 @@ impl HotTextIndex {
                 .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
         });
         all.dedup_by(|a, b| a.partition == b.partition && a.offset == b.offset);
-        all.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all.sort_by(hot_hit_order);
         all.truncate(top_k);
         Ok(all)
     }

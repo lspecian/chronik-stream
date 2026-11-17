@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Paging through a search returns every match exactly once.
+`tests/cluster/e2e/search_pagination.sh` fails on v2.17.2 and passes now.
+
+### Fixed
+- **Pages after the first were wrong.** `from` was applied in the wrong
+  places: each archived segment skipped its own first `from` hits, the hot
+  index ignored `from`, and neither the node nor the cluster merge skipped it
+  on the merged list. Paging 600 records 50 at a time reached 150–183 distinct
+  records, with up to 142 repeated across pages. Every source now returns its
+  top `from + size`, unskipped; the cluster asks each node for `from: 0, size:
+  from + size`; the merged list is paged once.
+- **The order of equal-scored hits changed from request to request.** Ties —
+  every hit of `match_all` — were broken differently by each source, so the
+  same page asked twice came back different. Hits are now ordered by score,
+  then newest first, then topic, partition and offset, everywhere (inside each
+  Tantivy index via fast fields, across partitions, segments and nodes). The
+  hot index's `offset` and `timestamp` became fast fields for this; it is
+  rebuilt from the WAL at boot, so nothing on disk changes.
+- **The `match_all` early stop respects paging.** Segments are searched newest
+  first and their results taken in that order; the search stops only once it
+  holds `from + size` hits and the next segment's newest record is strictly
+  older than the last of them, so no unsearched record can belong on the page.
+
+### Added
+- **Result window limit.** `from + size` above
+  `CHRONIK_SEARCH_MAX_RESULT_WINDOW` (default 10,000, Elasticsearch's
+  `index.max_result_window`) is refused with 400
+  `illegal_argument_exception`, since every source on every node would
+  collect that many hits.
+
 ## [2.17.2] - 2026-11-17
 
 A search naming no topic answers on a node with thousands of archived

@@ -141,7 +141,8 @@ async fn search_hot_topic(
     // No query means match_all, as in Elasticsearch and on the cold path.
     let match_all = QueryDsl::MatchAll(crate::api::MatchAllQuery {});
     let dsl = request.query.as_ref().unwrap_or(&match_all);
-    let k = request.size.max(10);
+    // The whole window: page `from` of the merge may come from here.
+    let k = request.from.saturating_add(request.size);
 
     if let Some(query_text) = extract_simple_query_text(dsl) {
         return match hot_idx.search_topic(topic, &query_text, k).await {
@@ -192,7 +193,8 @@ async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest) -> Vec<Hi
     topics.sort();
     topics.dedup();
 
-    let k = request.size.max(10);
+    // The whole window: page `from` of the merge may come from here.
+    let k = request.from.saturating_add(request.size);
     let simple_text = extract_simple_query_text(dsl);
     let mut out = Vec::new();
     for topic in topics {
@@ -247,12 +249,7 @@ fn merge_hot_and_cold_hits(hot: Vec<Hit>, cold: Vec<Hit>) -> Vec<Hit> {
             merged.push(c);
         }
     }
-    merged.sort_by(|a, b| {
-        b._score
-            .unwrap_or(0.0)
-            .partial_cmp(&a._score.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    merged.sort_by(crate::ranking::hit_order);
     merged
 }
 
@@ -263,6 +260,9 @@ pub async fn search_all(
 ) -> impl IntoResponse {
     let start = SystemTime::now();
     let deadline = search_deadline(&request, tokio::time::Instant::now());
+    if let Err(reason) = crate::ranking::check_result_window(request.from, request.size) {
+        return Err(result_window_error(&reason));
+    }
 
     // Generate cache key
     let cache_key = crate::cache::QueryCache::generate_key(None, &request);
@@ -274,7 +274,7 @@ pub async fn search_all(
     // Check cache first
     if !hot_enabled {
         if let Some(cached_response) = api.cache.get(&cache_key) {
-            return Json(cached_response);
+            return Ok(Json(cached_response));
         }
     }
 
@@ -358,17 +358,9 @@ pub async fn search_all(
             debug!("hot text index contributed {} hits", hot_hits.len());
         }
         all_hits = merge_hot_and_cold_hits(hot_hits, all_hits);
-    } else {
-        // preserve existing behavior (cold-only sort)
-        all_hits.sort_by(|a, b| {
-            b._score
-                .unwrap_or(0.0)
-                .partial_cmp(&a._score.unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
     }
-    let found = all_hits.len();
-    all_hits.truncate(request.size);
+    // Every source returned its top `from + size`; page the merged list once.
+    let (all_hits, found) = crate::ranking::page(all_hits, request.from, request.size);
 
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
 
@@ -386,7 +378,7 @@ pub async fn search_all(
         hits: HitsInfo {
             total: TotalHits {
                 value: found as u64,
-                relation: total_relation(found, request.size, timed_out).to_string(),
+                relation: total_relation(found, request.from + request.size, timed_out).to_string(),
             },
             max_score: all_hits.first().and_then(|h| h._score),
             hits: all_hits,
@@ -400,7 +392,7 @@ pub async fn search_all(
         api.cache.put(cache_key, response.clone());
     }
 
-    Json(response)
+    Ok(Json(response))
 }
 
 /// Search specific index
@@ -411,6 +403,9 @@ pub async fn search_index(
 ) -> impl IntoResponse {
     let start = SystemTime::now();
     let deadline = search_deadline(&request, tokio::time::Instant::now());
+    if let Err(reason) = crate::ranking::check_result_window(request.from, request.size) {
+        return Err(result_window_error(&reason));
+    }
 
     // v2.5.4: Build cold hits from every source available for this topic,
     // in priority order:
@@ -511,21 +506,14 @@ pub async fn search_index(
     }
 
     // HP-1.3: merge with hot index hits; hot wins on (_index, _id) dedup.
-    let mut hits = if api.hot_text_index.is_some() {
+    let hits = if api.hot_text_index.is_some() {
         let hot_hits = search_hot_topic(&api, &index, &request).await;
         merge_hot_and_cold_hits(hot_hits, cold_hits)
     } else {
-        cold_hits.sort_by(|a, b| {
-            b._score
-                .unwrap_or(0.0)
-                .partial_cmp(&a._score.unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
         cold_hits
     };
-    // Every segment contributes up to `size` hits; answer with one page.
-    let found = hits.len();
-    hits.truncate(request.size);
+    // Every source returned its top `from + size`; page the merged list once.
+    let (hits, found) = crate::ranking::page(hits, request.from, request.size);
 
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
 
@@ -541,7 +529,7 @@ pub async fn search_index(
         hits: HitsInfo {
             total: TotalHits {
                 value: found as u64,
-                relation: total_relation(found, request.size, timed_out).to_string(),
+                relation: total_relation(found, request.from + request.size, timed_out).to_string(),
             },
             max_score: hits.first().and_then(|h| h._score),
             hits,
@@ -656,14 +644,23 @@ async fn search_cold_segments(
     let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) else {
         return out;
     };
+    let window = request.from.saturating_add(request.size);
     if segments.is_empty() || request.size == 0 {
         return out;
     }
-    segments.sort_by(|a, b| b.max_timestamp.cmp(&a.max_timestamp));
-    let enough = if is_unranked(request) { Some(request.from + request.size) } else { None };
+    // Newest first, and a fixed order among equals, so the same request
+    // searches the same segments in the same order.
+    segments.sort_by(|a, b| {
+        b.max_timestamp.cmp(&a.max_timestamp).then_with(|| a.object_store_path.cmp(&b.object_store_path))
+    });
+    let newest: Vec<i64> = segments.iter().map(|s| s.max_timestamp).collect();
+    let unranked = is_unranked(request);
     let store = wal_indexer.object_store();
     let request = Arc::new(request.clone());
 
+    // Results come back in segment order (`buffered`, not `buffer_unordered`),
+    // so "the segments searched so far" is always a prefix of the newest-first
+    // list — which is what makes the early stop below exact.
     let mut searches = stream::iter(segments.into_iter().map(|seg| {
         let (cache, store, request) = (cache.clone(), store.clone(), request.clone());
         async move {
@@ -682,7 +679,7 @@ async fn search_cold_segments(
             .map_err(|e| Error::Internal(format!("segment search task failed: {}", e)))?
         }
     }))
-    .buffer_unordered(cold_search_concurrency());
+    .buffered(cold_search_concurrency());
 
     loop {
         match tokio::time::timeout_at(deadline, searches.next()).await {
@@ -691,16 +688,22 @@ async fn search_cold_segments(
                 break;
             }
             Ok(None) => break,
-            Ok(Some(Ok(mut hits))) => {
+            Ok(Some(result)) => {
+                match result {
+                    Ok(mut hits) => out.hits.append(&mut hits),
+                    Err(e) => debug!("cold segment skipped: {}", e),
+                }
                 out.searched += 1;
-                out.hits.append(&mut hits);
-                if enough.is_some_and(|n| out.hits.len() >= n) {
+                // Only the top `window` can reach the page; keep a margin for
+                // duplicates the merge will drop, and bound memory on a
+                // ranked query that reads thousands of segments.
+                if out.hits.len() > window.saturating_mul(2) {
+                    out.hits.sort_by(crate::ranking::hit_order);
+                    out.hits.truncate(window.saturating_mul(2));
+                }
+                if unranked && can_stop_unranked(&out.hits, window, newest.get(out.searched)) {
                     break;
                 }
-            }
-            Ok(Some(Err(e))) => {
-                out.searched += 1;
-                debug!("cold segment skipped: {}", e);
             }
         }
     }
@@ -712,6 +715,29 @@ async fn search_cold_segments(
         );
     }
     out
+}
+
+/// For a query whose hits all score alike, whether the segments searched so far
+/// already hold the whole top `window`. Hits are ordered newest first
+/// ([`crate::ranking::hit_order`]) and segments are searched newest first, so
+/// once there are `window` hits and the next segment's newest record is
+/// strictly older than the `window`-th hit, nothing unsearched can rank above
+/// any hit kept. (Equal timestamps go on searching: the tie-break could still
+/// favour the unsearched record.)
+fn can_stop_unranked(hits: &[Hit], window: usize, next_newest: Option<&i64>) -> bool {
+    if hits.len() < window || window == 0 {
+        return false;
+    }
+    let Some(&next_newest) = next_newest else {
+        return true; // nothing left to search
+    };
+    let mut stamps: Vec<i64> = hits
+        .iter()
+        .map(|h| h._source.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(i64::MIN))
+        .collect();
+    // The window-th newest timestamp.
+    let (_, kth, _) = stamps.select_nth_unstable_by(window - 1, |a, b| b.cmp(a));
+    next_newest < *kth
 }
 
 /// What a cold search found.
@@ -913,7 +939,9 @@ fn search_tantivy_index(
     };
 
     // Execute search
-    let top_docs = searcher.search(&*query, &TopDocs::with_limit(request.size).and_offset(request.from))
+    // The source's top `from + size`, unskipped: the merge pages once
+    // (crate::ranking). Skipping `from` here skipped it once per segment.
+    let top_docs = crate::ranking::top_docs(searcher, &*query, request.from.saturating_add(request.size), crate::ranking::RankFields::Archive)
         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
 
     // Collect results
@@ -1069,7 +1097,7 @@ async fn search_in_index(
     };
 
     // Execute search
-    let top_docs = searcher.search(&*query, &TopDocs::with_limit(request.size).and_offset(request.from))
+    let top_docs = searcher.search(&*query, &TopDocs::with_limit(request.from.saturating_add(request.size)))
         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
     
     // Collect results
@@ -2043,6 +2071,10 @@ fn index_not_found_error(index: &str) -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
+fn result_window_error(reason: &str) -> (StatusCode, Json<ErrorResponse>) {
+    error_response("illegal_argument_exception", reason, StatusCode::BAD_REQUEST)
+}
+
 fn search_error(error: Error) -> (StatusCode, Json<ErrorResponse>) {
     error_response(
         "search_phase_execution_exception",
@@ -2522,5 +2554,35 @@ mod search_limit_tests {
         assert_eq!(total_relation(3, 10, false), "eq");
         assert_eq!(total_relation(10, 10, false), "gte");
         assert_eq!(total_relation(3, 10, true), "gte");
+    }
+}
+
+#[cfg(test)]
+mod unranked_stop_tests {
+    use super::*;
+
+    fn at(ts: i64) -> Hit {
+        Hit {
+            _index: "t".into(),
+            _id: format!("0-{ts}"),
+            _score: Some(1.0),
+            _source: serde_json::json!({"timestamp": ts, "partition": 0, "offset": ts}),
+            highlight: None,
+        }
+    }
+
+    #[test]
+    fn stops_only_when_nothing_unsearched_can_rank_higher() {
+        let hits: Vec<Hit> = [100, 90, 80, 70].into_iter().map(at).collect();
+        // Not a full window yet.
+        assert!(!can_stop_unranked(&hits[..2], 3, Some(&10)));
+        // The 3rd newest is 80; the next segment's newest is older: done.
+        assert!(can_stop_unranked(&hits, 3, Some(&79)));
+        // A tie at 80 could still win the tie-break: keep going.
+        assert!(!can_stop_unranked(&hits, 3, Some(&80)));
+        // A newer record could be in the next segment.
+        assert!(!can_stop_unranked(&hits, 3, Some(&95)));
+        // Nothing left.
+        assert!(can_stop_unranked(&hits, 3, None));
     }
 }
