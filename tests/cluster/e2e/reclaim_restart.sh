@@ -30,7 +30,7 @@ check() {  # label
 }
 
 echo "=== $LABEL ($TEST_BIN)"
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1; up localhost:9092 || { echo "cluster did not start"; exit 1; }
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092 || { echo "cluster did not start"; exit 1; }
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $T --partitions 3 --replication-factor 3 >/dev/null 2>&1
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $LIVE --partitions 1 --replication-factor 3 >/dev/null 2>&1; sleep 8
 for p in 0 1 2; do seq 1 $N | sed "s/^/p$p-a/" | kcat -P -b $B -t $T -p $p -X acks=all -X batch.num.messages=20; done
@@ -42,7 +42,7 @@ echo x | kcat -P -b $B -t $LIVE -p 0 -X acks=all   # keep the WAL non-empty, as 
 PRE=$(ends)
 
 ./tests/cluster/stop.sh >/dev/null 2>&1; sleep 2
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/restart.sh >/dev/null 2>&1; up localhost:9092; sleep 20
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/restart.sh >/dev/null 2>&1 || { echo "FAIL: restart.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092; sleep 20
 POST=$(ends)
 echo "ends before restart: $PRE"
 echo "ends after restart:  $POST"

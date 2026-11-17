@@ -21,7 +21,7 @@ readp() { timeout 60 kcat -C -b $B -t $T -p $1 -o beginning -e -q -f '%o %s\n' 2
 held() { grep -ahoE "$2-[0-9]+" tests/cluster/data/node$1/wal/$T/$3/*.log tests/cluster/data/node$1/segments/segments/$T/$3/*.segment 2>/dev/null | sort -u | wc -l; }
 
 echo "=== $LABEL ($TEST_BIN)"
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1; up localhost:9092 || { echo "cluster did not start"; exit 1; }
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092 || { echo "cluster did not start"; exit 1; }
 for t in $DONOR $T; do $K/kafka-topics.sh --bootstrap-server $B --create --topic $t --partitions 3 --replication-factor 3 >/dev/null 2>&1; done
 sleep 8
 # Donor records in every partition, archived on every node.
@@ -39,7 +39,7 @@ for p in 0 1 2; do
 done
 echo "setup: planted; leader-held records: p0=$(held ${L[0]} p0-old 0) p1=$(held ${L[1]} p1-old 1) p2=$(held ${L[2]} p2-old 2)"
 
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/restart.sh >/dev/null 2>&1; up localhost:9092; sleep 45
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/restart.sh >/dev/null 2>&1 || { echo "FAIL: restart.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092; sleep 45
 echo "end offsets after restart: $(ends $T)"
 fail=0
 for p in 0 1 2; do [ "$(ends $T | grep -o "$T:$p:[0-9]*" | cut -d: -f3)" = $N ] || fail=1; done

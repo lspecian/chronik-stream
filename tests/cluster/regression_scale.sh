@@ -37,13 +37,13 @@ say "== regression_scale: $N topics, per-node RSS budget ${MAX_RSS_MB}MB =="
 "$SCRIPT_DIR/stop.sh" >/dev/null 2>&1
 "$SCRIPT_DIR/start.sh" >/dev/null 2>&1 &
 sleep 25
-alive=$(pgrep -cf 'chronik-server.*node[123].toml')
+alive=$(pgrep -cf "start --config $SCRIPT_DIR/node[123].toml")
 [ "$alive" -eq 3 ] || { say "SKIP: cluster failed to start ($alive/3)"; exit 1; }
 
 # RSS sampler (per-node peaks)
 RSS_LOG=$(mktemp)
 ( while true; do
-    ps -o rss=,args= -C chronik-server 2>/dev/null | grep -E 'node[123].toml' \
+    ps -eo rss=,args= 2>/dev/null | grep -E "start --config $SCRIPT_DIR/node[123].toml" | grep -v grep \
       | awk '{print $1}' | paste -sd' ' >> "$RSS_LOG"
     sleep 5
   done ) &
@@ -56,7 +56,7 @@ sleep 15
 kill "$SAMPLER" 2>/dev/null
 
 # 1. No OOM: all nodes alive
-alive=$(pgrep -cf 'chronik-server.*node[123].toml')
+alive=$(pgrep -cf "start --config $SCRIPT_DIR/node[123].toml")
 [ "$alive" -eq 3 ] || fail "nodes alive after load: $alive/3 (OOM regression?)"
 
 # 2. RSS budget

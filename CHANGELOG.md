@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.2] - 2026-11-17
+
+A search naming no topic answers on a node with thousands of archived
+segments, and the unpacked copies it keeps no longer grow without limit.
+`tests/cluster/e2e/search_many_segments.sh` fails on v2.17.1 and passes now.
+
+### Fixed
+- **`/_search` with no topic never answered on a large node.** It opened every
+  archived index segment of every topic, one after another, unpacking each the
+  first time (about five a second) and stopping early for nothing — not even
+  `match_all` with `size: 1`. A production node with 6,000–13,000 archives
+  would have needed 20–40 minutes; clients gave up first. Segments are now
+  searched in parallel (`CHRONIK_SEARCH_CONCURRENCY`, default: cores, at most
+  8), newest first; a query that does not rank (`match_all`, no sort) stops at
+  one page; and every search has a time limit — the request's `timeout`
+  ("500ms", "10s"), else `CHRONIK_SEARCH_TIMEOUT_MS` (default 10 s) — after
+  which it answers with what it found and `timed_out: true`. A merged answer
+  is `timed_out` when any node's was, and its total is then a lower bound.
+  The same applies to `/{topic}/_search`.
+- **Unpacked segments filled the disk.** They were kept forever under
+  `/tmp/chronik-cold-search`: two cut-off requests left 14 GB on one node, and
+  a completed search across all topics would have left hundreds of GB. They
+  now live in `{data_dir}/search-cache` (`CHRONIK_SEARCH_CACHE_DIR` to move
+  it), which is emptied at boot and holds at most `CHRONIK_SEARCH_CACHE_BYTES`
+  (default 4GB), least recently used first; at most
+  `CHRONIK_SEARCH_CACHE_OPEN_SEGMENTS` (default 256) are open at once.
+- **Brokers sharing a host read each other's unpacked segments.** The `/tmp`
+  directory was shared and named by object key, which is the same on every
+  node. The cache is now per node.
+- **A watcher thread per archived segment.** Every opened archive, and every
+  query's reader, used Tantivy's default reload policy, which polls the index
+  directory from its own thread. Archives never change; they are now opened
+  without one.
+- **A cluster search waited for itself, then for its peers.** The node that
+  received the request searched locally before asking its peers, so a slow
+  local search delayed the whole answer twice; both now run at once. When the
+  local search failed and no peer had results, it ran the whole search again
+  to build the error response; it now returns the first one.
+
+### Testing
+- **The local cluster scripts missed nodes run from a renamed binary.**
+  `tests/cluster/{start,restart,stop}.sh` found nodes by the name
+  `chronik-server`, so a build kept for comparison under another name was
+  never stopped: a restart's new nodes died on bind and the old ones kept
+  answering, so every check after a restart tested the old cluster. Nodes are
+  now found by their config path, `start.sh`/`restart.sh` refuse to launch
+  while the cluster's ports are held (`tests/cluster/ports_free.sh`) and exit
+  non-zero when a node does not come up, and the e2e checks stop when a
+  (re)start fails. The full e2e suite was re-run under the fixed scripts (17/17).
+
 ## [2.17.1] - 2026-11-17
 
 Full-text search keeps answering once records are archived. Each bug below

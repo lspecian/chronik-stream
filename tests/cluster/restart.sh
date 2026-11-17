@@ -29,11 +29,12 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 # Stop if running
-if pgrep -f "chronik-server.*start.*--config.*node[123].toml" > /dev/null; then
+if pgrep -f "start --config $SCRIPT_DIR/node[123].toml" > /dev/null; then
     echo -e "${YELLOW}Stopping existing cluster...${NC}"
     "$SCRIPT_DIR/stop.sh"
     sleep 2
 fi
+. "$SCRIPT_DIR/ports_free.sh"
 
 # Verify data directories exist
 if [ ! -d "$SCRIPT_DIR/data/node1" ]; then
@@ -73,25 +74,29 @@ sleep 3
 # Check if nodes are running
 echo
 echo -e "${GREEN}Checking cluster status...${NC}"
-if pgrep -f "chronik-server.*start.*--config.*node1.toml" > /dev/null; then
+if pgrep -f "start --config $SCRIPT_DIR/node1.toml" > /dev/null; then
     echo -e "  Node 1: ${GREEN}Running${NC} (port 9092)"
 else
-    echo -e "  Node 1: ${RED}FAILED${NC}"
+    echo -e "  Node 1: ${RED}FAILED${NC}"; restart_failed=1
 fi
 
-if pgrep -f "chronik-server.*start.*--config.*node2.toml" > /dev/null; then
+if pgrep -f "start --config $SCRIPT_DIR/node2.toml" > /dev/null; then
     echo -e "  Node 2: ${GREEN}Running${NC} (port 9093)"
 else
-    echo -e "  Node 2: ${RED}FAILED${NC}"
+    echo -e "  Node 2: ${RED}FAILED${NC}"; restart_failed=1
 fi
 
-if pgrep -f "chronik-server.*start.*--config.*node3.toml" > /dev/null; then
+if pgrep -f "start --config $SCRIPT_DIR/node3.toml" > /dev/null; then
     echo -e "  Node 3: ${GREEN}Running${NC} (port 9094)"
 else
-    echo -e "  Node 3: ${RED}FAILED${NC}"
+    echo -e "  Node 3: ${RED}FAILED${NC}"; restart_failed=1
 fi
 
 echo
+if [ "${restart_failed:-0}" = 1 ]; then
+    echo -e "${RED}Cluster did NOT restart: see $SCRIPT_DIR/logs/${NC}"
+    exit 1
+fi
 echo -e "${GREEN}Cluster restarted (data preserved)${NC}"
 echo "Logs: $SCRIPT_DIR/logs/"
 echo "Data: $SCRIPT_DIR/data/"

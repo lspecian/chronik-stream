@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.17.1.
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.17.2.
 
 **Key Differentiators:**
 - Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)
@@ -1044,6 +1044,11 @@ Key environment variables:
 - `CHRONIK_HOT_TEXT_COMMIT_INTERVAL_MS` - In-memory buffer visibility flip interval (default: `100`). Purely a RAM-only Tantivy `commit` — no disk I/O.
 - `CHRONIK_HOT_TEXT_MAX_DOCS` - Soft cap on documents per (topic, partition) in hot index (default: `100000`). Also the trailing-offset window read from WAL at startup warm-up.
 - `CHRONIK_HOT_TEXT_WRITER_HEAP_BYTES` - Tantivy writer heap budget per partition in bytes (default: `15_000_000`, Tantivy minimum). In-memory only.
+- `CHRONIK_SEARCH_TIMEOUT_MS` - Time limit for a `/_search` or `/{topic}/_search` when the request sets no `timeout` (default: `10000`). At the limit the node answers with the hits found so far and `timed_out: true`; the merged answer is `timed_out` when any node's was. Keep it under the 30 s a node waits for its peers.
+- `CHRONIK_SEARCH_CONCURRENCY` - Archived segments searched at once per request (default: cores the process may use, at most 8).
+- `CHRONIK_SEARCH_CACHE_BYTES` - Disk budget for unpacked archived segments kept between searches (default: `4GB`; accepts `KB`/`MB`/`GB` or raw bytes). Least recently used are deleted first.
+- `CHRONIK_SEARCH_CACHE_OPEN_SEGMENTS` - Unpacked segments kept open at once (default: `256`).
+- `CHRONIK_SEARCH_CACHE_DIR` - Where unpacked segments go (default: `{data_dir}/search-cache`). Emptied at boot.
 - `CHRONIK_HOT_VECTOR_ENABLED` - Enable in-memory hot vector index for NRT ANN search (default: `true`). Works with any configured embedding provider (OpenAI or external/local). Fire-and-forget from the produce path; embedder runs on a dedicated worker.
 - `CHRONIK_HOT_VECTOR_MAX_VECTORS` - Soft cap on vectors per (topic, partition) in hot index (default: `50000`). Trimmed to the most recent offsets on the trim timer.
 - `CHRONIK_HOT_VECTOR_BATCH_SIZE_LOCAL` - Batch size for the `external` embedding provider (default: `32`).

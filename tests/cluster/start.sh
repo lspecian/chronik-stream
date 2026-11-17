@@ -31,11 +31,17 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 # Check if cluster is already running
-if pgrep -f "chronik-server.*start.*--config.*node[123].toml" > /dev/null; then
+if pgrep -f "start --config $SCRIPT_DIR/node[123].toml" > /dev/null; then
     echo -e "${YELLOW}WARNING: Cluster appears to be already running${NC}"
-    echo "Run ./cluster-local/stop.sh first"
+    echo "Run ./tests/cluster/stop.sh first"
     exit 1
 fi
+
+# Nodes are found by their config path, never by binary name: a copy of the
+# binary under another name (a build kept for comparison) used to escape both
+# this check and stop.sh, so the old cluster kept its ports, the new nodes died
+# on bind, and every check after that tested the old cluster.
+. "$SCRIPT_DIR/ports_free.sh"
 
 # Clean up old data
 echo -e "${YELLOW}Cleaning up old data...${NC}"
@@ -81,9 +87,14 @@ for i in 1 2 3; do
         else
             echo -e "${RED}✗ Node $i: Failed to start${NC}"
             cat "$SCRIPT_DIR/logs/node$i.log"
+            start_failed=1
         fi
     fi
 done
+if [ "${start_failed:-0}" = 1 ]; then
+    echo -e "${RED}Cluster did NOT start: see the node log(s) above${NC}"
+    exit 1
+fi
 
 echo
 echo -e "${GREEN}========================================${NC}"

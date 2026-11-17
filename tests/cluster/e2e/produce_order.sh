@@ -18,7 +18,7 @@ cd "$REPO"
 up() { for _ in $(seq 240); do (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && return 0; sleep 0.5; done; return 1; }
 
 echo "=== $LABEL ($TEST_BIN)"
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }
 for p in 9092 9093 9094; do up $p || { echo "FAIL: broker on $p did not start"; exit 1; }; done
 sleep 10
 

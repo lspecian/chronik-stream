@@ -67,7 +67,7 @@ local_setup() {
   "$SCRIPT_DIR/stop.sh" >/dev/null 2>&1
   "$SCRIPT_DIR/start.sh" >/dev/null 2>&1 &
   sleep 25
-  local alive; alive=$(pgrep -cf 'chronik-server.*node[123].toml')
+  local alive; alive=$(pgrep -cf "start --config $SCRIPT_DIR/node[123].toml")
   [ "$alive" -eq 3 ] || { say "SKIP: cluster failed to start ($alive/3) — is :9092 in use?"; exit 1; }
 }
 local_teardown() { "$SCRIPT_DIR/stop.sh" >/dev/null 2>&1; }
