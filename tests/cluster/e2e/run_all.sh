@@ -38,6 +38,7 @@ run single_copy "$E2E/single_copy.sh" "$BIN" "$LABEL"
 run straddle "$E2E/straddle.sh" "$BIN" "$LABEL"
 run produce_order "$E2E/produce_order.sh" "$BIN" "$LABEL"
 run search_after_archive "$E2E/search_after_archive.sh" "$BIN" "$LABEL"
+run search_many_segments "$E2E/search_many_segments.sh" "$BIN" "$LABEL"
 run regression_replication ./tests/cluster/regression_replication.sh
 run follower_catchup ./tests/cluster/follower_catchup.sh
 run concurrent_produce_order ./tests/test_concurrent_produce_order.sh

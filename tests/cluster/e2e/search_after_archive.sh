@@ -38,6 +38,15 @@ search() {
   echo "$code ${total:--} ${rel:--} ${offs:--}"
 }
 
+# page <topic> <query-json> -> "<http code> <relation> <N> hits": for queries
+# matching more than a page. The total is then only a lower bound (each node
+# may return a different page), so check the page itself.
+page() {
+  local r; r=$(search "$1" "$2")
+  local n; n=$(cut -d' ' -f4 <<<"$r" | tr ',' '\n' | grep -c '[0-9]')
+  echo "$(cut -d' ' -f1 <<<"$r") $(cut -d' ' -f3 <<<"$r") $n hits"
+}
+
 # expect <what> <actual> <expected>
 expect() {
   if [ "$2" = "$3" ]; then echo "  ok   $1: $2"
@@ -71,7 +80,7 @@ NONE='{"match":{"marker":"zzzunmatchedzzz"}}'
 
 echo "=== $LABEL ($TEST_BIN)"
 $C/stop.sh >/dev/null 2>&1
-CHRONIK_BIN=$TEST_BIN $C/start.sh >/dev/null 2>&1
+CHRONIK_BIN=$TEST_BIN $C/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }
 up || { echo "FAIL: cluster did not start"; exit 1; }
 T=saa-$LABEL
 make_topic $T
@@ -79,16 +88,16 @@ sleep 5
 echo "hot:"
 expect "field match" "$(search $T "$M")" "200 1 eq 41"
 expect "value match" "$(search $T "$V")" "200 2 eq 41,42"
-expect "match_all fills the page" "$(search $T '{"match_all":{}}' | cut -d" " -f1-3)" "200 50 gte"
+expect "match_all fills the page" "$(page $T '{"match_all":{}}')" "200 gte 50 hits"
 wait_archived $T
 echo "archived:"
 expect "field match" "$(search $T "$M")" "200 1 eq 41"
 expect "field match, other field" "$(search $T '{"match":{"note":"quixoticbellwether"}}')" "200 1 eq 42"
 expect "value match counts each record once" "$(search $T "$V")" "200 2 eq 41,42"
 expect "no match" "$(search $T "$NONE")" "200 0 eq -"
-expect "match_all fills the page" "$(search $T '{"match_all":{}}' | cut -d" " -f1-3)" "200 50 gte"
+expect "match_all fills the page" "$(page $T '{"match_all":{}}')" "200 gte 50 hits"
 
-CHRONIK_HOT_TEXT_ENABLED=false CHRONIK_BIN=$TEST_BIN $C/restart.sh >/dev/null 2>&1
+CHRONIK_HOT_TEXT_ENABLED=false CHRONIK_BIN=$TEST_BIN $C/restart.sh >/dev/null 2>&1 || { echo "FAIL: restart.sh failed (cluster not (re)started)"; exit 1; }
 up || { echo "FAIL: cluster did not restart"; exit 1; }
 sleep 20
 echo "restarted, hot index off:"
@@ -97,12 +106,12 @@ expect "no match is 0 hits, not 404" "$(search $T "$NONE")" "200 0 eq -"
 
 echo "=== archive written by $LEGACY_BIN, searched after the upgrade"
 $C/stop.sh >/dev/null 2>&1
-CHRONIK_BIN=$LEGACY_BIN $C/start.sh >/dev/null 2>&1
+CHRONIK_BIN=$LEGACY_BIN $C/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }
 up || { echo "FAIL: legacy cluster did not start"; exit 1; }
 L=saal-$LABEL
 make_topic $L
 wait_archived $L
-CHRONIK_HOT_TEXT_ENABLED=false CHRONIK_BIN=$TEST_BIN $C/restart.sh >/dev/null 2>&1
+CHRONIK_HOT_TEXT_ENABLED=false CHRONIK_BIN=$TEST_BIN $C/restart.sh >/dev/null 2>&1 || { echo "FAIL: restart.sh failed (cluster not (re)started)"; exit 1; }
 up || { echo "FAIL: upgraded cluster did not start"; exit 1; }
 sleep 20
 # No per-field index in a legacy archive: the field query searches the whole

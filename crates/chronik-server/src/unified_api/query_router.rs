@@ -3727,8 +3727,11 @@ pub fn merge_search_responses(
     let mut shards_total = local._shards.total;
     let mut shards_successful = local._shards.successful;
     let mut shards_failed = local._shards.failed;
+    // One node stopping at its time limit makes the whole answer partial.
+    let mut timed_out = local.timed_out;
 
     for peer_resp in peers {
+        timed_out |= peer_resp.timed_out;
         shards_total += peer_resp._shards.total;
         shards_successful += peer_resp._shards.successful;
         shards_failed += peer_resp._shards.failed;
@@ -3757,7 +3760,7 @@ pub fn merge_search_responses(
     // fewer than `size` distinct hits means none was cut off and the count
     // is exact; otherwise it is a lower bound, which ES reports as "gte".
     let total_value = all_hits.len() as u64;
-    let total_relation = if all_hits.len() < size { "eq" } else { "gte" };
+    let total_relation = if all_hits.len() < size && !timed_out { "eq" } else { "gte" };
 
     // Sort by score descending
     all_hits.sort_by(|a, b| {
@@ -3771,7 +3774,7 @@ pub fn merge_search_responses(
 
     SearchResponse {
         took: local.took,
-        timed_out: false,
+        timed_out,
         _shards: ShardInfo {
             total: shards_total,
             successful: shards_successful,
@@ -4757,6 +4760,18 @@ mod fan_out_completeness_tests {
         let merged = merge_search_responses(resp(&["0-1", "0-2"]), vec![resp(&["0-3"])], 2);
         assert_eq!(merged.hits.hits.len(), 2);
         assert_eq!(merged.hits.total.value, 3);
+
+        // One node stopping at its time limit makes the merged answer partial,
+        // and its count a lower bound, however few hits came back.
+        let mut slow = resp(&["1-7"]);
+        slow.timed_out = true;
+        let merged = merge_search_responses(resp(&["0-1"]), vec![slow], 10);
+        assert!(merged.timed_out, "a peer's timed_out must survive the merge");
+        assert_eq!(merged.hits.total.value, 2);
+        assert_eq!(merged.hits.total.relation, "gte");
+        let mut slow_local = resp(&[]);
+        slow_local.timed_out = true;
+        assert!(merge_search_responses(slow_local, vec![resp(&["0-1"])], 10).timed_out);
         assert_eq!(merged.hits.total.relation, "gte");
     }
 }

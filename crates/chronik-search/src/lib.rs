@@ -9,6 +9,7 @@ pub mod cache;
 pub mod client;
 pub mod geo;
 pub mod hot_text_index;
+pub mod cold_cache;
 
 pub use api::SearchApi;
 pub use indexer::{TantivyIndexer, IndexerConfig, SearchResult};

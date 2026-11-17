@@ -37,6 +37,8 @@ pub struct SearchApi {
     index_base_path: Option<String>,
     /// HP-1.3: In-memory hot text index for NRT search, shadowing the WAL tail.
     pub hot_text_index: Option<Arc<crate::hot_text_index::HotTextIndex>>,
+    /// Unpacked archived segments, for the cold search path.
+    cold_cache: Option<Arc<crate::cold_cache::ColdSegmentCache>>,
 }
 
 /// State for a single index
@@ -135,6 +137,11 @@ pub struct SearchRequest {
     pub aggregations: Option<serde_json::Value>,
     #[serde(default)]
     pub highlight: Option<HighlightConfig>,
+    /// How long to spend searching before answering with what was found so
+    /// far (`timed_out: true`), as in Elasticsearch: "500ms", "10s", "1m".
+    /// Unset: `CHRONIK_SEARCH_TIMEOUT_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
 }
 
 fn default_size() -> usize {
@@ -419,6 +426,7 @@ impl SearchApi {
             wal_indexer: None,
             index_base_path: None,
             hot_text_index: None,
+            cold_cache: None,
         })
     }
 
@@ -426,6 +434,9 @@ impl SearchApi {
     /// The index_base_path parameter specifies where to find WAL-created Tantivy indices.
     pub fn new_with_wal_indexer(wal_indexer: Arc<chronik_storage::WalIndexer>, index_base_path: String) -> Result<Self> {
         let cache_config = crate::cache::CacheConfig::default();
+        let cold_cache = crate::cold_cache::ColdSegmentCache::shared(
+            crate::cold_cache::ColdSegmentCache::dir_for(&index_base_path),
+        );
         Ok(Self {
             indices: Arc::new(DashMap::new()),
             metrics: ApiMetrics::new()?,
@@ -433,6 +444,7 @@ impl SearchApi {
             wal_indexer: Some(wal_indexer),
             index_base_path: Some(index_base_path),
             hot_text_index: None,
+            cold_cache: Some(cold_cache),
         })
     }
 
@@ -457,6 +469,11 @@ impl SearchApi {
     /// reachable via the on-disk `index_base_path`).
     pub fn wal_indexer(&self) -> Option<&Arc<chronik_storage::WalIndexer>> {
         self.wal_indexer.as_ref()
+    }
+
+    /// The cache of unpacked archived segments (present with a WAL indexer).
+    pub fn cold_cache(&self) -> Option<&Arc<crate::cold_cache::ColdSegmentCache>> {
+        self.cold_cache.as_ref()
     }
 
     /// Create router for the API (standalone mode)

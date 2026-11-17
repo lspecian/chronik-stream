@@ -262,6 +262,7 @@ pub async fn search_all(
     Json(request): Json<SearchRequest>,
 ) -> impl IntoResponse {
     let start = SystemTime::now();
+    let deadline = search_deadline(&request, tokio::time::Instant::now());
 
     // Generate cache key
     let cache_key = crate::cache::QueryCache::generate_key(None, &request);
@@ -328,28 +329,20 @@ pub async fn search_all(
     // missed cold data. When the request targets a specific index (recall always
     // does), read that topic's segments; otherwise fan across all topics in the
     // segment index.
+    let mut timed_out = false;
     if let Some(wal_indexer) = api.wal_indexer() {
-        let topics: Vec<String> = if let Some(ref idx) = request.index {
-            vec![idx.clone()]
-        } else {
-            wal_indexer
-                .segment_index()
-                .get_all_segments()
-                .await
-                .map(|segs| {
-                    let mut t: Vec<String> = segs.into_iter().map(|s| s.topic).collect();
-                    t.sort();
-                    t.dedup();
-                    t
-                })
-                .unwrap_or_default()
+        let index = wal_indexer.segment_index();
+        let segments = match request.index {
+            Some(ref idx) => index.get_segments_for_topic(idx).await,
+            None => index.get_all_segments().await,
         };
-        for topic in topics {
-            match search_object_store_segments(wal_indexer, &topic, &request).await {
-                Ok(Some(mut hits)) => all_hits.append(&mut hits),
-                Ok(None) => {}
-                Err(e) => debug!(topic = %topic, "object-store cold search error: {}", e),
+        match segments {
+            Ok(segments) => {
+                let cold = search_cold_segments(&api, segments, &request, deadline).await;
+                timed_out = cold.timed_out;
+                all_hits.extend(cold.hits);
             }
+            Err(e) => debug!("segment lookup for the cold search failed: {}", e),
         }
     }
 
@@ -367,8 +360,14 @@ pub async fn search_all(
         all_hits = merge_hot_and_cold_hits(hot_hits, all_hits);
     } else {
         // preserve existing behavior (cold-only sort)
-        all_hits.sort_by(|a, b| b._score.partial_cmp(&a._score).unwrap());
+        all_hits.sort_by(|a, b| {
+            b._score
+                .unwrap_or(0.0)
+                .partial_cmp(&a._score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
+    let found = all_hits.len();
     all_hits.truncate(request.size);
 
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
@@ -377,7 +376,7 @@ pub async fn search_all(
 
     let response = SearchResponse {
         took,
-        timed_out: false,
+        timed_out,
         _shards: ShardInfo {
             total: total_shards,
             successful: total_shards,
@@ -386,8 +385,8 @@ pub async fn search_all(
         },
         hits: HitsInfo {
             total: TotalHits {
-                value: all_hits.len() as u64,
-                relation: "eq".to_string(),
+                value: found as u64,
+                relation: total_relation(found, request.size, timed_out).to_string(),
             },
             max_score: all_hits.first().and_then(|h| h._score),
             hits: all_hits,
@@ -395,8 +394,9 @@ pub async fn search_all(
         aggregations: None,
     };
 
-    // Cache the response — skip when hot path active (would cache stale NRT view)
-    if !hot_enabled {
+    // Cache the response — skip when hot path active (would cache stale NRT
+    // view), and never cache a partial answer.
+    if !hot_enabled && !timed_out {
         api.cache.put(cache_key, response.clone());
     }
 
@@ -410,6 +410,7 @@ pub async fn search_index(
     Json(request): Json<SearchRequest>,
 ) -> impl IntoResponse {
     let start = SystemTime::now();
+    let deadline = search_deadline(&request, tokio::time::Instant::now());
 
     // v2.5.4: Build cold hits from every source available for this topic,
     // in priority order:
@@ -481,19 +482,23 @@ pub async fn search_index(
     // index (regression 0e37747). Consulted when the on-disk sources yielded
     // nothing for this topic, so legacy topics that still have a `{data}/index`
     // dir keep their existing single-source behavior and don't double-count.
+    let mut timed_out = false;
     if cold_hits.is_empty() {
         if let Some(wal_indexer) = api.wal_indexer() {
-            match search_object_store_segments(wal_indexer, &index, &request).await {
-                // Archived segments exist: the topic is known even when none
-                // of them matches. Counting it only when it returned hits
-                // turned every no-match query on an archived topic into
-                // "no such index" once the hot index was off.
-                Ok(Some(hits)) => {
-                    have_any_cold_source = true;
-                    cold_hits.extend(hits);
+            match wal_indexer.segment_index().get_segments_for_topic(&index).await {
+                Ok(segments) => {
+                    let cold = search_cold_segments(&api, segments, &request, deadline).await;
+                    // Archived segments exist: the topic is known even when
+                    // none of them matches. Counting it only when it returned
+                    // hits turned every no-match query on an archived topic
+                    // into "no such index" once the hot index was off.
+                    if cold.segments > 0 {
+                        have_any_cold_source = true;
+                    }
+                    timed_out = cold.timed_out;
+                    cold_hits.extend(cold.hits);
                 }
-                Ok(None) => {}
-                Err(e) => debug!(topic = %index, "object-store cold search error: {}", e),
+                Err(e) => debug!(topic = %index, "segment lookup for the cold search failed: {}", e),
             }
         }
     }
@@ -506,18 +511,27 @@ pub async fn search_index(
     }
 
     // HP-1.3: merge with hot index hits; hot wins on (_index, _id) dedup.
-    let hits = if api.hot_text_index.is_some() {
+    let mut hits = if api.hot_text_index.is_some() {
         let hot_hits = search_hot_topic(&api, &index, &request).await;
         merge_hot_and_cold_hits(hot_hits, cold_hits)
     } else {
+        cold_hits.sort_by(|a, b| {
+            b._score
+                .unwrap_or(0.0)
+                .partial_cmp(&a._score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         cold_hits
     };
+    // Every segment contributes up to `size` hits; answer with one page.
+    let found = hits.len();
+    hits.truncate(request.size);
 
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
-    
+
     let response = SearchResponse {
         took,
-        timed_out: false,
+        timed_out,
         _shards: ShardInfo {
             total: 1,
             successful: 1,
@@ -526,8 +540,8 @@ pub async fn search_index(
         },
         hits: HitsInfo {
             total: TotalHits {
-                value: hits.len() as u64,
-                relation: "eq".to_string(),
+                value: found as u64,
+                relation: total_relation(found, request.size, timed_out).to_string(),
             },
             max_score: hits.first().and_then(|h| h._score),
             hits,
@@ -589,7 +603,9 @@ async fn search_wal_indices_for_topic(
         match Index::open_in_dir(&path) {
             Ok(index) => {
                 chronik_storage::register_analyzer(&index);
-                match search_tantivy_index(topic, &index, request).await {
+                match query_searcher(&index)
+                    .and_then(|s| search_tantivy_index(topic, &index, &s, request))
+                {
                     Ok(mut hits) => {
                         // Normalize _index to the queried topic name (strip "-N" suffix)
                         for h in &mut hits {
@@ -617,61 +633,181 @@ async fn search_wal_indices_for_topic(
 /// searchable topics were served only by the in-memory hot-text index, which
 /// ages out — making documents silently disappear from search over time.
 ///
-/// Here we enumerate the topic's segments from the segment index, download and
-/// open each archive via [`TantivySegmentReader::from_object_store`] (works for
-/// both local and S3 backends), and reuse [`search_tantivy_index`] to build
-/// hits. Fan-out across partitions is implicit: the segment index holds every
-/// partition's segments for the topic.
-async fn search_object_store_segments(
-    wal_indexer: &std::sync::Arc<chronik_storage::WalIndexer>,
-    topic: &str,
+/// The segments are opened through the node's [`ColdSegmentCache`] and
+/// searched in parallel on blocking threads, newest first.
+///
+/// Before v2.17.2 this opened every segment one after another with no bound.
+/// A `/_search` naming no topic walked every archive on the node — 6,000 to
+/// 13,000 of them on a production cluster, at about five a second the first
+/// time — and never answered. Now the search stops at the request's time limit
+/// and answers with what it found (`timed_out`), and a query that does not rank
+/// (`match_all`, no sort) stops as soon as it has a page of hits.
+///
+/// [`ColdSegmentCache`]: crate::cold_cache::ColdSegmentCache
+async fn search_cold_segments(
+    api: &SearchApi,
+    mut segments: Vec<chronik_storage::segment_index::SegmentMetadata>,
     request: &SearchRequest,
-) -> Result<Option<Vec<Hit>>> {
-    use chronik_storage::tantivy_segment::TantivySegmentReader;
+    deadline: tokio::time::Instant,
+) -> ColdSearch {
+    use futures::stream::{self, StreamExt};
 
-    let segments = wal_indexer
-        .segment_index()
-        .get_segments_for_topic(topic)
-        .await
-        .map_err(|e| Error::Internal(format!("segment lookup for {}: {}", topic, e)))?;
-    if segments.is_empty() {
-        return Ok(None);
+    let mut out = ColdSearch { segments: segments.len(), ..Default::default() };
+    let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) else {
+        return out;
+    };
+    if segments.is_empty() || request.size == 0 {
+        return out;
     }
+    segments.sort_by(|a, b| b.max_timestamp.cmp(&a.max_timestamp));
+    let enough = if is_unranked(request) { Some(request.from + request.size) } else { None };
+    let store = wal_indexer.object_store();
+    let request = Arc::new(request.clone());
 
-    let object_store = wal_indexer.object_store();
-    // Persistent extraction cache, keyed by the (immutable) segment object key.
-    // Survives across queries; re-populated after a restart. Kept off the data
-    // dir deliberately — it is a disposable cache, not durable state.
-    let cache_root = std::env::temp_dir().join("chronik-cold-search");
-    let mut all_hits = Vec::new();
-    for seg in segments {
-        let dest_dir = cache_root.join(seg.object_store_path.replace(['/', '\\'], "_"));
-        match TantivySegmentReader::from_object_store_cached(
-            object_store.clone(),
-            &seg.object_store_path,
-            &dest_dir,
-        )
-        .await
-        {
-            Ok(reader) => match search_tantivy_index(topic, reader.index(), request).await {
-                Ok(mut hits) => {
-                    for h in &mut hits {
-                        h._index = topic.to_string();
-                    }
-                    all_hits.append(&mut hits);
+    let mut searches = stream::iter(segments.into_iter().map(|seg| {
+        let (cache, store, request) = (cache.clone(), store.clone(), request.clone());
+        async move {
+            let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
+                Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
+            })?;
+            tokio::task::spawn_blocking(move || {
+                let mut hits =
+                    search_tantivy_index(&seg.topic, reader.index(), &reader.searcher(), &request)?;
+                for h in &mut hits {
+                    h._index = seg.topic.clone();
                 }
-                Err(e) => debug!(
-                    "cold segment search error ({}): {}",
-                    seg.object_store_path, e
-                ),
-            },
-            Err(e) => debug!(
-                "could not open cold segment {}: {}",
-                seg.object_store_path, e
-            ),
+                Ok::<_, Error>(hits)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("segment search task failed: {}", e)))?
+        }
+    }))
+    .buffer_unordered(cold_search_concurrency());
+
+    loop {
+        match tokio::time::timeout_at(deadline, searches.next()).await {
+            Err(_) => {
+                out.timed_out = true;
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(Ok(mut hits))) => {
+                out.searched += 1;
+                out.hits.append(&mut hits);
+                if enough.is_some_and(|n| out.hits.len() >= n) {
+                    break;
+                }
+            }
+            Ok(Some(Err(e))) => {
+                out.searched += 1;
+                debug!("cold segment skipped: {}", e);
+            }
         }
     }
-    Ok(Some(all_hits))
+    if out.timed_out {
+        debug!(
+            searched = out.searched,
+            segments = out.segments,
+            "search time limit reached; answering with the segments searched so far"
+        );
+    }
+    out
+}
+
+/// What a cold search found.
+#[derive(Default)]
+struct ColdSearch {
+    hits: Vec<Hit>,
+    /// Archived segments that could hold a match.
+    segments: usize,
+    /// Of those, how many were searched.
+    searched: usize,
+    /// The time limit stopped the search before every segment was searched.
+    timed_out: bool,
+}
+
+/// "eq" when `found` is every match there is; "gte" when it is a lower bound:
+/// the time limit stopped the search, or a source returned a full page and so
+/// may have had more.
+fn total_relation(found: usize, size: usize, timed_out: bool) -> &'static str {
+    if timed_out || found >= size {
+        "gte"
+    } else {
+        "eq"
+    }
+}
+
+/// A query whose hits all score alike, so any `from + size` of them is a
+/// correct page: there is no need to search every segment for the best.
+fn is_unranked(request: &SearchRequest) -> bool {
+    request.sort.is_none()
+        && matches!(request.query, None | Some(QueryDsl::MatchAll(_)))
+}
+
+/// Segments searched at once (`CHRONIK_SEARCH_CONCURRENCY`, default: the
+/// cores the process may use, at most 8).
+fn cold_search_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CHRONIK_SEARCH_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8)
+            })
+    })
+}
+
+/// When a search has to answer: the request's `timeout`, or
+/// `CHRONIK_SEARCH_TIMEOUT_MS` (default 10 s). Comfortably inside the 30 s a
+/// node waits for its peers, so a slow node still answers with partial hits
+/// instead of being dropped from the merge.
+fn search_deadline(request: &SearchRequest, start: tokio::time::Instant) -> tokio::time::Instant {
+    static DEFAULT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let default_ms = *DEFAULT_MS.get_or_init(|| {
+        std::env::var("CHRONIK_SEARCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(10_000)
+    });
+    let limit = request
+        .timeout
+        .as_deref()
+        .and_then(parse_time_value)
+        .unwrap_or(std::time::Duration::from_millis(default_ms));
+    start + limit
+}
+
+/// An Elasticsearch time value: "250ms", "10s", "2m"; a bare number is ms.
+fn parse_time_value(raw: &str) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    let v = raw.trim();
+    let (num, unit) = match v.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => v.split_at(i),
+        None => (v, "ms"),
+    };
+    let n: u64 = num.parse().ok()?;
+    match unit.trim() {
+        "ms" => Some(Duration::from_millis(n)),
+        "s" => Some(Duration::from_secs(n)),
+        "m" => Some(Duration::from_secs(n * 60)),
+        "h" => Some(Duration::from_secs(n * 3600)),
+        _ => None,
+    }
+}
+
+/// A searcher for an on-disk index opened for one query. The default reload
+/// policy would start a thread to watch the directory for the reader's
+/// lifetime; a query does not live long enough to want new commits.
+fn query_searcher(index: &tantivy::Index) -> Result<tantivy::Searcher> {
+    index
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::Manual)
+        .try_into()
+        .map(|r: tantivy::IndexReader| r.searcher())
+        .map_err(|e| Error::Internal(format!("Failed to create index reader: {}", e)))
 }
 
 async fn search_wal_indices(base_path: &str, request: &SearchRequest) -> Result<Vec<Hit>> {
@@ -711,7 +847,9 @@ async fn search_wal_indices(base_path: &str, request: &SearchRequest) -> Result<
                     debug!("Successfully opened index: {}", index_name);
 
                     // Search this index
-                    match search_tantivy_index(&index_name, &index, request).await {
+                    match query_searcher(&index)
+                        .and_then(|s| search_tantivy_index(&index_name, &index, &s, request))
+                    {
                         Ok(mut hits) => {
                             debug!("Found {} hits in index {}", hits.len(), index_name);
                             all_hits.append(&mut hits);
@@ -733,15 +871,14 @@ async fn search_wal_indices(base_path: &str, request: &SearchRequest) -> Result<
 }
 
 /// Search a Tantivy index directly (for WAL-created indices)
-async fn search_tantivy_index(
+///
+/// Synchronous and CPU-bound: the cold path runs it on a blocking thread.
+fn search_tantivy_index(
     index_name: &str,
     index: &tantivy::Index,
+    searcher: &tantivy::Searcher,
     request: &SearchRequest,
 ) -> Result<Vec<Hit>> {
-    let reader = index.reader()
-        .map_err(|e| Error::Internal(format!("Failed to create index reader: {}", e)))?;
-    let searcher = reader.searcher();
-
     // Handle size=0: return empty hits (caller just wants count)
     // Tantivy's TopDocs collector panics if limit is 0
     if request.size == 0 {
@@ -2323,7 +2460,7 @@ mod archived_hit_tests {
             "query": {"match": {"marker": "quixoticbellwether"}}
         }))
         .unwrap();
-        let hits = search_tantivy_index("orders", &index, &request).await.unwrap();
+        let hits = search_tantivy_index("orders", &index, &query_searcher(&index).unwrap(), &request).unwrap();
         assert_eq!(hits.len(), 1, "the field query reaches the archive");
         let hit = &hits[0];
         assert_eq!(hit._id, "2-104", "same id format as hot hits, for dedup");
@@ -2338,5 +2475,52 @@ mod archived_hit_tests {
                 "value": r#"{"marker":"quixoticbellwether"}"#,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod search_limit_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn request(body: serde_json::Value) -> SearchRequest {
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn time_values_parse_as_elasticsearch_writes_them() {
+        assert_eq!(parse_time_value("250ms"), Some(Duration::from_millis(250)));
+        assert_eq!(parse_time_value("10s"), Some(Duration::from_secs(10)));
+        assert_eq!(parse_time_value("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_time_value("1500"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_time_value("soon"), None);
+        assert_eq!(parse_time_value("1.5s"), None);
+    }
+
+    #[test]
+    fn the_request_timeout_sets_the_deadline() {
+        let start = tokio::time::Instant::now();
+        let r = request(serde_json::json!({"query": {"match_all": {}}, "timeout": "300ms"}));
+        assert_eq!(search_deadline(&r, start), start + Duration::from_millis(300));
+        // Unparseable: the server default, not "no limit".
+        let r = request(serde_json::json!({"timeout": "whenever"}));
+        assert!(search_deadline(&r, start) > start);
+    }
+
+    #[test]
+    fn only_unranked_queries_stop_at_one_page() {
+        assert!(is_unranked(&request(serde_json::json!({}))));
+        assert!(is_unranked(&request(serde_json::json!({"query": {"match_all": {}}}))));
+        assert!(!is_unranked(&request(serde_json::json!({"query": {"match": {"value": "x"}}}))));
+        assert!(!is_unranked(&request(
+            serde_json::json!({"query": {"match_all": {}}, "sort": [{"offset": "desc"}]})
+        )));
+    }
+
+    #[test]
+    fn a_timed_out_or_full_page_count_is_a_lower_bound() {
+        assert_eq!(total_relation(3, 10, false), "eq");
+        assert_eq!(total_relation(10, 10, false), "gte");
+        assert_eq!(total_relation(3, 10, true), "gte");
     }
 }

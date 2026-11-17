@@ -520,6 +520,19 @@ impl TantivySegmentWriter {
     }
 }
 
+/// A reader for an archived segment, which never changes once written.
+///
+/// Tantivy's default reload policy watches the index directory for new
+/// commits with a polling thread per index. An archive never gets one, and the
+/// cold search path keeps hundreds of archives open at a time, so that would be
+/// hundreds of threads polling directories for nothing.
+fn archived_reader(index: &Index) -> tantivy::Result<IndexReader> {
+    index
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::Manual)
+        .try_into()
+}
+
 /// Reader for querying Tantivy segments
 pub struct TantivySegmentReader {
     index: Index,
@@ -534,7 +547,7 @@ impl TantivySegmentReader {
         let index = Index::open_in_dir(index_path)
             .map_err(|e| Error::Internal(format!("Failed to open index: {}", e)))?;
         text_analysis::register_analyzer(&index);
-        let reader = index.reader()
+        let reader = archived_reader(&index)
             .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
 
         Ok(Self { index, reader, schema_fields, metadata })
@@ -544,6 +557,11 @@ impl TantivySegmentReader {
     /// full-text queries against a cold segment via the shared query builder.
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// A searcher over the segment, from the reader opened with it.
+    pub fn searcher(&self) -> tantivy::Searcher {
+        self.reader.searcher()
     }
 
     /// Segment metadata (topic, partition, offset range, record count).
@@ -580,7 +598,7 @@ impl TantivySegmentReader {
         let index = Index::open_in_dir(&index_path)
             .map_err(|e| Error::Internal(format!("Failed to open index: {}", e)))?;
         text_analysis::register_analyzer(&index);
-        let reader = index.reader()
+        let reader = archived_reader(&index)
             .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
 
         Ok(Self { index, reader, schema_fields, metadata })
@@ -614,7 +632,7 @@ impl TantivySegmentReader {
         let index = Index::open_in_dir(&index_path)
             .map_err(|e| Error::Internal(format!("Failed to open index: {}", e)))?;
         text_analysis::register_analyzer(&index);
-        let reader = index.reader()
+        let reader = archived_reader(&index)
             .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
 
         Ok(Self { index, reader, schema_fields, metadata })

@@ -238,8 +238,9 @@ mod tests {
             aggs: None,
             aggregations: None,
             highlight: None,
+            timeout: None,
         };
-        
+
         let key1 = QueryCache::generate_key(Some("index1"), &request);
         let key2 = QueryCache::generate_key(Some("index2"), &request);
         let key3 = QueryCache::generate_key(Some("index1"), &request);

@@ -124,64 +124,136 @@ struct SearchFanoutState {
     query_router: Arc<super::query_router::QueryRouter>,
 }
 
-/// Execute the search_all handler locally and extract the SearchResponse.
-///
-/// Calls the original handler, converts the `impl IntoResponse` to HTTP,
-/// and parses the body back to SearchResponse.
+/// Run a local search handler and read its `SearchResponse` back. A non-200
+/// answer (e.g. "no such index") is returned as it was, for the caller to
+/// serve when no peer has anything either — re-running the search to rebuild
+/// it cost another full search, time limit included.
 #[cfg(feature = "search")]
-async fn execute_local_search_all(
-    search_api: Arc<SearchApi>,
-    request: chronik_search::api::SearchRequest,
-) -> Option<chronik_search::api::SearchResponse> {
+async fn local_search_response(
+    response: axum::response::Response,
+) -> Result<chronik_search::api::SearchResponse, axum::response::Response> {
     use axum::response::IntoResponse;
 
-    let result = chronik_search::handlers::search_all(
-        axum::extract::State(search_api),
-        axum::Json(request),
-    )
-    .await;
-
-    let http_response = result.into_response();
-    let (parts, body) = http_response.into_parts();
-
-    if parts.status != axum::http::StatusCode::OK {
-        return None;
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let body_bytes = match hyper::body::to_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read the local search response: {e}"),
+            )
+                .into_response())
+        }
+    };
+    if status == axum::http::StatusCode::OK {
+        if let Ok(parsed) = serde_json::from_slice(&body_bytes) {
+            return Ok(parsed);
+        }
     }
-
-    let body_bytes = hyper::body::to_bytes(body).await.ok()?;
-    serde_json::from_slice(&body_bytes).ok()
+    Err(axum::response::Response::from_parts(parts, axum::body::boxed(axum::body::Full::from(body_bytes))))
 }
 
-/// Execute the search_index handler locally and extract the SearchResponse.
 #[cfg(feature = "search")]
-async fn execute_local_search_index(
-    search_api: Arc<SearchApi>,
-    index: String,
+fn empty_search_response() -> chronik_search::api::SearchResponse {
+    chronik_search::api::SearchResponse {
+        took: 0,
+        timed_out: false,
+        _shards: chronik_search::api::ShardInfo { total: 0, successful: 0, skipped: 0, failed: 0 },
+        hits: chronik_search::api::HitsInfo {
+            total: chronik_search::api::TotalHits { value: 0, relation: "eq".to_string() },
+            max_score: None,
+            hits: Vec::new(),
+        },
+        aggregations: None,
+    }
+}
+
+/// Search this node and every peer at the same time, and merge.
+///
+/// The local search and the fan-out used to run one after the other, so a
+/// node that spent its whole time limit on its own archives made the client
+/// wait that long again for the peers.
+#[cfg(feature = "search")]
+async fn search_everywhere<F>(
+    state: SearchFanoutState,
+    path: String,
     request: chronik_search::api::SearchRequest,
-) -> Option<chronik_search::api::SearchResponse> {
+    local: F,
+    what: &'static str,
+) -> axum::response::Response
+where
+    F: std::future::Future<Output = axum::response::Response>,
+{
     use axum::response::IntoResponse;
 
-    let result = chronik_search::handlers::search_index(
-        axum::extract::Path(index),
-        axum::extract::State(search_api),
-        axum::Json(request),
-    )
-    .await;
+    let size = request.size;
+    let peers = state.query_router.all_peers();
+    let (local, fan_out) = tokio::join!(local_search_response_of(local), async {
+        if peers.is_empty() {
+            None
+        } else {
+            Some(
+                state
+                    .query_router
+                    .fan_out_post::<_, chronik_search::api::SearchResponse>(&path, &request, &peers)
+                    .await,
+            )
+        }
+    });
 
-    let http_response = result.into_response();
-    let (parts, body) = http_response.into_parts();
-
-    if parts.status != axum::http::StatusCode::OK {
-        return None;
+    let Some(fan_out) = fan_out else {
+        return match local {
+            Ok(resp) => axum::Json(resp).into_response(),
+            Err(error_response) => error_response,
+        };
+    };
+    let unanswered = fan_out.failures.len();
+    if !fan_out.is_complete() {
+        tracing::warn!(
+            path = %path,
+            failures = %fan_out.failure_summary(),
+            "Serving a partial {}: some nodes did not answer", what
+        );
     }
+    tracing::debug!(path = %path, peer_count = fan_out.responses.len(), "Merging {} results from peers", what);
 
-    let body_bytes = hyper::body::to_bytes(body).await.ok()?;
-    serde_json::from_slice(&body_bytes).ok()
+    match local {
+        Ok(local_resp) => {
+            let mut merged =
+                super::query_router::merge_search_responses(local_resp, fan_out.responses, size);
+            // Hits are ranked, so a partial answer is still worth serving — but
+            // `_shards.failed` has to say so, or a search that missed a node is
+            // indistinguishable from one where that node held no match (issue #57).
+            super::query_router::note_unanswered_peers(&mut merged, unanswered);
+            axum::Json(merged).into_response()
+        }
+        Err(error_response) if fan_out.responses.is_empty() => error_response,
+        Err(_) => {
+            let mut merged = super::query_router::merge_search_responses(
+                empty_search_response(),
+                fan_out.responses,
+                size,
+            );
+            // The local search failed, so this answer is short by this node
+            // too — count it with the peers that did not reply.
+            super::query_router::note_unanswered_peers(&mut merged, unanswered + 1);
+            axum::Json(merged).into_response()
+        }
+    }
+}
+
+#[cfg(feature = "search")]
+async fn local_search_response_of<F>(
+    local: F,
+) -> Result<chronik_search::api::SearchResponse, axum::response::Response>
+where
+    F: std::future::Future<Output = axum::response::Response>,
+{
+    local_search_response(local.await).await
 }
 
 /// Fan-out-aware search across all indices.
-///
-/// Executes the search locally, fans out to all peer nodes, and merges results.
 #[cfg(feature = "search")]
 async fn search_all_fanout(
     axum::extract::State(state): axum::extract::State<SearchFanoutState>,
@@ -190,121 +262,21 @@ async fn search_all_fanout(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let size = request.size;
-
-    // If this is a forwarded request, just execute locally and return
+    let api = state.search_api.clone();
+    let local_request = request.clone();
+    let local = async move {
+        chronik_search::handlers::search_all(axum::extract::State(api), axum::Json(local_request))
+            .await
+            .into_response()
+    };
+    // A forwarded request is a peer's share of a fan-out: answer locally only.
     if super::query_router::is_forwarded_request(&headers) {
-        let result = chronik_search::handlers::search_all(
-            axum::extract::State(state.search_api),
-            axum::Json(request),
-        )
-        .await;
-        return result.into_response();
+        return local.await;
     }
-
-    // Execute locally and parse the response
-    let local_response = match execute_local_search_all(
-        state.search_api.clone(),
-        request.clone(),
-    )
-    .await
-    {
-        Some(resp) => resp,
-        None => {
-            // Local search failed — still try peers, return their merged results
-            let peers = state.query_router.all_peers();
-            if !peers.is_empty() {
-                let fan_out = state
-                    .query_router
-                    .fan_out_post::<_, chronik_search::api::SearchResponse>(
-                        "/_search", &request, &peers,
-                    )
-                    .await;
-                let unanswered = fan_out.failures.len();
-                if !fan_out.is_complete() {
-                    tracing::warn!(
-                        failures = %fan_out.failure_summary(),
-                        "Serving a partial _search: some nodes did not answer"
-                    );
-                }
-                let peer_responses = fan_out.responses;
-                if !peer_responses.is_empty() {
-                    let empty = chronik_search::api::SearchResponse {
-                        took: 0,
-                        timed_out: false,
-                        _shards: chronik_search::api::ShardInfo {
-                            total: 0,
-                            successful: 0,
-                            skipped: 0,
-                            failed: 0,
-                        },
-                        hits: chronik_search::api::HitsInfo {
-                            total: chronik_search::api::TotalHits {
-                                value: 0,
-                                relation: "eq".to_string(),
-                            },
-                            max_score: None,
-                            hits: Vec::new(),
-                        },
-                        aggregations: None,
-                    };
-                    let mut merged = super::query_router::merge_search_responses(
-                        empty,
-                        peer_responses,
-                        size,
-                    );
-                    // The local search already failed here, so this answer is
-                    // short by the local node too — count it with the peers that
-                    // did not reply rather than reporting all-successful.
-                    super::query_router::note_unanswered_peers(&mut merged, unanswered + 1);
-                    return axum::Json(merged).into_response();
-                }
-            }
-            // No local or peer results — return local error
-            let result = chronik_search::handlers::search_all(
-                axum::extract::State(state.search_api),
-                axum::Json(request),
-            )
-            .await;
-            return result.into_response();
-        }
-    };
-
-    // Fan out to peers
-    let peers = state.query_router.all_peers();
-    let response = if !peers.is_empty() {
-        let fan_out = state
-            .query_router
-            .fan_out_post::<_, chronik_search::api::SearchResponse>("/_search", &request, &peers)
-            .await;
-        let unanswered = fan_out.failures.len();
-        if !fan_out.is_complete() {
-            tracing::warn!(
-                failures = %fan_out.failure_summary(),
-                "Serving a partial _search: some nodes did not answer"
-            );
-        }
-        tracing::debug!(
-            peer_count = fan_out.responses.len(),
-            "Merging ES search results from peers"
-        );
-        let mut merged =
-            super::query_router::merge_search_responses(local_response, fan_out.responses, size);
-        // Hits are ranked, so a partial answer is still worth serving — but
-        // `_shards.failed` has to say so, or a search that missed a node is
-        // indistinguishable from one where that node held no match (issue #57).
-        super::query_router::note_unanswered_peers(&mut merged, unanswered);
-        merged
-    } else {
-        local_response
-    };
-
-    axum::Json(response).into_response()
+    search_everywhere(state, "/_search".to_string(), request, local, "_search").await
 }
 
 /// Fan-out-aware search for a specific index.
-///
-/// Executes the search locally, fans out to all peer nodes, and merges results.
 #[cfg(feature = "search")]
 async fn search_index_fanout(
     axum::extract::Path(index): axum::extract::Path<String>,
@@ -314,120 +286,22 @@ async fn search_index_fanout(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let size = request.size;
-
-    // If this is a forwarded request, just execute locally and return
+    let api = state.search_api.clone();
+    let local_request = request.clone();
+    let local_index = index.clone();
+    let local = async move {
+        chronik_search::handlers::search_index(
+            axum::extract::Path(local_index),
+            axum::extract::State(api),
+            axum::Json(local_request),
+        )
+        .await
+        .into_response()
+    };
     if super::query_router::is_forwarded_request(&headers) {
-        let result = chronik_search::handlers::search_index(
-            axum::extract::Path(index),
-            axum::extract::State(state.search_api),
-            axum::Json(request),
-        )
-        .await;
-        return result.into_response();
+        return local.await;
     }
-
-    // Execute locally and parse the response
-    let local_response = execute_local_search_index(
-        state.search_api.clone(),
-        index.clone(),
-        request.clone(),
-    )
-    .await;
-
-    // Fan out to peers
-    let peers = state.query_router.all_peers();
-    let path = format!("/{}/_search", index);
-
-    if let Some(local_resp) = local_response {
-        // Local succeeded — merge with peers
-        let response = if !peers.is_empty() {
-            let fan_out = state
-                .query_router
-                .fan_out_post::<_, chronik_search::api::SearchResponse>(&path, &request, &peers)
-                .await;
-            let unanswered = fan_out.failures.len();
-            if !fan_out.is_complete() {
-                tracing::warn!(
-                    index = %index,
-                    failures = %fan_out.failure_summary(),
-                    "Serving a partial index _search: some nodes did not answer"
-                );
-            }
-            tracing::debug!(
-                index = %index,
-                peer_count = fan_out.responses.len(),
-                "Merging ES index search results from peers"
-            );
-            let mut merged =
-                super::query_router::merge_search_responses(local_resp, fan_out.responses, size);
-            super::query_router::note_unanswered_peers(&mut merged, unanswered);
-            merged
-        } else {
-            local_resp
-        };
-        axum::Json(response).into_response()
-    } else if !peers.is_empty() {
-        // Local failed but peers might have the index
-        let fan_out = state
-            .query_router
-            .fan_out_post::<_, chronik_search::api::SearchResponse>(&path, &request, &peers)
-            .await;
-        let unanswered = fan_out.failures.len();
-        if !fan_out.is_complete() {
-            tracing::warn!(
-                index = %index,
-                failures = %fan_out.failure_summary(),
-                "Serving a partial index _search: some nodes did not answer"
-            );
-        }
-        let peer_responses = fan_out.responses;
-        if !peer_responses.is_empty() {
-            let empty = chronik_search::api::SearchResponse {
-                took: 0,
-                timed_out: false,
-                _shards: chronik_search::api::ShardInfo {
-                    total: 0,
-                    successful: 0,
-                    skipped: 0,
-                    failed: 0,
-                },
-                hits: chronik_search::api::HitsInfo {
-                    total: chronik_search::api::TotalHits {
-                        value: 0,
-                        relation: "eq".to_string(),
-                    },
-                    max_score: None,
-                    hits: Vec::new(),
-                },
-                aggregations: None,
-            };
-            let mut merged =
-                super::query_router::merge_search_responses(empty, peer_responses, size);
-            // The local index search failed, so count this node among the
-            // shards that did not contribute.
-            super::query_router::note_unanswered_peers(&mut merged, unanswered + 1);
-            axum::Json(merged).into_response()
-        } else {
-            // No results from anywhere — return original local error
-            let result = chronik_search::handlers::search_index(
-                axum::extract::Path(index),
-                axum::extract::State(state.search_api),
-                axum::Json(request),
-            )
-            .await;
-            result.into_response()
-        }
-    } else {
-        // No peers and local failed — return local error
-        let result = chronik_search::handlers::search_index(
-            axum::extract::Path(index),
-            axum::extract::State(state.search_api),
-            axum::Json(request),
-        )
-        .await;
-        result.into_response()
-    }
+    search_everywhere(state, format!("/{}/_search", index), request, local, "index _search").await
 }
 
 #[cfg(test)]
