@@ -1899,12 +1899,12 @@ impl WalIndexer {
             writer.write_batch(&canonical_record)?;
         }
 
-        // Create output directory for tar.gz
+        // Create output directory for the archive
         let temp_dir = tempfile::tempdir()
             .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
 
-        // Commit and serialize to tar.gz (CPU + I/O intensive)
-        let (tar_gz_path, metadata) = writer.commit_and_serialize(temp_dir.path())?;
+        // Commit and serialize to a tar (CPU + I/O intensive)
+        let (archive_path, metadata) = writer.commit_and_serialize(temp_dir.path())?;
 
         info!(
             topic = %tp.topic,
@@ -1916,14 +1916,14 @@ impl WalIndexer {
             metadata.record_count
         );
 
-        // Read tar.gz file (blocking I/O)
-        let tar_gz_data = tokio::fs::read(&tar_gz_path).await
-            .map_err(|e| Error::Internal(format!("Failed to read tar.gz: {}", e)))?;
-        let bytes_written = tar_gz_data.len() as u64;
+        // Read the archive (blocking I/O)
+        let archive_data = tokio::fs::read(&archive_path).await
+            .map_err(|e| Error::Internal(format!("Failed to read the archive: {}", e)))?;
+        let bytes_written = archive_data.len() as u64;
 
         // Upload to object store
         let object_key = format!(
-            "{}/{}/partition-{}/segment-{}-{}.tar.gz",
+            "{}/{}/partition-{}/segment-{}-{}.tar",
             config.index_base_path,
             tp.topic,
             tp.partition,
@@ -1931,7 +1931,7 @@ impl WalIndexer {
             metadata.last_offset
         );
 
-        let data_bytes = bytes::Bytes::from(tar_gz_data);
+        let data_bytes = bytes::Bytes::from(archive_data);
         object_store.put(&object_key, data_bytes).await
             .map_err(|e| Error::Internal(format!("Failed to upload index: {}", e)))?;
 
@@ -1947,7 +1947,7 @@ impl WalIndexer {
         // without opening it when a required word is absent. Best effort — a
         // missing filter only means the archive is always opened (and the
         // search builds one the first time it does).
-        let filter_path = crate::term_filter::term_filter_key(&tar_gz_path.to_string_lossy());
+        let filter_path = crate::term_filter::term_filter_key(&archive_path.to_string_lossy());
         if let Ok(filter) = tokio::fs::read(&filter_path).await {
             let key = crate::term_filter::term_filter_key(&object_key);
             if let Err(e) = object_store.put(&key, bytes::Bytes::from(filter)).await {

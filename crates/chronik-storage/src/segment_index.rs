@@ -261,6 +261,42 @@ impl SegmentIndex {
         Ok(())
     }
 
+    /// Replace the segments `old_ids` of a partition with `merged`, in one
+    /// step under the index lock — or do nothing and answer `false` if any of
+    /// them is no longer registered (a truncation or topic delete removed it
+    /// while the merge ran: registering the merge would bring its records
+    /// back). Readers see either the old segments or the merged one, never
+    /// both, so no offset is ever covered twice.
+    pub async fn replace_segments(&self, old_ids: &[String], merged: SegmentMetadata) -> Result<bool> {
+        let tp = TopicPartition::new(merged.topic.clone(), merged.partition);
+        let mut segments = self.segments.write().await;
+        let Some(partition_segments) = segments.get_mut(&tp) else {
+            return Ok(false);
+        };
+        let present = old_ids
+            .iter()
+            .all(|id| partition_segments.values().any(|s| &s.segment_id == id));
+        if !present {
+            return Ok(false);
+        }
+        partition_segments.retain(|_, s| !old_ids.contains(&s.segment_id));
+        partition_segments.insert(merged.min_offset, merged.clone());
+        info!(
+            topic = %tp.topic,
+            partition = tp.partition,
+            replaced = old_ids.len(),
+            segment_id = %merged.segment_id,
+            min_offset = merged.min_offset,
+            max_offset = merged.max_offset,
+            "Merged segments in index"
+        );
+        drop(segments);
+        if self.auto_save {
+            self.save().await?;
+        }
+        Ok(true)
+    }
+
     /// Remove a segment from the index
     pub async fn remove_segment(&self, topic: &str, partition: i32, segment_id: &str) -> Result<bool> {
         let tp = TopicPartition::new(topic.to_string(), partition);

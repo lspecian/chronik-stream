@@ -18,6 +18,12 @@ use crate::object_store::{
 /// Core object storage trait
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// The file holding `key`, when this store is a local directory: lets a
+    /// reader memory-map an object instead of copying it into memory.
+    fn local_path(&self, _key: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Put an object into storage
     async fn put(&self, key: &str, data: Bytes) -> ObjectStoreResult<()> {
         self.put_with_options(key, data, PutOptions::default()).await
@@ -285,6 +291,10 @@ impl<T> ObjectStore for RetryableObjectStore<T>
 where
     T: ObjectStore,
 {
+    fn local_path(&self, key: &str) -> Option<std::path::PathBuf> {
+        self.inner.local_path(key)
+    }
+
     #[instrument(skip(self, data))]
     async fn put_with_options(&self, key: &str, data: Bytes, options: PutOptions) -> ObjectStoreResult<()> {
         retry_async_with_backoff(

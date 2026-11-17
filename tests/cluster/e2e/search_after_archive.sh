@@ -68,7 +68,7 @@ make_topic() { # topic
 
 wait_archived() { # topic: every node has archived the segment, plus time for hot eviction
   for _ in $(seq 60); do
-    [ "$(find $C/data -path "*/$1/*" -name '*.tar.gz' 2>/dev/null | wc -l)" -ge 3 ] && { sleep 20; return 0; }
+    [ "$(find $C/data -path "*/$1/*" \( -name '*.tar' -o -name '*.tar.gz' \) 2>/dev/null | wc -l)" -ge 3 ] && { sleep 20; return 0; }
     sleep 5
   done
   echo "  FAIL $1: no archive on all three nodes within 5 minutes"; fail=1; return 1

@@ -61,7 +61,9 @@ struct State {
 }
 
 struct Entry {
-    dir: PathBuf,
+    /// Its unpacked or downloaded copy in the cache; `None` for a local
+    /// plain-tar archive, which is opened where it is.
+    dir: Option<PathBuf>,
     bytes: u64,
     last_used: u64,
     reader: Option<Arc<TantivySegmentReader>>,
@@ -164,11 +166,11 @@ impl ColdSegmentCache {
         key: String,
     ) -> std::result::Result<Arc<TantivySegmentReader>, String> {
         let known = self.state.lock().unwrap().entries.contains_key(&key);
-        let dir = self.root.join(dir_name(&key));
-        let opened = TantivySegmentReader::from_object_store_cached(store.clone(), &key, &dir).await;
-        let bytes = match (&opened, known) {
-            (Ok(_), false) => {
-                let d = dir.clone();
+        let local = store.local_path(&key);
+        let (opened, dir) = open_archive(store.clone(), &key, &self.root, local).await;
+        let bytes = match (&opened, known, &dir) {
+            (Ok(_), false, Some(d)) => {
+                let d = d.clone();
                 tokio::task::spawn_blocking(move || dir_size(&d)).await.unwrap_or(0)
             }
             _ => 0,
@@ -179,8 +181,8 @@ impl ColdSegmentCache {
         match opened {
             Err(e) => {
                 drop(s);
-                if !known {
-                    let _ = std::fs::remove_dir_all(&dir);
+                if let (false, Some(dir)) = (known, &dir) {
+                    let _ = std::fs::remove_dir_all(dir);
                 }
                 Err(e.to_string())
             }
@@ -197,7 +199,7 @@ impl ColdSegmentCache {
                     s.bytes += bytes;
                     s.entries.insert(
                         key.clone(),
-                        Entry { dir, bytes, last_used: now, reader: Some(reader.clone()) },
+                        Entry { dir: dir.clone(), bytes, last_used: now, reader: Some(reader.clone()) },
                     );
                 }
                 let evicted = s.evict(self.budget_bytes, self.max_open, &key, &self.root);
@@ -328,41 +330,110 @@ impl State {
     fn evict(&mut self, budget: u64, max_open: usize, keep: &str, root: &Path) -> Vec<PathBuf> {
         let mut doomed = Vec::new();
         while self.bytes > budget {
-            let Some(victim) = self.lru(keep, false) else { break };
+            let Some(victim) = self.lru(keep, Pick::OnDisk) else { break };
             let e = self.entries.remove(&victim).expect("lru returns a present key");
             self.bytes = self.bytes.saturating_sub(e.bytes);
             self.evictions += 1;
+            let Some(dir) = e.dir else { continue };
             // An open reader keeps working: its files are mapped, and an
             // unlinked file stays readable while mapped.
             let trash = root.join(format!(".evicted-{}", self.evictions));
-            match std::fs::rename(&e.dir, &trash) {
+            match std::fs::rename(&dir, &trash) {
                 Ok(()) => doomed.push(trash),
                 Err(err) => {
-                    debug!(dir = %e.dir.display(), "evicting by rename failed ({err}); deleting in place");
-                    let _ = std::fs::remove_dir_all(&e.dir);
+                    debug!(dir = %dir.display(), "evicting by rename failed ({err}); deleting in place");
+                    let _ = std::fs::remove_dir_all(&dir);
                 }
             }
         }
         while self.entries.values().filter(|e| e.reader.is_some()).count() > max_open {
-            let Some(victim) = self.lru(keep, true) else { break };
-            if let Some(e) = self.entries.get_mut(&victim) {
+            let Some(victim) = self.lru(keep, Pick::Open) else { break };
+            // An archive opened in place has nothing else cached: forget it.
+            if self.entries.get(&victim).is_some_and(|e| e.dir.is_none()) {
+                self.entries.remove(&victim);
+            } else if let Some(e) = self.entries.get_mut(&victim) {
                 e.reader = None;
             }
         }
         doomed
     }
 
-    fn lru(&self, keep: &str, open_only: bool) -> Option<String> {
+    fn lru(&self, keep: &str, pick: Pick) -> Option<String> {
         self.entries
             .iter()
             .filter(|(k, e)| {
                 k.as_str() != keep
                     && !self.in_flight.contains_key(k.as_str())
-                    && (!open_only || e.reader.is_some())
+                    && match pick {
+                        Pick::OnDisk => e.dir.is_some(),
+                        Pick::Open => e.reader.is_some(),
+                    }
             })
             .min_by_key(|(_, e)| e.last_used)
             .map(|(k, _)| k.clone())
     }
+}
+
+/// Which entries an eviction may choose from.
+#[derive(Clone, Copy)]
+enum Pick {
+    /// Holding a copy in the cache directory (the byte budget).
+    OnDisk,
+    /// Holding an open reader (the open-segment cap).
+    Open,
+}
+
+/// Open the archive at `key`: a local plain tar in place (no cache copy,
+/// `None`); otherwise through the cache directory — a downloaded plain tar
+/// kept as one file, or a `.tar.gz` (written by an earlier version) unpacked.
+async fn open_archive(
+    store: Arc<dyn ObjectStore>,
+    key: &str,
+    root: &Path,
+    local_path: Option<PathBuf>,
+) -> (chronik_common::Result<TantivySegmentReader>, Option<PathBuf>) {
+    if let Some(path) = local_path.filter(|p| p.is_file()) {
+        let p = path.clone();
+        match tokio::task::spawn_blocking(move || TantivySegmentReader::open_tar_file(&p)).await {
+            Ok(Ok(Some(reader))) => return (Ok(reader), None),
+            Ok(Ok(None)) => {} // a .tar.gz: unpack it below
+            Ok(Err(e)) => return (Err(e), None),
+            Err(e) => return (Err(chronik_common::Error::Internal(format!("open task: {e}"))), None),
+        }
+    }
+    let dir = root.join(dir_name(key));
+    let tar = dir.join("archive.tar");
+    let ready = dir.join(".ready");
+    if !ready.exists() {
+        match store.get(key).await {
+            Ok(bytes) if !chronik_storage::tar_directory::is_gzip(&bytes) => {
+                let (d, t, r) = (dir.clone(), tar.clone(), ready.clone());
+                let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                    let _ = std::fs::remove_dir_all(&d);
+                    std::fs::create_dir_all(&d)?;
+                    std::fs::write(&t, &bytes)?;
+                    std::fs::write(&r, b"")
+                })
+                .await;
+                if let Err(e) = written.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+                    return (Err(chronik_common::Error::Internal(format!("caching {key}: {e}"))), Some(dir));
+                }
+            }
+            Ok(_) => {} // a .tar.gz: from_object_store_cached unpacks it
+            Err(e) => return (Err(chronik_common::Error::Internal(format!("download {key}: {e}"))), Some(dir)),
+        }
+    }
+    if tar.is_file() {
+        let t = tar.clone();
+        let opened = match tokio::task::spawn_blocking(move || TantivySegmentReader::open_tar_file(&t)).await {
+            Ok(Ok(Some(reader))) => Ok(reader),
+            Ok(Ok(None)) => Err(chronik_common::Error::Internal(format!("{key}: cached copy is not a tar"))),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(chronik_common::Error::Internal(format!("open task: {e}"))),
+        };
+        return (opened, Some(dir));
+    }
+    (TantivySegmentReader::from_object_store_cached(store, key, &dir).await, Some(dir))
 }
 
 /// A fixed-length directory name for an object key. Keys embed topic names
@@ -453,7 +524,9 @@ mod tests {
     }
 
     /// Archive `n` segments of 50 records into a local object store.
-    async fn archives(n: i64) -> (tempfile::TempDir, Arc<dyn ObjectStore>, Vec<String>) {
+    /// `gzip`: archives as earlier versions wrote them (`.tar.gz`, unpacked to be
+    /// read); otherwise plain tars, as written now (opened in place).
+    async fn archives(n: i64, gzip: bool) -> (tempfile::TempDir, Arc<dyn ObjectStore>, Vec<String>) {
         let dir = tempfile::tempdir().unwrap();
         let config = ObjectStoreConfig {
             backend: StorageBackend::Local { path: dir.path().join("store").to_string_lossy().to_string() },
@@ -491,9 +564,17 @@ mod tests {
             w.write_batch(&batch).unwrap();
             let out = dir.path().join(format!("out-{s}"));
             std::fs::create_dir_all(&out).unwrap();
-            let (tar_gz, _) = w.commit_and_serialize(&out).unwrap();
-            let key = format!("tantivy_indexes/cachetest/partition-0/segment-{}-{}.tar.gz", base, base + 49);
-            store.put(&key, bytes::Bytes::from(std::fs::read(tar_gz).unwrap())).await.unwrap();
+            let (tar, _) = w.commit_and_serialize(&out).unwrap();
+            let mut data = std::fs::read(tar).unwrap();
+            if gzip {
+                use std::io::Write;
+                let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                gz.write_all(&data).unwrap();
+                data = gz.finish().unwrap();
+            }
+            let ext = if gzip { "tar.gz" } else { "tar" };
+            let key = format!("tantivy_indexes/cachetest/partition-0/segment-{}-{}.{ext}", base, base + 49);
+            store.put(&key, bytes::Bytes::from(data)).await.unwrap();
             keys.push(key);
         }
         (dir, store, keys)
@@ -501,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn stays_within_its_byte_budget_and_open_limit() {
-        let (_d, store, keys) = archives(8).await;
+        let (_d, store, keys) = archives(8, true).await;
         let root = tempfile::tempdir().unwrap();
         // Measure one unpacked segment, then allow room for three.
         let probe = Arc::new(ColdSegmentCache::new(root.path().join("probe"), u64::MAX, 100));
@@ -536,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_searches_of_one_segment_unpack_it_once() {
-        let (_d, store, keys) = archives(1).await;
+        let (_d, store, keys) = archives(1, true).await;
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(ColdSegmentCache::new(root.path().join("c"), u64::MAX, 10));
         let loads: Vec<_> = (0..16)
@@ -557,7 +638,7 @@ mod tests {
     /// a search opens it, stored beside it for every later search.
     #[tokio::test]
     async fn an_old_archive_gets_its_term_filter_on_first_open() {
-        let (_d, store, keys) = archives(1).await;
+        let (_d, store, keys) = archives(1, false).await;
         let root = tempfile::tempdir().unwrap();
         let cache = Arc::new(ColdSegmentCache::new(root.path().join("c"), u64::MAX, 10));
         assert!(store.get(&term_filter_key(&keys[0])).await.is_err(), "starts without one");
@@ -578,6 +659,40 @@ mod tests {
         // A fresh node (empty memory) loads it from the store.
         let other = Arc::new(ColdSegmentCache::new(root.path().join("d"), u64::MAX, 10));
         assert_eq!(other.term_filter(store.as_ref(), &keys[0]).await.as_deref(), Some(&stored));
+    }
+
+    /// A plain-tar archive on local disk is opened where it is: nothing is
+    /// copied into the cache, and closing its reader forgets it entirely.
+    #[tokio::test]
+    async fn a_local_plain_tar_opens_in_place() {
+        let (_d, store, keys) = archives(3, false).await;
+        let root = tempfile::tempdir().unwrap();
+        let cache = Arc::new(ColdSegmentCache::new(root.path().join("c"), 1, 2));
+        for key in &keys {
+            let reader = cache.reader(store.clone(), key).await.unwrap();
+            assert_eq!(reader.searcher().num_docs(), 50);
+        }
+        let (entries, bytes, open, evictions) = cache.stats();
+        assert_eq!(bytes, 0, "no copy in the cache");
+        assert_eq!(evictions, 0, "nothing on disk to evict, even over a 1-byte budget");
+        assert!(open <= 2 && entries <= 2, "open cap still applies ({entries} entries, {open} open)");
+        assert_eq!(std::fs::read_dir(root.path().join("c")).unwrap().count(), 0, "cache directory untouched");
+    }
+
+    /// A plain tar from a store with no local file (S3, GCS, Azure) is
+    /// downloaded once into the cache, as one file, and opened from there.
+    #[tokio::test]
+    async fn a_remote_plain_tar_is_cached_as_one_file() {
+        let (_d, store, keys) = archives(1, false).await;
+        let root = tempfile::tempdir().unwrap();
+        let (opened, dir) = open_archive(store.clone(), &keys[0], root.path(), None).await;
+        assert_eq!(opened.unwrap().searcher().num_docs(), 50);
+        let dir = dir.expect("a cache copy");
+        assert!(dir.join("archive.tar").is_file());
+        assert!(!dir.join("index").exists(), "not unpacked");
+        // Reopened from the cached copy without downloading again.
+        let (again, _) = open_archive(store, &keys[0], root.path(), None).await;
+        assert_eq!(again.unwrap().searcher().num_docs(), 50);
     }
 
     #[test]

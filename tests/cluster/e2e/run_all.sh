@@ -43,6 +43,8 @@ run search_after_archive "$E2E/search_after_archive.sh" "$BIN" "$LABEL"
 run search_many_segments "$E2E/search_many_segments.sh" "$BIN" "$LABEL"
 run search_pagination "$E2E/search_pagination.sh" "$BIN" "$LABEL"
 run legacy_index_retirement "$E2E/legacy_index_retirement.sh" "$BIN" "$LABEL"
+run archive_merge "$E2E/archive_merge.sh" "$BIN" "$LABEL"
+run archive_merge_crash "$E2E/archive_merge_crash.sh" "$BIN" "$LABEL"
 run regression_replication ./tests/cluster/regression_replication.sh
 run follower_catchup ./tests/cluster/follower_catchup.sh
 run concurrent_produce_order ./tests/test_concurrent_produce_order.sh
