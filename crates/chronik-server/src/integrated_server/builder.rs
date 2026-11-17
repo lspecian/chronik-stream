@@ -1530,6 +1530,7 @@ impl IntegratedKafkaServerBuilder {
             self.config.advertised_host.clone(),
             self.config.advertised_port,
             self.config.num_partitions,  // Pass default partition count from config
+            self.config.replication_factor,
         ).await?);
 
         self.kafka_handler = Some(kafka_handler);

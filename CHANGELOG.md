@@ -91,6 +91,28 @@ about a topic, a leader or an epoch.
   Produce request now queues on its partitions as it is read and enters them
   in that order; the turn passes once the append lock is held, so fsync and
   replication waits still overlap and other partitions never wait.
+- **`kafka-topics.sh --create` without `--partitions` failed** ("Invalid number
+  of partitions"). Since KIP-464 clients send -1 for "broker default"; it is
+  now the default auto-create uses, and a -1 replication factor is the
+  cluster's (it became 1, so a topic on an RF-3 cluster got one replica).
+  `--replica-assignment`, which sends both counts as -1, takes its counts
+  from the assignment. All three present in v2.16.11.
+- **Tantivy archive keys embedded the node's data directory** (an absolute
+  path used as an object-store key: `segments/home/<user>/…/tantivy_indexes/`
+  locally, the same path inside a bucket). New archives use the key
+  `tantivy_indexes/…`; existing ones keep resolving through the segment index.
+- **DescribeConfigs reported a Chronik-specific key's own value as its default**
+  (`DEFAULT_CONFIG:searchable=true` while the default is false); keys without
+  a known default now carry only their topic value.
+
+### Documentation
+
+- Stock `kafka-topics.sh` refuses topic config names Kafka does not define
+  ("Unknown topic config name: columnar.enabled") before the request reaches
+  the broker, so the README and CLAUDE.md examples that set `columnar.*`,
+  `vector.*` or `searchable` with `--config` never worked with it. They now
+  create the topic and set the configs with `kafka-configs.sh --alter`. The
+  README also named the search key `searchable.enabled`; it is `searchable`.
 
 ## [2.16.11] - 2026-11-16
 

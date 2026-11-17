@@ -848,12 +848,13 @@ Chronik supports optional per-topic columnar storage using Apache Arrow and Parq
 ### Enabling Columnar Storage
 
 ```bash
-# Create topic with columnar storage
-kafka-topics.sh --create --topic orders \
-  --bootstrap-server localhost:9092 \
-  --config columnar.enabled=true \
-  --config columnar.format=parquet \
-  --config columnar.compression=zstd
+# Create the topic, then set its columnar configs. Stock kafka-topics.sh
+# refuses config names Kafka itself does not define ("Unknown topic config
+# name: columnar.enabled") before the request reaches Chronik; kafka-configs.sh
+# --alter, or any AdminClient createTopics with configs, passes them through.
+kafka-topics.sh --create --topic orders --bootstrap-server localhost:9092
+kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type topics --entity-name orders \
+  --add-config 'columnar.enabled=true,columnar.format=parquet,columnar.compression=zstd'
 ```
 
 ### SQL Query API (Port 6092)
@@ -894,13 +895,11 @@ Chronik supports optional per-topic vector search using HNSW indexes and embeddi
 ### Enabling Vector Search
 
 ```bash
-# Create topic with vector search
-kafka-topics.sh --create --topic logs \
-  --bootstrap-server localhost:9092 \
-  --config vector.enabled=true \
-  --config vector.embedding.provider=openai \
-  --config vector.embedding.model=text-embedding-3-small \
-  --config vector.field=value
+# Create the topic, then set its vector configs (see Columnar above for why
+# not kafka-topics.sh --config)
+kafka-topics.sh --create --topic logs --bootstrap-server localhost:9092
+kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type topics --entity-name logs \
+  --add-config 'vector.enabled=true,vector.embedding.provider=openai,vector.embedding.model=text-embedding-3-small,vector.field=value'
 
 # Set OpenAI API key
 export OPENAI_API_KEY="sk-..."

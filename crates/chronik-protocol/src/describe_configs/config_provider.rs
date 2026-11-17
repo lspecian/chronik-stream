@@ -55,7 +55,7 @@ impl ConfigProvider {
             let value = overrides.remove(name);
             configs.push(Self::build_topic_config_entry(
                 name,
-                default_value,
+                Some(default_value),
                 value.as_deref().filter(|v| *v != default_value),
                 doc,
                 config_type_val,
@@ -66,9 +66,11 @@ impl ConfigProvider {
         }
         for (name, value) in overrides {
             if Self::should_include_config(&name, configuration_keys) {
+                // No known default: report the topic value alone, never the
+                // value itself dressed up as the default.
                 configs.push(Self::build_topic_config_entry(
                     &name,
-                    &value,
+                    None,
                     Some(&value),
                     "",
                     config_type::STRING,
@@ -138,7 +140,7 @@ impl ConfigProvider {
     /// Complexity: < 15
     fn build_topic_config_entry(
         name: &str,
-        default_value: &str,
+        default_value: Option<&str>,
         topic_value: Option<&str>,
         doc: &str,
         config_type_val: i8,
@@ -155,15 +157,17 @@ impl ConfigProvider {
                     source: config_source::TOPIC_CONFIG,
                 });
             }
-            synonyms.push(ConfigSynonym {
-                name: name.to_string(),
-                value: Some(default_value.to_string()),
-                source: config_source::DEFAULT_CONFIG,
-            });
+            if let Some(default_value) = default_value {
+                synonyms.push(ConfigSynonym {
+                    name: name.to_string(),
+                    value: Some(default_value.to_string()),
+                    source: config_source::DEFAULT_CONFIG,
+                });
+            }
         }
         ConfigEntry {
             name: name.to_string(),
-            value: Some(topic_value.unwrap_or(default_value).to_string()),
+            value: topic_value.or(default_value).map(str::to_string),
             read_only: false,
             is_default: topic_value.is_none(),
             config_source: if topic_value.is_some() { config_source::TOPIC_CONFIG } else { config_source::DEFAULT_CONFIG },
@@ -288,6 +292,12 @@ mod tests {
         assert!(!get("cleanup.policy").is_default);
         assert_eq!(get("columnar.enabled").value.as_deref(), Some("true"));
         assert!(get("segment.bytes").is_default);
+        // A key with no known default carries only its topic value: its own
+        // value used to be reported as the default too ("DEFAULT_CONFIG:
+        // searchable=true" for a key whose default is false).
+        let c = get("columnar.enabled");
+        assert_eq!(c.synonyms.len(), 1, "{:?}", c.synonyms);
+        assert_eq!(c.synonyms[0].source, config_source::TOPIC_CONFIG);
     }
 
     #[tokio::test]

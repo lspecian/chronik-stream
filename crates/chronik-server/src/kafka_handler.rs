@@ -65,6 +65,7 @@ impl KafkaProtocolHandler {
         host: String,
         port: i32,
         default_num_partitions: u32,
+        default_replication_factor: u32,
     ) -> Result<Self> {
         let group_manager = Arc::new(GroupManager::new(metadata_store.clone()));
         group_manager.clone().start_expiration_checker();
@@ -87,12 +88,17 @@ impl KafkaProtocolHandler {
         acl_store.clone().spawn_reload_on_change(metadata_store.clone());
 
         Ok(Self {
+            // CreateTopics with -1 counts gets what auto-create gives.
             protocol_handler: ProtocolHandler::with_full_config(
                 metadata_store.clone(),
                 node_id,
                 host.clone(),
                 port
-            ),
+            )
+            .with_topic_defaults(chronik_protocol::handler::TopicDefaults {
+                partitions: default_num_partitions.max(1) as i32,
+                replication_factor: default_replication_factor.max(1) as i16,
+            }),
             produce_handler,
             wal_handler,
             segment_reader,

@@ -99,6 +99,24 @@ pub struct ProtocolHandler {
     advertised_port: i32,
     /// SASL authenticator for client authentication
     sasl_authenticator: Arc<Mutex<crate::sasl::SaslAuthenticator>>,
+    /// What CreateTopics uses when a client leaves the counts to the broker.
+    topic_defaults: TopicDefaults,
+}
+
+/// The partition count and replication factor a topic gets when CreateTopics
+/// sends -1 for them (KIP-464: "use the broker default"), as kafka-topics.sh
+/// does when --partitions or --replication-factor is left out. Kafka's own
+/// defaults are 1 and 1; the server sets the ones auto-create uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopicDefaults {
+    pub partitions: i32,
+    pub replication_factor: i16,
+}
+
+impl Default for TopicDefaults {
+    fn default() -> Self {
+        Self { partitions: 1, replication_factor: 1 }
+    }
 }
 
 /// This cluster's identity, as reported by both Metadata and DescribeCluster.
@@ -175,6 +193,7 @@ impl ProtocolHandler {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 
@@ -189,6 +208,7 @@ impl ProtocolHandler {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 
@@ -206,6 +226,7 @@ impl ProtocolHandler {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 
@@ -225,9 +246,42 @@ impl ProtocolHandler {
             advertised_host,
             advertised_port,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
+            topic_defaults: TopicDefaults::default(),
         }
     }
-    
+
+    /// Use these counts when CreateTopics leaves them to the broker.
+    pub fn with_topic_defaults(mut self, defaults: TopicDefaults) -> Self {
+        self.topic_defaults = defaults;
+        self
+    }
+
+    /// The topic as it will be created: a count the client sent as -1 becomes
+    /// the broker default, and explicit replica assignments (which Kafka sends
+    /// with both counts -1) decide the counts themselves.
+    pub fn resolve_topic_counts(
+        &self,
+        mut topic: crate::create_topics_types::CreateTopicRequest,
+    ) -> crate::create_topics_types::CreateTopicRequest {
+        if !topic.replica_assignments.is_empty() {
+            topic.num_partitions = topic.replica_assignments.len() as i32;
+            topic.replication_factor = topic
+                .replica_assignments
+                .iter()
+                .map(|a| a.broker_ids.len())
+                .max()
+                .unwrap_or(0) as i16;
+            return topic;
+        }
+        if topic.num_partitions == -1 {
+            topic.num_partitions = self.topic_defaults.partitions;
+        }
+        if topic.replication_factor == -1 {
+            topic.replication_factor = self.topic_defaults.replication_factor;
+        }
+        topic
+    }
+
     // Public parse methods for use by KafkaProtocolHandler
     
     /// Parse FindCoordinator request
