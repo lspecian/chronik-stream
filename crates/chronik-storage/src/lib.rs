@@ -25,6 +25,7 @@ pub mod vector_search;
 pub mod extended_segment;
 pub mod text_analysis;
 pub mod json_index;
+pub mod term_filter;
 // v2.2.7 Phase 5: Deleted metadata_wal_adapter.rs (old WAL adapter, replaced by Raft)
 
 pub use canonical_record::{

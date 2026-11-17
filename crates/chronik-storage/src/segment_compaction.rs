@@ -418,6 +418,11 @@ impl SegmentCompactor {
                         path = %segment.object_store_path,
                         "Deleted segment from object store"
                     );
+                    // Its term filter, if it has one.
+                    let _ = self
+                        .object_store
+                        .delete(&crate::term_filter::term_filter_key(&segment.object_store_path))
+                        .await;
                 }
                 Err(e) => {
                     return Err(Error::Internal(format!(

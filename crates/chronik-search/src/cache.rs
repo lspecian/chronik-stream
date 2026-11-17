@@ -278,6 +278,7 @@ mod tests {
                 hits: vec![],
             },
             aggregations: None,
+            _segments: None,
         };
         
         cache.put("key1".to_string(), response.clone());

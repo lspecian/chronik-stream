@@ -270,6 +270,8 @@ async fn remove_indexed_from(
         if !in_store && !on_disk {
             debug!("archive: no file removed for {} (already gone or elsewhere)", path);
         }
+        // A Tantivy archive's term filter goes with it (absent for Parquet).
+        let _ = store.delete(&crate::term_filter::term_filter_key(&path)).await;
     }
     removed
 }

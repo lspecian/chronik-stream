@@ -17,6 +17,7 @@
 use chronik_common::{Error, Result};
 use chronik_storage::object_store::ObjectStore;
 use chronik_storage::tantivy_segment::TantivySegmentReader;
+use chronik_storage::term_filter::{term_filter_key, TermFilter};
 use futures::future::{BoxFuture, FutureExt, Shared};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -36,6 +37,17 @@ pub struct ColdSegmentCache {
     budget_bytes: u64,
     max_open: usize,
     state: Mutex<State>,
+    filters: Mutex<Filters>,
+}
+
+/// Term filters of archives, by archive key: present, or known to be absent
+/// (an archive written before filters existed — one is built the first time
+/// it is opened).
+#[derive(Default)]
+struct Filters {
+    entries: HashMap<String, (Option<Arc<TermFilter>>, u64)>,
+    bytes: usize,
+    clock: u64,
 }
 
 #[derive(Default)]
@@ -103,7 +115,13 @@ impl ColdSegmentCache {
             max_open,
             "search cache for archived segments"
         );
-        Self { root, budget_bytes, max_open: max_open.max(1), state: Mutex::new(State::default()) }
+        Self {
+            root,
+            budget_bytes,
+            max_open: max_open.max(1),
+            state: Mutex::new(State::default()),
+            filters: Mutex::new(Filters::default()),
+        }
     }
 
     /// An open reader for the archived segment at `object_key`, unpacking it
@@ -147,7 +165,7 @@ impl ColdSegmentCache {
     ) -> std::result::Result<Arc<TantivySegmentReader>, String> {
         let known = self.state.lock().unwrap().entries.contains_key(&key);
         let dir = self.root.join(dir_name(&key));
-        let opened = TantivySegmentReader::from_object_store_cached(store, &key, &dir).await;
+        let opened = TantivySegmentReader::from_object_store_cached(store.clone(), &key, &dir).await;
         let bytes = match (&opened, known) {
             (Ok(_), false) => {
                 let d = dir.clone();
@@ -191,9 +209,98 @@ impl ColdSegmentCache {
                         }
                     });
                 }
+                if !known {
+                    self.build_missing_filter(store, key, reader.clone());
+                }
                 Ok(reader)
             }
         }
+    }
+
+    /// The term filter of the archive at `object_key`, or `None` when it has
+    /// none (yet). Loaded from the store on first use and kept in memory,
+    /// within `CHRONIK_SEARCH_TERM_FILTER_BYTES` (default 256MB).
+    pub async fn term_filter(&self, store: &dyn ObjectStore, object_key: &str) -> Option<Arc<TermFilter>> {
+        {
+            let mut f = self.filters.lock().unwrap();
+            f.clock += 1;
+            let now = f.clock;
+            if let Some(entry) = f.entries.get_mut(object_key) {
+                entry.1 = now;
+                return entry.0.clone();
+            }
+        }
+        let loaded = match store.get(&term_filter_key(object_key)).await {
+            Ok(bytes) => TermFilter::from_bytes(&bytes).map(Arc::new),
+            Err(_) => None,
+        };
+        self.remember_filter(object_key, loaded.clone());
+        loaded
+    }
+
+    fn remember_filter(&self, object_key: &str, filter: Option<Arc<TermFilter>>) {
+        static BUDGET: OnceLock<usize> = OnceLock::new();
+        let budget = *BUDGET.get_or_init(|| {
+            env_bytes("CHRONIK_SEARCH_TERM_FILTER_BYTES").unwrap_or(256 * 1024 * 1024) as usize
+        });
+        let mut f = self.filters.lock().unwrap();
+        f.clock += 1;
+        let now = f.clock;
+        let size = filter.as_ref().map_or(0, |t| t.memory_bytes());
+        if let Some((old, _)) = f.entries.insert(object_key.to_string(), (filter, now)) {
+            f.bytes = f.bytes.saturating_sub(old.map_or(0, |t| t.memory_bytes()));
+        }
+        f.bytes += size;
+        // Over budget: drop the least recently used (they reload on demand).
+        while f.bytes > budget && f.entries.len() > 1 {
+            let Some(victim) = f
+                .entries
+                .iter()
+                .filter(|(k, _)| k.as_str() != object_key)
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some((old, _)) = f.entries.remove(&victim) {
+                f.bytes = f.bytes.saturating_sub(old.map_or(0, |t| t.memory_bytes()));
+            }
+        }
+    }
+
+    /// Give an archive written before term filters existed its filter, from
+    /// the reader a search just opened, so later searches can skip it.
+    fn build_missing_filter(
+        self: &Arc<Self>,
+        store: Arc<dyn ObjectStore>,
+        object_key: String,
+        reader: Arc<TantivySegmentReader>,
+    ) {
+        let known_present = matches!(
+            self.filters.lock().unwrap().entries.get(&object_key),
+            Some((Some(_), _))
+        );
+        if known_present {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            if this.term_filter(store.as_ref(), &object_key).await.is_some() {
+                return;
+            }
+            let built = tokio::task::spawn_blocking(move || TermFilter::build(reader.index())).await;
+            match built {
+                Ok(Ok(filter)) => {
+                    let key = term_filter_key(&object_key);
+                    if let Err(e) = store.put(&key, bytes::Bytes::from(filter.to_bytes())).await {
+                        debug!(object_key = %key, "could not store a term filter: {}", e);
+                    }
+                    this.remember_filter(&object_key, Some(Arc::new(filter)));
+                }
+                Ok(Err(e)) => debug!(object_key = %object_key, "could not build a term filter: {}", e),
+                Err(e) => debug!(object_key = %object_key, "term filter task failed: {}", e),
+            }
+        });
     }
 
     /// (unpacked segments, bytes on disk, segments open, evictions so far)
@@ -444,6 +551,33 @@ mod tests {
         assert_eq!(cache.stats().0, 1);
         let dirs = std::fs::read_dir(root.path().join("c")).unwrap().count();
         assert_eq!(dirs, 1, "one unpacked copy");
+    }
+
+    /// An archive written before term filters existed gets one the first time
+    /// a search opens it, stored beside it for every later search.
+    #[tokio::test]
+    async fn an_old_archive_gets_its_term_filter_on_first_open() {
+        let (_d, store, keys) = archives(1).await;
+        let root = tempfile::tempdir().unwrap();
+        let cache = Arc::new(ColdSegmentCache::new(root.path().join("c"), u64::MAX, 10));
+        assert!(store.get(&term_filter_key(&keys[0])).await.is_err(), "starts without one");
+        assert!(cache.term_filter(store.as_ref(), &keys[0]).await.is_none());
+
+        cache.reader(store.clone(), &keys[0]).await.unwrap();
+        let mut stored = None;
+        for _ in 0..100 {
+            if let Ok(bytes) = store.get(&term_filter_key(&keys[0])).await {
+                stored = TermFilter::from_bytes(&bytes);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stored = stored.expect("a filter stored beside the archive");
+        assert_eq!(cache.term_filter(store.as_ref(), &keys[0]).await.as_deref(), Some(&stored));
+
+        // A fresh node (empty memory) loads it from the store.
+        let other = Arc::new(ColdSegmentCache::new(root.path().join("d"), u64::MAX, 10));
+        assert_eq!(other.term_filter(store.as_ref(), &keys[0]).await.as_deref(), Some(&stored));
     }
 
     #[test]

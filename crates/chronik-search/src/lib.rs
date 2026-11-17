@@ -11,6 +11,8 @@ pub mod geo;
 pub mod hot_text_index;
 pub mod cold_cache;
 pub mod ranking;
+pub mod prefilter;
+pub mod legacy_index;
 
 pub use api::SearchApi;
 pub use indexer::{TantivyIndexer, IndexerConfig, SearchResult};

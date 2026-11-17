@@ -703,6 +703,21 @@ impl WalIndexer {
         &self.segment_index
     }
 
+    /// Archive `batches` of `topic`/`partition` as one Tantivy segment —
+    /// uploaded with its term filter and registered, exactly as the indexer
+    /// archives the WAL. For records the indexer missed (re-archived from the
+    /// log); the batches must hold only offsets no archive covers yet.
+    /// Returns (bytes written, highest offset archived).
+    pub async fn archive_batches(
+        &self,
+        topic: &str,
+        partition: i32,
+        batches: Vec<CanonicalRecord>,
+    ) -> Result<(u64, i64)> {
+        let tp = TopicPartition::new(topic.to_string(), partition);
+        Self::create_tantivy_index(&self.config, &self.object_store, &self.segment_index, &tp, batches).await
+    }
+
     /// Object store holding this node's cold Tantivy/Parquet segments. Exposed
     /// so `/_search` can download+open a topic's cold Tantivy segments (the
     /// WalIndexer writes them here via `object_store.put`; nothing else can
@@ -1927,6 +1942,18 @@ impl WalIndexer {
             bytes = bytes_written,
             "Uploaded Tantivy index to object store"
         );
+
+        // Its term filter, when one was built: searches skip the archive
+        // without opening it when a required word is absent. Best effort — a
+        // missing filter only means the archive is always opened (and the
+        // search builds one the first time it does).
+        let filter_path = crate::term_filter::term_filter_key(&tar_gz_path.to_string_lossy());
+        if let Ok(filter) = tokio::fs::read(&filter_path).await {
+            let key = crate::term_filter::term_filter_key(&object_key);
+            if let Err(e) = object_store.put(&key, bytes::Bytes::from(filter)).await {
+                warn!(object_key = %key, "Failed to upload term filter: {}", e);
+            }
+        }
 
         // Register segment in index
         let segment_id = format!("{}-{}-{}-{}", tp.topic, tp.partition, min_offset, max_offset);
