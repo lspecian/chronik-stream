@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Full-text search keeps answering once records are archived. Each bug below
+was present in v2.17.0 and earlier; `tests/cluster/e2e/search_after_archive.sh`
+fails on v2.17.0 and passes now.
+
+### Fixed
+
+- **Field queries found nothing once records were archived.** A `match` on a
+  field of a JSON record (`{"match": {"marker": "x"}}`) worked for the first
+  30–60 seconds and then returned 0 hits: the archived index had no per-field
+  index, and the query was skipped there. JSON-object values are now indexed
+  into a `_json` field in both the hot index and archived segments, and a
+  field name the schema does not define is a path into it (`user.name`
+  reaches nested and dotted keys alike). Numbers and booleans match typed
+  values.
+- **The hot index ignored the field name** of a simple `match`, so
+  `{"match": {"anything": "x"}}` matched `x` in any field. It now honours the
+  field, so hot and archived results agree.
+- **`hits.total` counted every replica.** With RF=3 a search matching one
+  record reported a total of 3; it now counts distinct documents, with
+  `relation: "gte"` when the page was full and the count is a lower bound.
+- **No-match queries on an archived topic answered 404** "no such index" when
+  the hot index was off, because the archive counted as a source only when it
+  returned hits.
+- **Archived hits had a different `_source`** from hot ones: raw internal
+  columns, the value as a list of byte numbers, no `offset` or `timestamp`.
+  They now have the hot shape (`topic`, `partition`, `offset`, `timestamp`,
+  `key`, `value`).
+- **`match_all` returned 0 hits on a hot topic** (#65), and a request with no
+  `query` found nothing in the hot index.
+- **Long-form match** (`{"match": {"f": {"query": "x"}}}`) searched for the
+  object's JSON text.
+- **Range bounds:** `gt`/`lt` were treated as inclusive, and a one-sided range
+  was rejected.
+- **Expected auto-create refusals logged at ERROR.** A client asking for a
+  topic while a node catches up with the catalog after boot is told to retry;
+  that is now a debug line (it logged ~20 errors in 5 s per booting node).
+  Metadata requests no longer log at INFO each.
+
+### Compatibility
+
+- Archives written by v2.17.0 and earlier have no per-field index. A field
+  query there searches the whole record text instead (the documents the hot
+  index used to return), so old data stays findable; newly archived segments
+  answer by field.
+- Range queries on JSON fields are refused with an error: Tantivy needs the
+  JSON field to be a fast (columnar) field for them, which would add a column
+  per JSON path to every index.
+
 ## [2.17.0] - 2026-11-17
 
 The cluster catalog — topics, partition assignments (replicas, leader, leader

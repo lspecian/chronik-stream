@@ -291,6 +291,10 @@ impl KafkaProtocolHandler {
                     Ok(_metadata) => {
                         tracing::info!("Successfully auto-created topic '{}' with Raft integration", topic_name);
                     }
+                    Err(chronik_common::Error::NotReady(reason)) => {
+                        // Expected while this node catches up; the client retries.
+                        tracing::debug!("Not auto-creating '{}' yet: {}", topic_name, reason);
+                    }
                     Err(e) => {
                         tracing::error!("Failed to auto-create topic '{}': {:?}", topic_name, e);
                         // Continue trying to create other topics
@@ -394,7 +398,7 @@ impl KafkaProtocolHandler {
         if allow_auto_topic_creation {
             if let Some(requested_topics) = &topics {
                 if !requested_topics.is_empty() {
-                    tracing::info!("Metadata request for topics: {:?}, auto-creating if needed", requested_topics);
+                    tracing::debug!("Metadata request for topics: {:?}, auto-creating if needed", requested_topics);
                     self.track_expected_topics(requested_topics).await;
                     if let Err(e) = self.auto_create_topics(requested_topics).await {
                         tracing::warn!("Failed to auto-create topics on metadata: {:?}", e);

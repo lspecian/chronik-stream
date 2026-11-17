@@ -3724,13 +3724,11 @@ pub fn merge_search_responses(
     size: usize,
 ) -> SearchResponse {
     let mut all_hits = local.hits.hits;
-    let mut total_value = local.hits.total.value;
     let mut shards_total = local._shards.total;
     let mut shards_successful = local._shards.successful;
     let mut shards_failed = local._shards.failed;
 
     for peer_resp in peers {
-        total_value += peer_resp.hits.total.value;
         shards_total += peer_resp._shards.total;
         shards_successful += peer_resp._shards.successful;
         shards_failed += peer_resp._shards.failed;
@@ -3752,6 +3750,14 @@ pub fn merge_search_responses(
         }
     }
     let mut all_hits: Vec<Hit> = best.into_values().collect();
+
+    // The total is the number of DISTINCT documents. Summing each node's
+    // total counted every replica: with RF=3 a topic holding one match
+    // reported `"total": 3`. Every source returns at most `size` hits, so
+    // fewer than `size` distinct hits means none was cut off and the count
+    // is exact; otherwise it is a lower bound, which ES reports as "gte".
+    let total_value = all_hits.len() as u64;
+    let total_relation = if all_hits.len() < size { "eq" } else { "gte" };
 
     // Sort by score descending
     all_hits.sort_by(|a, b| {
@@ -3775,7 +3781,7 @@ pub fn merge_search_responses(
         hits: HitsInfo {
             total: TotalHits {
                 value: total_value,
-                relation: "eq".to_string(),
+                relation: total_relation.to_string(),
             },
             max_score,
             hits: all_hits,
@@ -4704,6 +4710,54 @@ mod fan_out_completeness_tests {
             partial._shards.total, 4,
             "and total must count the shards that were supposed to answer"
         );
+    }
+
+    /// With RF=3 every node holds every record and answers with it. The hits
+    /// were already deduplicated, but the total summed each node's own count,
+    /// so one matching record reported `"total": 3`.
+    #[test]
+    fn search_total_counts_each_document_once_across_replicas() {
+        fn resp(ids: &[&str]) -> chronik_search::api::SearchResponse {
+            let hits: Vec<chronik_search::api::Hit> = ids
+                .iter()
+                .map(|id| chronik_search::api::Hit {
+                    _index: "t".to_string(),
+                    _id: id.to_string(),
+                    _score: Some(1.0),
+                    _source: serde_json::json!({}),
+                    highlight: None,
+                })
+                .collect();
+            chronik_search::api::SearchResponse {
+                took: 1,
+                timed_out: false,
+                _shards: chronik_search::api::ShardInfo { total: 1, successful: 1, skipped: 0, failed: 0 },
+                hits: chronik_search::api::HitsInfo {
+                    total: chronik_search::api::TotalHits {
+                        value: hits.len() as u64,
+                        relation: "eq".to_string(),
+                    },
+                    max_score: Some(1.0),
+                    hits,
+                },
+                aggregations: None,
+            }
+        }
+
+        let merged = merge_search_responses(resp(&["0-42"]), vec![resp(&["0-42"]), resp(&["0-42"])], 10);
+        assert_eq!(merged.hits.hits.len(), 1);
+        assert_eq!(merged.hits.total.value, 1, "one record, three replicas");
+        assert_eq!(merged.hits.total.relation, "eq");
+
+        // Disjoint partitions led by different nodes still add up.
+        let merged = merge_search_responses(resp(&["0-1"]), vec![resp(&["1-1"]), resp(&["2-1", "0-1"])], 10);
+        assert_eq!(merged.hits.total.value, 3);
+
+        // Hitting `size` means a source may have been cut off: a lower bound.
+        let merged = merge_search_responses(resp(&["0-1", "0-2"]), vec![resp(&["0-3"])], 2);
+        assert_eq!(merged.hits.hits.len(), 2);
+        assert_eq!(merged.hits.total.value, 3);
+        assert_eq!(merged.hits.total.relation, "gte");
     }
 }
 

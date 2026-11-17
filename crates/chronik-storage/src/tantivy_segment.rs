@@ -54,6 +54,12 @@ pub struct SchemaFields {
     /// Partition, INDEXED so a hit can be uniquely identified by
     /// `(partition, offset)` — offset alone collides across partitions.
     pub partition: Field,
+    /// Field-level index of a JSON-object value (see [`crate::json_index`]).
+    /// LAST in the schema on purpose: readers rebuild these field ids from
+    /// code and apply them to archives written before it existed, so every
+    /// earlier id must stay where it was. Not stored; rebuilt from `_value`
+    /// whenever documents are copied out of the stored form.
+    pub json: Field,
 }
 
 impl SchemaFields {
@@ -79,6 +85,10 @@ impl SchemaFields {
         // Content-searchable value + indexed partition (see field docs).
         let value_text = schema_builder.add_text_field("value", TEXT | STORED);
         let partition = schema_builder.add_i64_field("partition", INDEXED | STORED | FAST);
+        let json = schema_builder.add_json_field(
+            crate::json_index::JSON_FIELD,
+            crate::json_index::json_field_options(),
+        );
 
         let schema = schema_builder.build();
 
@@ -86,8 +96,19 @@ impl SchemaFields {
             offset, timestamp, key, value, headers_json, attributes,
             base_offset, partition_leader_epoch, producer_id, producer_epoch,
             base_sequence, sequence, is_transactional, is_control,
-            compression, timestamp_type, value_text, partition,
+            compression, timestamp_type, value_text, partition, json,
         })
+    }
+}
+
+/// Index a JSON-object record value into the segment's JSON field; anything
+/// else (non-JSON, arrays, scalars) is left to the `value` text field.
+fn add_json_document(doc: &mut TantivyDocument, json_field: Field, value: &[u8]) {
+    if let Some(object) = crate::json_index::json_object(value) {
+        doc.add_object(
+            json_field,
+            object.into_iter().map(|(k, v)| (k, v.into())).collect(),
+        );
     }
 }
 
@@ -171,6 +192,7 @@ impl TantivySegmentWriter {
                 doc.add_bytes(self.schema_fields.value, v);
                 // Tokenized, searchable copy for full-text `/_search`.
                 doc.add_text(self.schema_fields.value_text, &String::from_utf8_lossy(v));
+                add_json_document(&mut doc, self.schema_fields.json, v);
             }
 
             doc.add_i64(self.schema_fields.partition, self.metadata.partition as i64);
@@ -260,8 +282,18 @@ impl TantivySegmentWriter {
             // from these indexes today, but a copy that ignored it would
             // resurrect anything that ever did.
             for doc in store.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
-                let doc = doc
+                let mut doc = doc
                     .map_err(|e| Error::Internal(format!("Failed to retrieve doc: {}", e)))?;
+                // The document store holds only STORED fields; the JSON field
+                // is not stored, so the copy would ship an archive in which
+                // field queries match nothing. Rebuild it from the raw value.
+                let raw_value = doc
+                    .get_first(self.schema_fields.value)
+                    .and_then(|v| v.as_bytes())
+                    .map(|b| b.to_vec());
+                if let Some(raw_value) = raw_value {
+                    add_json_document(&mut doc, self.schema_fields.json, &raw_value);
+                }
                 disk_writer.add_document(doc)
                     .map_err(|e| Error::Internal(format!("Failed to add doc to disk index: {}", e)))?;
                 copied += 1;
@@ -1137,6 +1169,54 @@ mod tests {
         let results = reader.query_by_offset_range(10, 20).unwrap();
         assert_eq!(results.len(), 10);
         assert_eq!(results.first().unwrap().offset, 10);
+    }
+
+    /// The archive is built by copying STORED documents out of the writer's
+    /// in-memory index. The JSON field is not stored, so a copy that only
+    /// moved stored fields shipped archives in which field queries matched
+    /// nothing; it has to be rebuilt from `_value` on the way through.
+    #[test]
+    fn json_values_stay_searchable_by_field_after_archiving() {
+        use tantivy::collector::Count;
+        use tantivy::query::TermQuery;
+        use tantivy::schema::IndexRecordOption;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut writer = TantivySegmentWriter::new("t".to_string(), 0, 0).unwrap();
+        let mut canonical = create_test_canonical_record(0, 30);
+        for (i, r) in canonical.records.iter_mut().enumerate() {
+            let marker = if i == 7 { "quixoticbellwether" } else { "ordinary" };
+            r.value = Some(format!(r#"{{"id":{},"marker":"{}"}}"#, i, marker).into_bytes());
+        }
+        // One non-JSON value: indexed as text only, must not break the copy.
+        canonical.records[3].value = Some(b"quixoticbellwether as plain text".to_vec());
+        writer.write_batch(&canonical).unwrap();
+        let (tar_gz_path, _) = writer.commit_and_serialize(&temp_dir.path().join("out")).unwrap();
+
+        let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
+        let index = reader.index();
+        let json = index.schema().get_field(crate::json_index::JSON_FIELD).unwrap();
+        // from_tar_gz unpacks into a temp dir it has already removed; its own
+        // open reader still works, a new one cannot take the lock.
+        let searcher = reader.reader.searcher();
+        let count = |path: &str, word: &str| {
+            // Terms are analyzed at index time (lowercase, stop words, stem).
+            let mut analyzer = crate::text_analysis::build_analyzer();
+            let mut stream = analyzer.token_stream(word);
+            let token = stream.next().expect("one token").text.clone();
+            let mut term = tantivy::Term::from_field_json_path(json, path, true);
+            term.append_type_and_str(&token);
+            searcher
+                .search(&TermQuery::new(term, IndexRecordOption::Basic), &Count)
+                .unwrap()
+        };
+        assert_eq!(count("marker", "quixoticbellwether"), 1, "only record 7's marker holds it");
+        assert_eq!(count("marker", "ordinary"), 28, "30 minus record 7 and the plain-text one");
+
+        // Offset reads use field ids rebuilt from code: still correct.
+        let rows = reader.query_by_offset_range(0, 30).unwrap();
+        assert_eq!(rows.len(), 30);
+        assert_eq!(rows[7].value.as_deref(), Some(br#"{"id":7,"marker":"quixoticbellwether"}"#.as_slice()));
     }
 
     #[test]
