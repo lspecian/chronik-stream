@@ -14,7 +14,7 @@ up() { for i in $(seq 90); do $K/kafka-topics.sh --bootstrap-server $1 --list >/
 isr() { $K/kafka-topics.sh --bootstrap-server $B --describe --topic $T 2>/dev/null | grep -P "Partition: $P\t" | awk '{print "leader="$6, "isr="$10}'; }
 
 echo "=== $LABEL ($TEST_BIN)"
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1; up localhost:9092 || { echo "cluster did not start"; exit 1; }
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092 || { echo "cluster did not start"; exit 1; }
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $T --partitions 3 --replication-factor 3 >/dev/null 2>&1; sleep 8
 # The catalog (Raft) leader, from each node's /admin/health (Unified API 6092+n-1).
 R=$(for n in 1 2 3; do curl -s -m 2 localhost:$((6091 + n))/admin/health | grep -q '"is_leader":true' && echo $n; done | head -1)
@@ -35,7 +35,7 @@ echo "setup: leader segment files for $T: $(find tests/cluster/data/node$L/segme
 rm -rf tests/cluster/data/node$L/wal/$T/$P
 echo "setup: leader WAL dir for $T removed (segment tier only, as on Thunderbird)"
 
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/restart.sh >/dev/null 2>&1; up localhost:9092
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/restart.sh >/dev/null 2>&1 || { echo "FAIL: restart.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092
 fail=0
 distinct() { timeout 60 kcat -C -b $B -t $T -p $P -o beginning -e -q 2>/dev/null | sort -u | wc -l; }
 sleep 60

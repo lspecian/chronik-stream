@@ -32,6 +32,6 @@ for i in 1 2 3; do
 done
 
 # Cleanup any remaining processes
-pkill -f "chronik-server.*start.*--config.*node[123].toml" 2>/dev/null || true
+pkill -f "start --config $SCRIPT_DIR/node[123].toml" 2>/dev/null || true
 
 echo -e "${GREEN}Cluster stopped${NC}"

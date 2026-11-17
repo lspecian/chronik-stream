@@ -24,7 +24,7 @@ check() {
 }
 
 echo "=== $LABEL ($TEST_BIN)"
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1; up localhost:9092 || { echo "cluster did not start"; exit 1; }
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092 || { echo "cluster did not start"; exit 1; }
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $T --partitions 1 --replication-factor 3 >/dev/null 2>&1; sleep 8
 seq 1 $N | sed 's/^/old-/' | kcat -P -b $B -t $T -p 0 -X acks=all -X batch.num.messages=20
 for i in $(seq 40); do sleep 10; [ "$(walfiles)" = 0 ] && break; done

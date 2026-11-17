@@ -19,7 +19,7 @@ isr() { $K/kafka-topics.sh --bootstrap-server $B --describe --topic $T 2>/dev/nu
 
 echo "=== $LABEL"
 # --- setup: the leader's history
-CHRONIK_BIN=$SETUP_BIN ./tests/cluster/start.sh >/dev/null 2>&1; up localhost:9092 || { echo "cluster did not start"; exit 1; }
+CHRONIK_BIN=$SETUP_BIN ./tests/cluster/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092 || { echo "cluster did not start"; exit 1; }
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $T --partitions 1 --replication-factor 3 >/dev/null 2>&1; sleep 5
 seq 0 999 | sed 's/^/leader-/' | kcat -P -b $B -t $T -p 0 -X batch.num.messages=7 -X linger.ms=200 -X acks=all
 sleep 15
@@ -43,7 +43,7 @@ done
 echo "setup: leader=node$L; followers now hold $(ls $W/standalone/wal/$T/0 | wc -l) planted WAL file(s)"
 
 # --- the binary under test
-CHRONIK_BIN=$TEST_BIN ./tests/cluster/restart.sh >/dev/null 2>&1; up localhost:9092
+CHRONIK_BIN=$TEST_BIN ./tests/cluster/restart.sh >/dev/null 2>&1 || { echo "FAIL: restart.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092
 fail=0
 sleep 60
 state=$(isr); echo "after 60s: $state"
