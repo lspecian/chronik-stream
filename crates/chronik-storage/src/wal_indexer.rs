@@ -76,7 +76,10 @@ pub struct WalIndexerConfig {
     /// Object store configuration for uploading Tantivy indexes
     pub object_store: ObjectStoreConfig,
 
-    /// Base path for Tantivy indexes
+    /// Object-store key prefix for Tantivy index archives. A key, not a
+    /// filesystem path: the object store adds its own root (a bucket, or the
+    /// local segments directory). Archives are found through the segment
+    /// index, which stores each full key, so changing it never orphans one.
     pub index_base_path: String,
 
     /// Enable parallel indexing (one task per topic-partition)
@@ -144,7 +147,7 @@ impl Default for WalIndexerConfig {
             segment_pause_ms: 0,
             delete_after_index: true,
             object_store: ObjectStoreConfig::default(),
-            index_base_path: "./data/indexes".to_string(),
+            index_base_path: "tantivy_indexes".to_string(),
             parallel_indexing: true,
             max_concurrent_tasks: 4,
             segment_index_path: Some(PathBuf::from("./data/segment_index.json")),

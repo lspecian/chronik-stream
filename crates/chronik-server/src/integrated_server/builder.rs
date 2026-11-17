@@ -1587,7 +1587,10 @@ impl IntegratedKafkaServerBuilder {
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
             object_store: storage_config.object_store_config.clone(),
-            index_base_path: format!("{}/tantivy_indexes", self.config.data_dir),
+            // A relative key: the data directory used to be prefixed, which put
+            // this node's local path into every archive key (in a bucket too,
+            // and nested under the local segments root).
+            index_base_path: "tantivy_indexes".to_string(),
             parallel_indexing: false, // Start with serial processing
             max_concurrent_tasks: 4,
             segment_index_path: Some(PathBuf::from(format!("{}/segment_index.json", self.config.data_dir))),
