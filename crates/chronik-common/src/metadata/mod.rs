@@ -3,6 +3,7 @@
 //! v2.2.7: All metadata now flows through Raft (see chronik-server/raft_metadata_store.rs)
 //! v2.2.9: Added WAL-based metadata store (Option A - Raft-free for performance)
 
+pub mod catalog;
 pub mod traits;
 pub mod transaction;
 pub mod memory;

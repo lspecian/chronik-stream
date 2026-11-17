@@ -25,7 +25,7 @@ pub enum MetadataError {
 pub type Result<T> = std::result::Result<T, MetadataError>;
 
 /// Topic configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicConfig {
     pub partition_count: u32,
     pub replication_factor: u32,
@@ -239,7 +239,7 @@ impl TopicConfig {
 }
 
 /// Topic metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicMetadata {
     pub id: Uuid,
     pub name: String,
@@ -311,7 +311,7 @@ pub struct ParquetSegmentMetadata {
 }
 
 /// Broker metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrokerMetadata {
     pub broker_id: i32,
     pub host: String,
@@ -330,7 +330,7 @@ pub enum BrokerStatus {
 }
 
 /// Partition assignment
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PartitionAssignment {
     pub topic: String,
     pub partition: u32,
@@ -597,10 +597,6 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
-    // Replicated event application (for followers receiving from leader)
-    // v2.2.9 Phase 7: Apply replicated metadata events WITHOUT writing to WAL
-    async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()>;
-
     // ---- ACLs (Security Phase 3) ----
     //
     // Default implementations make ACLs a no-op for stores that do not persist
@@ -682,6 +678,85 @@ pub trait MetadataStore: Send + Sync {
         offsets: Vec<(u32, i64, i64)>
     ) -> Result<TopicMetadata> {
         self.create_topic_with_assignments(topic_name, config, assignments, offsets).await
+    }
+
+    /// ISR reports from partition leaders, applied only while the reporter is
+    /// still the leader at the epoch it reports (a deposed leader's late
+    /// report must not overwrite its successor's set). One outcome per update.
+    ///
+    /// The catalog store applies the whole batch as one command; this default
+    /// checks and writes one assignment at a time.
+    async fn update_isr(
+        &self,
+        updates: Vec<super::catalog::IsrUpdate>,
+    ) -> Result<Vec<std::result::Result<(), super::catalog::CatalogError>>> {
+        use super::catalog::CatalogError;
+        let mut out = Vec::with_capacity(updates.len());
+        for u in updates {
+            let current = self
+                .get_partition_assignments(&u.topic)
+                .await?
+                .into_iter()
+                .find(|a| a.partition == u.partition);
+            let verdict = match current {
+                None => Err(CatalogError::UnknownPartition),
+                Some(a) if a.leader_id != u.leader_id => Err(CatalogError::NotLeader { current: a.leader_id }),
+                Some(a) if a.leader_epoch != u.leader_epoch => Err(CatalogError::StaleEpoch { current: a.leader_epoch }),
+                Some(a) => {
+                    let isr: Vec<u64> = a.replicas.iter().copied().filter(|r| u.isr.contains(r)).collect();
+                    if !isr.contains(&a.leader_id) {
+                        Err(CatalogError::InvalidReplicaAssignment("the leader must be in its ISR".into()))
+                    } else {
+                        self.assign_partition(PartitionAssignment { isr, ..a }).await?;
+                        Ok(())
+                    }
+                }
+            };
+            out.push(verdict);
+        }
+        Ok(out)
+    }
+
+    /// Placement and leadership changes, each refused when it carries an
+    /// `expected_epoch` the partition has moved past. One outcome per change.
+    async fn set_assignments(
+        &self,
+        changes: Vec<super::catalog::AssignmentChange>,
+    ) -> Result<Vec<std::result::Result<(), super::catalog::CatalogError>>> {
+        use super::catalog::CatalogError;
+        let mut out = Vec::with_capacity(changes.len());
+        for c in changes {
+            let current = self
+                .get_partition_assignments(&c.topic)
+                .await?
+                .into_iter()
+                .find(|a| a.partition == c.partition);
+            if let (Some(expected), Some(cur)) = (c.expected_epoch, &current) {
+                if cur.leader_epoch != expected {
+                    out.push(Err(CatalogError::StaleEpoch { current: cur.leader_epoch }));
+                    continue;
+                }
+            }
+            let replicas = c.replicas.clone().or_else(|| current.as_ref().map(|a| a.replicas.clone())).unwrap_or_default();
+            if replicas.is_empty() {
+                out.push(Err(CatalogError::InvalidReplicaAssignment("no replica list".into())));
+                continue;
+            }
+            let leader = c.leader.or_else(|| current.as_ref().map(|a| a.leader_id)).unwrap_or(replicas[0]);
+            self.assign_partition(PartitionAssignment {
+                topic: c.topic,
+                partition: c.partition,
+                broker_id: leader as i32,
+                is_leader: true,
+                replicas,
+                leader_id: leader,
+                leader_epoch: 0,
+                isr: c.isr.unwrap_or_default(),
+            })
+            .await?;
+            out.push(Ok(()));
+        }
+        Ok(out)
     }
 }
 /// A persisted ACL binding.

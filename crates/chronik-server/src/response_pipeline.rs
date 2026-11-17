@@ -239,7 +239,7 @@ impl ResponsePipeline {
                             // Remove empty bucket
                             if bucket.is_empty() {
                                 drop(bucket);
-                                pending.remove(&bucket_key);
+                                pending.remove_if(&bucket_key, |_, b| b.is_empty());
                             }
                         }
                     }
@@ -367,7 +367,9 @@ impl ResponsePipeline {
         // Clean up empty bucket
         if bucket.is_empty() {
             drop(bucket);
-            self.pending.remove(&bucket_key);
+            // Only if still empty, checked under the shard lock: a `register`
+            // may have refilled it since `bucket` was dropped.
+            self.pending.remove_if(&bucket_key, |_, b| b.is_empty());
         }
 
         if self.config.enable_metrics && (delivered > 0 || dropped > 0) {
@@ -434,7 +436,9 @@ impl ResponsePipeline {
 
         if bucket.is_empty() {
             drop(bucket);
-            self.pending.remove(&bucket_key);
+            // Only if still empty, checked under the shard lock: a `register`
+            // may have refilled it since `bucket` was dropped.
+            self.pending.remove_if(&bucket_key, |_, b| b.is_empty());
         }
     }
 
@@ -492,6 +496,44 @@ mod tests {
         assert_eq!(response.base_offset, 100);
 
         assert_eq!(pipeline.pending_count(), 0);
+    }
+
+    /// A response registered while another task empties the same partition's
+    /// bucket must not be thrown away with it.
+    ///
+    /// Emptying the bucket released its lock and THEN removed the key; a
+    /// `register` in between went into the bucket that was about to be
+    /// removed, its sender was dropped, and the produce answered
+    /// KAFKA_STORAGE_ERROR for a batch already in the WAL. The client retried
+    /// it: measured on the Dells, one 985-record batch stored twice in a
+    /// 2M-record acks=1 run (identical values, 1,970 offsets apart).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_response_registered_while_the_bucket_empties_is_delivered() {
+        let pipeline = Arc::new(ResponsePipeline::new());
+        let next = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let lost = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let (p, next, lost) = (Arc::clone(&pipeline), Arc::clone(&next), Arc::clone(&lost));
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..20_000 {
+                    let off = next.fetch_add(1, Ordering::SeqCst);
+                    let (tx, rx) = oneshot::channel();
+                    p.register("t".to_string(), 0, off, off, tx);
+                    p.notify_batch_committed("t", 0, off, off);
+                    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                        Ok(Ok(r)) if r.error_code == 0 => {}
+                        _ => {
+                            lost.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(lost.load(Ordering::Relaxed), 0, "responses lost to a concurrent bucket removal");
     }
 
     #[tokio::test]

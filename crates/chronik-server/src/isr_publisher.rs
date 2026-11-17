@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chronik_common::metadata::catalog::IsrUpdate;
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_common::metadata::PartitionAssignment;
 use tracing::{debug, info, warn};
@@ -160,15 +161,19 @@ impl IsrPublisher {
     /// The store is the only reference. A per-process "last published" map used
     /// to sit in front of it, and because it starts empty, every boot rewrote the
     /// in-sync set of every partition the node led — about 5,600 metadata writes,
-    /// each replicated to every peer, on a restart that changed nothing. Peers
-    /// that missed an update are healed by the catalog anti-entropy pass, which
-    /// re-sends assignments with their ISR, not by this loop.
+    /// each replicated to every peer, on a restart that changed nothing. A peer
+    /// that was down catches up by reading the catalog log, not through this
+    /// loop. Changed sets go out as one batch per pass, fenced by leader epoch.
     async fn publish_once(&self) -> chronik_common::Result<()> {
         let topics = self.metadata_store.list_topics().await?;
 
         // Partitions led this pass. Feeds the tracker's leadership clock, which
         // is what lets a follower that never fetches fall out of the set.
         let mut led: std::collections::HashSet<(String, i32)> = std::collections::HashSet::new();
+        // Changed sets, published together at the end of the pass, each fenced
+        // by the leader epoch it was measured under.
+        let mut updates: Vec<IsrUpdate> = Vec::new();
+        let mut previous: Vec<(Vec<u64>, Vec<u64>)> = Vec::new();
 
         for topic in topics {
             // Internal topics are not replicated through this path.
@@ -220,26 +225,14 @@ impl IsrPublisher {
                     continue; // already what the cluster holds
                 }
 
-                // Same leader_id, so `assign_partition` keeps the epoch: this
-                // must not read as a leadership change.
-                let update = PartitionAssignment {
-                    isr: isr.clone(),
-                    ..assignment.clone()
-                };
-
-                match self.metadata_store.assign_partition(update).await {
-                    Ok(()) => {
-                        info!(
-                            "{}-{}: in-sync set is now {:?} (was {:?}, of replicas {:?})",
-                            topic.name, partition, isr, assignment.isr, assignment.replicas
-                        );
-                        self.published.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => warn!(
-                        "{}-{}: could not publish in-sync set {:?}: {}",
-                        topic.name, partition, isr, e
-                    ),
-                }
+                previous.push((assignment.isr.clone(), assignment.replicas.clone()));
+                updates.push(IsrUpdate {
+                    topic: topic.name.clone(),
+                    partition: assignment.partition,
+                    leader_id: assignment.leader_id,
+                    leader_epoch: assignment.leader_epoch,
+                    isr,
+                });
             }
         }
 
@@ -247,6 +240,23 @@ impl IsrPublisher {
         // not be read) restarts its grace period when next led. Erring that way
         // only delays a shrink; keeping a stale clock could shrink too early.
         self.isr_tracker.retain_leading(&led);
+
+        if !updates.is_empty() {
+            let outcomes = self.metadata_store.update_isr(updates.clone()).await?;
+            for ((u, (was, replicas)), outcome) in updates.into_iter().zip(previous).zip(outcomes) {
+                match outcome {
+                    Ok(()) => {
+                        info!(
+                            "{}-{}: in-sync set is now {:?} (was {:?}, of replicas {:?})",
+                            u.topic, u.partition, u.isr, was, replicas
+                        );
+                        self.published.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Leadership moved since the measurement: the new leader publishes.
+                    Err(e) => debug!("{}-{}: in-sync set {:?} not published: {}", u.topic, u.partition, u.isr, e),
+                }
+            }
+        }
 
         Ok(())
     }

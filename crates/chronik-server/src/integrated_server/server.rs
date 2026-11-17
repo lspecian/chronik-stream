@@ -192,127 +192,6 @@ impl IntegratedKafkaServer {
     }
 
 
-    /// Assign existing partitions to cluster nodes (Phase 3.4)
-    ///
-    /// This method is called on cluster startup to ensure all partitions have assignments.
-    /// It uses the round-robin strategy from `crates/chronik-common/src/partition_assignment.rs`.
-    pub async fn assign_existing_partitions(&self, cluster_config: &chronik_config::ClusterConfig) -> Result<()> {
-        use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
-        use chronik_common::metadata::PartitionAssignment;
-
-        info!("Starting partition assignment for existing topics");
-
-        // Get list of all cluster node IDs (convert from u64 to u32 for partition_assignment module)
-        let node_ids: Vec<u32> = cluster_config.peers.iter().map(|p| p.id as u32).collect();
-        if node_ids.is_empty() {
-            warn!("No cluster nodes found, skipping partition assignment");
-            return Ok(());
-        }
-
-        info!("Cluster nodes: {:?}", node_ids);
-
-        // Get all topics
-        let topics = self.metadata_store.list_topics().await?;
-        if topics.is_empty() {
-            info!("No topics found, skipping partition assignment");
-            return Ok(());
-        }
-
-        info!("Found {} topics to assign", topics.len());
-
-        // For each topic, assign partitions using round-robin
-        for topic in topics {
-            let topic_name = &topic.name;
-            let partition_count = topic.config.partition_count;
-            let replication_factor = topic.config.replication_factor.min(node_ids.len() as u32);
-
-            info!(
-                "Assigning topic '{}': {} partitions, RF={}",
-                topic_name, partition_count, replication_factor
-            );
-
-            // Check if partitions are already assigned
-            let existing_assignments = self.metadata_store.get_partition_assignments(topic_name).await?;
-            if !existing_assignments.is_empty() {
-                info!("Topic '{}' already has {} assignments, skipping", topic_name, existing_assignments.len());
-                continue;
-            }
-
-            // Create assignment manager and assign partitions
-            let mut assignment_mgr = AssignmentManager::new();
-            assignment_mgr.add_topic(
-                topic_name,
-                partition_count as i32,
-                replication_factor as i32,
-                &node_ids,
-            )?;
-
-            // Convert to metadata PartitionAssignment and persist
-            let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
-            for (partition_id, partition_info) in topic_assignments {
-                // Create SINGLE assignment per partition with FULL replica list
-                let replicas: Vec<u64> = partition_info.replicas.iter().map(|&id| id as u64).collect();
-                let leader_id = partition_info.leader as u64;
-
-                let assignment = PartitionAssignment {
-                    topic: topic_name.clone(),
-                    partition: partition_id as u32,
-                    broker_id: leader_id as i32,  // Deprecated field
-                    is_leader: true,  // Deprecated field
-                    replicas: replicas.clone(),
-                    leader_id,
-                    leader_epoch: 0, // assigned by the metadata store
-                    isr: Vec::new(), // placement only — the leader publishes this
-                };
-
-                // Persist assignment via metadata store (will replicate via Raft)
-                self.metadata_store.assign_partition(assignment).await?;
-
-                info!(
-                    "Assigned partition {}/{} to replicas {:?} (leader={})",
-                    topic_name, partition_id, replicas, leader_id
-                );
-            }
-
-            info!(
-                "Successfully assigned {} partitions for topic '{}'",
-                partition_count, topic_name
-            );
-        }
-
-        info!("Partition assignment complete");
-        Ok(())
-    }
-
-    /// Ensure a default topic exists for client connectivity
-    async fn ensure_default_topic(&self) -> Result<()> {
-        use chronik_common::metadata::TopicConfig;
-        
-        // Check if any topics exist
-        let existing_topics = self.metadata_store.list_topics().await?;
-        
-        if existing_topics.is_empty() {
-            info!("No topics exist, creating default topic 'chronik-default'");
-            
-            // Create topic config
-            let topic_config = TopicConfig {
-                partition_count: 1,
-                replication_factor: 1,
-                retention_ms: Some(604800000), // 7 days
-                segment_bytes: 1073741824, // 1GB
-                config: Default::default(),
-            };
-            
-            self.metadata_store.create_topic("chronik-default", topic_config).await?;
-            
-            info!("Successfully created default topic 'chronik-default'");
-        } else {
-            info!("Topics already exist ({}), skipping default topic creation", existing_topics.len());
-        }
-        
-        Ok(())
-    }
-
     /// Gracefully shutdown the server, flushing all pending data
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down IntegratedKafkaServer...");
@@ -775,7 +654,10 @@ impl IntegratedKafkaServer {
                                 break;
                             }
 
-                            let request_data = request_buffer[..request_size].to_vec();
+                            let request_data = bytes::Bytes::copy_from_slice(&request_buffer[..request_size]);
+                            // A Produce takes its place in the connection's write order here,
+                            // on the read loop, so places follow read order (see produce_order).
+                            let produce_ticket = (api_key == 0).then(|| conn_ctx.issue_produce_ticket(&request_data));
 
                             // Reserve this request's response slot IN READ ORDER
                             // before spawning the handler; the ordered writer
@@ -802,6 +684,11 @@ impl IntegratedKafkaServer {
                                 );
 
                                 // Acquire semaphore to limit concurrent handlers
+                                // Permits in read order too: a Produce waiting for an earlier
+                                // one must never hold the permit that earlier one needs.
+                                if let Some(ticket) = &produce_ticket {
+                                    ticket.permit_order().await;
+                                }
                                 let _permit = match semaphore_clone.acquire_owned().await {
                                     Ok(p) => p,
                                     Err(_) => {
@@ -810,12 +697,15 @@ impl IntegratedKafkaServer {
                                         return;
                                     }
                                 };
+                                if let Some(ticket) = &produce_ticket {
+                                    ticket.permit_held();
+                                }
 
                                 // Handle request; produce response bytes (or None).
                                 // Encoding runs here (concurrent); only the WRITE
                                 // is ordered, via resp_tx → ordered writer.
                                 let bytes = match handler_clone
-                                    .handle_request_with_context(&conn_ctx_clone, &request_data)
+                                    .handle_request_with_context(&conn_ctx_clone, &request_data, produce_ticket)
                                     .await
                                 {
                                     Ok(response) => Some(Self::encode_response(response)),
@@ -930,7 +820,10 @@ impl IntegratedKafkaServer {
                                 break;
                             }
 
-                            let request_data = request_buffer[..request_size].to_vec();
+                            let request_data = bytes::Bytes::copy_from_slice(&request_buffer[..request_size]);
+                            // A Produce takes its place in the connection's write order here,
+                            // on the read loop, so places follow read order (see produce_order).
+                            let produce_ticket = (api_key == 0).then(|| conn_ctx.issue_produce_ticket(&request_data));
 
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
                             if resp_order_tx.send(resp_rx).is_err() {
@@ -951,6 +844,11 @@ impl IntegratedKafkaServer {
                                     &control_sem_clone
                                 );
 
+                                // Permits in read order too: a Produce waiting for an earlier
+                                // one must never hold the permit that earlier one needs.
+                                if let Some(ticket) = &produce_ticket {
+                                    ticket.permit_order().await;
+                                }
                                 let _permit = match semaphore_clone.acquire_owned().await {
                                     Ok(p) => p,
                                     Err(_) => {
@@ -959,9 +857,12 @@ impl IntegratedKafkaServer {
                                         return;
                                     }
                                 };
+                                if let Some(ticket) = &produce_ticket {
+                                    ticket.permit_held();
+                                }
 
                                 let bytes = match handler_clone
-                                    .handle_request_with_context(&conn_ctx_clone, &request_data)
+                                    .handle_request_with_context(&conn_ctx_clone, &request_data, produce_ticket)
                                     .await
                                 {
                                     Ok(response) => Some(Self::encode_response(response)),
@@ -1233,8 +1134,8 @@ mod tests {
         let stats = server.get_stats().await.unwrap();
 
         assert_eq!(stats.node_id, 1);
-        // Builder doesn't register brokers in metadata store — that's a runtime concern
-        assert_eq!(stats.brokers_count, 0);
+        // Single-node mode registers itself, so the catalog can place partitions.
+        assert_eq!(stats.brokers_count, 1);
 
         // Drop server in blocking context (WalIndexer has its own tokio runtime)
         tokio::task::spawn_blocking(move || drop(server)).await.unwrap();

@@ -18,7 +18,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$ROOT/target/release/chronik-server"
+BIN="${CHRONIK_BIN:-$ROOT/target/release/chronik-server}"
 DIR="$ROOT/tests/cluster"
 LOGS="$DIR/logs"
 BOOT="localhost:9392,localhost:9393,localhost:9394"
@@ -37,10 +37,16 @@ start_node() {
   echo $! > "$LOGS/alt-node$1.pid"
 }
 stop_all() {
+  local pids=""
   for n in 1 2 3; do
     p=$(cat "$LOGS/alt-node$n.pid" 2>/dev/null)
-    [ -n "$p" ] && kill -9 "$p" 2>/dev/null
+    [ -n "$p" ] && kill -9 "$p" 2>/dev/null && pids="$pids $p"
     rm -f "$LOGS/alt-node$n.pid"
+  done
+  # Wait until they are gone: a run started right after this one must not
+  # find its ports still bound (it would lose nodes to EADDRINUSE).
+  for p in $pids; do
+    for _ in $(seq 1 100); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
   done
 }
 trap stop_all EXIT
@@ -111,9 +117,20 @@ say "== throughput with follower-pull replication (3 nodes, RF=3, min_insync=2) 
 say "   $RECORDS records x ${PAYLOAD}B, one machine, WAL profile left at its default"
 say ""
 rm -rf "$DIR/data/alt-node"{1,2,3}
+# A previous run (or a stray broker) still holding a port would make a node
+# exit with EADDRINUSE and every measurement time out; refuse to start instead.
+port_busy() { (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && { exec 3<&-; return 0; }; return 1; }
+for p in 9392 9393 9394 5101 5102 5103 6392 6393 6394; do
+  for _ in $(seq 1 30); do port_busy "$p" || break; sleep 1; done
+  port_busy "$p" && { say "FAIL: port $p is still in use; stop whatever holds it"; exit 1; }
+done
 for n in 1 2 3; do start_node "$n"; done
-for p in 9392 9393 9394; do wait_for_port "$p" || { say "node on $p never came up"; exit 1; }; done
+for p in 9392 9393 9394; do wait_for_port "$p" || { say "FAIL: node on $p never came up"; exit 1; }; done
 sleep 12
+for n in 1 2 3; do
+  kill -0 "$(cat "$LOGS/alt-node$n.pid")" 2>/dev/null \
+    || { say "FAIL: node $n exited during startup: $(grep -m1 -E 'ERROR' "$LOGS/perf-node$n.log" | cut -c1-200)"; exit 1; }
+done
 
 measure 0 0
 measure 1 1

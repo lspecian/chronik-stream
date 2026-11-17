@@ -41,7 +41,7 @@ use chronik_common::metadata::PartitionAssignment;
 use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
-use crate::raft_cluster::RaftCluster;
+use crate::cluster_catalog::ClusterCatalog;
 
 /// How often peer liveness is sampled and assignments are checked.
 const DEFAULT_TICK: Duration = Duration::from_secs(2);
@@ -98,6 +98,9 @@ pub struct Failover {
     /// What legitimately shrinks on failure is ISR, and `IsrTracker` already
     /// does that from its own liveness (RP-2.1).
     pub replicas: Vec<u64>,
+    /// The leader epoch the plan was made at. The move is refused if the
+    /// partition has changed leader since, instead of undoing that change.
+    pub from_epoch: i32,
     /// Replicas currently alive. Reported, not written — diagnostics only.
     pub live_replicas: Vec<u64>,
 }
@@ -194,6 +197,7 @@ pub fn plan_failover(
                 topic: assignment.topic.clone(),
                 partition: assignment.partition,
                 from: assignment.leader_id,
+                from_epoch: assignment.leader_epoch,
                 to,
                 replicas: assignment.replicas.clone(),
                 live_replicas,
@@ -267,6 +271,7 @@ pub fn plan_preferred_leaders(
             topic: assignment.topic.clone(),
             partition: assignment.partition,
             from: assignment.leader_id,
+            from_epoch: assignment.leader_epoch,
             to: preferred,
             replicas: assignment.replicas.clone(),
             live_replicas: assignment
@@ -281,29 +286,11 @@ pub fn plan_preferred_leaders(
     moves
 }
 
-/// Nodes present now that were absent before — the ones that just came back.
-///
-/// `previous` is `None` on the first observation after becoming Raft leader.
-/// Everyone looks new then, but nobody has rejoined: treating that as a rejoin
-/// would fire a full catalog broadcast on every Raft leadership change, which
-/// on a large catalog is exactly the burst the anti-entropy interval exists to
-/// space out.
-pub fn rejoined_nodes(previous: Option<&[u64]>, current: &[u64]) -> Vec<u64> {
-    let Some(previous) = previous else {
-        return Vec::new();
-    };
-    current
-        .iter()
-        .copied()
-        .filter(|id| !previous.contains(id))
-        .collect()
-}
-
 /// Tracks which nodes have been heard from, and moves partitions off the ones
 /// that have not.
 pub struct PartitionFailoverController {
     node_id: u64,
-    raft: Arc<RaftCluster>,
+    raft: Arc<ClusterCatalog>,
     metadata_store: Arc<dyn MetadataStore>,
     /// Last moment each node was observed active by Raft.
     last_active: DashMap<u64, Instant>,
@@ -314,9 +301,6 @@ pub struct PartitionFailoverController {
     /// Last live set logged, so the line above prints on change rather than
     /// every tick.
     last_reported_live: parking_lot::Mutex<Option<Vec<u64>>>,
-    /// Woken when a node rejoins, so the catalog anti-entropy loop re-broadcasts
-    /// immediately (RP-6).
-    rejoin_notify: Option<Arc<tokio::sync::Notify>>,
     /// Whether we have already said we hold failover authority, so the line
     /// prints on transition rather than every tick.
     announced_authority: AtomicBool,
@@ -341,9 +325,8 @@ pub struct PartitionFailoverController {
 impl PartitionFailoverController {
     pub fn new(
         node_id: u64,
-        raft: Arc<RaftCluster>,
+        raft: Arc<ClusterCatalog>,
         metadata_store: Arc<dyn MetadataStore>,
-        rejoin_notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             node_id,
@@ -352,7 +335,6 @@ impl PartitionFailoverController {
             last_active: DashMap::new(),
             leader_since: parking_lot::Mutex::new(None),
             last_reported_live: parking_lot::Mutex::new(None),
-            rejoin_notify,
             announced_authority: AtomicBool::new(false),
             tick: env_secs("CHRONIK_FAILOVER_TICK_SECS").unwrap_or(DEFAULT_TICK),
             liveness_window: env_secs("CHRONIK_FAILOVER_LIVENESS_SECS")
@@ -393,7 +375,7 @@ impl PartitionFailoverController {
         while !self.shutdown.load(Ordering::Relaxed) {
             tokio::time::sleep(self.tick).await;
 
-            let active = match self.raft.sample_active_peers().await {
+            let active = match self.raft.sample_live_nodes().await {
                 Some(active) => {
                     // Say once that this node has taken over deciding failover.
                     // "Is the controller even sampling?" cost six round trips of
@@ -435,8 +417,7 @@ impl PartitionFailoverController {
         info!("Partition failover controller stopped on node {}", self.node_id);
     }
 
-    /// Log the live set whenever it changes, and push the catalog when a node
-    /// rejoins (RP-6).
+    /// Log the live set whenever it changes.
     ///
     /// The first build of this controller shipped as a silent no-op on a real
     /// cluster: the planner was correct and its liveness input was a constant,
@@ -451,28 +432,8 @@ impl PartitionFailoverController {
             return;
         }
 
-        // A node present now that was absent before has just come back, and its
-        // metadata is stale by whatever happened while it was away — including,
-        // if it was a partition leader, the failover that demoted it. Until it
-        // learns that, it believes it still leads and replicates nothing for
-        // those partitions. Waking the anti-entropy loop turns a wait of up to
-        // `CHRONIK_METADATA_REBROADCAST_SECS` (default 300s) into one pass.
-        let rejoined = rejoined_nodes(last.as_deref(), &sorted);
-
         info!("Partition failover: live nodes {:?}", sorted);
         *last = Some(sorted);
-        drop(last);
-
-        if !rejoined.is_empty() {
-            if let Some(notify) = &self.rejoin_notify {
-                info!(
-                    "Node(s) {:?} rejoined — asking for an immediate catalog re-broadcast so they \
-                     learn any leadership that moved while they were away",
-                    rejoined
-                );
-                notify.notify_one();
-            }
-        }
     }
 
     /// Forget everything observed while we were Raft leader.
@@ -532,9 +493,7 @@ impl PartitionFailoverController {
             );
         }
 
-        for failover in &plan.failovers {
-            self.apply(failover, MoveReason::LeaderUnreachable).await;
-        }
+        self.apply_all(&plan.failovers, MoveReason::LeaderUnreachable).await;
         if !plan.failovers.is_empty() {
             *self.last_leadership_change.lock() = Some(now);
             // Never rebalance in a pass that failed something over.
@@ -543,9 +502,7 @@ impl PartitionFailoverController {
 
         if self.rebalance_due(now) {
             let moves = plan_preferred_leaders(&assignments, &live, self.rebalance_max_moves);
-            for m in &moves {
-                self.apply(m, MoveReason::PreferredReplicaInSync).await;
-            }
+            self.apply_all(&moves, MoveReason::PreferredReplicaInSync).await;
             if !moves.is_empty() {
                 *self.last_leadership_change.lock() = Some(now);
             }
@@ -579,56 +536,59 @@ impl PartitionFailoverController {
         self.rebalances_performed.load(Ordering::Relaxed)
     }
 
-    /// Move one partition to its new leader.
+    /// Move partitions to their new leaders, in batches of catalog commands.
     ///
-    /// Persisted through `assign_partition`, which is what makes this real: it
-    /// derives the leader epoch, so a genuine leader change bumps it exactly
-    /// once. That bump is what tells followers to re-run the RP-3.3 epoch
-    /// handshake and truncate anything the old leader never committed.
-    async fn apply(&self, failover: &Failover, reason: MoveReason) {
-        let assignment = PartitionAssignment {
-            topic: failover.topic.clone(),
-            partition: failover.partition,
-            broker_id: failover.to as i32,
-            is_leader: true,
-            // Unchanged — see `Failover::replicas`.
-            replicas: failover.replicas.clone(),
-            leader_id: failover.to,
-            // Derived by the store, never by callers.
-            leader_epoch: 0,
-            // Empty means "unknown", which the store reads as "leave what is
-            // published". The set this election was made FROM must survive the
-            // election: the new leader republishes from its own measurements
-            // shortly, and until then the old set is the only evidence anyone
-            // has about who holds the data.
-            isr: Vec::new(),
-        };
-
-        match self.metadata_store.assign_partition(assignment).await {
-            Ok(()) => match reason {
-                MoveReason::LeaderUnreachable => {
-                    self.failovers_performed.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        "{}-{}: leader {} is unreachable — failed over to {} (live replicas {:?})",
-                        failover.topic,
-                        failover.partition,
-                        failover.from,
-                        failover.to,
-                        failover.live_replicas
-                    );
+    /// Each move is fenced by the epoch its plan was made at: the catalog bumps
+    /// the epoch exactly once for a genuine leader change (which tells
+    /// followers to re-run the RP-3.3 handshake and truncate anything the old
+    /// leader never committed), and refuses a move whose partition changed
+    /// leader since the plan. The replica set is unchanged — see
+    /// `Failover::replicas` — and the published ISR is kept: the new leader
+    /// republishes from its own measurements shortly, and until then the set
+    /// this election was made from is the only evidence of who holds the data.
+    ///
+    /// Batched because a dead node can lead thousands of partitions, and one
+    /// command per move would leave them offline for many round trips.
+    async fn apply_all(&self, moves: &[Failover], reason: MoveReason) {
+        const BATCH: usize = 1000;
+        for chunk in moves.chunks(BATCH) {
+            let changes: Vec<chronik_common::metadata::catalog::AssignmentChange> = chunk
+                .iter()
+                .map(|m| chronik_common::metadata::catalog::AssignmentChange {
+                    topic: m.topic.clone(),
+                    partition: m.partition,
+                    replicas: None,
+                    leader: Some(m.to),
+                    isr: None,
+                    expected_epoch: Some(m.from_epoch),
+                })
+                .collect();
+            let outcomes = match self.metadata_store.set_assignments(changes).await {
+                Ok(items) => items.into_iter().map(|r| r.map_err(|e| e.to_string())).collect::<Vec<_>>(),
+                Err(e) => vec![Err(e.to_string()); chunk.len()],
+            };
+            for (m, outcome) in chunk.iter().zip(outcomes) {
+                match (outcome, reason) {
+                    (Ok(()), MoveReason::LeaderUnreachable) => {
+                        self.failovers_performed.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "{}-{}: leader {} is unreachable — failed over to {} (live replicas {:?})",
+                            m.topic, m.partition, m.from, m.to, m.live_replicas
+                        );
+                    }
+                    (Ok(()), MoveReason::PreferredReplicaInSync) => {
+                        self.rebalances_performed.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "{}-{}: preferred replica {} is in sync — leadership returned to it from {}",
+                            m.topic, m.partition, m.to, m.from
+                        );
+                    }
+                    (Err(e), _) => error!(
+                        "{}-{}: could not move leadership from {} to {} ({:?}): {}",
+                        m.topic, m.partition, m.from, m.to, reason, e
+                    ),
                 }
-                MoveReason::PreferredReplicaInSync => {
-                    self.rebalances_performed.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        "{}-{}: preferred replica {} is in sync — leadership returned to it from {}",
-                        failover.topic, failover.partition, failover.to, failover.from
-                    );
-                }
-            },
-            Err(e) => error!(
-                "{}-{}: could not move leadership from {} to {} ({:?}): {}",
-                failover.topic, failover.partition, failover.from, failover.to, reason, e
-            ),
+            }
         }
     }
 
@@ -870,36 +830,6 @@ mod tests {
     }
 
     // ---- RP-6: pushing the catalog to a node that just came back ----
-
-    /// The case RP-6 exists for: a node that was away returns, and its metadata
-    /// is stale by exactly the failover that demoted it.
-    #[test]
-    fn a_returning_node_is_detected_as_rejoined() {
-        assert_eq!(rejoined_nodes(Some(&[2, 3]), &[1, 2, 3]), vec![1]);
-    }
-
-    /// A node leaving is not a rejoin — it needs no catalog, and broadcasting
-    /// on every departure would double the burst during an outage.
-    #[test]
-    fn a_departing_node_is_not_a_rejoin() {
-        assert_eq!(rejoined_nodes(Some(&[1, 2, 3]), &[2, 3]), Vec::<u64>::new());
-        assert_eq!(rejoined_nodes(Some(&[1, 2, 3]), &[1, 2, 3]), Vec::<u64>::new());
-    }
-
-    /// The first observation after this node becomes Raft leader must not count
-    /// as everyone rejoining, or every leadership change would trigger a full
-    /// catalog broadcast.
-    #[test]
-    fn the_first_observation_is_not_a_rejoin() {
-        assert_eq!(rejoined_nodes(None, &[1, 2, 3]), Vec::<u64>::new());
-    }
-
-    /// Two nodes returning together are both reported, so a single broadcast
-    /// covers them.
-    #[test]
-    fn several_nodes_returning_at_once_are_all_reported() {
-        assert_eq!(rejoined_nodes(Some(&[3]), &[1, 2, 3]), vec![1, 2]);
-    }
 
     /// Repeated failures must not erode the replica set. This is the property
     /// that the first cluster run violated silently.

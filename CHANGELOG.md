@@ -5,7 +5,114 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.17.0] - 2026-11-17
+
+The cluster catalog — topics, partition assignments (replicas, leader, leader
+epoch, ISR), brokers, ACLs, SCRAM credentials, node addresses — now lives in
+one Raft group on every node, single-node included. It replaces per-node
+metadata WALs kept in step by push replication, anti-entropy and
+reconciliation, which could diverge for good: a node down when a change fired
+never received it, and several bugs this year were two nodes disagreeing
+about a topic, a leader or an epoch.
+
+### Changed
+
+- **One writer, one order.** Every catalog change is a command proposed to the
+  catalog leader (any node forwards) and applied by a deterministic state
+  machine on every node; the caller is answered once it has applied on the
+  node it asked. Validation happens at apply time, so two concurrent creates
+  of a name both commit and exactly one succeeds; auto-create and CreateTopics
+  share that path. Placement (round-robin over registered brokers, rotating
+  first replicas) is decided inside the catalog.
+- **Fencing by leader epoch.** Epochs move only when the leader changes. ISR
+  reports are accepted only from the current leader at the current epoch, and
+  failovers and preferred-leader moves are refused if the epoch they were
+  planned at has moved on. A stale node waking up can no longer reclaim
+  leadership — before, a frozen node's ISR publisher did exactly that and a
+  preferred-leader return lost 5,000 of 15,000 acknowledged records in the
+  acceptance test.
+- **Convergence by replay.** A node that was down reads the log, or installs a
+  snapshot (every `CHRONIK_CATALOG_SNAPSHOT_EVERY` entries, default 10,000).
+  Anti-entropy, pruning, push replication and the metadata port 9291 are gone.
+- **Caught-up gate.** A node that has not heard from a leader within an
+  election timeout, or has not yet applied what was committed when it booted,
+  does not auto-create topics.
+- **Membership.** `cluster add-node` records the node and makes it a voter;
+  start it with `CHRONIK_CLUSTER_JOIN=true`. `cluster remove-node` moves its
+  replicas away (epoch-fenced) first. A node whose catalog log was wiped stops
+  with the remedy (remove `--force`, add, join) instead of crashing.
+- **Upgrade.** On first boot with the catalog each node imports what its own
+  metadata WAL holds — topics with their assignments and epochs, brokers,
+  ACLs, SCRAM users — once. Imports from several nodes merge per partition by
+  the higher leader epoch. Verified on a copy of a production node's 9.5 GB
+  metadata WAL: 5,643 topics and 5,897 partitions came through with the same
+  leader and replicas v2.16.11 served.
+
+### Fixed
+
+- **DescribeConfigs returned hard-coded defaults** for every topic, so a
+  `retention.ms` someone set was reported as the default. It now reports the
+  topic's configuration, overrides marked as such, and UNKNOWN_TOPIC for a
+  topic that does not exist.
+- **Creating a topic with N partitions could give every partition all
+  brokers** as replicas (protocol-side placement); the catalog places now.
+- **A pipelined idempotent batch failed OUT_OF_ORDER_SEQUENCE when the batch
+  before it was slow.** The sequence check waited a fixed 500 ms for an
+  earlier in-flight batch; on spinning disks shared with other clusters the
+  first write to a new partition took over two seconds, and 77–154 of 15,000
+  idempotent `acks=all` records on a fresh topic failed — on v2.16.11 as well.
+  A later batch now waits as long as an earlier batch of its producer is in
+  progress, bounded by the request timeout. Twelve probe runs on the same
+  hardware, stalls up to 62 s: no failures (v2.16.11 alternating with it:
+  failures in 8 of 24 runs).
+- **An acks=1 producer without idempotence could have a batch written
+  twice.** When a partition's pending-response bucket emptied, the key was
+  removed after its lock was released; a response registered in between was
+  dropped, and the client got a retriable KAFKA_STORAGE_ERROR for a batch
+  already in the log and sent it again. Found as 2,000,985 records stored for
+  2,000,000 sent: exactly one 985-record batch, identical values, 1,970
+  offsets apart. Present in v2.16.11.
+- **Sustained acks=all throughput was capped ~3.5× low by ISR churn.** A
+  follower more than 10,000 records behind left the in-sync set at once —
+  77 ms of ordinary fetch lag on a busy partition — and the producer backed
+  off on NOT_ENOUGH_REPLICAS. On a 3-node cluster, 1–3M-record runs managed
+  110–133K msg/s (v2.16.11 the same); they now sustain ~450–460K with a stable
+  ISR. `CHRONIK_REPLICA_LAG_MAX_ENTRIES` is off unless set; time
+  (`CHRONIK_REPLICA_LAG_TIME_MAX_MS`) is the bound, as in Kafka since 0.9.
+- **Operator: `isLeader` / `leaderNodeId` were never set** in ChronikCluster
+  status. The operator now asks each ready pod's `/admin/health`.
+- **A producer without idempotence could have its records stored out of the
+  order it sent them, with no retry involved.** Each request on a connection
+  runs in its own task, and a later request could reach a partition's append
+  lock first and take the lower offsets. Kafka handles a connection's requests
+  one at a time, so clients rely on that order. With librdkafka (kcat) sending
+  1M numbered records to one partition, v2.16.11 stored them with 0–5
+  inversions per run (5 of 6 runs) and no duplicates; now 0 in every run. Each
+  Produce request now queues on its partitions as it is read and enters them
+  in that order; the turn passes once the append lock is held, so fsync and
+  replication waits still overlap and other partitions never wait.
+- **`kafka-topics.sh --create` without `--partitions` failed** ("Invalid number
+  of partitions"). Since KIP-464 clients send -1 for "broker default"; it is
+  now the default auto-create uses, and a -1 replication factor is the
+  cluster's (it became 1, so a topic on an RF-3 cluster got one replica).
+  `--replica-assignment`, which sends both counts as -1, takes its counts
+  from the assignment. All three present in v2.16.11.
+- **Tantivy archive keys embedded the node's data directory** (an absolute
+  path used as an object-store key: `segments/home/<user>/…/tantivy_indexes/`
+  locally, the same path inside a bucket). New archives use the key
+  `tantivy_indexes/…`; existing ones keep resolving through the segment index.
+- **DescribeConfigs reported a Chronik-specific key's own value as its default**
+  (`DEFAULT_CONFIG:searchable=true` while the default is false); keys without
+  a known default now carry only their topic value.
+
+### Documentation
+
+- Stock `kafka-topics.sh` refuses topic config names Kafka does not define
+  ("Unknown topic config name: columnar.enabled") before the request reaches
+  the broker, so the README and CLAUDE.md examples that set `columnar.*`,
+  `vector.*` or `searchable` with `--config` never worked with it. They now
+  create the topic and set the configs with `kafka-configs.sh --alter`. The
+  README also named the search key `searchable.enabled`; it is `searchable`.
 
 ## [2.16.11] - 2026-11-16
 

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
-use crate::raft_cluster::RaftCluster;
+use crate::cluster_catalog::ClusterCatalog;
 use chronik_common::metadata::MetadataStore;
 
 /// Partition Rebalancer
@@ -37,7 +37,7 @@ use chronik_common::metadata::MetadataStore;
 /// rebalances partition assignments when nodes are added or removed.
 pub struct PartitionRebalancer {
     /// Raft cluster handle
-    raft_cluster: Arc<RaftCluster>,
+    raft_cluster: Arc<ClusterCatalog>,
 
     /// Metadata store for querying topics/partitions
     metadata_store: Arc<dyn MetadataStore>,
@@ -56,18 +56,18 @@ impl PartitionRebalancer {
     /// Create a new Partition Rebalancer
     ///
     /// # Arguments
-    /// - `raft_cluster` - Raft cluster handle
+    /// - `raft_cluster` - the cluster catalog (membership and leadership)
     /// - `metadata_store` - Metadata store for querying topics
     /// - `replication_factor` - Number of replicas per partition
     ///
     /// # Returns
     /// Arc-wrapped rebalancer with background worker started
     pub async fn new(
-        raft_cluster: Arc<RaftCluster>,
+        raft_cluster: Arc<ClusterCatalog>,
         metadata_store: Arc<dyn MetadataStore>,
         replication_factor: usize,
     ) -> Arc<Self> {
-        let current_nodes = raft_cluster.get_all_nodes().await;
+        let current_nodes = raft_cluster.voters();
 
         info!(
             "Initializing Partition Rebalancer (current nodes: {}, replication_factor: {})",
@@ -98,9 +98,17 @@ impl PartitionRebalancer {
                 sleep(rebalancer.rebalance_interval).await;
 
                 // Get current cluster membership
-                let current_nodes = rebalancer.raft_cluster.get_all_nodes().await;
+                let current_nodes = rebalancer.raft_cluster.voters();
                 let current_count = current_nodes.len();
                 let last_count = rebalancer.last_member_count.load(Ordering::Relaxed);
+
+                // One writer: only the catalog leader rebalances. Every other
+                // node keeps its count current, so taking over leadership
+                // later does not look like a membership change.
+                if !rebalancer.raft_cluster.am_i_leader() {
+                    rebalancer.last_member_count.store(current_count, Ordering::Relaxed);
+                    continue;
+                }
 
                 debug!(
                     "Rebalancer check: {} nodes (prev: {})",
@@ -306,7 +314,7 @@ impl PartitionRebalancer {
     ///
     /// Returns information about the rebalancer state.
     pub async fn status(&self) -> RebalancerStatus {
-        let current_nodes = self.raft_cluster.get_all_nodes().await;
+        let current_nodes = self.raft_cluster.voters();
         let last_count = self.last_member_count.load(Ordering::Relaxed);
 
         RebalancerStatus {

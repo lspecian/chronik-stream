@@ -10,7 +10,7 @@
 
 use crate::storage::{StorageConfig, StorageService};
 use crate::fetch_handler::FetchHandler;
-use crate::raft_cluster::RaftCluster;  // NEW: v2.2.7 Phase 3
+use crate::cluster_catalog::ClusterCatalog;
 use chronik_common::{Result, Error};
 use chronik_monitoring::MetricsRecorder;
 use chronik_protocol::{
@@ -42,8 +42,6 @@ use futures::stream::{self, StreamExt};
 use dashmap::DashMap;
 use crossbeam::queue::SegQueue;
 
-/// Re-export WalReplicationManager from wal_replication module (v2.2.0 Phase 3.1)
-pub use crate::wal_replication::WalReplicationManager;
 
 /// v2.2.9: Async pipelined connection for leader forwarding (eliminates 168x slowdown)
 use crate::pipelined_connection::{PipelinedConnection, PipelinedConnectionPool};
@@ -236,6 +234,61 @@ enum SequenceCheck {
     AdvanceNow,
 }
 
+/// Sequenced batches currently inside `produce_to_partition`, keyed by
+/// (producer id, topic, partition), each entry a base sequence.
+///
+/// The connection handler runs a producer's pipelined requests concurrently,
+/// so batch N+1 can reach the sequence check while batch N is still being
+/// processed. N is usually a few milliseconds behind, but not always: the
+/// first write to a new partition builds its state (segment writer, a
+/// metadata-WAL fsync), and on a busy disk that took over two seconds on the
+/// Dells. A fixed wait then rejected N+1..N+4 as out of order — measured, 77
+/// of 15,000 idempotent acks=all records failed on a fresh topic, on v2.16.11
+/// as well. With this registry the check keeps waiting exactly as long as an
+/// earlier batch of the same producer is known to be in progress.
+type InFlightSequences = Arc<DashMap<(i64, String, i32), Vec<i32>>>;
+
+/// Registration of one batch in [`InFlightSequences`]; removed on drop, so
+/// every exit path — success, error, early return — unregisters it.
+struct InFlightGuard {
+    map: InFlightSequences,
+    key: (i64, String, i32),
+    sequence: i32,
+}
+
+impl InFlightGuard {
+    /// Register `records` if it is a sequenced (idempotent, non-control) v2
+    /// batch. Reads the fixed header fields directly so it can run before
+    /// anything else in the produce path.
+    fn register(map: &InFlightSequences, topic: &str, partition: i32, records: &[u8]) -> Option<Self> {
+        if records.len() < 61 || records[16] != 2 {
+            return None;
+        }
+        let attributes = i16::from_be_bytes([records[21], records[22]]);
+        let producer_id = i64::from_be_bytes(records[43..51].try_into().ok()?);
+        let sequence = i32::from_be_bytes(records[53..57].try_into().ok()?);
+        if producer_id < 0 || attributes & 0x20 != 0 {
+            return None;
+        }
+        let key = (producer_id, topic.to_string(), partition);
+        map.entry(key.clone()).or_default().push(sequence);
+        Some(Self { map: Arc::clone(map), key, sequence })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut e) = self.map.entry(self.key.clone()) {
+            if let Some(i) = e.get().iter().position(|s| *s == self.sequence) {
+                e.get_mut().swap_remove(i);
+            }
+            if e.get().is_empty() {
+                e.remove();
+            }
+        }
+    }
+}
+
 /// Producer information for idempotence tracking
 #[derive(Debug, Clone)]
 struct ProducerInfo {
@@ -397,6 +450,8 @@ pub struct ProduceHandler {
     /// read. See `archived_high_watermark`.
     archived_hwm_cache: Arc<DashMap<(String, i32), (i64, Instant)>>,
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
+    /// See [`InFlightSequences`].
+    in_flight_sequences: InFlightSequences,
     metrics: Arc<ProduceMetrics>,
     running: Arc<AtomicBool>,
     /// P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking with AtomicU64
@@ -423,7 +478,7 @@ pub struct ProduceHandler {
     /// Raft cluster for metadata coordination (v2.2.7 Phase 3)
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Used to query partition replicas and ISR for replication decisions
-    raft_cluster: Option<Arc<RaftCluster>>,
+    raft_cluster: Option<Arc<ClusterCatalog>>,
     /// WAL replication manager for PostgreSQL-style streaming (v2.2.0+)
     /// CRITICAL: Option<Arc<>> NOT Arc<RwLock<>> to avoid hot path locks!
     /// Fire-and-forget async replication, never blocks produce path
@@ -670,7 +725,7 @@ impl ProduceHandler {
     }
 
     /// Get reference to Raft cluster (for request forwarding)
-    pub fn get_raft_cluster(&self) -> &Option<Arc<RaftCluster>> {
+    pub fn get_raft_cluster(&self) -> &Option<Arc<ClusterCatalog>> {
         &self.raft_cluster
     }
 
@@ -716,115 +771,6 @@ impl ProduceHandler {
                 false  // On error, assume not searchable (safe default)
             }
         }
-    }
-
-    /// Assign a partition to replica nodes (writes to metadata WAL)
-    ///
-    /// v2.2.9 Phase 1: Direct metadata writes bypass Raft consensus.
-    /// This method writes partition assignment metadata directly to the __chronik_metadata WAL,
-    /// which then replicates to followers via WAL replication (microsecond latency).
-    pub async fn assign_partition(
-        &self,
-        topic: &str,
-        partition: i32,
-        replicas: Vec<u64>,
-    ) -> Result<()> {
-        // Assume first replica is the leader by default
-        let leader_id = replicas.first().copied().unwrap_or(self.config.node_id as u64);
-
-        let assignment = PartitionAssignment {
-            topic: topic.to_string(),
-            partition: partition as u32,
-            broker_id: -1,  // Deprecated field
-            is_leader: false,  // Deprecated field
-            replicas,
-            leader_id,
-            leader_epoch: 0, // assigned by the metadata store
-            isr: Vec::new(), // placement only — the leader publishes the in-sync set
-        };
-
-        // Write AssignPartition event to metadata_store
-        // metadata_store will persist to __chronik_metadata WAL
-        // WAL replication will propagate to followers
-        self.metadata_store.assign_partition(assignment).await?;
-        Ok(())
-    }
-
-    /// Set partition leader (writes to metadata WAL)
-    ///
-    /// v2.2.9 Phase 1: Updates the leader for a partition by writing to metadata WAL.
-    /// This preserves the existing replicas but changes which node is the leader.
-    pub async fn set_partition_leader(
-        &self,
-        topic: &str,
-        partition: i32,
-        leader: u64,
-    ) -> Result<()> {
-        // Get current assignment to preserve replicas
-        let assignments = self.metadata_store
-            .get_partition_assignments(topic)
-            .await?;
-
-        let current = assignments.iter()
-            .find(|a| a.partition == partition as u32)
-            .ok_or_else(|| Error::Storage(format!("Partition not found: {}-{}", topic, partition)))?;
-
-        let assignment = PartitionAssignment {
-            topic: topic.to_string(),
-            partition: partition as u32,
-            broker_id: -1,  // Deprecated field
-            is_leader: false,  // Deprecated field
-            replicas: current.replicas.clone(),
-            leader_id: leader,
-            leader_epoch: 0, // assigned by the metadata store
-            isr: Vec::new(), // leadership only — leaves the published set intact
-        };
-
-        self.metadata_store.assign_partition(assignment).await?;
-        Ok(())
-    }
-
-    /// Update in-sync replica set (writes to metadata WAL)
-    ///
-    /// v2.2.9 Phase 1: Updates the ISR (in-sync replicas) for a partition via metadata WAL.
-    /// This preserves the existing leader but changes which nodes are in-sync.
-    pub async fn update_isr(
-        &self,
-        topic: &str,
-        partition: i32,
-        isr: Vec<u64>,
-    ) -> Result<()> {
-        // Get current assignment to preserve leader
-        let assignments = self.metadata_store
-            .get_partition_assignments(topic)
-            .await?;
-
-        let current = assignments.iter()
-            .find(|a| a.partition == partition as u32)
-            .ok_or_else(|| Error::Storage(format!("Partition not found: {}-{}", topic, partition)))?;
-
-        // The in-sync set goes in `isr`; `replicas` is the assignment and does
-        // not change because a follower fell behind.
-        //
-        // This used to write the in-sync set into `replicas`, which permanently
-        // shrank the replica set every time a follower lagged: a partition at
-        // RF=3 whose follower dropped out became RF=2 in metadata, and the
-        // follower was no longer a replica to catch up to. Same shape as the bug
-        // that made failover shrink RF, in a second place — there was nowhere
-        // else to put the value until `PartitionAssignment::isr` existed.
-        let assignment = PartitionAssignment {
-            topic: topic.to_string(),
-            partition: partition as u32,
-            broker_id: -1,  // Deprecated field
-            is_leader: false,  // Deprecated field
-            replicas: current.replicas.clone(),
-            leader_id: current.leader_id,
-            leader_epoch: 0, // assigned by the metadata store
-            isr,
-        };
-
-        self.metadata_store.assign_partition(assignment).await?;
-        Ok(())
     }
 
     /// Ensure a partition exists with the specified starting offset (for WAL recovery)
@@ -1345,6 +1291,7 @@ impl ProduceHandler {
             partition_states: Arc::new(DashMap::new()),  // PERFORMANCE (v2.2.7 - P2): Lock-free concurrent hashmap
             archived_hwm_cache: Arc::new(DashMap::new()),
             producer_info: Arc::new(RwLock::new(HashMap::new())),
+            in_flight_sequences: Arc::new(DashMap::new()),
             metrics: Arc::new(ProduceMetrics::default()),
             running: Arc::new(AtomicBool::new(true)),
             memory_used_bytes,
@@ -1411,8 +1358,8 @@ impl ProduceHandler {
     }
 
     /// Set the Raft cluster for metadata coordination (v2.2.7 Phase 3)
-    pub fn set_raft_cluster(&mut self, raft_cluster: Arc<RaftCluster>) {
-        info!("Setting RaftCluster for ProduceHandler - enables partition replication routing");
+    pub fn set_raft_cluster(&mut self, raft_cluster: Arc<ClusterCatalog>) {
+        info!("ProduceHandler attached to the cluster catalog");
         self.raft_cluster = Some(raft_cluster);
     }
 
@@ -1737,6 +1684,19 @@ impl ProduceHandler {
         correlation_id: i32,
         forwarded: bool,
     ) -> Result<ProduceResponse> {
+        self.handle_produce_ordered(request, correlation_id, forwarded, None).await
+    }
+
+    /// Like [`Self::handle_produce_from`], for a request read from a client
+    /// connection: `ticket` keeps its writes in the connection's order (see
+    /// `produce_order`).
+    pub async fn handle_produce_ordered(
+        &self,
+        request: ProduceRequest,
+        correlation_id: i32,
+        forwarded: bool,
+        ticket: Option<Arc<crate::produce_order::ProduceTicket>>,
+    ) -> Result<ProduceResponse> {
         let start_time = Instant::now();
         let mut response_topics = Vec::new();
         let acks = request.acks;
@@ -1770,7 +1730,7 @@ impl ProduceHandler {
         // Handle request with timeout
         let result = timeout(
             Duration::from_millis(timeout_ms.max(self.config.request_timeout_ms)),
-            self.process_produce_request(request, acks, forwarded),
+            self.process_produce_request(request, acks, forwarded, ticket),
         ).await;
         
         match result {
@@ -1850,10 +1810,18 @@ impl ProduceHandler {
         request: ProduceRequest,
         acks: i16,
         forwarded: bool,
+        ticket: Option<Arc<crate::produce_order::ProduceTicket>>,
     ) -> Result<Vec<ProduceResponseTopic>> {
         let mut response_topics = Vec::new();
         let transactional_id = request.transactional_id.clone();
-        
+        // A topic this request will not write releases the connection's
+        // later requests on it now, not when the whole request is answered.
+        let pass_topic = |name: &str| {
+            if let Some(ticket) = &ticket {
+                ticket.pass_topic(name);
+            }
+        };
+
         for topic_data in request.topics {
             // Validate topic exists or auto-create if enabled
             let topic_metadata = match self.metadata_store.get_topic(&topic_data.name).await? {
@@ -1883,6 +1851,7 @@ impl ProduceHandler {
                                     }
                                 }).collect();
                                 
+                                pass_topic(&topic_data.name);
                                 response_topics.push(ProduceResponseTopic {
                                     name: topic_data.name,
                                     partitions: error_partitions,
@@ -1902,6 +1871,7 @@ impl ProduceHandler {
                             }
                         }).collect();
                         
+                        pass_topic(&topic_data.name);
                         response_topics.push(ProduceResponseTopic {
                             name: topic_data.name,
                             partitions: error_partitions,
@@ -1923,6 +1893,7 @@ impl ProduceHandler {
                     let node_id = self.config.node_id;
                     let transactional_id = transactional_id.clone();
                     let metrics = self.metrics.clone();
+                    let turn = ticket.as_ref().and_then(|t| t.partition(&topic_name, partition_data.index));
 
                     async move {
                         // Validate partition exists
@@ -1995,6 +1966,13 @@ impl ProduceHandler {
                                     topic_name, partition_data.index, leader_id
                                 );
 
+                                // Forwarded in the connection's order, holding
+                                // the turn until the leader answers: the leader
+                                // orders by arrival, so sending later requests
+                                // first would reorder them there.
+                                if let Some(turn) = &turn {
+                                    turn.wait().await;
+                                }
                                 match self.forward_produce_to_leader(
                                     leader_id,
                                     &topic_name,
@@ -2051,6 +2029,7 @@ impl ProduceHandler {
                             &partition_data.records,
                             transactional_id.as_deref(),
                             acks,
+                            turn,
                         ).await {
                             Ok(response) => response,
                             Err(e) => {
@@ -2261,7 +2240,7 @@ impl ProduceHandler {
     }
 
     /// Produce records to a specific partition
-    #[instrument(skip(self, records_data), fields(topic, partition, acks, bytes = records_data.len()))]
+    #[instrument(skip(self, records_data, turn), fields(topic, partition, acks, bytes = records_data.len()))]
     async fn produce_to_partition(
         &self,
         topic: &str,
@@ -2269,6 +2248,7 @@ impl ProduceHandler {
         records_data: &[u8],  // This contains the original wire-format bytes with correct CRC!
         transactional_id: Option<&str>,
         acks: i16,
+        turn: Option<crate::produce_order::PartitionTurn>,
     ) -> Result<ProduceResponsePartition> {
         use std::time::Instant;
         let start_time = Instant::now();
@@ -2276,6 +2256,16 @@ impl ProduceHandler {
 
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         debug!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
+
+        // A connection's earlier requests enter this partition first (see
+        // `produce_order`). The turn passes once the append lock is held.
+        if let Some(turn) = &turn {
+            turn.wait().await;
+        }
+
+        // Before any await: later batches of this producer wait while this
+        // one is in progress (see `InFlightSequences`).
+        let _in_flight = InFlightGuard::register(&self.in_flight_sequences, topic, partition, records_data);
 
         // acks=all: refuse BEFORE writing when the in-sync set is already too
         // small, as Kafka does. Refusing after the write (the old behaviour,
@@ -2387,6 +2377,8 @@ impl ProduceHandler {
         let is_control_batch = (temp_batch.header.attributes & 0x20) != 0;
         let sequenced = temp_batch.header.producer_id >= 0 && !is_control_batch;
         if sequenced {
+            #[cfg(test)]
+            tests::pause_before_sequence_check(temp_batch.header.producer_id, temp_batch.header.base_sequence).await;
             // Phase 1, outside the append lock: wait until this batch is next
             // in its producer's sequence. Duplicates are rejected here, so a
             // retry never reserves offsets.
@@ -2426,9 +2418,12 @@ impl ProduceHandler {
         // the fsync and the acks=all ISR wait happen outside it and concurrent
         // requests still share a group commit.
         #[cfg(test)]
-        tests::pause_before_append_lock(temp_batch.header.producer_id, temp_batch.header.base_sequence).await;
+        tests::pause_before_append_lock(temp_batch.header.producer_id, temp_batch.header.base_sequence, records_data.len()).await;
 
         let append_guard = partition_state.append_lock.lock().await;
+        // The lock is FIFO: this batch's offsets now precede any later
+        // request's, so the connection's next request may queue for it.
+        drop(turn);
 
         // Phase 2, under the append lock: record the sequence and, right below,
         // reserve the offsets — together, so a producer's batches take offsets
@@ -3371,6 +3366,27 @@ impl ProduceHandler {
     }
     
     /// Validate producer sequence for idempotence
+    /// Whether a batch of the same producer with a lower sequence is still in
+    /// `produce_to_partition` for this partition, and `hard_deadline` has not
+    /// passed. Such a batch either advances the sequence or fails; waiting for
+    /// it is what Kafka's one-request-at-a-time connections give for free.
+    fn earlier_batch_in_flight(
+        &self,
+        batch: &KafkaRecordBatch,
+        topic: &str,
+        partition: i32,
+        hard_deadline: Instant,
+    ) -> bool {
+        if Instant::now() >= hard_deadline {
+            return false;
+        }
+        let key = (batch.header.producer_id, topic.to_string(), partition);
+        self.in_flight_sequences
+            .get(&key)
+            .map(|seqs| seqs.iter().any(|s| *s < batch.header.base_sequence))
+            .unwrap_or(false)
+    }
+
     async fn validate_producer_sequence(
         &self,
         batch: &KafkaRecordBatch,
@@ -3400,7 +3416,12 @@ impl ProduceHandler {
         // validate + advance happen in ONE write-lock critical section so they are
         // atomic (a separate advance call was a second race window).
         let key = (topic.to_string(), partition);
+        // The grace window covers an earlier batch that has not reached
+        // `produce_to_partition` yet; past it, waiting continues only while
+        // an earlier batch is known to be in progress, and never beyond what a
+        // request may take.
         let deadline = Instant::now() + std::time::Duration::from_millis(500);
+        let hard_deadline = Instant::now() + std::time::Duration::from_millis(self.config.request_timeout_ms.max(1000));
         loop {
             {
                 let mut producers = self.producer_info.write().await;
@@ -3475,9 +3496,10 @@ impl ProduceHandler {
                 )));
             }
 
-            if Instant::now() >= deadline {
-                // The earlier batch never arrived within the window — genuinely out
-                // of order. This is the correct terminal error.
+            if Instant::now() >= deadline && !self.earlier_batch_in_flight(batch, topic, partition, hard_deadline) {
+                // No earlier batch of this producer is in progress (or one has
+                // been for longer than a request may take) — genuinely out of
+                // order. This is the correct terminal error.
                 return Err(Error::OutOfOrderSequenceNumber(format!(
                     "Out of order sequence after wait: producer={}, topic={}, partition={}, got={}",
                     batch.header.producer_id, topic, partition, batch.header.base_sequence
@@ -3856,19 +3878,17 @@ impl ProduceHandler {
             return Err(Error::Protocol(format!("Cannot auto-create reserved topic: '{}'", topic_name)));
         }
 
-        // P0 FIX (v2.2.7 Phase 1): Let RaftMetadataStore handle leader-forwarding automatically
-        // The metadata store already has Phase 1 forwarding logic built in:
-        // - Followers forward create_topic to leader via RPC
-        // - Leader processes create via metadata WAL (Phase 2)
-        // - Followers wait for replication with exponential backoff
-        // DO NOT reject here - let the abstraction layer handle it properly!
-        if let Some(ref raft) = self.raft_cluster {
-            if raft.am_i_leader().await {
-                debug!("Leader node (id={}) processing topic auto-creation for '{}'",
-                    raft.node_id(), topic_name);
-            } else {
-                debug!("Follower node (id={}) will forward topic auto-creation for '{}' to leader via Phase 1 RPC",
-                    raft.node_id(), topic_name);
+        // A node that is booting, or has lost touch with the catalog leader,
+        // has not seen everything: "I do not have this topic" is not "this
+        // topic does not exist". Clients retry; by then the catalog has
+        // caught up and either has the topic or creates it once.
+        if let Some(ref catalog) = self.raft_cluster {
+            if !catalog.is_caught_up() {
+                debug!("Not auto-creating '{}': catalog not caught up", topic_name);
+                return Err(Error::Internal(format!(
+                    "cluster catalog not caught up; '{}' cannot be auto-created yet",
+                    topic_name
+                )));
             }
         }
 
@@ -3925,87 +3945,7 @@ impl ProduceHandler {
         // with `--partitions 1`.
         let result = match self.metadata_store.auto_create_topic(topic_name, topic_config).await {
             Ok(metadata) => {
-                // v2.2.7 FIX: Partition initialization happens through PartitionAssignment module below
-                // which has proper metadata WAL writes and replication (in raft_metadata_store.rs)
-                // The broken initialize_raft_partitions() method has been removed.
-
-                // Create partition assignments
-                // For clustered mode, use round-robin assignment across nodes
-                // For standalone mode, assign all partitions to this node
-                if let Some(ref raft_cluster) = self.raft_cluster {
-                    // Clustered mode: Use round-robin assignment
-                    use chronik_common::partition_assignment::PartitionAssignment as AssignmentManager;
-
-                    let nodes = raft_cluster.get_all_nodes().await;
-                    info!("Auto-creating topic '{}' in cluster mode with {} nodes", topic_name, nodes.len());
-
-                    // Convert node IDs from u64 to u32 for partition_assignment module
-                    let node_ids: Vec<u32> = nodes.iter().map(|&id| id as u32).collect();
-
-                    let mut assignment_mgr = AssignmentManager::new();
-                    if let Err(e) = assignment_mgr.add_topic(
-                        topic_name,
-                        self.config.num_partitions as i32,
-                        self.config.default_replication_factor.min(nodes.len() as u32) as i32,
-                        &node_ids,
-                    ) {
-                        warn!("Failed to create partition assignment plan for topic '{}': {:?}", topic_name, e);
-                    } else {
-                        // v2.2.9 PERFORMANCE OPTIMIZATION: Batch all partition operations into single Raft proposal
-                        // OLD: 3 separate proposals per partition (assignment, leader, ISR) × N partitions = 3N Raft rounds
-                        // NEW: 1 batched proposal for all partitions = 1 Raft round
-                        // Result: 3x faster for N partitions (600ms → 200ms for 3 partitions)
-
-                        let topic_assignments = assignment_mgr.get_topic_assignments(topic_name);
-
-                        // v2.2.9 Phase 3: Option 4 - Use metadata_store directly (WAL-only, no Raft proposal)
-                        // Instead of batching into a Raft command, call assign_partition() for each partition
-                        // This writes to __chronik_metadata WAL which replicates to followers automatically
-                        for (partition_id, partition_info) in topic_assignments {
-                            let replicas: Vec<u64> = partition_info.replicas.iter().map(|&id| id as u64).collect();
-
-                            // assign_partition() sets leader (first replica) and ISR (all replicas) automatically
-                            if let Err(e) = self.assign_partition(topic_name, partition_id as i32, replicas.clone()).await {
-                                warn!("Failed to assign partition {}/{}: {:?}", topic_name, partition_id, e);
-                            } else {
-                                info!("  ✓ Assigned partition {}/{} with replica list: {:?} (leader: {})",
-                                    topic_name, partition_id, partition_info.replicas, partition_info.leader);
-                            }
-                        }
-
-                        info!("✅ Assigned all partitions for topic '{}' via metadata_store (WAL-only)", topic_name);
-                    }
-                } else {
-                    // Standalone mode: partitions will be assigned on-demand during first produce
-                    debug!("Standalone mode: topic '{}' created with {} partitions",
-                        topic_name, self.config.num_partitions);
-                }
-
-                // v2.2.7 FIX: Runtime check instead of compile-time cfg
-                // Standalone mode ONLY (when raft_cluster is None) assign partitions via metadata WAL
-                if self.raft_cluster.is_none() {
-                    for partition in 0..self.config.num_partitions {
-                        let assignment = chronik_common::metadata::PartitionAssignment {
-                            topic: topic_name.to_string(),
-                            partition,
-                            broker_id: self.config.node_id,
-                            is_leader: true,
-                            replicas: vec![self.config.node_id as u64],
-                            leader_id: self.config.node_id as u64,
-                            leader_epoch: 0, // assigned by the metadata store
-                            // Sole replica: trivially in sync with itself.
-                            isr: vec![self.config.node_id as u64],
-                        };
-
-                        if let Err(e) = self.metadata_store.assign_partition(assignment).await {
-                            warn!("Failed to assign partition {} for topic '{}': {:?}",
-                                partition, topic_name, e);
-                        }
-                    }
-                    debug!("Standalone mode: assigned {} partitions for topic '{}'",
-                        self.config.num_partitions, topic_name);
-                }
-
+                // The catalog placed the replicas when it applied the create.
                 let elapsed = start_time.elapsed();
                 self.metrics.topics_auto_created.fetch_add(1, Ordering::Relaxed);
                 
@@ -4081,90 +4021,6 @@ impl ProduceHandler {
         };
         
         result
-    }
-
-    /// Initialize partition metadata for an existing topic (WAL-ONLY, no Raft propose)
-    ///
-    /// This method is called by CreateTopics API handler to ensure partition
-    /// assignments are written to metadata WAL and replicated to followers.
-    ///
-    /// **CRITICAL**: Uses ONLY WAL-based metadata replication, NOT Raft propose().
-    /// This eliminates the race condition where Raft and WAL have different replica lists.
-    ///
-    /// # Arguments
-    /// - `topic_name`: Name of the topic
-    /// - `num_partitions`: Number of partitions in the topic
-    ///
-    /// # Returns
-    /// Ok(()) if partition metadata was successfully initialized, or if Raft is not enabled
-    pub async fn initialize_raft_partitions(&self, topic_name: &str, num_partitions: u32) -> Result<()> {
-        // Only initialize if Raft is enabled
-        if let Some(ref raft) = self.raft_cluster {
-            // v2.2.7 CRITICAL FIX: This method should ONLY be called by the Raft leader
-            // The caller (auto_create_topic) must check am_i_leader() before calling this method.
-            // We assert this condition to catch programming errors.
-            if !raft.am_i_leader().await {
-                error!(
-                    "PROGRAMMING ERROR: initialize_raft_partitions called on Raft follower for topic '{}'",
-                    topic_name
-                );
-                return Err(Error::Internal(
-                    "Cannot initialize partitions on Raft follower - this is a programming error".into()
-                ));
-            }
-
-            info!("Initializing partition metadata for topic '{}' ({} partitions) - WAL-ONLY (no Raft propose)",
-                  topic_name, num_partitions);
-
-            // Get the ACTUAL cluster node IDs from Raft membership.
-            //
-            // CRITICAL (single-node correctness): this must NOT be a hardcoded
-            // vec![1, 2, 3]. A single-node deployment still runs a 1-voter Raft, so
-            // this method executes with `raft` = Some and `am_i_leader` = true. The
-            // old hardcoded list round-robined partitions onto nonexistent nodes 2
-            // and 3, leaving those partitions with a leader_id the broker list never
-            // advertises. Clients then could not route produce/fetch to partitions
-            // 1..N — every multi-partition topic hung on acks=1/all produce because
-            // the Java client can't find a leader for those partitions.
-            //
-            // get_all_nodes() returns the Raft voter set: [1] on single-node,
-            // [1, 2, 3] on a real 3-node cluster. Fall back to just this node if the
-            // membership somehow comes back empty (a bootstrapped Raft always has
-            // self as a voter, so this is only a safety net).
-            let mut all_nodes = raft.get_all_nodes().await;
-            all_nodes.sort_unstable();
-            all_nodes.dedup();
-            if all_nodes.is_empty() {
-                all_nodes.push(raft.node_id());
-            }
-            let replication_factor = self.config.default_replication_factor.min(all_nodes.len() as u32).max(1);
-
-            for partition in 0..num_partitions {
-                // Assign replicas (round-robin across nodes)
-                let mut replicas = Vec::new();
-                for i in 0..replication_factor {
-                    let node_idx = (partition as usize + i as usize) % all_nodes.len();
-                    replicas.push(all_nodes[node_idx]);
-                }
-
-                // v2.2.9 Phase 2: Option 4 - Use metadata_store methods (WAL-only, no Raft commands)
-                // assign_partition sets both leader (replicas[0]) and ISR (replicas) in one call
-                if let Err(e) = self.assign_partition(topic_name, partition as i32, replicas.clone()).await {
-                    warn!("Failed to assign partition {}-{} via metadata_store: {:?}", topic_name, partition, e);
-                    continue;  // Skip this partition, try next one
-                }
-
-                let leader = replicas[0];
-                info!("✓ Initialized partition metadata for {}-{}: replicas={:?}, leader={} (metadata_store)",
-                      topic_name, partition, replicas, leader);
-            }
-
-            info!("✓ Completed partition metadata initialization for topic '{}' using WAL-ONLY approach", topic_name);
-        } else {
-            debug!("Raft not enabled, skipping partition metadata initialization for '{}'", topic_name);
-        }
-
-        Ok(())
     }
 
     /// Validate topic name according to Kafka rules
@@ -4276,6 +4132,7 @@ impl Clone for ProduceHandler {
             partition_states: Arc::clone(&self.partition_states),
             archived_hwm_cache: Arc::clone(&self.archived_hwm_cache),
             producer_info: Arc::clone(&self.producer_info),
+            in_flight_sequences: Arc::clone(&self.in_flight_sequences),
             metrics: Arc::clone(&self.metrics),
             running: Arc::clone(&self.running),
             memory_used_bytes: Arc::clone(&self.memory_used_bytes),
@@ -4708,11 +4565,71 @@ pub(crate) mod tests {
     /// sequence but not yet reserved its offsets. Production never pauses.
     static PAUSE_BEFORE_LOCK: std::sync::Mutex<Option<(i64, i32)>> = std::sync::Mutex::new(None);
 
-    pub(super) async fn pause_before_append_lock(producer_id: i64, base_sequence: i32) {
-        let hit = *PAUSE_BEFORE_LOCK.lock().unwrap() == Some((producer_id, base_sequence));
+    /// The same pause for an unsequenced batch, picked by its size in bytes
+    /// (unsequenced batches all carry producer id -1).
+    static PAUSE_BEFORE_LOCK_BYTES: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+    pub(super) async fn pause_before_append_lock(producer_id: i64, base_sequence: i32, bytes: usize) {
+        let hit = *PAUSE_BEFORE_LOCK.lock().unwrap() == Some((producer_id, base_sequence))
+            || *PAUSE_BEFORE_LOCK_BYTES.lock().unwrap() == Some(bytes);
         if hit {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// `(producer_id, base_sequence)` to hold just before its sequence check,
+    /// longer than the 500 ms grace window. Production never pauses.
+    static PAUSE_BEFORE_SEQUENCE: std::sync::Mutex<Option<(i64, i32)>> = std::sync::Mutex::new(None);
+
+    pub(super) async fn pause_before_sequence_check(producer_id: i64, base_sequence: i32) {
+        let hit = *PAUSE_BEFORE_SEQUENCE.lock().unwrap() == Some((producer_id, base_sequence));
+        if hit {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+    }
+
+    /// A pipelined batch waits for an earlier one that is slow, however long
+    /// that takes within a request.
+    ///
+    /// On the Dells the first write to a new partition took over two seconds
+    /// (state creation on a busy disk); the batches pipelined behind it gave
+    /// up after the fixed 500 ms wait and failed OUT_OF_ORDER_SEQUENCE — 77
+    /// of 15,000 idempotent records, on v2.16.11 too. Batch 0 is held 1.5 s
+    /// here; batch 1 must still land after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_batch_waits_for_a_slow_earlier_batch_of_its_producer() {
+        let (handler, _temp) = create_test_handler().await;
+        let handler = Arc::new(handler);
+        let produce = |records: Vec<u8>| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        };
+
+        let pid = 5151;
+        *PAUSE_BEFORE_SEQUENCE.lock().unwrap() = Some((pid, 0));
+        let first = create_test_record_batch(pid, 0, vec![("a", "1"), ("b", "2"), ("c", "3")]);
+        let second = create_test_record_batch(pid, 3, vec![("d", "4"), ("e", "5")]);
+        let h = Arc::clone(&handler);
+        let req = produce(first);
+        let early = tokio::spawn(async move { h.handle_produce(req, 1).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let late = handler.handle_produce(produce(second), 2).await.unwrap();
+        let early = early.await.unwrap().unwrap();
+        *PAUSE_BEFORE_SEQUENCE.lock().unwrap() = None;
+
+        let (e, l) = (&early.topics[0].partitions[0], &late.topics[0].partitions[0]);
+        assert_eq!(
+            (e.error_code, l.error_code),
+            (0, 0),
+            "the batch behind a slow one was rejected (error {})",
+            l.error_code
+        );
+        assert_eq!((e.base_offset, l.base_offset), (0, 3));
     }
 
     /// A producer's batches take offsets in sequence order.
@@ -4760,6 +4677,65 @@ pub(crate) mod tests {
             e.base_offset,
             l.base_offset
         );
+    }
+
+    /// A connection's pipelined non-idempotent requests take offsets in the
+    /// order they were read.
+    ///
+    /// Each request runs in its own task, so request 2 could reach the append
+    /// lock while request 1 was still on its way and take the lower offsets.
+    /// A non-idempotent producer has no sequence numbers to catch that: its
+    /// records were simply stored out of the order it sent them, with no
+    /// retry involved (seen with librdkafka). The hook holds request 1 in that
+    /// window; without tickets request 2 overtakes it, which this test also
+    /// asserts so that it keeps proving the window is real.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connections_requests_take_offsets_in_read_order() {
+        use crate::produce_order::ProduceOrder;
+
+        let (handler, _temp) = create_test_handler().await;
+        let handler = Arc::new(handler);
+        let produce = |records: Vec<u8>| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        };
+        // Returns the base offsets of (request 1, request 2).
+        let race = |ordered: bool| {
+            let handler = Arc::clone(&handler);
+            async move {
+                let first = create_test_record_batch(-1, -1, vec![("a", "1"), ("b", "2"), ("c", "3")]);
+                let second = create_test_record_batch(-1, -1, vec![("d", "4"), ("e", "5")]);
+                *PAUSE_BEFORE_LOCK_BYTES.lock().unwrap() = Some(first.len());
+                let order = ProduceOrder::new();
+                let key = || vec![("test-topic".to_string(), 0)];
+                let (t1, t2) = if ordered {
+                    (Some(Arc::new(order.issue(key()))), Some(Arc::new(order.issue(key()))))
+                } else {
+                    (None, None)
+                };
+                let h = Arc::clone(&handler);
+                let req = produce(first);
+                let early = tokio::spawn(async move { h.handle_produce_ordered(req, 1, false, t1).await });
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let late = handler.handle_produce_ordered(produce(second), 2, false, t2).await.unwrap();
+                let early = early.await.unwrap().unwrap();
+                *PAUSE_BEFORE_LOCK_BYTES.lock().unwrap() = None;
+                let (e, l) = (&early.topics[0].partitions[0], &late.topics[0].partitions[0]);
+                assert_eq!((e.error_code, l.error_code), (0, 0));
+                (e.base_offset, l.base_offset)
+            }
+        };
+
+        let (e, l) = race(false).await;
+        assert!(l < e, "the window did not open: request 2 did not overtake ({e}, {l})");
+
+        let (e, l) = race(true).await;
+        assert!(e < l, "request 2 took offset {l} before request 1's {e}");
     }
 
     #[tokio::test]

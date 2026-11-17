@@ -2,8 +2,9 @@
 //!
 //! Tracks follower lag per partition to determine which replicas are in-sync.
 //! A replica is considered in-sync if:
-//! 1. Its lag is below max_lag_entries (default: 10,000 messages)
-//! 2. Its last update was within max_lag_ms (default: 10 seconds)
+//! 1. It has been caught up to the leader within max_lag_ms (default: 10 s)
+//! 2. Optionally, its lag is below max_lag_entries (off unless
+//!    CHRONIK_REPLICA_LAG_MAX_ENTRIES is set)
 //!
 //! Usage:
 //! ```rust
@@ -103,8 +104,9 @@ pub struct IsrTracker {
     /// set if the follower has not caught up.
     leading_since_ms: DashMap<PartitionKey, u64>,
 
-    /// Maximum lag in number of entries before marking out-of-sync
-    max_lag_entries: u64,
+    /// Optional record-count bound on lag; `None` (the default) leaves time
+    /// as the only bound, as in Kafka since 0.9. See `from_env`.
+    max_lag_entries: Option<u64>,
 
     /// Maximum lag in milliseconds before marking out-of-sync
     max_lag_ms: u64,
@@ -129,7 +131,7 @@ impl IsrTracker {
             follower_offsets: DashMap::new(),
             node_last_seen_ms: DashMap::new(),
             leading_since_ms: DashMap::new(),
-            max_lag_entries,
+            max_lag_entries: Some(max_lag_entries),
             max_lag_ms,
             node_liveness_ms: max_lag_ms.saturating_mul(3),
         }
@@ -231,7 +233,7 @@ impl IsrTracker {
         }
 
         let offset_lag = leader_offset - state.last_offset;
-        if offset_lag > self.max_lag_entries as i64 {
+        if self.max_lag_entries.is_some_and(|max| offset_lag > max as i64) {
             return SyncState::Lagging;
         }
 
@@ -585,14 +587,14 @@ impl IsrTracker {
 /// are on a link where 10s of lag is routine, and re-run that suite.
 const DEFAULT_REPLICA_LAG_TIME_MAX_MS: u64 = 10_000;
 
-/// How far behind in records a replica may fall before it leaves ISR.
-///
-/// Kafka removed the equivalent (`replica.lag.max.messages`) in 0.9 because a
-/// single fixed count cannot suit partitions with different write rates: it
-/// ejects healthy replicas on a busy partition and tolerates hopeless ones on a
-/// quiet partition. Time is the primary bound here for the same reason; this
-/// count is a secondary guard.
-const DEFAULT_REPLICA_LAG_MAX_ENTRIES: u64 = 10_000;
+// A record-count bound on follower lag is OFF unless
+// CHRONIK_REPLICA_LAG_MAX_ENTRIES is set. Kafka removed the equivalent
+// (`replica.lag.max.messages`) in 0.9: a fixed count ejects healthy replicas on
+// a busy partition. Measured here: it defaulted to 10,000, which at ~130K msg/s
+// per partition is 77 ms of ordinary fetch lag, so followers left ISR in the
+// middle of every sustained acks=all run and the producer backed off on
+// NOT_ENOUGH_REPLICAS — 130K msg/s instead of 460K on a 3-node cluster, on
+// v2.16.11 too. The time bound already catches a follower that cannot keep up.
 
 impl IsrTracker {
     /// Build from the environment, so the bound is operator-tunable.
@@ -622,24 +624,27 @@ impl IsrTracker {
             "CHRONIK_REPLICA_LAG_TIME_MAX_MS",
             DEFAULT_REPLICA_LAG_TIME_MAX_MS,
         );
-        let max_lag_entries = env_u64(
-            "CHRONIK_REPLICA_LAG_MAX_ENTRIES",
-            DEFAULT_REPLICA_LAG_MAX_ENTRIES,
-        );
+        let max_lag_entries = std::env::var("CHRONIK_REPLICA_LAG_MAX_ENTRIES")
+            .ok()
+            .map(|_| env_u64("CHRONIK_REPLICA_LAG_MAX_ENTRIES", u64::MAX));
 
         tracing::info!(
             max_lag_ms,
-            max_lag_entries,
+            max_lag_entries = ?max_lag_entries,
             "ISR lag bounds (CHRONIK_REPLICA_LAG_TIME_MAX_MS / _MAX_ENTRIES)"
         );
 
-        Self::new(max_lag_entries, max_lag_ms)
+        let mut tracker = Self::new(0, max_lag_ms);
+        tracker.max_lag_entries = max_lag_entries;
+        tracker
     }
 }
 
 impl Default for IsrTracker {
     fn default() -> Self {
-        Self::new(DEFAULT_REPLICA_LAG_MAX_ENTRIES, DEFAULT_REPLICA_LAG_TIME_MAX_MS)
+        let mut tracker = Self::new(0, DEFAULT_REPLICA_LAG_TIME_MAX_MS);
+        tracker.max_lag_entries = None;
+        tracker
     }
 }
 
@@ -672,6 +677,28 @@ mod tests {
 
         // Out of sync if lag > max_lag_entries
         assert!(!tracker.is_in_sync(2, "orders", 0, 2000)); // lag = 1050 > 1000
+    }
+
+    /// A follower far behind in records but caught up moments ago stays in
+    /// sync by default: on a busy partition 10,000 records is tens of
+    /// milliseconds of ordinary fetch lag. The default count bound ejected such
+    /// followers in the middle of sustained acks=all runs, and throughput fell
+    /// from ~460K to ~130K msg/s as the producer backed off on
+    /// NOT_ENOUGH_REPLICAS.
+    #[test]
+    fn a_recently_caught_up_follower_stays_in_sync_however_many_records_behind() {
+        let tracker = IsrTracker::default();
+        tracker.record_follower_fetch(2, "busy", 0, 1_000_000, 1_000_000);
+        // The leader has written 50,000 more since the follower's last fetch.
+        assert!(tracker.is_in_sync(2, "busy", 0, 1_050_000));
+    }
+
+    /// An operator who sets CHRONIK_REPLICA_LAG_MAX_ENTRIES still gets it.
+    #[test]
+    fn an_explicit_count_bound_still_applies() {
+        let tracker = IsrTracker::new(10_000, 10_000);
+        tracker.record_follower_fetch(2, "busy", 0, 1_000_000, 1_000_000);
+        assert!(!tracker.is_in_sync(2, "busy", 0, 1_050_000));
     }
 
     /// A partition whose followers have all gone silent must report that

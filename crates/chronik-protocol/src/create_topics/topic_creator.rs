@@ -22,6 +22,10 @@ impl TopicCreator {
         validate_only: bool,
         api_version: i16,
     ) -> CreateTopicResponse {
+        // -1 counts mean "broker default"; resolve them first, so validation,
+        // creation and the response all see the counts the topic really gets.
+        let topic = handler.resolve_topic_counts(topic);
+
         // Phase 1: Validate topic parameters
         let error_code = match Self::validate_topic(&topic) {
             Ok(_) => {
@@ -120,6 +124,53 @@ impl TopicCreator {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn request(partitions: i32, rf: i16, assignments: Vec<Vec<i32>>) -> CreateTopicRequest {
+        CreateTopicRequest {
+            name: "t".to_string(),
+            num_partitions: partitions,
+            replication_factor: rf,
+            replica_assignments: assignments
+                .into_iter()
+                .enumerate()
+                .map(|(i, broker_ids)| crate::create_topics_types::ReplicaAssignment {
+                    partition_index: i as i32,
+                    broker_ids,
+                })
+                .collect(),
+            configs: HashMap::new(),
+        }
+    }
+
+    /// kafka-topics.sh without --partitions / --replication-factor sends -1
+    /// (KIP-464). That was rejected as "Invalid number of partitions", and a
+    /// -1 replication factor would have become 1 whatever the cluster's default.
+    #[test]
+    fn minus_one_counts_take_the_broker_defaults() {
+        let handler = ProtocolHandler::new().with_topic_defaults(
+            crate::handler::TopicDefaults { partitions: 3, replication_factor: 3 },
+        );
+        let t = handler.resolve_topic_counts(request(-1, -1, vec![]));
+        assert_eq!((t.num_partitions, t.replication_factor), (3, 3));
+        assert!(TopicCreator::validate_topic(&t).is_ok());
+
+        let t = handler.resolve_topic_counts(request(6, -1, vec![]));
+        assert_eq!((t.num_partitions, t.replication_factor), (6, 3));
+        let t = handler.resolve_topic_counts(request(-1, 2, vec![]));
+        assert_eq!((t.num_partitions, t.replication_factor), (3, 2));
+        // Anything else invalid stays invalid.
+        let t = handler.resolve_topic_counts(request(0, 3, vec![]));
+        assert!(TopicCreator::validate_topic(&t).is_err());
+    }
+
+    /// Explicit assignments arrive with both counts -1; they decide the counts.
+    #[test]
+    fn explicit_assignments_decide_the_counts() {
+        let handler = ProtocolHandler::new();
+        let t = handler.resolve_topic_counts(request(-1, -1, vec![vec![1, 2], vec![2, 3], vec![3, 1]]));
+        assert_eq!((t.num_partitions, t.replication_factor), (3, 2));
+        assert!(TopicCreator::validate_topic(&t).is_ok());
+    }
 
     #[test]
     fn test_validate_topic_valid() {

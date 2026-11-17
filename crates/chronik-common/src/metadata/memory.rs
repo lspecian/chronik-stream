@@ -327,41 +327,6 @@ impl MetadataStore for InMemoryMetadataStore {
         Ok(())
     }
 
-    async fn apply_replicated_event(&self, event: super::events::MetadataEvent) -> Result<()> {
-        use super::events::MetadataEventPayload;
-        match event.payload {
-            MetadataEventPayload::PartitionAssigned { assignment } => {
-                let mut assignments = self.partition_assignments.write().await;
-                let key = (assignment.topic.clone(), assignment.partition);
-                assignments.insert(key, assignment);
-            }
-            MetadataEventPayload::HighWatermarkUpdated { topic, partition, new_watermark } => {
-                let mut offsets = self.partition_offsets.write().await;
-                let key = (topic, partition as u32);
-                let log_start = offsets.get(&key).map(|(_, ls)| *ls).unwrap_or(0);
-                offsets.insert(key, (new_watermark, log_start));
-            }
-            MetadataEventPayload::TopicCreated { name, config, .. } => {
-                let mut topics = self.topics.write().await;
-                if !topics.contains_key(&name) {
-                    let metadata = TopicMetadata {
-                        id: uuid::Uuid::new_v4(),
-                        name: name.clone(),
-                        config: config.into(),
-                        created_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                        auto_created: false,
-                    };
-                    topics.insert(name, metadata);
-                }
-            }
-            _ => {
-                // Other events not handled by InMemoryMetadataStore
-            }
-        }
-        Ok(())
-    }
-
     async fn init_system_state(&self) -> Result<()> {
         // No-op for in-memory store
         Ok(())
@@ -383,6 +348,35 @@ impl MetadataStore for InMemoryMetadataStore {
             }
         }
         
+        // No replica lists: place them here, round-robin over the registered
+        // brokers (broker 1 alone when none is registered), as the cluster
+        // catalog does.
+        let assignments = if assignments.is_empty() {
+            let mut brokers: Vec<u64> = self.brokers.read().await.keys().map(|&b| b as u64).collect();
+            brokers.sort_unstable();
+            if brokers.is_empty() {
+                brokers.push(1);
+            }
+            let rf = (config.replication_factor.max(1) as usize).min(brokers.len());
+            (0..config.partition_count)
+                .map(|p| {
+                    let replicas: Vec<u64> = (0..rf).map(|r| brokers[(p as usize + r) % brokers.len()]).collect();
+                    PartitionAssignment {
+                        topic: topic_name.to_string(),
+                        partition: p,
+                        broker_id: replicas[0] as i32,
+                        is_leader: true,
+                        isr: replicas.clone(),
+                        leader_id: replicas[0],
+                        replicas,
+                        leader_epoch: 0,
+                    }
+                })
+                .collect()
+        } else {
+            assignments
+        };
+
         let metadata = TopicMetadata {
             name: topic_name.to_string(),
             id: uuid::Uuid::new_v4(),

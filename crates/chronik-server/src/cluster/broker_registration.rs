@@ -1,131 +1,51 @@
-//! Broker registration and partition assignment
+//! Broker registration.
 //!
-//! Extracted from `run_cluster_mode()` to reduce complexity.
-//! Handles leader election wait, broker registration, and partition assignment.
+//! Every node, once its catalog has caught up, registers every broker listed
+//! in its cluster config. Registration is a catalog command (forwarded to the
+//! catalog leader, idempotent), so it does not matter which node gets there
+//! first, and a node that was down while the others started still finds the
+//! full broker list in the catalog when it comes back.
 
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::{info, error, warn};
+use std::time::Duration;
+use tracing::{info, warn};
 
-use crate::integrated_server::IntegratedKafkaServer;
-use crate::raft_cluster::RaftCluster;
+use crate::cluster_catalog::ClusterCatalog;
 use super::config::ClusterInitConfig;
+use chronik_common::metadata::MetadataStore;
 
-/// Wait for Raft leader election
-///
-/// Polls Raft cluster for leader election with timeout.
-/// Complexity: < 15 (polling loop with timeout)
-pub async fn wait_for_leader_election(
-    raft_cluster: Arc<RaftCluster>,
-    node_id: u64,
-) -> Result<bool> {
-    info!("Waiting for Raft leader election (max 10s)...");
-
-    let mut election_attempts = 0;
-    let max_election_wait = 100; // 100 * 100ms = 10 seconds
-    let mut is_leader = false;
-
-    while election_attempts < max_election_wait {
-        let (has_leader, leader_id, state) = raft_cluster.is_leader_ready().await;
-        if has_leader {
-            is_leader = leader_id == node_id;
-            info!(
-                "✓ Raft leader elected: leader_id={}, this_node={}, is_leader={}, state={}",
-                leader_id, node_id, is_leader, state
-            );
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        election_attempts += 1;
-    }
-
-    Ok(is_leader)
-}
-
-/// Register all brokers from cluster configuration
-///
-/// Leader node registers all peers as brokers in metadata store.
-/// Runs in background task to avoid blocking message loop.
-/// Complexity: < 20 (broker registration loop)
-pub async fn register_brokers_and_assign_partitions(
-    server: Arc<IntegratedKafkaServer>,
-    raft_cluster: Arc<RaftCluster>,
+/// Register the configured brokers in the background, retrying until each
+/// succeeds.
+pub fn register_configured_brokers(
+    metadata_store: Arc<dyn MetadataStore>,
+    catalog: Arc<ClusterCatalog>,
     init_config: &ClusterInitConfig,
 ) -> Result<()> {
-    // Wait for leader election
-    let is_leader = wait_for_leader_election(raft_cluster, init_config.node_id).await?;
-
-    if !is_leader {
-        info!("This node is a follower - registering brokers locally from config");
-        // CRITICAL FIX: Followers must populate their broker list from cluster config.
-        // The leader broadcasts BrokerRegistered events via replication, but followers
-        // may miss them due to timing (leader registers before followers connect) and
-        // because apply_replicated_event() doesn't write to local WAL (so broker info
-        // is lost on restart). By registering locally, followers always have the full
-        // broker list for Metadata responses.
-        let metadata_store = server.metadata_store();
-        for peer in &init_config.cluster_config.peers {
-            let (host, port) = parse_kafka_address(&peer.kafka);
-            let broker_metadata = create_broker_metadata(peer.id, host, port);
-            match metadata_store.register_broker(broker_metadata).await {
-                Ok(_) => info!("✅ Follower registered broker {} ({}) locally", peer.id, peer.kafka),
-                Err(e) => warn!("Failed to register broker {} locally: {:?}", peer.id, e),
-            }
-        }
-        info!("✅ Follower broker registration complete ({} brokers)", init_config.cluster_config.peers.len());
-        return Ok(());
-    }
-
-    // Leader registers ALL brokers from config
-    info!("This node is the Raft leader - spawning broker registration task");
-    let metadata_store = server.metadata_store();
-    let peers_clone = init_config.cluster_config.peers.clone();
-
-    // Signal when broker registration completes
-    let (broker_reg_tx, broker_reg_rx) = tokio::sync::oneshot::channel();
-
+    let peers: Vec<(u64, String)> =
+        init_config.cluster_config.peers.iter().map(|p| (p.id, p.kafka.clone())).collect();
     tokio::spawn(async move {
-        info!("Background task: Registering {} brokers from config", peers_clone.len());
-
-        for peer in &peers_clone {
-            // Parse actual Kafka address from config
-            let (host, port) = parse_kafka_address(&peer.kafka);
-
-            let broker_metadata = create_broker_metadata(peer.id, host, port);
-
-            match metadata_store.register_broker(broker_metadata.clone()).await {
-                Ok(_) => {
-                    info!("✅ Successfully registered broker {} ({}) via Raft", peer.id, peer.kafka);
-                }
-                Err(e) => {
-                    error!("❌ Failed to register broker {} ({}): {:?}", peer.id, peer.kafka, e);
+        while !catalog.wait_caught_up(Duration::from_secs(30)).await {
+            info!("Broker registration waiting for the catalog to catch up");
+        }
+        for (id, kafka) in peers {
+            let (host, port) = parse_kafka_address(&kafka);
+            let mut backoff = Duration::from_millis(200);
+            loop {
+                match metadata_store.register_broker(create_broker_metadata(id, host.clone(), port)).await {
+                    Ok(()) => {
+                        info!("Broker {} ({}) registered in the catalog", id, kafka);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Registering broker {} ({}) failed, retrying: {}", id, kafka, e);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    }
                 }
             }
         }
-
-        info!("✓ Broker registration task completed");
-        let _ = broker_reg_tx.send(()); // Signal completion
     });
-
-    info!("Broker registration task spawned - will complete in background");
-
-    // Wait for broker registration, then assign partitions
-    let server_clone = server.clone();
-    let config_clone = init_config.cluster_config.clone();
-    tokio::spawn(async move {
-        if broker_reg_rx.await.is_ok() {
-            info!("Broker registration completed - starting partition assignment");
-
-            if let Err(e) = server_clone.assign_existing_partitions(&config_clone).await {
-                error!("❌ Failed to assign existing partitions: {:?}", e);
-            } else {
-                info!("✅ Partition assignment completed successfully");
-            }
-        } else {
-            warn!("⚠️ Broker registration task dropped before completing - skipping partition assignment");
-        }
-    });
-
     Ok(())
 }
 

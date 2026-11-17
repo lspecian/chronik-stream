@@ -20,7 +20,6 @@
 
 use anyhow::{Result, Context};
 use chronik_wal::{GroupCommitWal, GroupCommitConfig, WalRecord};
-use crate::raft_metadata::MetadataCommand;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -121,25 +120,6 @@ impl MetadataWal {
             partition,
             next_offset: AtomicI64::new(0),
         })
-    }
-
-    /// Append metadata command to WAL
-    ///
-    /// This is a durable, synchronous write that returns immediately after fsync (1-2ms).
-    /// Uses group commit for efficiency - multiple concurrent writes are batched together.
-    ///
-    /// # Arguments
-    /// - `cmd`: Metadata command to persist
-    ///
-    /// # Returns
-    /// Offset of the written command in the WAL
-    pub async fn append(&self, cmd: &MetadataCommand) -> Result<i64> {
-        // Serialize command to bytes (bincode)
-        let data = bincode::serialize(cmd)
-            .context("Failed to serialize metadata command")?;
-
-        // Use common append_bytes implementation
-        self.append_bytes(data).await
     }
 
     /// Append pre-serialized bytes to WAL (v2.2.9 Option A)
@@ -463,51 +443,14 @@ impl MetadataWal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[tokio::test]
-    async fn test_metadata_wal_basic() {
+    async fn appends_get_consecutive_offsets() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wal = MetadataWal::new(temp_dir.path().to_path_buf()).await.unwrap();
-
-        // Test topic name and partition
         assert_eq!(wal.topic_name(), "__chronik_metadata");
         assert_eq!(wal.partition(), 0);
-
-        // Test append
-        let cmd = MetadataCommand::AddNode {
-            node_id: 1,
-            address: "localhost:9092".to_string(),
-        };
-
-        let offset = wal.append(&cmd).await.unwrap();
-        assert_eq!(offset, 0); // First write
-    }
-
-    #[tokio::test]
-    async fn test_metadata_wal_multiple_writes() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let wal = MetadataWal::new(temp_dir.path().to_path_buf()).await.unwrap();
-
-        // Write multiple commands
-        let cmd1 = MetadataCommand::RegisterBroker {
-            broker_id: 1,
-            host: "localhost".to_string(),
-            port: 9092,
-            rack: None,
-        };
-
-        let cmd2 = MetadataCommand::RegisterBroker {
-            broker_id: 2,
-            host: "localhost".to_string(),
-            port: 9093,
-            rack: None,
-        };
-
-        let offset1 = wal.append(&cmd1).await.unwrap();
-        let offset2 = wal.append(&cmd2).await.unwrap();
-
-        assert_eq!(offset1, 0);
-        assert_eq!(offset2, 1);
+        assert_eq!(wal.append_bytes(b"first".to_vec()).await.unwrap(), 0);
+        assert_eq!(wal.append_bytes(b"second".to_vec()).await.unwrap(), 1);
     }
 }

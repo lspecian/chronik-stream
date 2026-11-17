@@ -353,10 +353,15 @@ fn test_api_versions_v1_field_ordering() {
 #[tokio::test]
 async fn test_describe_configs() {
     use chronik_protocol::handler::ProtocolHandler;
+    use chronik_common::metadata::{InMemoryMetadataStore, MetadataStore, TopicConfig};
     use bytes::BytesMut;
-    
-    let handler = ProtocolHandler::new();
-    
+
+    // DescribeConfigs reports a topic's actual config, so the topic must exist
+    // (an unknown topic is UNKNOWN_TOPIC_OR_PARTITION).
+    let store = std::sync::Arc::new(InMemoryMetadataStore::new());
+    store.create_topic("test-topic", TopicConfig::default()).await.unwrap();
+    let handler = ProtocolHandler::with_metadata_store(store);
+
     // Build a DescribeConfigs request (v0)
     let mut request_buf = BytesMut::new();
     

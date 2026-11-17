@@ -301,19 +301,18 @@ impl<T: Storage> RaftLog<T> {
         if self.committed >= to_commit {
             return;
         }
-        let last = self.last_index();
-        if last < to_commit {
-            // During node bootstrap the log may be empty (last_index=0) while peers
-            // already have entries. Clamp to last_index instead of panicking so the
-            // node can catch up via snapshot or append.
-            warn!(
+        // Upstream behaviour, restored: a commit index beyond the log means this
+        // node lost entries it acknowledged (raft safety is already broken), so
+        // continuing would only hide it. The clamp that was here (ba4139d)
+        // masked nodes booting with an empty log; `RaftDriver` now bootstraps
+        // from a snapshot, and a node that loses its storage must rejoin as new.
+        if self.last_index() < to_commit {
+            fatal!(
                 self.unstable.logger,
-                "to_commit {} is out of range [last_index {}], clamping",
+                "to_commit {} is out of range [last_index {}]",
                 to_commit,
-                last;
-            );
-            self.committed = last;
-            return;
+                self.last_index()
+            )
         }
         self.committed = to_commit;
     }

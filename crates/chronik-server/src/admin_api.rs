@@ -48,7 +48,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::isr_tracker::IsrTracker;
-use crate::raft_cluster::RaftCluster;
+use crate::cluster_catalog::ClusterCatalog;
 use crate::schema_registry::{
     CompatibilityConfig, CompatibilityLevel, GetSchemaResponse, GetSubjectVersionResponse,
     RegisterSchemaRequest, RegisterSchemaResponse, SchemaRegistry, SchemaRegistryConfig,
@@ -62,7 +62,7 @@ pub struct AdminApiState {
     /// v2.5.2: Optional so single-node mode (no Raft) can still expose
     /// `/admin/health`, `/subjects/*`, `/schemas/*`. Mutation routes that
     /// require cluster consensus return 501 when this is None.
-    pub raft_cluster: Option<Arc<RaftCluster>>,
+    pub raft_cluster: Option<Arc<ClusterCatalog>>,
     pub metadata_store: Arc<dyn MetadataStore>,
     pub api_key: Option<String>,
     /// v2.2.22: ISR tracker for accurate in-sync replica queries
@@ -221,30 +221,7 @@ where
     }
 }
 
-/// Helper function to call propose_remove_node
-///
-/// NOTE: This helper exists because calling `propose_remove_node` directly
-/// in the handler causes a Rust compiler type inference issue with axum 0.6's
-/// Handler trait. The method internally calls `reassign_partitions_from_node`
-/// which has multiple nested await points in a loop, creating a complex Future
-/// type that confuses the compiler. Boxing the future resolves this.
-fn do_remove_node(
-    raft_cluster: Arc<RaftCluster>,
-    node_id: u64,
-    force: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
-    Box::pin(async move {
-        raft_cluster.propose_remove_node(node_id, force).await
-    })
-}
-
 /// POST /admin/remove-node - Remove a node from the cluster
-///
-/// **Implementation Note**: This handler uses a helper function `do_remove_node` that
-/// boxes the Future to resolve a Rust compiler type inference issue with axum 0.6's
-/// Handler trait. Direct calls to `propose_remove_node` fail because the method
-/// internally calls `reassign_partitions_from_node` which has multiple nested await
-/// points in a loop, creating a complex Future type that confuses the compiler.
 async fn handle_node_removal(
     State(state): State<AdminApiState>,
     Json(req): Json<RemoveNodeRequest>,
@@ -262,15 +239,14 @@ async fn handle_node_removal(
         }));
     };
 
-    // Call helper function instead of direct method call
-    match do_remove_node(raft, req.node_id, req.force).await {
-        Ok(()) => {
-            info!("✓ Successfully proposed removing node {}", req.node_id);
+    match raft.remove_node(req.node_id, req.force).await {
+        Ok(cs) => {
+            info!("✓ Node {} removed from the cluster", req.node_id);
             Ok(Json(RemoveNodeResponse {
                 success: true,
                 message: format!(
-                    "Node {} removal proposed. Waiting for Raft consensus...",
-                    req.node_id
+                    "Node {} removed; voters are now {:?}",
+                    req.node_id, cs.voters
                 ),
                 node_id: Some(req.node_id),
             }))
@@ -314,23 +290,14 @@ async fn handle_add_node(
         }));
     };
 
-    // Call RaftCluster::propose_add_node()
-    match raft
-        .propose_add_node(
-            req.node_id,
-            req.kafka_addr.clone(),
-            req.wal_addr.clone(),
-            req.raft_addr.clone(),
-        )
-        .await
-    {
-        Ok(_) => {
-            info!("✓ Successfully proposed adding node {}", req.node_id);
+    match raft.add_node(req.node_id, &req.kafka_addr, &req.raft_addr).await {
+        Ok(cs) => {
+            info!("✓ Node {} added to the cluster", req.node_id);
             Ok(Json(AddNodeResponse {
                 success: true,
                 message: format!(
-                    "Node {} addition proposed. Waiting for Raft consensus...",
-                    req.node_id
+                    "Node {} added; voters are now {:?}. Start it with CHRONIK_CLUSTER_JOIN=true.",
+                    req.node_id, cs.voters
                 ),
                 node_id: Some(req.node_id),
             }))
@@ -358,8 +325,8 @@ async fn handle_health(
     let (node_id, is_leader, cluster_nodes) = match state.raft_cluster.as_ref() {
         Some(raft) => (
             raft.node_id(),
-            raft.is_leader().await,
-            raft.get_all_nodes().await,
+            raft.am_i_leader(),
+            raft.voters(),
         ),
         None => (1, true, Vec::new()), // Single-node: always "leader" of itself
     };
@@ -382,9 +349,9 @@ async fn handle_status(
     let (node_id, is_leader, leader_id_opt, nodes) = match state.raft_cluster.as_ref() {
         Some(raft) => {
             let nid = raft.node_id();
-            let is_ldr = raft.is_leader().await;
-            let (leader_ready, leader_id, _) = raft.is_leader_ready().await;
-            let node_info = raft.get_node_info();
+            let is_ldr = raft.am_i_leader();
+            let (leader_ready, leader_id, _) = raft.is_leader_ready();
+            let node_info = raft.node_addresses();
             let nodes: Vec<NodeInfo> = node_info
                 .iter()
                 .map(|(id, addr)| NodeInfo {
@@ -449,7 +416,7 @@ async fn handle_rebalance(
     };
 
     // Get current cluster nodes
-    let current_nodes = raft.get_all_nodes().await;
+    let current_nodes = raft.voters();
     let node_count = current_nodes.len();
 
     if node_count == 0 {
@@ -1177,7 +1144,7 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
 /// The Schema Registry is always enabled and provides Confluent-compatible REST API
 /// for schema management. Schema Registry routes do NOT require authentication.
 pub async fn start_admin_api(
-    raft_cluster: Option<Arc<RaftCluster>>,
+    raft_cluster: Option<Arc<ClusterCatalog>>,
     metadata_store: Arc<dyn MetadataStore>,
     port: u16,
     api_key: Option<String>,

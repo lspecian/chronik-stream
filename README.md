@@ -66,26 +66,30 @@ Features are orthogonal and enabled per topic. A topic with no features enabled 
 
 ```bash
 # Pure Kafka — no extras, just streaming
-kafka-topics.sh --create --topic logs
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic logs
+
+# Capabilities are topic configs. Stock kafka-topics.sh refuses config names
+# Kafka itself does not define ("Unknown topic config name"), so create the
+# topic, then set them with kafka-configs.sh (any AdminClient can also pass
+# them directly at create time).
+alter() { kafka-configs.sh --bootstrap-server localhost:9092 --alter \
+            --entity-type topics --entity-name "$1" --add-config "$2"; }
 
 # SQL analytics — enables /_sql queries
-kafka-topics.sh --create --topic orders \
-  --config columnar.enabled=true
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic orders
+alter orders columnar.enabled=true
 
 # Full-text search — enables /_search queries
-kafka-topics.sh --create --topic documents \
-  --config searchable.enabled=true
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic documents
+alter documents searchable=true
 
 # Vector search — enables /_vector semantic queries
-kafka-topics.sh --create --topic support-tickets \
-  --config vector.enabled=true \
-  --config vector.embedding.provider=openai
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic support-tickets
+alter support-tickets 'vector.enabled=true,vector.embedding.provider=openai'
 
 # All capabilities on a single topic
-kafka-topics.sh --create --topic events \
-  --config columnar.enabled=true \
-  --config searchable.enabled=true \
-  --config vector.enabled=true
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic events
+alter events 'columnar.enabled=true,searchable=true,vector.enabled=true'
 ```
 
 Enable what you need, pay only for what you use. A topic with nothing enabled has zero indexing overhead.
@@ -96,7 +100,7 @@ Enable what you need, pay only for what you use. A topic with nothing enabled ha
 |------------|--------|----------------|--------|---------|
 | **Streaming** | always on | Kafka Fetch (9092) | WAL | < 1ms |
 | **SQL** | `columnar.enabled=true` | `POST /_sql` | DataFusion + Arrow/Parquet | 0-200ms |
-| **Search** | `searchable.enabled=true` | `POST /_search` | Tantivy (BM25) | 1-500ms |
+| **Search** | `searchable=true` | `POST /_search` | Tantivy (BM25) | 1-500ms |
 | **Vector** | `vector.enabled=true` | `POST /_vector/:topic/search` | HNSW + embeddings | 5-100ms |
 | **Orchestrator** | automatic | `POST /_query` | RRF multi-backend fusion | 10-500ms |
 

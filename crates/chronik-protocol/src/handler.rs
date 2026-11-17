@@ -99,6 +99,24 @@ pub struct ProtocolHandler {
     advertised_port: i32,
     /// SASL authenticator for client authentication
     sasl_authenticator: Arc<Mutex<crate::sasl::SaslAuthenticator>>,
+    /// What CreateTopics uses when a client leaves the counts to the broker.
+    topic_defaults: TopicDefaults,
+}
+
+/// The partition count and replication factor a topic gets when CreateTopics
+/// sends -1 for them (KIP-464: "use the broker default"), as kafka-topics.sh
+/// does when --partitions or --replication-factor is left out. Kafka's own
+/// defaults are 1 and 1; the server sets the ones auto-create uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopicDefaults {
+    pub partitions: i32,
+    pub replication_factor: i16,
+}
+
+impl Default for TopicDefaults {
+    fn default() -> Self {
+        Self { partitions: 1, replication_factor: 1 }
+    }
 }
 
 /// This cluster's identity, as reported by both Metadata and DescribeCluster.
@@ -175,6 +193,7 @@ impl ProtocolHandler {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 
@@ -189,6 +208,7 @@ impl ProtocolHandler {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 
@@ -206,6 +226,7 @@ impl ProtocolHandler {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
+            topic_defaults: TopicDefaults::default(),
         }
     }
 
@@ -225,9 +246,42 @@ impl ProtocolHandler {
             advertised_host,
             advertised_port,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
+            topic_defaults: TopicDefaults::default(),
         }
     }
-    
+
+    /// Use these counts when CreateTopics leaves them to the broker.
+    pub fn with_topic_defaults(mut self, defaults: TopicDefaults) -> Self {
+        self.topic_defaults = defaults;
+        self
+    }
+
+    /// The topic as it will be created: a count the client sent as -1 becomes
+    /// the broker default, and explicit replica assignments (which Kafka sends
+    /// with both counts -1) decide the counts themselves.
+    pub fn resolve_topic_counts(
+        &self,
+        mut topic: crate::create_topics_types::CreateTopicRequest,
+    ) -> crate::create_topics_types::CreateTopicRequest {
+        if !topic.replica_assignments.is_empty() {
+            topic.num_partitions = topic.replica_assignments.len() as i32;
+            topic.replication_factor = topic
+                .replica_assignments
+                .iter()
+                .map(|a| a.broker_ids.len())
+                .max()
+                .unwrap_or(0) as i16;
+            return topic;
+        }
+        if topic.num_partitions == -1 {
+            topic.num_partitions = self.topic_defaults.partitions;
+        }
+        if topic.replication_factor == -1 {
+            topic.replication_factor = self.topic_defaults.replication_factor;
+        }
+        topic
+    }
+
     // Public parse methods for use by KafkaProtocolHandler
     
     /// Parse FindCoordinator request
@@ -2591,9 +2645,23 @@ impl ProtocolHandler {
 
             let configs = match resource.resource_type {
                 2 => {
-                    // Topic configs
+                    // Topic configs, as the topic holds them.
+                    let topic = match &self.metadata_store {
+                        Some(store) => store.get_topic(&resource.resource_name).await.ok().flatten(),
+                        None => None,
+                    };
+                    let Some(topic) = topic else {
+                        results.push(DescribeConfigsResult {
+                            error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
+                            error_message: Some(format!("Topic '{}' does not exist", resource.resource_name)),
+                            resource_type: resource.resource_type,
+                            resource_name: resource.resource_name,
+                            configs: vec![],
+                        });
+                        continue;
+                    };
                     ConfigProvider::get_topic_configs(
-                        &resource.resource_name,
+                        &topic,
                         &resource.configuration_keys,
                         request.include_synonyms,
                         request.include_documentation,
@@ -3547,8 +3615,6 @@ impl ProtocolHandler {
         existing: &chronik_common::metadata::TopicMetadata,
         new_count: i32,
     ) -> Result<()> {
-        use chronik_common::metadata::{PartitionAssignment, BrokerStatus};
-
         let current = existing.config.partition_count as i32;
 
         // 1) Bump the topic's partition count.
@@ -3558,38 +3624,8 @@ impl ProtocolHandler {
             .map_err(|e| Error::Internal(format!("update_topic failed: {:?}", e)))?;
 
         // 2) Assign + initialise offsets for each newly-added partition.
-        let brokers = metadata_store.list_brokers().await
-            .map_err(|e| Error::Internal(format!("list_brokers failed: {:?}", e)))?;
-        let online: Vec<_> = brokers.iter()
-            .filter(|b| b.status == BrokerStatus::Online)
-            .collect();
-        let broker_count = if online.is_empty() { 1 } else { online.len() };
-        let all_replicas: Vec<u64> = if online.is_empty() {
-            vec![self.broker_id as u64]
-        } else {
-            online.iter().map(|b| b.broker_id as u64).collect()
-        };
-
+        // The catalog places the new partitions when it applies the growth.
         for partition in current..new_count {
-            let broker_id = if online.is_empty() {
-                self.broker_id
-            } else {
-                online[(partition as usize) % broker_count].broker_id
-            };
-            metadata_store.assign_partition(PartitionAssignment {
-                topic: existing.name.clone(),
-                partition: partition as u32,
-                broker_id,
-                is_leader: true, // deprecated field, kept for compatibility
-                replicas: all_replicas.clone(),
-                leader_id: broker_id as u64,
-                leader_epoch: 0, // assigned by the metadata store
-                // Placement only: this caller has not measured who is caught up.
-                // Empty means "unknown" and leaves any published set intact.
-                isr: Vec::new(),
-            }).await
-                .map_err(|e| Error::Internal(format!("assign_partition failed: {:?}", e)))?;
-
             metadata_store.update_partition_offset(&existing.name, partition as u32, 0, 0).await
                 .map_err(|e| Error::Internal(format!("update_partition_offset failed: {:?}", e)))?;
         }
@@ -5831,173 +5867,79 @@ impl ProtocolHandler {
         Ok(())
     }
     
-    /// Create a topic in the metadata store
+    /// Create a topic in the metadata store.
+    ///
+    /// Replica lists are passed only when the client gave an explicit
+    /// assignment; otherwise the store places the partitions (round-robin over
+    /// the registered brokers, honouring the replication factor). In cluster
+    /// mode creation is decided once, in order, by the catalog: a topic that
+    /// already exists — including one auto-created moments earlier — is
+    /// reported as TOPIC_ALREADY_EXISTS, never silently widened.
     pub async fn create_topic_in_metadata(&self, topic: &crate::create_topics_types::CreateTopicRequest) -> Result<()> {
-        if let Some(metadata_store) = &self.metadata_store {
-            use chronik_common::metadata::traits::{TopicConfig, PartitionAssignment};
-            
-            // Parse configurations - validation already done in handle_create_topics
-            let retention_ms = topic.configs.get("retention.ms")
-                .and_then(|v| v.parse().ok());
-            let segment_bytes = topic.configs.get("segment.bytes")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1024 * 1024 * 1024); // 1GB default
-            
-            let config = TopicConfig {
-                partition_count: topic.num_partitions as u32,
-                replication_factor: topic.replication_factor as u32,
-                retention_ms,
-                segment_bytes,
-                config: topic.configs.clone(),
-            };
-            
-            // Get available brokers for partition assignment
-            let brokers = metadata_store.list_brokers().await
-                .map_err(|e| Error::Internal(format!("Failed to list brokers: {:?}", e)))?;
-            
-            let online_brokers: Vec<_> = brokers.iter()
-                .filter(|b| b.status == chronik_common::metadata::BrokerStatus::Online)
-                .collect();
-            
-            // Handle case where no brokers are registered
-            if online_brokers.is_empty() {
-                tracing::warn!("No online brokers found, using default broker ID {}", self.broker_id);
-                // Register this broker if not already registered
-                if metadata_store.get_broker(self.broker_id).await
-                    .map_err(|e| Error::Internal(format!("Failed to get broker: {:?}", e)))?
-                    .is_none() {
-                    let broker_metadata = chronik_common::metadata::BrokerMetadata {
-                        broker_id: self.broker_id,
-                        host: self.advertised_host.clone(),
-                        port: self.advertised_port,
-                        rack: None,
-                        status: chronik_common::metadata::BrokerStatus::Online,
-                        created_at: chronik_common::Utc::now(),
-                        updated_at: chronik_common::Utc::now(),
-                    };
-                    metadata_store.register_broker(broker_metadata).await
-                        .map_err(|e| Error::Internal(format!("Failed to register broker: {:?}", e)))?;
-                }
-            }
-            
-            // Create partition assignments using round-robin assignment
-            let mut assignments = Vec::new();
-            let broker_count = if online_brokers.is_empty() { 1 } else { online_brokers.len() };
-
-            // Build list of all replica node IDs (for cluster mode)
-            let all_replicas: Vec<u64> = if online_brokers.is_empty() {
-                vec![self.broker_id as u64]  // Standalone mode: single broker
-            } else {
-                online_brokers.iter().map(|b| b.broker_id as u64).collect()  // Cluster mode: all brokers
-            };
-
-            for partition in 0..topic.num_partitions {
-                let broker_index = (partition as usize) % broker_count;
-                let broker_id = if online_brokers.is_empty() {
-                    self.broker_id
-                } else {
-                    online_brokers[broker_index].broker_id
-                };
-
-                assignments.push(PartitionAssignment {
-                    topic: topic.name.clone(),
-                    partition: partition as u32,
-                    broker_id,
-                    is_leader: true, // Deprecated field
-                    replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
-                    leader_id: broker_id as u64,
-                    leader_epoch: 0, // assigned by the metadata store
-                    isr: Vec::new(), // placement only — the leader publishes this
-                });
-            }
-            
-            // Prepare offset initialization data
-            let mut offsets = Vec::new();
-            for partition in 0..topic.num_partitions {
-                offsets.push((
-                    partition as u32,
-                    0i64, // high_watermark
-                    0i64, // log_start_offset
-                ));
-            }
-            
-            // Create topic atomically with all assignments and offsets
-            match metadata_store.create_topic_with_assignments(
-                &topic.name,
-                config.clone(),
-                assignments.clone(),
-                offsets.clone(),
-            ).await {
-                Ok(topic_metadata) => {
-                    tracing::info!("Successfully created topic '{}' with ID {} and {} partitions atomically across {} brokers",
-                        topic.name, topic_metadata.id, topic.num_partitions, broker_count);
-                }
-                Err(e) => {
-                    let err_msg = format!("{:?}", e);
-                    if err_msg.contains("already exists") || err_msg.contains("AlreadyExists") {
-                        // v2.3.2 CRITICAL FIX: Topic may have been auto-created with default
-                        // partition count (e.g., 3) by a Metadata request before the explicit
-                        // CreateTopics request arrived. Check if we need to expand partitions.
-                        if let Ok(Some(existing)) = metadata_store.get_topic(&topic.name).await {
-                            let existing_count = existing.config.partition_count;
-                            let requested_count = topic.num_partitions as u32;
-                            if existing_count < requested_count {
-                                tracing::info!(
-                                    "Topic '{}' exists with {} partitions, expanding to {} (explicit CreateTopics overrides auto-create)",
-                                    topic.name, existing_count, requested_count
-                                );
-                                // Update topic config with new partition count and configs
-                                if let Err(update_err) = metadata_store.update_topic(&topic.name, config).await {
-                                    tracing::warn!("Failed to update topic config: {:?}", update_err);
-                                }
-                                // Add partition assignments for the new partitions
-                                for assignment in &assignments {
-                                    if assignment.partition >= existing_count {
-                                        if let Err(assign_err) = metadata_store.assign_partition(assignment.clone()).await {
-                                            tracing::warn!("Failed to assign partition {}: {:?}", assignment.partition, assign_err);
-                                        }
-                                    }
-                                }
-                                // Initialize offsets for new partitions
-                                for &(partition, hwm, lso) in &offsets {
-                                    if partition >= existing_count {
-                                        if let Err(offset_err) = metadata_store.update_partition_offset(&topic.name, partition, hwm, lso).await {
-                                            tracing::warn!("Failed to init offset for partition {}: {:?}", partition, offset_err);
-                                        }
-                                    }
-                                }
-                                tracing::info!("✅ Expanded topic '{}' from {} to {} partitions",
-                                    topic.name, existing_count, requested_count);
-                            } else {
-                                // Genuine duplicate: the topic already exists with at
-                                // least the requested partition count (nothing to
-                                // expand). Kafka returns TOPIC_ALREADY_EXISTS here — the
-                                // caller maps this "already exists" error to error code
-                                // 36. (The expansion branch above still returns Ok, so
-                                // an explicit CreateTopics that grows an auto-created
-                                // topic keeps working.)
-                                tracing::info!("Topic '{}' already exists with {} partitions (requested {})",
-                                    topic.name, existing_count, requested_count);
-                                return Err(Error::Internal(format!("Topic '{}' already exists", topic.name)));
-                            }
-                        } else {
-                            // Reported as existing but not retrievable — surface it.
-                            return Err(Error::Internal(format!("Topic '{}' already exists", topic.name)));
-                        }
-                    } else {
-                        return Err(Error::Internal(format!("Failed to create topic: {:?}", e)));
-                    }
-                }
-            }
-            
-            Ok(())
-        } else {
-            // No metadata store, just log
+        let Some(metadata_store) = &self.metadata_store else {
             tracing::warn!("No metadata store configured, topic creation not persisted");
-            Ok(())
+            return Ok(());
+        };
+        use chronik_common::metadata::traits::{PartitionAssignment, TopicConfig};
+
+        // Validation already done in handle_create_topics.
+        let retention_ms = topic.configs.get("retention.ms").and_then(|v| v.parse().ok());
+        let segment_bytes = topic
+            .configs
+            .get("segment.bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024 * 1024 * 1024);
+
+        let mut explicit = topic.replica_assignments.clone();
+        explicit.sort_by_key(|a| a.partition_index);
+        let (partition_count, replication_factor) = if explicit.is_empty() {
+            (topic.num_partitions as u32, topic.replication_factor.max(1) as u32)
+        } else {
+            let rf = explicit.iter().map(|a| a.broker_ids.len()).max().unwrap_or(1);
+            (explicit.len() as u32, rf as u32)
+        };
+        let config = TopicConfig {
+            partition_count,
+            replication_factor,
+            retention_ms,
+            segment_bytes,
+            config: topic.configs.clone(),
+        };
+        let assignments: Vec<PartitionAssignment> = explicit
+            .iter()
+            .map(|a| {
+                let replicas: Vec<u64> = a.broker_ids.iter().map(|&b| b as u64).collect();
+                let leader = replicas.first().copied().unwrap_or(self.broker_id as u64);
+                PartitionAssignment {
+                    topic: topic.name.clone(),
+                    partition: a.partition_index as u32,
+                    broker_id: leader as i32,
+                    is_leader: true,
+                    replicas,
+                    leader_id: leader,
+                    leader_epoch: 0,
+                    isr: Vec::new(),
+                }
+            })
+            .collect();
+        let offsets: Vec<(u32, i64, i64)> = (0..partition_count).map(|p| (p, 0, 0)).collect();
+
+        match metadata_store.create_topic_with_assignments(&topic.name, config, assignments, offsets).await {
+            Ok(created) => {
+                tracing::info!(
+                    "Created topic '{}' (id {}) with {} partitions",
+                    topic.name, created.id, partition_count
+                );
+                Ok(())
+            }
+            Err(chronik_common::metadata::MetadataError::AlreadyExists(_)) => {
+                // The caller maps "already exists" to TOPIC_ALREADY_EXISTS (36).
+                Err(Error::Internal(format!("Topic '{}' already exists", topic.name)))
+            }
+            Err(e) => Err(Error::Internal(format!("Failed to create topic: {:?}", e))),
         }
     }
-    
+
     /// Validate topic name according to Kafka rules
     fn is_valid_topic_name(name: &str) -> bool {
         // Topic name must:
@@ -6483,27 +6425,8 @@ impl ProtocolHandler {
                     }
 
                     // Build list of all replica node IDs (for cluster mode)
-                    let all_replicas: Vec<u64> = online_broker_ids.iter().map(|&id| id as u64).collect();
-
-                    // Create assignments for all partitions
-                    let mut assignments = Vec::new();
-                    for partition in 0..default_num_partitions {
-                        let broker_index = (partition as usize) % online_broker_ids.len();
-                        let broker_id = online_broker_ids[broker_index];
-
-                        assignments.push(chronik_common::metadata::PartitionAssignment {
-                            topic: topic_name.clone(),
-                            partition,
-                            broker_id,
-                            is_leader: true,  // Deprecated field
-                            replicas: all_replicas.clone(),  // FIXED: All brokers as replicas for cluster mode
-                            leader_id: broker_id as u64,
-                            leader_epoch: 0, // assigned by the metadata store
-                            isr: Vec::new(), // placement only — the leader publishes this
-                        });
-                    }
-                    
-                    // Create initial offsets
+                    // No replica lists: the catalog places the partitions.
+                    let assignments = Vec::new();
                     let mut offsets = Vec::new();
                     for partition in 0..default_num_partitions {
                         offsets.push((partition, 0i64, 0i64)); // partition, high_watermark, log_start_offset
@@ -6538,5 +6461,161 @@ impl ProtocolHandler {
 impl Default for ProtocolHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The (topic, partition) pairs a Produce request body writes to, in request
+/// order, without copying any record data.
+///
+/// The connection handler calls this as it reads each Produce request, before
+/// the request is handed to a concurrent task, so that a connection's writes
+/// to one partition take offsets in the order the client sent them (see
+/// `ProduceOrder` in chronik-server). It walks the same layout as
+/// [`ProtocolHandler::parse_produce_request`] and skips the record bytes.
+pub fn produce_request_partitions(api_version: i16, body: &mut Bytes) -> Result<Vec<(String, i32)>> {
+    use crate::parser::Decoder;
+
+    let flexible = api_version >= 9;
+    let mut decoder = Decoder::new(body);
+
+    fn skip_tagged_fields(decoder: &mut Decoder<'_>) -> Result<()> {
+        for _ in 0..decoder.read_unsigned_varint()? {
+            decoder.read_unsigned_varint()?;
+            let size = decoder.read_unsigned_varint()? as usize;
+            decoder.advance(size)?;
+        }
+        Ok(())
+    }
+    fn read_count(decoder: &mut Decoder<'_>, flexible: bool) -> Result<usize> {
+        Ok(if flexible {
+            (decoder.read_unsigned_varint()? as usize).saturating_sub(1)
+        } else {
+            decoder.read_i32()?.max(0) as usize
+        })
+    }
+
+    if api_version >= 3 {
+        if flexible {
+            decoder.read_compact_string()?;
+        } else {
+            decoder.read_string()?;
+        }
+    }
+    decoder.read_i16()?; // acks
+    decoder.read_i32()?; // timeout_ms
+
+    let mut out = Vec::new();
+    for _ in 0..read_count(&mut decoder, flexible)? {
+        let topic = if flexible {
+            decoder.read_compact_string()?
+        } else {
+            decoder.read_string()?
+        }
+        .ok_or_else(|| Error::Protocol("Topic name cannot be null".into()))?;
+        for _ in 0..read_count(&mut decoder, flexible)? {
+            let partition = decoder.read_i32()?;
+            if flexible {
+                decoder.read_compact_bytes()?;
+                skip_tagged_fields(&mut decoder)?;
+            } else {
+                decoder.read_bytes()?;
+            }
+            out.push((topic.clone(), partition));
+        }
+        if flexible {
+            skip_tagged_fields(&mut decoder)?;
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod produce_partitions_tests {
+    use super::*;
+    use crate::parser::{ApiKey, RequestHeader};
+
+    /// Encode a Produce body by hand for `version`: topics of (name, partitions).
+    fn body(version: i16, topics: &[(&str, &[i32])]) -> Bytes {
+        let flexible = version >= 9;
+        let mut b = BytesMut::new();
+        let put_str = |b: &mut BytesMut, s: &str| {
+            if flexible {
+                b.extend_from_slice(&[(s.len() + 1) as u8]);
+            } else {
+                b.extend_from_slice(&(s.len() as i16).to_be_bytes());
+            }
+            b.extend_from_slice(s.as_bytes());
+        };
+        let put_count = |b: &mut BytesMut, n: usize| {
+            if flexible {
+                b.extend_from_slice(&[(n + 1) as u8]);
+            } else {
+                b.extend_from_slice(&(n as i32).to_be_bytes());
+            }
+        };
+        if version >= 3 {
+            put_str(&mut b, "txn");
+        }
+        b.extend_from_slice(&(-1i16).to_be_bytes());
+        b.extend_from_slice(&30_000i32.to_be_bytes());
+        put_count(&mut b, topics.len());
+        for (name, parts) in topics {
+            put_str(&mut b, name);
+            put_count(&mut b, parts.len());
+            for p in *parts {
+                b.extend_from_slice(&p.to_be_bytes());
+                let records = vec![7u8; 40 + *p as usize];
+                if flexible {
+                    b.extend_from_slice(&[(records.len() + 1) as u8]);
+                } else {
+                    b.extend_from_slice(&(records.len() as i32).to_be_bytes());
+                }
+                b.extend_from_slice(&records);
+                if flexible {
+                    b.extend_from_slice(&[0]);
+                }
+            }
+            if flexible {
+                b.extend_from_slice(&[0]);
+            }
+        }
+        if flexible {
+            b.extend_from_slice(&[0]);
+        }
+        b.freeze()
+    }
+
+    #[test]
+    fn agrees_with_the_full_parser_on_every_layout() {
+        let topics: &[(&str, &[i32])] = &[("orders", &[2, 0]), ("audit", &[5])];
+        for version in [2i16, 3, 8, 9] {
+            let got = produce_request_partitions(version, &mut body(version, topics)).unwrap();
+            let header = RequestHeader {
+                api_key: ApiKey::Produce,
+                api_version: version,
+                correlation_id: 1,
+                client_id: None,
+            };
+            let parsed = ProtocolHandler::new()
+                .parse_produce_request(&header, &mut body(version, topics))
+                .unwrap();
+            let expected: Vec<(String, i32)> = parsed
+                .topics
+                .iter()
+                .flat_map(|t| t.partitions.iter().map(move |p| (t.name.clone(), p.index)))
+                .collect();
+            assert_eq!(got, expected, "v{version}");
+            assert_eq!(
+                got,
+                vec![("orders".into(), 2), ("orders".into(), 0), ("audit".into(), 5)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_body_is_an_error_not_a_partial_list() {
+        let full = body(9, &[("orders", &[1, 2])]);
+        let mut cut = full.slice(..full.len() - 10);
+        assert!(produce_request_partitions(9, &mut cut).is_err());
     }
 }

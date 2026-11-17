@@ -381,6 +381,8 @@ pub struct ConnectionContext {
     tls: bool,
     sasl: Arc<SaslConfig>,
     inner: Mutex<ConnectionInner>,
+    /// Order of this connection's pipelined Produce requests.
+    produce_order: Arc<crate::produce_order::ProduceOrder>,
 }
 
 impl ConnectionContext {
@@ -426,6 +428,7 @@ impl ConnectionContext {
                 auth,
                 warned_unauthenticated: false,
             }),
+            produce_order: crate::produce_order::ProduceOrder::new(),
         }
     }
 
@@ -449,6 +452,23 @@ impl ConnectionContext {
 
     pub fn is_tls(&self) -> bool {
         self.tls
+    }
+
+    /// Queue a Produce request read from this connection, in read order (see
+    /// `produce_order`). `request` is the whole request, header included; a
+    /// body that does not parse queues on no partition (the handler will
+    /// reject it) but still keeps its place for concurrency permits.
+    pub fn issue_produce_ticket(
+        &self,
+        request: &bytes::Bytes,
+    ) -> Arc<crate::produce_order::ProduceTicket> {
+        let mut buf = request.clone();
+        let partitions = chronik_protocol::parser::parse_request_header(&mut buf)
+            .and_then(|header| {
+                chronik_protocol::handler::produce_request_partitions(header.api_version, &mut buf)
+            })
+            .unwrap_or_default();
+        Arc::new(self.produce_order.issue(partitions))
     }
 
     pub async fn auth_state(&self) -> AuthState {

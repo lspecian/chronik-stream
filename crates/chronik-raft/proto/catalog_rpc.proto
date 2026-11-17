@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+// Transport for the cluster catalog's Raft group (RaftDriver).
+package chronik.catalog;
+
+service CatalogRaft {
+  // Raft messages from one peer, in order. Fire-and-forget: raft retries.
+  rpc Send(MessageBatch) returns (SendAck);
+  // A command forwarded to the leader; answered once applied there.
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
+}
+
+message MessageBatch {
+  uint64 from = 1;
+  // Each one an encoded raft eraftpb::Message.
+  repeated bytes messages = 2;
+}
+
+message SendAck {}
+
+message ProposeRequest {
+  bytes data = 1;
+  // data is an encoded ConfChangeV2 rather than a state machine command.
+  bool conf_change = 2;
+}
+
+message ProposeResponse {
+  oneof outcome {
+    Applied applied = 1;
+    // The leader this node knows of; 0 when none.
+    uint64 not_leader = 2;
+    bool dropped = 3;
+    bool outcome_unknown = 4;
+    string stopped = 5;
+  }
+}
+
+message Applied {
+  uint64 index = 1;
+  uint64 term = 2;
+  bytes result = 3;
+}

@@ -14,14 +14,14 @@
 //! Extract 335-line monolithic `run_cluster_mode()` into focused, testable modules.
 
 pub mod config;
-pub mod raft_setup;
+pub mod catalog_setup;
 pub mod server_setup;
 pub mod listener_setup;
 pub mod broker_registration;
 
 // Re-export key types for convenience
 pub use config::ClusterInitConfig;
-pub use raft_setup::{bootstrap_raft_cluster, start_raft_grpc_server};
+pub use catalog_setup::{start_cluster_catalog, start_catalog_grpc_server};
 pub use server_setup::create_integrated_server;
 pub use listener_setup::{start_kafka_listener, start_search_api, start_admin_api, log_listener_status};
-pub use broker_registration::register_brokers_and_assign_partitions;
+pub use broker_registration::register_configured_brokers;
