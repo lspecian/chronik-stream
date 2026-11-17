@@ -4,7 +4,9 @@
 # Usage: run_all.sh <binary> <label>
 # Needs: KAFKA_HOME (a Kafka distribution), LEGACY_BIN (a v2.17.0 binary, for
 # search_after_archive), SETUP_BIN (a v2.16.7 binary, for
-# straddle's setup), kcat and a JDK. Logs go to tests/cluster/data/e2e/<label>/.
+# straddle's setup), kcat and a JDK, and the legacy_index_tool example built
+# (cargo build --release -p chronik-search --example legacy_index_tool).
+# Logs go to tests/cluster/data/e2e/<label>/.
 # Each check starts and stops the local 3-node cluster (tests/cluster/), so
 # nothing else may use it meanwhile.
 set -u
@@ -40,6 +42,7 @@ run produce_order "$E2E/produce_order.sh" "$BIN" "$LABEL"
 run search_after_archive "$E2E/search_after_archive.sh" "$BIN" "$LABEL"
 run search_many_segments "$E2E/search_many_segments.sh" "$BIN" "$LABEL"
 run search_pagination "$E2E/search_pagination.sh" "$BIN" "$LABEL"
+run legacy_index_retirement "$E2E/legacy_index_retirement.sh" "$BIN" "$LABEL"
 run regression_replication ./tests/cluster/regression_replication.sh
 run follower_catchup ./tests/cluster/follower_catchup.sh
 run concurrent_produce_order ./tests/test_concurrent_produce_order.sh

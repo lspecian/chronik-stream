@@ -81,62 +81,102 @@ pub fn legacy_index_dirs(data_dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Measure the old index at `dir` against `archives` (the topic's archived
-/// segments). Fails if `dir` is not an index the RealtimeIndexer wrote.
-pub fn analyze(topic: &str, dir: &Path, archives: &[SegmentMetadata]) -> Result<LegacyIndexReport> {
+/// The records an old index holds: its topic and each partition's offsets.
+#[derive(Debug, Clone)]
+pub struct LegacyIndexContents {
+    pub topic: String,
+    pub dir: PathBuf,
+    pub bytes: u64,
+    offsets: BTreeMap<i32, Vec<i64>>,
+}
+
+/// Read the old index at `dir` (named `dir_name` under `index/`). Two layouts
+/// are left there by earlier versions:
+/// - the RealtimeIndexer's: one index per topic, fast `_partition` and
+///   `_offset`; the directory is named after the topic;
+/// - an early archive written unpacked: fast `_offset`, `_ts`, one partition,
+///   the directory named `<topic>-<partition>` (or a fast `partition` field).
+///
+/// Anything else is an error, and the caller leaves it alone.
+pub fn read_index(dir_name: &str, dir: &Path) -> Result<LegacyIndexContents> {
     let index = tantivy::Index::open_in_dir(dir)
         .map_err(|e| Error::Internal(format!("open {}: {e}", dir.display())))?;
     let schema = index.schema();
-    for name in ["_partition", "_offset", "_timestamp"] {
-        let fast = schema.get_field(name).map(|f| schema.get_field_entry(f).is_fast()).unwrap_or(false);
-        if !fast {
-            return Err(Error::Internal(format!(
-                "{} is not a RealtimeIndexer index (no fast field {name})",
-                dir.display()
-            )));
-        }
+    let fast = |name: &str| schema.get_field(name).map(|f| schema.get_field_entry(f).is_fast()).unwrap_or(false);
+    // Where each document's partition comes from.
+    enum Partition {
+        Field(&'static str),
+        Fixed(i32),
     }
+    let (topic, partition) = if fast("_partition") && fast("_offset") {
+        (dir_name.to_string(), Partition::Field("_partition"))
+    } else if fast("_offset") && schema.get_field("_ts").is_ok() {
+        if fast("partition") {
+            let topic = dir_name.rsplit_once('-').map(|(t, _)| t).unwrap_or(dir_name);
+            (topic.to_string(), Partition::Field("partition"))
+        } else {
+            let (topic, p) = dir_name
+                .rsplit_once('-')
+                .and_then(|(t, p)| p.parse::<i32>().ok().map(|p| (t, p)))
+                .ok_or_else(|| {
+                    Error::Internal(format!("{}: an archive index not named <topic>-<partition>", dir.display()))
+                })?;
+            (topic.to_string(), Partition::Fixed(p))
+        }
+    } else {
+        return Err(Error::Internal(format!("{} is not an index an earlier version left here", dir.display())));
+    };
+
     let reader = index
         .reader_builder()
         .reload_policy(tantivy::ReloadPolicy::Manual)
         .try_into()
         .map_err(|e: tantivy::TantivyError| Error::Internal(format!("reader {}: {e}", dir.display())))?;
     let searcher = reader.searcher();
-
     let mut offsets: BTreeMap<i32, Vec<i64>> = BTreeMap::new();
     for segment in searcher.segment_readers() {
         let ff = segment.fast_fields();
-        let part = ff
-            .i64("_partition")
-            .map_err(|e| Error::Internal(format!("{e}")))?
-            .first_or_default_col(0);
-        let off = ff
-            .i64("_offset")
-            .map_err(|e| Error::Internal(format!("{e}")))?
-            .first_or_default_col(-1);
+        let off = ff.i64("_offset").map_err(|e| Error::Internal(format!("{e}")))?.first_or_default_col(-1);
+        let part = match partition {
+            Partition::Field(name) => {
+                Some(ff.i64(name).map_err(|e| Error::Internal(format!("{e}")))?.first_or_default_col(0))
+            }
+            Partition::Fixed(_) => None,
+        };
         for doc in segment.doc_ids_alive() {
             let o = off.get_val(doc);
-            if o >= 0 {
-                offsets.entry(part.get_val(doc) as i32).or_default().push(o);
+            if o < 0 {
+                continue;
             }
+            let p = match (&part, &partition) {
+                (Some(col), _) => col.get_val(doc) as i32,
+                (None, Partition::Fixed(p)) => *p,
+                (None, Partition::Field(_)) => unreachable!("a field partition has a column"),
+            };
+            offsets.entry(p).or_default().push(o);
         }
     }
-
-    let mut partitions = Vec::new();
-    for (partition, mut offs) in offsets {
+    for offs in offsets.values_mut() {
         offs.sort_unstable();
         offs.dedup();
-        let mut covered = covered_ranges(archives, partition);
-        covered.sort_unstable();
+    }
+    Ok(LegacyIndexContents { topic, dir: dir.to_path_buf(), bytes: dir_bytes(dir), offsets })
+}
+
+/// Measure an old index's records against `archives` (its topic's archived
+/// segments).
+pub fn coverage(contents: &LegacyIndexContents, archives: &[SegmentMetadata]) -> LegacyIndexReport {
+    let mut partitions = Vec::new();
+    for (&partition, offs) in &contents.offsets {
+        let covered = covered_ranges(archives, partition);
         let mut uncovered: Vec<(i64, i64)> = Vec::new();
         let mut uncovered_docs = 0u64;
         let mut ci = 0;
-        for &o in &offs {
+        for &o in offs {
             while ci < covered.len() && covered[ci].1 < o {
                 ci += 1;
             }
-            let is_covered = ci < covered.len() && covered[ci].0 <= o;
-            if !is_covered {
+            if !(ci < covered.len() && covered[ci].0 <= o) {
                 uncovered_docs += 1;
                 match uncovered.last_mut() {
                     Some(last) if last.1 + 1 == o => last.1 = o,
@@ -153,12 +193,17 @@ pub fn analyze(topic: &str, dir: &Path, archives: &[SegmentMetadata]) -> Result<
             uncovered,
         });
     }
-    Ok(LegacyIndexReport {
-        topic: topic.to_string(),
-        dir: dir.to_path_buf(),
-        bytes: dir_bytes(dir),
+    LegacyIndexReport {
+        topic: contents.topic.clone(),
+        dir: contents.dir.clone(),
+        bytes: contents.bytes,
         partitions,
-    })
+    }
+}
+
+/// [`read_index`] then [`coverage`].
+pub fn analyze(dir_name: &str, dir: &Path, archives: &[SegmentMetadata]) -> Result<LegacyIndexReport> {
+    Ok(coverage(&read_index(dir_name, dir)?, archives))
 }
 
 /// The partition's archived offset ranges, merged.
@@ -248,6 +293,33 @@ mod tests {
         assert_eq!(r.live_uncovered_docs(|p| if p == 0 { 50 } else { 5 }), 10 + 5);
 
         assert_eq!(legacy_index_dirs(root.path()), vec![("t".to_string(), dir.clone())]);
+        // An early archive left unpacked under index/<topic>-<partition>: fast
+        // `_offset` and `_ts`, no partition field.
+        let early = root.path().join("index").join("orders.v2-7");
+        std::fs::create_dir_all(&early).unwrap();
+        {
+            let mut b = Schema::builder();
+            let fast = || NumericOptions::default().set_indexed().set_stored().set_fast();
+            let o = b.add_i64_field("_offset", fast());
+            let t = b.add_date_field("_ts", DateOptions::default().set_indexed().set_stored().set_fast());
+            let index = tantivy::Index::create_in_dir(&early, b.build()).unwrap();
+            let mut w: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+            for off in 10..15 {
+                let mut d = tantivy::TantivyDocument::default();
+                d.add_i64(o, off);
+                d.add_date(t, tantivy::DateTime::from_timestamp_millis(0));
+                w.add_document(d).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let contents = read_index("orders.v2-7", &early).unwrap();
+        assert_eq!(contents.topic, "orders.v2", "topic from the directory name");
+        let r = coverage(&contents, &[archive(7, 0, 12)]);
+        assert_eq!(r.partitions.len(), 1);
+        assert_eq!(r.partitions[0].partition, 7);
+        assert_eq!(r.partitions[0].uncovered, vec![(13, 14)]);
+        std::fs::remove_dir_all(&early).unwrap();
+
         // Fully covered once the gaps are archived.
         let full = [archive(0, 0, 99), archive(1, 0, 49)];
         assert_eq!(analyze("t", &dir, &full).unwrap().uncovered_docs(), 0);
