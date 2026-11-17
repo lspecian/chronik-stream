@@ -2804,12 +2804,50 @@ impl FetchHandler {
             }
         }
         
-        tracing::debug!("Combined {} bytes of raw Kafka data from {} segments", 
+        tracing::debug!("Combined {} bytes of raw Kafka data from {} segments",
             combined_bytes.len(), num_segments);
         Ok(combined_bytes)
     }
-    
-    
+
+    /// The record batches this node holds for `topic`/`partition` from
+    /// `from_offset`, up to about `max_bytes`, bounded by the log start and
+    /// the readable end — whether or not this node leads the partition.
+    ///
+    /// For maintenance only (re-archiving records the indexer missed), never
+    /// for clients: clients must be refused by a non-leader (RP-7), but a
+    /// follower's local copy is exactly what a node re-archives from. Empty
+    /// when the offset is outside the log (a deleted topic, an emptied or
+    /// recreated partition, records past retention).
+    pub async fn read_local_range(
+        &self,
+        topic: &str,
+        partition: i32,
+        from_offset: i64,
+        max_bytes: i32,
+    ) -> Result<Vec<u8>> {
+        let high_watermark = self.readable_end_offset(topic, partition, from_offset, -1).await?;
+        let log_start_offset = self.get_log_start_offset_for_fetch(topic, partition).await;
+        if from_offset < log_start_offset.max(0) || from_offset >= high_watermark {
+            return Ok(Vec::new());
+        }
+        let served = self
+            .fetch_data_available_path(
+                topic,
+                partition,
+                from_offset,
+                high_watermark,
+                log_start_offset,
+                max_bytes,
+                0,
+                Instant::now(),
+            )
+            .await?;
+        if served.error_code != 0 {
+            return Ok(Vec::new());
+        }
+        Ok(served.records)
+    }
+
     /// ListOffsets by timestamp: the earliest offset whose record timestamp is
     /// at or after `target_ms`, with that record's timestamp, or `None` when no
     /// record is that recent (Kafka answers offset -1).

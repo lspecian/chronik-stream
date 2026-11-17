@@ -13,6 +13,23 @@ failed on thunderbird: paging 500 `match_all` hits of `amazon-grocery` 50 at a
 time reached 195 distinct records, 82 of them on two pages.
 
 ### Added
+- **Old indexes in `{data_dir}/index` are retired.** The RealtimeIndexer
+  (removed in 08b1c58) and an early archiver left frozen indexes there that
+  searches still read (thunderbird: 26 / 87 / 92 per node). Measured against
+  the archives of all three nodes, what they held that no archive did was
+  records of deleted topics (`json-columns-test`, 15,354), of a partition
+  since emptied, and offset 0 of early topics, which the archiver of the time
+  skipped. Two minutes after boot each old index is measured against the
+  node's archives; offsets the log still holds below the highest archived
+  offset are re-read from the node's own copy of the log (a maintenance read,
+  `FetchHandler::read_local_range`, whatever the leader) and archived exactly
+  as the WalIndexer does (`WalIndexer::archive_batches`); records the log no
+  longer has are dropped; then the old index is deleted. An index is kept, and
+  retried next boot, while a re-archive fails or the indexer has not yet
+  reached records it holds. `CHRONIK_LEGACY_INDEX_RETIREMENT=false` leaves
+  them alone. `legacy_index_tool report <data_dir>` (a chronik-search example)
+  measures a node's old indexes read-only. Thunderbird node 1's 25 indexes
+  (460 MB, 1.0M records) planted in a local cluster were retired in 6 s.
 - **Term filters: word searches skip archives that cannot match.** Every
   archived index segment now has a Bloom filter of its text and JSON terms
   beside it (`<archive>.terms`, ~10 bits a term, 1% false positives). A search

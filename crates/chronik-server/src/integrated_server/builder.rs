@@ -1627,6 +1627,18 @@ impl IntegratedKafkaServerBuilder {
         info!("WAL Indexer started successfully (interval: {}s)", self.config.wal_indexing_interval_secs);
         info!("  Segment index will track Tantivy segments for future query optimization");
 
+        // Retire the indexes the removed RealtimeIndexer left in
+        // {data_dir}/index: re-archive what the log still holds that no archive
+        // covers, then delete them (once, shortly after boot).
+        #[cfg(feature = "search")]
+        if let Some(fetch_handler) = self.fetch_handler.clone() {
+            crate::legacy_index_retirement::spawn(
+                std::path::PathBuf::from(&self.config.data_dir),
+                wal_indexer.clone(),
+                fetch_handler,
+            );
+        }
+
         self.wal_indexer = Some(wal_indexer);
 
         info!("✅ WAL Indexer initialized");
