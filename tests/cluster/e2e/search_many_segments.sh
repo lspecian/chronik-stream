@@ -14,7 +14,7 @@
 #   - match_all across every topic answers with a full page;
 #   - a term in one record of one topic is found by a search naming no topic;
 #   - the cache lives in each node's data dir and stays within
-#     CHRONIK_SEARCH_CACHE_BYTES; local plain-tar archives (v2.17.4+) are
+#     CHRONIK_SEARCH_CACHE_BYTES; local plain-tar archives (v2.18.0+) are
 #     searched in place, so nothing is copied into it.
 #
 # Usage: search_many_segments.sh <binary> <label>
@@ -122,7 +122,7 @@ for node in 1 2 3; do
     sz=$(du -sb "$d" | cut -f1)
     # One segment may be in use past the budget while the next is unpacked.
     expect "node$node cache within budget" "$([ "$sz" -le $((BUDGET * 2)) ] && echo within || echo "$sz bytes")" "within"
-    # Archives are plain tars on local disk (v2.17.4+): searched in place,
+    # Archives are plain tars on local disk (v2.18.0+): searched in place,
     # nothing unpacked or copied into the cache.
     copies=$(find "$d" -mindepth 1 -maxdepth 1 -type d ! -name '.evicted-*' | wc -l)
     expect "node$node archives searched in place, no copies" "$copies" "0"

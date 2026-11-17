@@ -150,7 +150,7 @@ fi
 # directory is still changing and the archive is either absent or short. Reading
 # it back proves it is complete, without depending on the cold-search read path
 # (a separate pipeline with its own history).
-# This topic's archive specifically (.tar since v2.17.4, .tar.gz before). Falling back to "any recent archive" would
+# This topic's archive specifically (.tar since v2.18.0, .tar.gz before). Falling back to "any recent archive" would
 # let another topic's healthy archive vouch for this one, which is how the
 # original report came to look topic-specific in the first place.
 # The topic is a directory in the object key (…/tantivy_indexes/<topic>/partition-N/segment-a-b.tar.gz),
