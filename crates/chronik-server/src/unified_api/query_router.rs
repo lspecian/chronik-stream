@@ -3734,9 +3734,11 @@ pub fn merge_search_responses(
     let mut shards_failed = local._shards.failed;
     // One node stopping at its time limit makes the whole answer partial.
     let mut timed_out = local.timed_out;
+    let mut segments = local._segments;
 
     for peer_resp in peers {
         timed_out |= peer_resp.timed_out;
+        segments = chronik_search::api::SegmentStats::add(segments, peer_resp._segments);
         shards_total += peer_resp._shards.total;
         shards_successful += peer_resp._shards.successful;
         shards_failed += peer_resp._shards.failed;
@@ -3776,6 +3778,7 @@ pub fn merge_search_responses(
             hits: all_hits,
         },
         aggregations: local.aggregations,
+        _segments: segments,
     }
 }
 
@@ -4681,6 +4684,7 @@ mod fan_out_completeness_tests {
                     hits: Vec::new(),
                 },
                 aggregations: None,
+                _segments: None,
             }
         }
 
@@ -4730,6 +4734,7 @@ mod fan_out_completeness_tests {
                     hits,
                 },
                 aggregations: None,
+                _segments: None,
             }
         }
 

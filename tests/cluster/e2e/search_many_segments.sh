@@ -93,6 +93,24 @@ expect "from the right topic and offset" \
   "$(grep -o "\"_index\":\"[^\"]*\"\|\"offset\":[0-9]*" <<<"$body" | sort -u | paste -sd' ' -)" \
   "\"_index\":\"$P-17\" \"offset\":122"
 
+echo "term filters:"
+# segs <body> -> "<total> <searched> <skipped>" summed over the nodes
+segs() { grep -o '"_segments":{[^}]*}' <<<"$1" | grep -o '[0-9]\+' | paste -sd' ' -; }
+read -r tot opened skipped <<<"$(segs "$body")"
+echo "  (word in 1 of $TOPICS topics: $tot archives, $opened opened, $skipped skipped)"
+# Each node holds one archive per topic. Only the topic holding the word needs
+# opening (3 archives, one per node); a 1% false-positive rate may add one.
+expect "archives without the word are skipped" "$([ "${skipped:-0}" -ge $((tot - 6)) ] && [ "${tot:-0}" -ge $((TOPICS * 3)) ] && echo yes || echo "no: $tot/$opened/$skipped")" "yes"
+body=$(curl -s -m 60 -X POST localhost:6092/_search -H 'Content-Type: application/json' \
+  -d '{"query":{"match":{"marker":"zzzunmatchedzzz"}},"size":10}')
+read -r tot opened skipped <<<"$(segs "$body")"
+echo "  (word in no topic: $tot archives, $opened opened, $skipped skipped)"
+expect "a word in no archive opens (almost) none" "$([ "${opened:-99}" -le 3 ] && echo yes || echo "no: opened $opened")" "yes"
+# must: both words have to be in one archive; they are in different topics.
+body=$(curl -s -m 60 -X POST localhost:6092/_search -H 'Content-Type: application/json' \
+  -d '{"query":{"bool":{"must":[{"match":{"marker":"zephyrquandary"}},{"match":{"marker":"zzzunmatchedzzz"}}]}},"size":10}')
+expect "bool must with an absent word: no hits" "$(grep -o '"total":{"value":[0-9]*' <<<"$body" | grep -o '[0-9]*$')" "0"
+
 echo "cache:"
 for node in 1 2 3; do
   d=$C/data/node$node/search-cache

@@ -12,6 +12,24 @@ the removed RealtimeIndexer. v2.17.3's pagination fix passed its tests but
 failed on thunderbird: paging 500 `match_all` hits of `amazon-grocery` 50 at a
 time reached 195 distinct records, 82 of them on two pages.
 
+### Added
+- **Term filters: word searches skip archives that cannot match.** Every
+  archived index segment now has a Bloom filter of its text and JSON terms
+  beside it (`<archive>.terms`, ~10 bits a term, 1% false positives). A search
+  reduces its query to the terms a hit must contain — keeping `bool`
+  structure: every `must`/`filter`, one `should` — and opens an archive only
+  when its filter says those terms may be present. A filter never hides a
+  real hit; queries it cannot judge (`match_all`, ranges, stop-word-only) open
+  every archive as before. Archives written by earlier versions get their
+  filter the first time a search opens them. Thunderbird holds 6,000–13,000
+  archives a node and a word search across all topics opened all of them,
+  hitting the 10 s limit every time. The response carries `_segments`
+  (`total`, `searched`, `skipped`, summed over nodes).
+  `CHRONIK_SEARCH_TERM_FILTERS=false` turns it off;
+  `CHRONIK_SEARCH_TERM_FILTER_BYTES` (256MB) bounds the filters kept in memory.
+  Filters are deleted with their archives (truncation, topic delete,
+  compaction).
+
 ### Fixed
 - **Topics with a leftover `{data_dir}/index/{topic}` were served from it.**
   The RealtimeIndexer was removed in 08b1c58 on the belief that nothing read

@@ -303,6 +303,36 @@ pub struct SearchResponse {
     pub hits: HitsInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregations: Option<serde_json::Value>,
+    /// How many archived segments could hold a hit, how many were searched,
+    /// and how many were skipped by their term filter (Chronik-specific;
+    /// Elasticsearch clients ignore it). Summed across nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub _segments: Option<SegmentStats>,
+}
+
+/// See [`SearchResponse::_segments`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SegmentStats {
+    pub total: u64,
+    pub searched: u64,
+    pub skipped: u64,
+}
+
+impl SegmentStats {
+    /// The sum of two nodes' stats; `None` when neither has any.
+    pub fn add(a: Option<SegmentStats>, b: Option<SegmentStats>) -> Option<SegmentStats> {
+        match (a, b) {
+            (None, None) => None,
+            (a, b) => {
+                let (a, b) = (a.unwrap_or_default(), b.unwrap_or_default());
+                Some(SegmentStats {
+                    total: a.total + b.total,
+                    searched: a.searched + b.searched,
+                    skipped: a.skipped + b.skipped,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

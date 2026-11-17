@@ -119,5 +119,13 @@ sleep 20
 expect "legacy archive, field match (full-text fallback)" "$(search $L "$M")" "200 2 eq 41,42"
 expect "legacy archive, value match" "$(search $L "$V")" "200 2 eq 41,42"
 
+# Archives written before term filters existed have none: the searches above
+# opened them, which builds one for each; from now on a word they do not hold
+# skips them.
+sleep 5
+skipped=$(curl -s -m 30 -X POST "localhost:6092/$L/_search" -H 'Content-Type: application/json' \
+  -d "{\"query\":$NONE,\"size\":50}" | grep -o '"_segments":{[^}]*}' | grep -o '"skipped":[0-9]*' | cut -d: -f2)
+expect "old archives gained a term filter and are skipped" "$([ "${skipped:-0}" -ge 3 ] && echo yes || echo "skipped=${skipped:-none}")" "yes"
+
 $C/stop.sh >/dev/null 2>&1
 if [ $fail = 0 ]; then echo "RESULT $LABEL: PASS"; else echo "RESULT $LABEL: FAIL"; exit 1; fi

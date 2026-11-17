@@ -330,6 +330,7 @@ pub async fn search_all(
     // does), read that topic's segments; otherwise fan across all topics in the
     // segment index.
     let mut timed_out = false;
+    let mut _segments = None;
     if let Some(wal_indexer) = api.wal_indexer() {
         let index = wal_indexer.segment_index();
         let segments = match request.index {
@@ -340,6 +341,7 @@ pub async fn search_all(
             Ok(segments) => {
                 let cold = search_cold_segments(&api, segments, &request, deadline).await;
                 timed_out = cold.timed_out;
+                _segments = Some(cold.stats());
                 all_hits.extend(cold.hits);
             }
             Err(e) => debug!("segment lookup for the cold search failed: {}", e),
@@ -384,6 +386,7 @@ pub async fn search_all(
             hits: all_hits,
         },
         aggregations: None,
+        _segments,
     };
 
     // Cache the response — skip when hot path active (would cache stale NRT
@@ -480,6 +483,7 @@ pub async fn search_index(
     // the topic from that stale copy. Records found in both are deduplicated
     // when the page is cut (`crate::ranking::page`).
     let mut timed_out = false;
+    let mut _segments = None;
     if let Some(wal_indexer) = api.wal_indexer() {
         match wal_indexer.segment_index().get_segments_for_topic(&index).await {
             Ok(segments) => {
@@ -492,6 +496,7 @@ pub async fn search_index(
                     have_any_cold_source = true;
                 }
                 timed_out = cold.timed_out;
+                _segments = Some(cold.stats());
                 cold_hits.extend(cold.hits);
             }
             Err(e) => debug!(topic = %index, "segment lookup for the cold search failed: {}", e),
@@ -535,6 +540,7 @@ pub async fn search_index(
             hits,
         },
         aggregations,
+        _segments,
     };
     
     Ok(Json(response))
@@ -656,14 +662,28 @@ async fn search_cold_segments(
     let newest: Vec<i64> = segments.iter().map(|s| s.max_timestamp).collect();
     let unranked = is_unranked(request);
     let store = wal_indexer.object_store();
+    // The terms a hit must contain, to skip archives whose term filter proves
+    // they hold none (crate::prefilter). `None` when no filter could ever rule
+    // an archive out for this query, so none is consulted.
+    let requirement = crate::prefilter::Requirement::of(request.query.as_ref());
+    let requirement = (term_filters_enabled() && requirement.can_skip()).then(|| Arc::new(requirement));
     let request = Arc::new(request.clone());
 
     // Results come back in segment order (`buffered`, not `buffer_unordered`),
     // so "the segments searched so far" is always a prefix of the newest-first
-    // list — which is what makes the early stop below exact.
+    // list — which is what makes the early stop below exact. `Ok(None)` is a
+    // segment its term filter ruled out.
     let mut searches = stream::iter(segments.into_iter().map(|seg| {
-        let (cache, store, request) = (cache.clone(), store.clone(), request.clone());
+        let (cache, store, request, requirement) =
+            (cache.clone(), store.clone(), request.clone(), requirement.clone());
         async move {
+            if let Some(req) = requirement {
+                if let Some(filter) = cache.term_filter(store.as_ref(), &seg.object_store_path).await {
+                    if !req.may_match(&filter) {
+                        return Ok(None);
+                    }
+                }
+            }
             let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
                 Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
             })?;
@@ -673,7 +693,7 @@ async fn search_cold_segments(
                 for h in &mut hits {
                     h._index = seg.topic.clone();
                 }
-                Ok::<_, Error>(hits)
+                Ok::<_, Error>(Some(hits))
             })
             .await
             .map_err(|e| Error::Internal(format!("segment search task failed: {}", e)))?
@@ -690,7 +710,8 @@ async fn search_cold_segments(
             Ok(None) => break,
             Ok(Some(result)) => {
                 match result {
-                    Ok(mut hits) => out.hits.append(&mut hits),
+                    Ok(Some(mut hits)) => out.hits.append(&mut hits),
+                    Ok(None) => out.skipped += 1,
                     Err(e) => debug!("cold segment skipped: {}", e),
                 }
                 out.searched += 1;
@@ -746,10 +767,34 @@ struct ColdSearch {
     hits: Vec<Hit>,
     /// Archived segments that could hold a match.
     segments: usize,
-    /// Of those, how many were searched.
+    /// Of those, how many were dealt with (opened, or skipped by filter).
     searched: usize,
+    /// Of those, how many their term filter ruled out without opening.
+    skipped: usize,
     /// The time limit stopped the search before every segment was searched.
     timed_out: bool,
+}
+
+impl ColdSearch {
+    fn stats(&self) -> crate::api::SegmentStats {
+        crate::api::SegmentStats {
+            total: self.segments as u64,
+            searched: (self.searched - self.skipped) as u64,
+            skipped: self.skipped as u64,
+        }
+    }
+}
+
+/// Whether archives' term filters are consulted (`CHRONIK_SEARCH_TERM_FILTERS`,
+/// default on; `false` opens every archive, as before v2.17.4).
+fn term_filters_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("CHRONIK_SEARCH_TERM_FILTERS").ok().as_deref().map(str::trim),
+            Some("false" | "0" | "off" | "no")
+        )
+    })
 }
 
 /// "eq" when `found` is every match there is; "gte" when it is a lower bound:

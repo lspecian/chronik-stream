@@ -166,6 +166,7 @@ fn empty_search_response() -> chronik_search::api::SearchResponse {
             hits: Vec::new(),
         },
         aggregations: None,
+        _segments: None,
     }
 }
 

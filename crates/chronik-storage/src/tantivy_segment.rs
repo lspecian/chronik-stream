@@ -352,6 +352,19 @@ impl TantivySegmentWriter {
 
         Self::write_tar_gz(&output_path, &index_dir, &metadata_path)?;
 
+        // The archive's term filter, beside it (`<archive>.terms`), so a search
+        // can skip this archive without opening it. Optional: an archive
+        // without one is simply always opened.
+        match crate::term_filter::TermFilter::build(&disk_index) {
+            Ok(filter) => {
+                let path = PathBuf::from(crate::term_filter::term_filter_key(&output_path.to_string_lossy()));
+                if let Err(e) = fs::write(&path, filter.to_bytes()) {
+                    tracing::warn!("could not write the term filter {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => tracing::warn!("could not build the term filter for {}: {}", output_path.display(), e),
+        }
+
         Ok((output_path, self.metadata))
     }
 
@@ -1214,6 +1227,28 @@ mod tests {
         let reader = TantivySegmentReader::from_tar_gz(&tar_gz_path).unwrap();
         let index = reader.index();
         let json = index.schema().get_field(crate::json_index::JSON_FIELD).unwrap();
+
+        // Archiving also wrote the term filter beside the archive, and it knows
+        // the marker word under its JSON path — as the analyzed term the
+        // archive's dictionary holds — and not a word that is absent.
+        let filter_bytes = std::fs::read(crate::term_filter::term_filter_key(&tar_gz_path.to_string_lossy()))
+            .expect("term filter written beside the archive");
+        let filter = crate::term_filter::TermFilter::from_bytes(&filter_bytes).expect("intact filter");
+        let analyzed = |word: &str| {
+            let mut a = crate::text_analysis::build_analyzer();
+            let mut s = a.token_stream(word);
+            let mut out = String::new();
+            while s.advance() {
+                out = s.token().text.clone();
+            }
+            out
+        };
+        let mut term = tantivy::Term::from_field_json_path(json, "marker", true);
+        term.append_type_and_str(&analyzed("quixoticbellwether"));
+        assert!(filter.may_contain(json.field_id(), term.serialized_value_bytes()));
+        let mut absent = tantivy::Term::from_field_json_path(json, "marker", true);
+        absent.append_type_and_str(&analyzed("zzzneverwrittenzzz"));
+        assert!(!filter.may_contain(json.field_id(), absent.serialized_value_bytes()));
         // from_tar_gz unpacks into a temp dir it has already removed; its own
         // open reader still works, a new one cannot take the lock.
         let searcher = reader.reader.searcher();
