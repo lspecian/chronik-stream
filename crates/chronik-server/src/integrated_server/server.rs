@@ -472,37 +472,66 @@ impl IntegratedKafkaServer {
     ///
     /// Fix: the read loop enqueues one `oneshot::Receiver` per request *in read
     /// order*; this task drains the queue FIFO, awaiting each slot before the
-    /// next, so completion order never leaks onto the wire. `None` = write
-    /// nothing for that slot (reserved for acks=0 suppression / throttle /
-    /// close). Generic over the writer so plaintext and TLS share one impl.
+    /// next, so completion order never leaks onto the wire. See [`ResponseSlot`]
+    /// for what a slot can hold. Generic over the
+    /// writer so plaintext and TLS share one impl.
     fn spawn_ordered_writer<W>(
         writer: Arc<tokio::sync::Mutex<W>>,
         addr: std::net::SocketAddr,
-    ) -> tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>>
+    ) -> tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<ResponseSlot>>
     where
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         use tokio::io::AsyncWriteExt;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
-            tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
+            tokio::sync::oneshot::Receiver<ResponseSlot>,
         >();
         tokio::spawn(async move {
             while let Some(slot) = rx.recv().await {
                 match slot.await {
-                    Ok(Some(bytes)) => {
+                    Ok(ResponseSlot::Write(bytes)) => {
                         let mut w = writer.lock().await;
                         if let Err(e) = w.write_all(&bytes).await {
                             debug!("ordered write to {} failed (peer gone?): {}", addr, e);
                             break;
                         }
                     }
+                    Ok(ResponseSlot::Close) => {
+                        let _ = writer.lock().await.shutdown().await;
+                        break;
+                    }
                     // handler chose to send nothing, or was dropped without responding
-                    Ok(None) | Err(_) => {}
+                    Ok(ResponseSlot::Nothing) | Err(_) => {}
                 }
             }
             debug!("ordered writer for {} stopped", addr);
         });
         tx
+    }
+
+    /// What to put in a request's response slot. `answered` is false for an
+    /// acks=0 produce (see [`ConnectionContext::produce_expects_response`]): it
+    /// gets nothing on success, and the connection is closed on an error, as
+    /// Kafka does, so the client reconnects and refreshes its metadata.
+    async fn response_slot(
+        result: chronik_common::Result<chronik_protocol::handler::Response>,
+        answered: bool,
+        error_handler: &Arc<ErrorHandler>,
+        correlation_id: i32,
+        request_data: &[u8],
+        addr: std::net::SocketAddr,
+    ) -> ResponseSlot {
+        match result {
+            Ok(_) if !answered => ResponseSlot::Nothing,
+            Ok(response) => ResponseSlot::Write(Self::encode_response(response)),
+            Err(e) if !answered => {
+                debug!("acks=0 produce from {} failed, closing the connection: {}", addr, e);
+                ResponseSlot::Close
+            }
+            Err(e) => Self::build_error_bytes(e, error_handler, correlation_id, request_data, addr)
+                .await
+                .map_or(ResponseSlot::Nothing, ResponseSlot::Write),
+        }
     }
 
     /// Handle request processing errors with recovery strategies
@@ -658,12 +687,13 @@ impl IntegratedKafkaServer {
                             // A Produce takes its place in the connection's write order here,
                             // on the read loop, so places follow read order (see produce_order).
                             let produce_ticket = (api_key == 0).then(|| conn_ctx.issue_produce_ticket(&request_data));
+                            let answered = api_key != 0 || ConnectionContext::produce_expects_response(&request_data);
 
                             // Reserve this request's response slot IN READ ORDER
                             // before spawning the handler; the ordered writer
                             // drains slots FIFO, so completion order never leaks
                             // onto the wire.
-                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<ResponseSlot>();
                             if resp_order_tx.send(resp_rx).is_err() {
                                 break; // ordered writer task gone → connection dead
                             }
@@ -693,7 +723,7 @@ impl IntegratedKafkaServer {
                                     Ok(p) => p,
                                     Err(_) => {
                                         error!("Failed to acquire semaphore for request");
-                                        let _ = resp_tx.send(None);
+                                        let _ = resp_tx.send(ResponseSlot::Nothing);
                                         return;
                                     }
                                 };
@@ -704,20 +734,18 @@ impl IntegratedKafkaServer {
                                 // Handle request; produce response bytes (or None).
                                 // Encoding runs here (concurrent); only the WRITE
                                 // is ordered, via resp_tx → ordered writer.
-                                let bytes = match handler_clone
+                                let result = handler_clone
                                     .handle_request_with_context(&conn_ctx_clone, &request_data, produce_ticket)
-                                    .await
-                                {
-                                    Ok(response) => Some(Self::encode_response(response)),
-                                    Err(e) => Self::build_error_bytes(
-                                        e,
-                                        &error_handler_clone,
-                                        correlation_id,
-                                        &request_data,
-                                        addr_clone,
-                                    ).await,
-                                };
-                                let _ = resp_tx.send(bytes);
+                                    .await;
+                                let slot = Self::response_slot(
+                                    result,
+                                    answered,
+                                    &error_handler_clone,
+                                    correlation_id,
+                                    &request_data,
+                                    addr_clone,
+                                ).await;
+                                let _ = resp_tx.send(slot);
                             });  // End of spawned handler task
                         }
 
@@ -824,8 +852,9 @@ impl IntegratedKafkaServer {
                             // A Produce takes its place in the connection's write order here,
                             // on the read loop, so places follow read order (see produce_order).
                             let produce_ticket = (api_key == 0).then(|| conn_ctx.issue_produce_ticket(&request_data));
+                            let answered = api_key != 0 || ConnectionContext::produce_expects_response(&request_data);
 
-                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<ResponseSlot>();
                             if resp_order_tx.send(resp_rx).is_err() {
                                 break; // ordered writer task gone → connection dead
                             }
@@ -853,7 +882,7 @@ impl IntegratedKafkaServer {
                                     Ok(p) => p,
                                     Err(_) => {
                                         error!("Failed to acquire semaphore for request");
-                                        let _ = resp_tx.send(None);
+                                        let _ = resp_tx.send(ResponseSlot::Nothing);
                                         return;
                                     }
                                 };
@@ -861,20 +890,18 @@ impl IntegratedKafkaServer {
                                     ticket.permit_held();
                                 }
 
-                                let bytes = match handler_clone
+                                let result = handler_clone
                                     .handle_request_with_context(&conn_ctx_clone, &request_data, produce_ticket)
-                                    .await
-                                {
-                                    Ok(response) => Some(Self::encode_response(response)),
-                                    Err(e) => Self::build_error_bytes(
-                                        e,
-                                        &error_handler_clone,
-                                        correlation_id,
-                                        &request_data,
-                                        addr_clone,
-                                    ).await,
-                                };
-                                let _ = resp_tx.send(bytes);
+                                    .await;
+                                let slot = Self::response_slot(
+                                    result,
+                                    answered,
+                                    &error_handler_clone,
+                                    correlation_id,
+                                    &request_data,
+                                    addr_clone,
+                                ).await;
+                                let _ = resp_tx.send(slot);
                             });
                         }
 
@@ -1113,10 +1140,64 @@ pub struct ServerStats {
     pub advertised_address: String,
 }
 
+/// What the per-connection ordered writer does with one request's slot.
+enum ResponseSlot {
+    /// Write these bytes (a framed response).
+    Write(Vec<u8>),
+    /// Write nothing: an acks=0 produce, a throttled or dropped request.
+    Nothing,
+    /// Close the connection: an acks=0 produce that failed, which has no
+    /// response to carry the error.
+    Close,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::integrated_server::IntegratedKafkaServerBuilder;
+
+    fn produce_response(correlation_id: i32) -> chronik_protocol::handler::Response {
+        chronik_protocol::handler::Response {
+            header: chronik_protocol::parser::ResponseHeader { correlation_id },
+            body: bytes::Bytes::from_static(b"body"),
+            is_flexible: false,
+            api_key: chronik_protocol::parser::ApiKey::Produce,
+            throttle_time_ms: None,
+        }
+    }
+
+    /// acks=0 (#66): nothing is written for a produce that succeeded, the
+    /// connection closes after one that failed, and every slot before it is
+    /// still written in order.
+    #[tokio::test]
+    async fn unanswered_produce_writes_nothing_and_a_failed_one_closes() {
+        use tokio::io::AsyncReadExt;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9092));
+        let handler = Arc::new(ErrorHandler::new());
+        let (server_end, mut client_end) = tokio::io::duplex(4096);
+        let writer = IntegratedKafkaServer::spawn_ordered_writer(Arc::new(tokio::sync::Mutex::new(server_end)), addr);
+        let failed = || Err(chronik_common::Error::Protocol("partition error".into()));
+        let slots = [
+            IntegratedKafkaServer::response_slot(Ok(produce_response(1)), true, &handler, 1, &[], addr).await,
+            IntegratedKafkaServer::response_slot(Ok(produce_response(2)), false, &handler, 2, &[], addr).await,
+            IntegratedKafkaServer::response_slot(Ok(produce_response(3)), true, &handler, 3, &[], addr).await,
+            IntegratedKafkaServer::response_slot(failed(), false, &handler, 4, &[], addr).await,
+            IntegratedKafkaServer::response_slot(Ok(produce_response(5)), true, &handler, 5, &[], addr).await,
+        ];
+        for slot in slots {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = writer.send(rx);
+            let _ = tx.send(slot);
+        }
+        let mut wire = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client_end.read_to_end(&mut wire))
+            .await
+            .expect("the connection closes")
+            .unwrap();
+        let mut expected = IntegratedKafkaServer::encode_response(produce_response(1));
+        expected.extend(IntegratedKafkaServer::encode_response(produce_response(3)));
+        assert_eq!(wire, expected, "responses 1 and 3 only, then the close");
+    }
     
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_server_creation() {

@@ -6464,6 +6464,25 @@ impl Default for ProtocolHandler {
     }
 }
 
+/// The `acks` of a Produce request body, read without touching the records.
+///
+/// `acks = 0` asks the broker to send no response at all; the connection
+/// handler reads this as it reads the request, so the response slot can be
+/// left empty (see `spawn_ordered_writer` in chronik-server).
+pub fn produce_request_acks(api_version: i16, body: &Bytes) -> Result<i16> {
+    use crate::parser::Decoder;
+    let mut body = body.clone();
+    let mut decoder = Decoder::new(&mut body);
+    if api_version >= 3 {
+        if api_version >= 9 {
+            decoder.read_compact_string()?;
+        } else {
+            decoder.read_string()?;
+        }
+    }
+    decoder.read_i16()
+}
+
 /// The (topic, partition) pairs a Produce request body writes to, in request
 /// order, without copying any record data.
 ///
@@ -6617,5 +6636,28 @@ mod produce_partitions_tests {
         let full = body(9, &[("orders", &[1, 2])]);
         let mut cut = full.slice(..full.len() - 10);
         assert!(produce_request_partitions(9, &mut cut).is_err());
+    }
+
+    #[test]
+    fn acks_agree_with_the_full_parser_on_every_layout() {
+        for version in [0i16, 2, 3, 8, 9] {
+            for acks in [0i16, 1, -1] {
+                let mut b = BytesMut::from(&body(version, &[("orders", &[0])])[..]);
+                // acks follows the transactional id ("txn") in v3+.
+                let at = if version >= 9 { 4 } else if version >= 3 { 5 } else { 0 };
+                b[at..at + 2].copy_from_slice(&acks.to_be_bytes());
+                let b = b.freeze();
+                assert_eq!(produce_request_acks(version, &b).unwrap(), acks, "v{version}");
+                let header = RequestHeader {
+                    api_key: ApiKey::Produce,
+                    api_version: version,
+                    correlation_id: 1,
+                    client_id: None,
+                };
+                let parsed = ProtocolHandler::new().parse_produce_request(&header, &mut b.clone()).unwrap();
+                assert_eq!(parsed.acks, acks, "v{version}");
+            }
+        }
+        assert!(produce_request_acks(9, &Bytes::from_static(&[4, b't'])).is_err());
     }
 }

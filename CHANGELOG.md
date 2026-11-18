@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **acks=0 produces were answered** (#66). A Kafka broker writes nothing back
+  for acks=0, and the Java client completes such a request as soon as it is
+  sent, so each response Chronik wrote arrived with no request waiting for it:
+  the client logged `IllegalStateException: There are no in-flight requests`,
+  dropped the connection and reconnected — 954 times in 200,000 records, at a
+  quarter of the throughput (118K vs 446K records/s on one node). Records in
+  flight when a connection dropped were lost without an error. An acks=0
+  produce now gets no response, and one that fails closes the connection, as
+  Kafka does, so the client refreshes its metadata. A produce another broker
+  forwarded is still answered. `tests/cluster/e2e/acks0_no_response.sh` fails
+  on v2.18.1 and passes now.
+
 ## [2.18.1] - 2026-11-18
 
 What v2.18.0 left undone on a real cluster, found by measuring it on
