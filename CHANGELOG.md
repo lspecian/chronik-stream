@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Kafka does, so the client refreshes its metadata. A produce another broker
   forwarded is still answered. `tests/cluster/e2e/acks0_no_response.sh` fails
   on v2.18.1 and passes now.
+- **The SQL hot buffer kept the oldest unflushed records** (#68). It read
+  `CHRONIK_HOT_BUFFER_MAX_RECORDS` forward from the Parquet flush point, so on a
+  partition further behind its flush than the limit, the newest records were
+  in neither the hot buffer nor Parquet: 100,000 fresh records with a 10,000
+  limit gave `/_sql` offsets 0–9,999. It now holds the newest. (The issue also
+  said the limit counted produce batches; the WAL read has counted messages
+  since v2.16.4.) `tests/cluster/e2e/hot_buffer_limit.sh` fails on v2.18.1 and
+  passes now.
 
 ## [2.18.1] - 2026-11-18
 
