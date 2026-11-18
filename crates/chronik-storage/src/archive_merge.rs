@@ -106,15 +106,20 @@ pub fn plan(mut archives: Vec<SegmentMetadata>, policy: &MergePolicy) -> Vec<Vec
 pub async fn sweep_orphans(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentIndex>, min_age: Duration) -> usize {
     use std::collections::{BTreeMap, HashSet};
     let norm = |k: &str| k.trim_start_matches('/').to_string();
-    let mut dirs: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    // Per archive directory (one partition): the referenced keys and the
+    // offset ranges they cover.
+    let mut dirs: BTreeMap<String, (HashSet<String>, Vec<(i64, i64)>)> = BTreeMap::new();
     for s in index.get_all_segments().await.unwrap_or_default() {
         if let Some((dir, _)) = s.object_store_path.rsplit_once('/') {
-            dirs.entry(format!("{dir}/")).or_default().insert(norm(&s.object_store_path));
+            let entry = dirs.entry(format!("{dir}/")).or_default();
+            entry.0.insert(norm(&s.object_store_path));
+            entry.1.push((s.min_offset, s.max_offset));
         }
     }
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let mut swept = 0;
-    for (dir, referenced) in dirs {
+    let (mut swept, mut kept) = (0usize, 0usize);
+    for (dir, (referenced, ranges)) in dirs {
+        let covered = merge_ranges(ranges);
         let Ok(objects) = store.list(&dir).await else { continue };
         for o in objects {
             let archive = o.key.strip_suffix(crate::term_filter::TERM_FILTER_SUFFIX).unwrap_or(&o.key);
@@ -126,15 +131,140 @@ pub async fn sweep_orphans(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentInde
             if now_ms.saturating_sub(o.last_modified) < min_age.as_millis() as u64 {
                 continue;
             }
+            // Only a file whose every offset a registered archive holds: an
+            // unreferenced archive with offsets nothing else covers may be the
+            // only copy of those records, and is kept.
+            let redundant = file_range(file).is_some_and(|(lo, hi)| {
+                covered.iter().any(|&(clo, chi)| clo <= lo && hi <= chi)
+            });
+            if !redundant {
+                kept += 1;
+                continue;
+            }
             if store.delete(&o.key).await.is_ok() {
                 swept += 1;
             }
         }
     }
-    if swept > 0 {
-        info!(files = swept, "swept archive files no catalogue entry references");
+    if swept > 0 || kept > 0 {
+        info!(
+            swept,
+            kept_uncovered = kept,
+            "swept archive files no catalogue entry references (kept those holding offsets no registered archive covers)"
+        );
     }
     swept
+}
+
+/// The offsets an archive's file name says it holds: `segment-<min>-<max>.tar[.gz]`.
+fn file_range(file: &str) -> Option<(i64, i64)> {
+    let stem = file.strip_prefix("segment-")?;
+    let stem = stem.strip_suffix(".tar.gz").or_else(|| stem.strip_suffix(".tar"))?;
+    let (lo, hi) = stem.split_once('-')?;
+    let (lo, hi) = (lo.parse().ok()?, hi.parse().ok()?);
+    (lo <= hi).then_some((lo, hi))
+}
+
+fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (lo, hi) in ranges {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+/// Bring every registered archive to the current format: a `.tar.gz` (written
+/// before v2.18.0) is rewritten as a plain `.tar`, so it is read in place
+/// instead of unpacked; any archive without a term filter gets one, so a word
+/// search can skip it without opening it. Without this, a cluster whose
+/// archives predate v2.18.0 kept unpacking them on every search — merging
+/// rewrites only runs of small archives, and most partitions have one or two.
+/// Each rewrite is swapped in like a merge (`replace_segments`, then the old
+/// file deleted after the grace period). Returns (converted, filters built).
+pub async fn upgrade_archives(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentIndex>, policy: &MergePolicy) -> (usize, usize) {
+    let (mut converted, mut filtered) = (0usize, 0usize);
+    for seg in index.get_all_segments().await.unwrap_or_default() {
+        let key = seg.object_store_path.clone();
+        let result = if let Some(stem) = key.strip_suffix(".tar.gz") {
+            convert_one(store, index, &seg, &format!("{stem}.tar"), policy).await.map(|done| {
+                if done {
+                    converted += 1;
+                }
+            })
+        } else if key.ends_with(".tar") && store.head(&term_filter_key(&key)).await.is_err() {
+            build_filter(store, &key).await.map(|_| filtered += 1)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = result {
+            debug!(archive = %key, "archive upgrade skipped: {}", e);
+        }
+    }
+    if converted > 0 || filtered > 0 {
+        info!(converted, filters_built = filtered, "archives brought to the current format");
+    }
+    (converted, filtered)
+}
+
+async fn convert_one(
+    store: &Arc<dyn ObjectStore>,
+    index: &Arc<SegmentIndex>,
+    seg: &SegmentMetadata,
+    new_key: &str,
+    policy: &MergePolicy,
+) -> Result<bool> {
+    let old_key = seg.object_store_path.clone();
+    let gz = store.get(&old_key).await.map_err(|e| Error::Internal(format!("download {old_key}: {e}")))?;
+    let (tar, filter) = tokio::task::spawn_blocking(move || -> Result<(bytes::Bytes, Option<TermFilter>)> {
+        use std::io::Read;
+        let mut tar = Vec::with_capacity(gz.len() * 3 / 2);
+        flate2::read::GzDecoder::new(gz.as_ref())
+            .read_to_end(&mut tar)
+            .map_err(|e| Error::Internal(format!("gunzip: {e}")))?;
+        let tar = bytes::Bytes::from(tar);
+        // It must open as an archive before it replaces one.
+        let reader = TantivySegmentReader::open_tar(crate::tar_directory::owned(tar.clone()))?;
+        let filter = TermFilter::build(reader.index()).ok();
+        Ok((tar, filter))
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("convert task: {e}")))??;
+
+    let size_bytes = tar.len() as u64;
+    store.put(new_key, tar).await.map_err(|e| Error::Internal(format!("upload {new_key}: {e}")))?;
+    if let Some(f) = &filter {
+        let _ = store.put(&term_filter_key(new_key), bytes::Bytes::from(f.to_bytes())).await;
+    }
+    let replacement = SegmentMetadata { object_store_path: new_key.to_string(), size_bytes, ..seg.clone() };
+    if !index.replace_segments(&[seg.segment_id.clone()], replacement).await? {
+        let _ = store.delete(new_key).await;
+        let _ = store.delete(&term_filter_key(new_key)).await;
+        return Ok(false);
+    }
+    let store = store.clone();
+    let grace = policy.grace;
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        let _ = store.delete(&old_key).await;
+        let _ = store.delete(&term_filter_key(&old_key)).await;
+    });
+    Ok(true)
+}
+
+async fn build_filter(store: &Arc<dyn ObjectStore>, key: &str) -> Result<()> {
+    let scratch = tempfile::tempdir().map_err(|e| Error::Internal(format!("{e}")))?;
+    let reader = open_source(store, key, scratch.path()).await?;
+    let filter = tokio::task::spawn_blocking(move || TermFilter::build(reader.index()))
+        .await
+        .map_err(|e| Error::Internal(format!("filter task: {e}")))??;
+    store
+        .put(&term_filter_key(key), bytes::Bytes::from(filter.to_bytes()))
+        .await
+        .map_err(|e| Error::Internal(format!("upload filter: {e}")))
 }
 
 /// Test-only: abort the process at a point of a merge, to prove a crash there
@@ -170,6 +300,9 @@ pub async fn merge_all(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentIndex>, 
             }
         }
     }
+    // What was not merged is brought to the current format (plain tar, with
+    // a term filter).
+    upgrade_archives(store, index, policy).await;
     if outcome.merges > 0 || outcome.abandoned > 0 {
         info!(
             merges = outcome.merges,
@@ -619,22 +752,91 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = local_store(dir.path()).await;
         let index = Arc::new(SegmentIndex::new());
-        archives(&store, &index, 2, false).await;
+        archives(&store, &index, 2, false).await; // registered: 0-9, 10-19
         let referenced = "idx/t/partition-0/segment-0-9.tar";
         store.put(&term_filter_key(referenced), bytes::Bytes::from_static(b"f")).await.unwrap();
-        let orphan = "idx/t/partition-0/segment-100-199.tar";
-        store.put(orphan, bytes::Bytes::from_static(b"x")).await.unwrap();
-        store.put(&term_filter_key(orphan), bytes::Bytes::from_static(b"f")).await.unwrap();
+        // Superseded: an earlier archive of a range a registered one now holds
+        // (thunderbird: segment-1003901-1041137 beside segment-1003901-1105876).
+        let superseded = "idx/t/partition-0/segment-10-15.tar.gz";
+        store.put(superseded, bytes::Bytes::from_static(b"x")).await.unwrap();
+        store.put(&term_filter_key(superseded), bytes::Bytes::from_static(b"f")).await.unwrap();
+        // Holds offsets no registered archive covers: may be their only copy.
+        let uncovered = "idx/t/partition-0/segment-100-199.tar";
+        store.put(uncovered, bytes::Bytes::from_static(b"x")).await.unwrap();
         store.put("idx/t/partition-0/notes.txt", bytes::Bytes::from_static(b"n")).await.unwrap();
 
         // Too young to be a leftover: kept (the indexer may be about to register it).
         assert_eq!(sweep_orphans(&store, &index, Duration::from_secs(3600)).await, 0);
         assert_eq!(sweep_orphans(&store, &index, Duration::ZERO).await, 2);
-        assert!(store.get(orphan).await.is_err());
-        assert!(store.get(&term_filter_key(orphan)).await.is_err());
+        assert!(store.get(superseded).await.is_err());
+        assert!(store.get(&term_filter_key(superseded)).await.is_err());
+        assert!(store.get(uncovered).await.is_ok(), "offsets nothing else covers: kept");
         assert!(store.get(referenced).await.is_ok(), "a referenced archive stays");
         assert!(store.get(&term_filter_key(referenced)).await.is_ok(), "and its filter");
         assert!(store.get("idx/t/partition-0/notes.txt").await.is_ok(), "anything else stays");
+        // Absolute keys, as thunderbird's catalogue holds them, sweep the same.
+        assert_eq!(file_range("segment-1003901-1041137.tar.gz"), Some((1003901, 1041137)));
+    }
+
+    /// Thunderbird's catalogue keys are absolute ("/data/tantivy_indexes/…")
+    /// while listed keys are not: v2.18.0's sweep listed nothing there and
+    /// left 4,000-12,000 superseded archives a node in place.
+    #[tokio::test]
+    async fn the_sweep_works_with_absolute_catalogue_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(dir.path()).await;
+        let index = Arc::new(SegmentIndex::new());
+        store.put("idx/t/partition-0/segment-0-9.tar", bytes::Bytes::from_static(b"r")).await.unwrap();
+        index
+            .add_segment(SegmentMetadata { object_store_path: "/idx/t/partition-0/segment-0-9.tar".into(), ..seg(0, 9, 1) })
+            .await
+            .unwrap();
+        store.put("idx/t/partition-0/segment-0-4.tar.gz", bytes::Bytes::from_static(b"old")).await.unwrap();
+        assert_eq!(sweep_orphans(&store, &index, Duration::ZERO).await, 1);
+        assert!(store.get("idx/t/partition-0/segment-0-4.tar.gz").await.is_err());
+        assert!(store.get("/idx/t/partition-0/segment-0-9.tar").await.is_ok(), "the registered one stays");
+    }
+
+    /// Archives from before v2.18.0 (`.tar.gz`, no term filter) that no merge
+    /// touches are rewritten as plain tars with filters; a plain tar without a
+    /// filter gets one.
+    #[tokio::test]
+    async fn old_archives_are_brought_to_the_current_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(dir.path()).await;
+        let index = Arc::new(SegmentIndex::new());
+        archives(&store, &index, 2, true).await; // 0-19 as two .tar.gz: too few to merge
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = local_store(dir2.path()).await;
+        let plain = Arc::new(SegmentIndex::new());
+        archives(&store2, &plain, 1, false).await; // a .tar without a filter
+        let p = MergePolicy { min_run: 4, ..policy() };
+
+        let (converted, _) = upgrade_archives(&store, &index, &p).await;
+        assert_eq!(converted, 2);
+        let segs = index.get_segments_for_partition("t", 0).await.unwrap();
+        assert_eq!(segs.len(), 2);
+        for s in &segs {
+            assert!(s.object_store_path.ends_with(".tar"), "{}", s.object_store_path);
+            let bytes = store.get(&s.object_store_path).await.unwrap();
+            assert!(!crate::tar_directory::is_gzip(&bytes));
+            let reader = TantivySegmentReader::from_archive_bytes(bytes).unwrap();
+            assert_eq!(reader.query_by_offset_range(s.min_offset, s.max_offset + 1).unwrap().len(), 10);
+            assert!(store.get(&term_filter_key(&s.object_store_path)).await.is_ok(), "with its filter");
+        }
+        for _ in 0..50 {
+            if store.get("idx/t/partition-0/segment-0-9.tar.gz").await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(store.get("idx/t/partition-0/segment-0-9.tar.gz").await.is_err(), "old file deleted");
+
+        let key = &plain.get_segments_for_partition("t", 0).await.unwrap()[0].object_store_path;
+        assert!(store2.get(&term_filter_key(key)).await.is_err());
+        assert_eq!(upgrade_archives(&store2, &plain, &p).await, (0, 1));
+        assert!(TermFilter::from_bytes(&store2.get(&term_filter_key(key)).await.unwrap()).is_some());
+        assert_eq!(upgrade_archives(&store2, &plain, &p).await, (0, 0), "nothing left to do");
     }
 
     #[test]

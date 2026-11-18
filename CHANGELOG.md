@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.1] - 2026-11-18
+
+What v2.18.0 left undone on a real cluster, found by measuring it on
+thunderbird: word searches across all topics still hit the 10 s limit, and
+4,000–12,000 superseded archive files per node stayed on disk.
+
+### Fixed
+- **Field queries skipped every archive written before v2.17.1.** The term
+  filter check reduced a query to the terms of the current archive layout,
+  where a field query is a JSON-path term; archives from before the JSON field
+  answer it from the record's full text, so their filters never held those
+  terms and every such archive was skipped once it had a filter — a field
+  query returned nothing from them. A query's terms are now taken from every
+  archive layout, and an archive is opened if any layout's terms may be in it.
+- **Archives from before v2.18.0 were never brought to the current format.**
+  Only merged archives became plain tars with term filters, and most
+  partitions have one or two archives (thunderbird: ~1,900 archives over 1,289
+  topics on a node), so searches kept unpacking `.tar.gz` and opening archives
+  without filters. Each merge pass now rewrites every registered `.tar.gz` as a
+  plain tar with its term filter, and builds a filter for any plain tar
+  without one, swapped in like a merge (atomically, old file deleted after the
+  grace period).
+- **The orphan sweep listed nothing on clusters with absolute archive keys.**
+  The local object store treated a leading `/` as part of a listing prefix but
+  not of a key, so listing `"/data/tantivy_indexes/…"` (thunderbird's catalogue
+  form) matched nothing. Listing now ignores it, as get/put/delete did.
+- **The sweep deleted archives regardless of what they held.** An unreferenced
+  archive is now deleted only if registered archives cover every offset in its
+  name (`segment-<min>-<max>`) — superseded copies, which is what thunderbird's
+  orphans are (`segment-1003901-1041137` beside `segment-1003901-1105876`); one
+  holding offsets nothing registered covers is kept and counted.
+
 ## [2.18.0] - 2026-11-18
 
 Search over archived data, at the scale of a real cluster: word searches skip
@@ -56,8 +88,10 @@ records, 82 of them on two pages (fixed below).
   searches still read (thunderbird: 26 / 87 / 92 per node). Measured against
   the archives of all three nodes, what they held that no archive did was
   records of deleted topics (`json-columns-test`, 15,354), of a partition
-  since emptied, and offset 0 of early topics, which the archiver of the time
-  skipped. Two minutes after boot each old index is measured against the
+  since emptied, and a document at offset 0 of early topics that the log
+  itself does not hold (corrected after release: the first notes said the
+  archiver had skipped offset 0, but consuming from 0 starts at offset 1). Two
+  minutes after boot each old index is measured against the
   node's archives; offsets the log still holds below the highest archived
   offset are re-read from the node's own copy of the log (a maintenance read,
   `FetchHandler::read_local_range`, whatever the leader) and archived exactly

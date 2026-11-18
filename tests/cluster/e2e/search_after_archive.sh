@@ -126,6 +126,10 @@ sleep 5
 skipped=$(curl -s -m 30 -X POST "localhost:6092/$L/_search" -H 'Content-Type: application/json' \
   -d "{\"query\":$NONE,\"size\":50}" | grep -o '"_segments":{[^}]*}' | grep -o '"skipped":[0-9]*' | cut -d: -f2)
 expect "old archives gained a term filter and are skipped" "$([ "${skipped:-0}" -ge 3 ] && echo yes || echo "skipped=${skipped:-none}")" "yes"
+# And with that filter, a field query still reaches them: the field is
+# answered from their full text (no JSON field before v2.17.1), and v2.18.0's
+# filter check, built for the JSON field only, skipped them.
+expect "legacy archive, field match once filtered" "$(search $L "$M")" "200 2 eq 41,42"
 
 $C/stop.sh >/dev/null 2>&1
 if [ $fail = 0 ]; then echo "RESULT $LABEL: PASS"; else echo "RESULT $LABEL: FAIL"; exit 1; fi

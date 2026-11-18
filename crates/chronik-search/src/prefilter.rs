@@ -26,15 +26,26 @@ pub enum Requirement {
     Any(Vec<Requirement>),
 }
 
-/// An empty index with the archive schema and Chronik's analyzer, to turn a
-/// query into the exact terms an archive's term dictionary would hold.
-fn archive_index() -> &'static tantivy::Index {
-    static INDEX: OnceLock<tantivy::Index> = OnceLock::new();
-    INDEX.get_or_init(|| {
-        let (schema, _) = chronik_storage::tantivy_segment::SchemaFields::build_schema();
-        let index = tantivy::Index::create_in_ram(schema);
-        chronik_storage::register_analyzer(&index);
-        index
+/// Empty indexes with each archive layout in use and Chronik's analyzer, to
+/// turn a query into the exact terms an archive's term dictionary would hold:
+/// the current one, and the one before the JSON field (v2.17.0 and earlier),
+/// whose archives answer a field query from the record's full text instead.
+/// The layouts share field ids up to the JSON field, which was added last.
+fn archive_indexes() -> &'static [tantivy::Index; 2] {
+    static INDEXES: OnceLock<[tantivy::Index; 2]> = OnceLock::new();
+    INDEXES.get_or_init(|| {
+        let (current, _) = chronik_storage::tantivy_segment::SchemaFields::build_schema();
+        let mut before_json = tantivy::schema::Schema::builder();
+        for (_, entry) in current.fields() {
+            if entry.name() != chronik_storage::json_index::JSON_FIELD {
+                before_json.add_field(entry.clone());
+            }
+        }
+        [current, before_json.build()].map(|schema| {
+            let index = tantivy::Index::create_in_ram(schema);
+            chronik_storage::register_analyzer(&index);
+            index
+        })
     })
 }
 
@@ -73,20 +84,35 @@ impl Requirement {
     /// A `match` or `term` clause: any one of the terms the query is built
     /// from. (A `term` on analyzed text needs all of its tokens; "any" is
     /// weaker and still sound.)
+    ///
+    /// The terms of every archive layout are accepted: an archive written
+    /// before the JSON field answers a field query from its full text, so
+    /// requiring only the JSON-path terms skipped every such archive — a false
+    /// negative (v2.18.0). Any layout's terms present: the archive may match.
     fn of_leaf(dsl: &QueryDsl) -> Self {
-        let index = archive_index();
-        let Ok(query) = crate::handlers::build_tantivy_query(dsl, &index.schema(), Some(index)) else {
-            return Requirement::Unknown;
-        };
         let mut terms = Vec::new();
-        query.query_terms(&mut |term, _| {
-            terms.push((term.field().field_id(), term.serialized_value_bytes().to_vec()));
-        });
-        // No terms: an AllQuery (e.g. a stop-word-only match) or a query the
-        // archive schema cannot express.
+        for index in archive_indexes() {
+            let Ok(query) = crate::handlers::build_tantivy_query(dsl, &index.schema(), Some(index)) else {
+                // A layout that cannot express the query: the search skips
+                // such an archive too, so it adds no requirement.
+                continue;
+            };
+            let mut layout_terms = Vec::new();
+            query.query_terms(&mut |term, _| {
+                layout_terms.push((term.field().field_id(), term.serialized_value_bytes().to_vec()));
+            });
+            // No terms: an AllQuery (e.g. a stop-word-only match) — any
+            // archive of this layout may match.
+            if layout_terms.is_empty() {
+                return Requirement::Unknown;
+            }
+            terms.extend(layout_terms);
+        }
         if terms.is_empty() {
             return Requirement::Unknown;
         }
+        terms.sort();
+        terms.dedup();
         Requirement::AnyTerm(terms)
     }
 
@@ -209,6 +235,42 @@ mod tests {
             assert_eq!(req.may_match(&filter), expect_possible, "{q}: {req:?}");
             // Never a false negative: whatever really matches is never skipped.
             assert!(!truth || req.may_match(&filter), "{q} matches but would be skipped");
+        }
+    }
+
+    /// An archive written before the JSON field (v2.17.0 and earlier) answers
+    /// a field query from its full text. v2.18.0 required the JSON-path terms
+    /// only and skipped every such archive.
+    #[test]
+    fn archives_of_the_layout_before_the_json_field_are_not_skipped() {
+        let schema = archive_indexes()[1].schema();
+        assert!(schema.get_field(chronik_storage::json_index::JSON_FIELD).is_err());
+        let index = tantivy::Index::create_in_ram(schema.clone());
+        chronik_storage::register_analyzer(&index);
+        let value = schema.get_field("value").unwrap();
+        let offset = schema.get_field("_offset").unwrap();
+        let mut w: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+        for (o, v) in [(0i64, r#"{"marker":"zephyrquandary","n":1}"#), (1, r#"{"marker":"ordinary","n":2}"#)] {
+            let mut d = tantivy::TantivyDocument::default();
+            d.add_i64(offset, o);
+            d.add_text(value, v);
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        let filter = TermFilter::build(&index).unwrap();
+        for (q, present) in [
+            (serde_json::json!({"match":{"marker":"zephyrquandary"}}), true),
+            (serde_json::json!({"match":{"value":"zephyrquandary"}}), true),
+            (serde_json::json!({"match":{"marker":"absentword"}}), false),
+        ] {
+            let dsl = query(q.clone());
+            let truth = matches(&index, &dsl);
+            assert_eq!(truth, present, "{q}: ground truth");
+            let req = Requirement::of(dsl.as_ref());
+            assert!(!truth || req.may_match(&filter), "{q} matches this archive but would be skipped");
+            if !present {
+                assert!(!req.may_match(&filter), "{q}: absent everywhere, skipped");
+            }
         }
     }
 
