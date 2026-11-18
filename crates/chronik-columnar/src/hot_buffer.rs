@@ -574,28 +574,16 @@ impl HotDataBuffer {
 
         // Cache miss or stale — read from WAL
         let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v);
-        let read_from = flushed_offset.map(|o| o + 1).unwrap_or(0);
-
-        let wal_records = self
-            .wal_manager
-            .read_from(topic, partition, read_from, self.config.max_records_per_partition)
+        let hot_records = self
+            .read_hot_records(topic, partition, flushed_offset)
             .await
             .map_err(|e| anyhow!("Failed to read WAL records: {}", e))?;
 
-        if wal_records.is_empty() {
+        if hot_records.is_empty() {
             debug!(
                 "No hot data for {}-{} (flushed_offset={:?})",
                 topic, partition, flushed_offset
             );
-            // Cache empty result to avoid repeated WAL reads
-            self.cache.remove(&tp);
-            return Ok(None);
-        }
-
-        let hot_records =
-            Self::wal_records_to_hot_records(topic, partition, &wal_records, flushed_offset)?;
-
-        if hot_records.is_empty() {
             self.cache.remove(&tp);
             return Ok(None);
         }
@@ -662,13 +650,7 @@ impl HotDataBuffer {
             // Cache miss or stale — read from WAL
             cache_misses += 1;
             let flushed_offset = self.flushed_offsets.get(&tp).map(|v| *v);
-            let read_from = flushed_offset.map(|o| o + 1).unwrap_or(0);
-
-            let wal_records = match self
-                .wal_manager
-                .read_from(topic, partition, read_from, self.config.max_records_per_partition)
-                .await
-            {
+            let hot_records = match self.read_hot_records(topic, partition, flushed_offset).await {
                 Ok(records) => records,
                 Err(e) => {
                     // A partition whose WAL was fully truncated after indexing
@@ -682,12 +664,6 @@ impl HotDataBuffer {
                 }
             };
 
-            if wal_records.is_empty() {
-                continue;
-            }
-
-            let hot_records =
-                Self::wal_records_to_hot_records(topic, partition, &wal_records, flushed_offset)?;
             if hot_records.is_empty() {
                 continue;
             }
@@ -806,6 +782,71 @@ impl HotDataBuffer {
 
         RecordBatch::try_new(schema, columns)
             .map_err(|e| anyhow!("Failed to create RecordBatch: {}", e))
+    }
+
+    /// The partition's records not yet in Parquet — the newest
+    /// `max_records_per_partition` of them, counted as messages.
+    ///
+    /// The limit used to be handed to one `WalManager::read_from` from the flush
+    /// point, which kept the OLDEST unflushed records: on a partition more than
+    /// the limit behind its Parquet flush, the newest records — what the hot
+    /// buffer is for — were in neither table until the flush caught up (#68).
+    ///
+    /// Reads start where the newest `max` messages can begin (one past the
+    /// last fsynced offset, minus `max`) when that end is known, so a
+    /// partition far behind its Parquet flush is not read from its flush
+    /// point; then forward in chunks, keeping a window of the newest `max`, so
+    /// memory stays at `max` rows plus one chunk either way.
+    async fn read_hot_records(
+        &self,
+        topic: &str,
+        partition: i32,
+        flushed_offset: Option<i64>,
+    ) -> Result<Vec<HotRecord>> {
+        /// Messages read per step (`read_from` counts messages; a batch is
+        /// never split, so a step may return a little more).
+        const CHUNK: usize = 8_192;
+        let max = self.config.max_records_per_partition;
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut from = flushed_offset.map(|o| o + 1).unwrap_or(0);
+        if let Some(end) = self.wal_manager.durable_end_offset(topic, partition) {
+            from = from.max(end.saturating_sub(max as i64));
+        }
+        let mut newest: std::collections::VecDeque<HotRecord> = std::collections::VecDeque::new();
+        loop {
+            let chunk = self
+                .wal_manager
+                .read_from(topic, partition, from, CHUNK)
+                .await
+                .map_err(|e| anyhow!("{}", e))?;
+            let next = chunk
+                .iter()
+                .filter_map(|r| match r {
+                    WalRecord::V2 { last_offset, .. } => Some(*last_offset + 1),
+                    _ => None,
+                })
+                .max();
+            for record in Self::wal_records_to_hot_records(topic, partition, &chunk, flushed_offset)? {
+                // A batch straddling `from` comes back whole; its earlier
+                // records were in the previous chunk.
+                if newest.back().is_some_and(|last| record.offset <= last.offset) {
+                    continue;
+                }
+                newest.push_back(record);
+                if newest.len() > max {
+                    newest.pop_front();
+                }
+            }
+            match next {
+                // Until a read returns nothing new: a short chunk does not
+                // prove the end (a read can stop at a segment boundary).
+                Some(next) if next > from => from = next,
+                _ => break,
+            }
+        }
+        Ok(newest.into())
     }
 
     /// Expand WAL batches into individual hot records.
@@ -1026,6 +1067,55 @@ mod tests {
 
         let hot = HotDataBuffer::wal_records_to_hot_records("t", 0, &records, Some(0)).unwrap();
         assert_eq!(hot.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// A WAL holding `batches` produce batches of `per_batch` messages on t-0.
+    async fn wal_with_batches(dir: &std::path::Path, batches: i64, per_batch: i64) -> Arc<WalManager> {
+        let config = chronik_wal::WalConfig { data_dir: dir.to_path_buf(), ..Default::default() };
+        let wal = WalManager::new(config).await.unwrap();
+        for b in 0..batches {
+            let (first, last) = (b * per_batch, b * per_batch + per_batch - 1);
+            let WalRecord::V2 { canonical_data, .. } = wal_batch("t", 0, first..=last) else { unreachable!() };
+            wal.append_canonical("t".into(), 0, canonical_data, first, last, per_batch as i32).await.unwrap();
+        }
+        wal.flush_all().await.unwrap();
+        Arc::new(wal)
+    }
+
+    fn buffer(wal: Arc<WalManager>, max: usize) -> HotDataBuffer {
+        HotDataBuffer::new(wal, HotBufferConfig { enabled: true, max_records_per_partition: max, refresh_interval_ms: 1000 })
+    }
+
+    async fn hot_offsets(buffer: &HotDataBuffer) -> Vec<i64> {
+        let flushed = buffer.flushed_offsets.get(&TopicPartition::new("t", 0)).map(|v| *v);
+        buffer.read_hot_records("t", 0, flushed).await.unwrap().iter().map(|r| r.offset).collect()
+    }
+
+    /// #68: the newest `max` messages, not the oldest. 1,000 batches of 100
+    /// with a limit of 10,000 held offsets 0-9,999: the newest 90,000 records
+    /// were in neither the hot buffer nor Parquet until the flush caught up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_limit_counts_messages_and_keeps_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = wal_with_batches(dir.path(), 1_000, 100).await;
+        let b = buffer(wal.clone(), 10_000);
+        assert_eq!(hot_offsets(&b).await, (90_000..100_000).collect::<Vec<_>>());
+
+        // A limit that falls inside a batch.
+        assert_eq!(hot_offsets(&buffer(wal.clone(), 150)).await, (99_850..100_000).collect::<Vec<_>>());
+
+        // Fewer unflushed than the limit: exactly the unflushed ones.
+        b.flushed_offsets.insert(TopicPartition::new("t", 0), 99_949);
+        assert_eq!(hot_offsets(&b).await, (99_950..100_000).collect::<Vec<_>>());
+
+        // After a restart nothing has been fsynced by this process, so the log
+        // end is unknown: the forward read must reach the same answer.
+        drop(b);
+        drop(wal);
+        let config = chronik_wal::WalConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
+        let reopened = Arc::new(WalManager::recover(&config).await.unwrap());
+        assert_eq!(reopened.durable_end_offset("t", 0), None, "the case under test");
+        assert_eq!(hot_offsets(&buffer(reopened, 10_000)).await, (90_000..100_000).collect::<Vec<_>>());
     }
 
     #[test]

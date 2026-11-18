@@ -454,6 +454,22 @@ impl ConnectionContext {
         self.tls
     }
 
+    /// Whether a Produce request (`request`, header included) is answered.
+    /// `acks = 0` is not: a Kafka broker writes nothing back, and a client
+    /// reads nothing. A produce another broker forwarded is always answered —
+    /// the forwarding broker waits for the reply whatever the client's acks.
+    /// A request that does not parse is answered (with its error).
+    pub fn produce_expects_response(request: &bytes::Bytes) -> bool {
+        let mut buf = request.clone();
+        let Ok(header) = chronik_protocol::parser::parse_request_header(&mut buf) else {
+            return true;
+        };
+        if header.client_id.as_deref() == Some(crate::produce_handler::FORWARD_CLIENT_ID) {
+            return true;
+        }
+        chronik_protocol::handler::produce_request_acks(header.api_version, &buf).map_or(true, |acks| acks != 0)
+    }
+
     /// Queue a Produce request read from this connection, in read order (see
     /// `produce_order`). `request` is the whole request, header included; a
     /// body that does not parse queues on no partition (the handler will
@@ -769,6 +785,40 @@ mod tests {
         let a = ConnectionId::next();
         let b = ConnectionId::next();
         assert_ne!(a, b);
+    }
+
+    /// A Produce request (header + start of the body) at `version`.
+    fn produce_request(version: i16, client_id: &str, acks: i16) -> bytes::Bytes {
+        let mut b = Vec::new();
+        b.extend_from_slice(&API_PRODUCE.to_be_bytes());
+        b.extend_from_slice(&version.to_be_bytes());
+        b.extend_from_slice(&7i32.to_be_bytes());
+        b.extend_from_slice(&(client_id.len() as i16).to_be_bytes());
+        b.extend_from_slice(client_id.as_bytes());
+        if version >= 9 {
+            b.push(0); // header tagged fields
+            b.push(0); // transactional_id: null (compact)
+        } else if version >= 3 {
+            b.extend_from_slice(&(-1i16).to_be_bytes()); // transactional_id: null
+        }
+        b.extend_from_slice(&acks.to_be_bytes());
+        b.extend_from_slice(&30_000i32.to_be_bytes());
+        bytes::Bytes::from(b)
+    }
+
+    /// #66: acks=0 gets no response — unless another broker forwarded it and
+    /// waits for one; anything that does not parse is answered.
+    #[test]
+    fn only_a_client_acks_0_produce_goes_unanswered() {
+        for version in [0i16, 2, 3, 8, 9] {
+            assert!(!ConnectionContext::produce_expects_response(&produce_request(version, "app", 0)), "v{version}");
+            assert!(ConnectionContext::produce_expects_response(&produce_request(version, "app", 1)), "v{version}");
+            assert!(ConnectionContext::produce_expects_response(&produce_request(version, "app", -1)), "v{version}");
+            let forwarded = produce_request(version, crate::produce_handler::FORWARD_CLIENT_ID, 0);
+            assert!(ConnectionContext::produce_expects_response(&forwarded), "v{version}");
+        }
+        let full = produce_request(9, "app", 0);
+        assert!(ConnectionContext::produce_expects_response(&full.slice(..full.len() - 6)));
     }
 }
 

@@ -46,6 +46,8 @@ run legacy_index_retirement "$E2E/legacy_index_retirement.sh" "$BIN" "$LABEL"
 run archive_merge "$E2E/archive_merge.sh" "$BIN" "$LABEL"
 run archive_merge_crash "$E2E/archive_merge_crash.sh" "$BIN" "$LABEL"
 run archive_upgrade "$E2E/archive_upgrade.sh" "$BIN" "$LABEL"
+run acks0_no_response "$E2E/acks0_no_response.sh" "$BIN" "$LABEL"
+run hot_buffer_limit "$E2E/hot_buffer_limit.sh" "$BIN" "$LABEL"
 run regression_replication ./tests/cluster/regression_replication.sh
 run follower_catchup ./tests/cluster/follower_catchup.sh
 run concurrent_produce_order ./tests/test_concurrent_produce_order.sh

@@ -504,10 +504,29 @@ impl KafkaProtocolHandler {
         // WAL is mandatory - all produce requests MUST go through WAL
         // There is no fallback path - WAL is the only durability mechanism
         let forwarded = header.client_id.as_deref() == Some(crate::produce_handler::FORWARD_CLIENT_ID);
+        let acks = request.acks;
         let response = self
             .wal_handler
             .handle_produce_ordered(request, header.correlation_id, forwarded, produce_ticket)
             .await?;
+
+        // acks=0 gets no response, so a partition error cannot be reported in
+        // one. Kafka closes the connection instead, which makes the client
+        // refresh its metadata and reconnect; the connection handler closes it
+        // when an acks=0 produce returns an error (see `produce_expects_response`).
+        if acks == 0 && !forwarded {
+            if let Some((topic, p)) = response
+                .topics
+                .iter()
+                .flat_map(|t| t.partitions.iter().map(move |p| (&t.name, p)))
+                .find(|(_, p)| p.error_code != 0)
+            {
+                return Err(Error::Protocol(format!(
+                    "acks=0 produce to {}-{} failed with error code {}; closing the connection",
+                    topic, p.index, p.error_code
+                )));
+            }
+        }
 
         // Encode the response
         let mut body_buf = BytesMut::new();

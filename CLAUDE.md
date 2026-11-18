@@ -1034,7 +1034,7 @@ Key environment variables:
 - `CHRONIK_COLUMNAR_FORMAT` - Default columnar format: `parquet`, `arrow`
 - `CHRONIK_COLUMNAR_COMPRESSION` - Default compression: `zstd`, `snappy`, `lz4`, `none`
 - `CHRONIK_HOT_BUFFER_ENABLED` - Enable hot buffer for sub-second SQL query latency (default: `true`)
-- `CHRONIK_HOT_BUFFER_MAX_RECORDS` - Max records per partition in hot buffer (default: `100000`)
+- `CHRONIK_HOT_BUFFER_MAX_RECORDS` - Max messages per partition in the SQL hot buffer (default: `100000`). The newest are kept; on a partition further behind its Parquet flush than this, older unflushed records are absent from `/_sql` until the flush catches up.
 - `CHRONIK_HOT_BUFFER_REFRESH_MS` - Hot buffer refresh interval in ms (default: `1000`)
 - `CHRONIK_SQL_COLD_PROBE_MS` - How often `/_sql` re-checks whether a topic has gained its first Parquet segment, in ms (default: `1000`). Once the `{topic}_cold` table exists it refreshes itself on every scan, so this only bounds how long a brand-new topic stays hot-only.
 - `CHRONIK_COLUMNAR_USE_OBJECT_STORE` - Enable S3/GCS/Azure for Parquet files (default: `false`, local-first)
