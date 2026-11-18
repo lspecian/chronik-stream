@@ -60,17 +60,59 @@ pub struct PassOutcome {
     pub partitions_behind: usize,
 }
 
+/// `CHRONIK_PARQUET_DEDUP`: remove Parquet segments every offset of which
+/// another segment also holds (`WalIndexer::dedup_parquet`). Default on;
+/// `dry-run` only logs what it would remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dedup {
+    Off,
+    DryRun,
+    On,
+}
+
+fn dedup_mode() -> Dedup {
+    match std::env::var("CHRONIK_PARQUET_DEDUP").ok().as_deref().map(str::trim) {
+        Some("false" | "0" | "off" | "no") => Dedup::Off,
+        Some("dry-run" | "dry_run" | "dryrun") => Dedup::DryRun,
+        _ => Dedup::On,
+    }
+}
+
 pub fn spawn(metadata_store: Arc<dyn MetadataStore>, wal_indexer: Arc<WalIndexer>, fetch: Arc<FetchHandler>) {
-    if !enabled() {
+    let catch_up = enabled();
+    let dedup = dedup_mode();
+    if !catch_up && dedup == Dedup::Off {
         return;
     }
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(env_u64("CHRONIK_COLUMNAR_CATCHUP_DELAY_SECS", 120))).await;
         let interval = Duration::from_secs(env_u64("CHRONIK_COLUMNAR_CATCHUP_INTERVAL_SECS", 300).max(1));
         let budget = env_u64("CHRONIK_COLUMNAR_CATCHUP_MAX_RECORDS", 1_000_000) as usize;
+        let grace = Duration::from_secs(env_u64("CHRONIK_PARQUET_DEDUP_GRACE_SECS", 60));
         let mut done_through: HashMap<(String, i32), i64> = HashMap::new();
+        let mut settled: HashMap<(String, i32), u64> = HashMap::new();
         loop {
-            run_pass(metadata_store.as_ref(), &wal_indexer, &fetch, budget, &mut done_through).await;
+            // Dedup first: the catch-up then measures coverage over what is
+            // left, and never mistakes a copy about to go for the only one
+            // (coverage is by offset, so it would not anyway).
+            if dedup != Dedup::Off {
+                match wal_indexer.dedup_parquet(dedup == Dedup::DryRun, grace, &mut settled).await {
+                    Ok(o) if o.segments_removed > 0 => info!(
+                        partitions = o.partitions_checked,
+                        segments = o.segments_removed,
+                        rows = o.rows_removed,
+                        bytes = o.bytes_removed,
+                        unreadable = o.unreadable,
+                        dry_run = dedup == Dedup::DryRun,
+                        "Parquet dedup pass: removed segments whose every offset another segment holds"
+                    ),
+                    Ok(o) => debug!(partitions = o.partitions_checked, unreadable = o.unreadable, "Parquet dedup pass: nothing redundant"),
+                    Err(e) => warn!("Parquet dedup pass failed: {}", e),
+                }
+            }
+            if catch_up {
+                run_pass(metadata_store.as_ref(), &wal_indexer, &fetch, budget, &mut done_through).await;
+            }
             tokio::time::sleep(interval).await;
         }
     });

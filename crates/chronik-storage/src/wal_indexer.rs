@@ -2777,6 +2777,159 @@ impl WalIndexer {
         Self::cold_ranges(&self.metadata_store, &TopicPartition::new(topic.to_string(), partition)).await
     }
 
+    /// Remove Parquet segments whose every offset another segment of the
+    /// partition also holds.
+    ///
+    /// Before the idempotent flush (v2.13.3), and whenever the indexer
+    /// re-read a WAL segment it had already flushed, the same offsets were
+    /// written to Parquet again: signal-stream's leaders held up to 7 copies
+    /// (`{topic}_cold` read 40M rows for 5.4M records, 44 GB of files). The
+    /// topic's view de-duplicates, at a cost on every query; the `_cold`
+    /// table and the disk carry every copy.
+    ///
+    /// Only partitions whose segment ranges overlap are examined. For those,
+    /// each segment's offsets are read from the file (`_offset` only — a
+    /// range does not say which offsets lie inside it). Segments are taken
+    /// newest first; one is redundant when every offset it holds is already in
+    /// segments kept. A segment whose file cannot be read is kept and vouches
+    /// for nothing. Redundant segments are unregistered under the partition's
+    /// flush lock (no concurrent write sees a half-done state), and their files
+    /// deleted `grace` later, so a scan that listed them can finish — unless a
+    /// kept segment points at the same file.
+    pub async fn dedup_parquet(
+        &self,
+        dry_run: bool,
+        grace: Duration,
+        settled: &mut HashMap<(String, i32), u64>,
+    ) -> Result<ParquetDedupOutcome> {
+        let mut outcome = ParquetDedupOutcome::default();
+        let topics = self
+            .metadata_store
+            .list_topics()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to list topics: {}", e)))?;
+        for topic in topics {
+            let segments = match self.metadata_store.list_parquet_segments(&topic.name, None).await {
+                Ok(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            let mut by_partition: HashMap<i32, Vec<(i64, i64)>> = HashMap::new();
+            for s in &segments {
+                by_partition.entry(s.partition).or_default().push((s.min_offset, s.max_offset));
+            }
+            let mut partitions: Vec<i32> = by_partition
+                .into_iter()
+                .filter(|(_, ranges)| ranges_overlap(ranges.clone()))
+                .map(|(p, _)| p)
+                .collect();
+            partitions.sort_unstable();
+            for partition in partitions {
+                let tp = TopicPartition::new(topic.name.clone(), partition);
+                let lock = parquet_flush_lock(&tp);
+                let _held = lock.lock().await;
+                // Fresh, under the lock: a write may have landed since.
+                let segments = self
+                    .metadata_store
+                    .list_parquet_segments(&tp.topic, Some(partition))
+                    .await
+                    .map_err(|e| Error::Internal(format!("Failed to list Parquet segments: {}", e)))?;
+                // A partition whose segments are the ones examined last time, with
+                // nothing removed, is not read again: its overlaps are partial and
+                // re-reading every file each pass would cost for nothing.
+                let fingerprint = segment_set_fingerprint(&segments);
+                if settled.get(&(tp.topic.clone(), partition)) == Some(&fingerprint) {
+                    continue;
+                }
+                outcome.partitions_checked += 1;
+                let mut files = Vec::with_capacity(segments.len());
+                for s in &segments {
+                    let path = std::path::PathBuf::from(&s.object_store_path);
+                    let runs = if path.is_file() {
+                        let p = path.clone();
+                        match tokio::task::spawn_blocking(move || chronik_columnar::reader::offset_runs(&p)).await {
+                            Ok(Ok(runs)) => Some(runs),
+                            Ok(Err(e)) => {
+                                warn!(topic = %tp.topic, partition, file = %s.object_store_path, "Parquet dedup: cannot read offsets, keeping the segment: {}", e);
+                                None
+                            }
+                            Err(e) => {
+                                warn!(topic = %tp.topic, partition, "Parquet dedup: offset read task failed: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        // In object storage, or missing: not judged here.
+                        None
+                    };
+                    if runs.is_none() {
+                        outcome.unreadable += 1;
+                    }
+                    files.push(DedupCandidate {
+                        id: s.segment_id.clone(),
+                        created_at: s.created_at,
+                        rows: s.record_count,
+                        runs,
+                    });
+                }
+                let redundant: HashSet<String> = plan_redundant_segments(files).into_iter().collect();
+                if redundant.is_empty() {
+                    settled.insert((tp.topic.clone(), partition), fingerprint);
+                    continue;
+                }
+                let kept_paths: HashSet<&str> = segments
+                    .iter()
+                    .filter(|s| !redundant.contains(&s.segment_id))
+                    .map(|s| s.object_store_path.as_str())
+                    .collect();
+                let mut removed_rows = 0usize;
+                let mut removed_bytes = 0u64;
+                let mut doomed_files = Vec::new();
+                for s in segments.iter().filter(|s| redundant.contains(&s.segment_id)) {
+                    removed_rows += s.record_count;
+                    removed_bytes += s.size_bytes;
+                    if dry_run {
+                        continue;
+                    }
+                    self.metadata_store
+                        .delete_parquet_segment(&tp.topic, partition, &s.segment_id)
+                        .await
+                        .map_err(|e| Error::Internal(format!("Failed to unregister Parquet segment: {}", e)))?;
+                    if let Err(e) = self.segment_index.remove_parquet_segment(&tp.topic, partition, &s.segment_id).await {
+                        debug!(topic = %tp.topic, partition, segment = %s.segment_id, "Parquet dedup: segment index removal: {}", e);
+                    }
+                    if !kept_paths.contains(s.object_store_path.as_str()) {
+                        doomed_files.push(s.object_store_path.clone());
+                    }
+                }
+                outcome.segments_removed += redundant.len();
+                outcome.rows_removed += removed_rows;
+                outcome.bytes_removed += removed_bytes;
+                info!(
+                    topic = %tp.topic,
+                    partition,
+                    segments = segments.len(),
+                    redundant = redundant.len(),
+                    rows = removed_rows,
+                    bytes = removed_bytes,
+                    dry_run,
+                    "Parquet dedup: segments whose every offset another segment holds{}",
+                    if dry_run { " (dry run: nothing removed)" } else { " removed" }
+                );
+                if !doomed_files.is_empty() {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(grace).await;
+                        for file in doomed_files {
+                            if let Err(e) = tokio::fs::remove_file(&file).await {
+                                warn!(file = %file, "Parquet dedup: could not delete a redundant file: {}", e);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
     pub async fn backfill_vector_embeddings(
         &self,
         topic: &str,
@@ -4004,4 +4157,130 @@ fn parquet_flush_lock(tp: &TopicPartition) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::LazyLock<dashmap::DashMap<(String, i32), Arc<tokio::sync::Mutex<()>>>> =
         std::sync::LazyLock::new(dashmap::DashMap::new);
     LOCKS.entry((tp.topic.clone(), tp.partition)).or_default().clone()
+}
+
+/// What one Parquet dedup pass did (see `WalIndexer::dedup_parquet`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ParquetDedupOutcome {
+    /// Partitions with overlapping segments, examined.
+    pub partitions_checked: usize,
+    /// Segments unregistered (or that would be, in a dry run).
+    pub segments_removed: usize,
+    /// Rows those segments held — every one also held by a kept segment.
+    pub rows_removed: usize,
+    pub bytes_removed: u64,
+    /// Segments whose offsets could not be read (kept, vouching for nothing).
+    pub unreadable: usize,
+}
+
+/// One segment as the dedup planner sees it.
+#[derive(Debug, Clone)]
+struct DedupCandidate {
+    id: String,
+    created_at: i64,
+    rows: usize,
+    /// Offsets held, as sorted runs; `None` when the file could not be read.
+    runs: Option<Vec<(i64, i64)>>,
+}
+
+/// Whether any two inclusive ranges overlap.
+fn ranges_overlap(mut ranges: Vec<(i64, i64)>) -> bool {
+    ranges.sort_unstable();
+    ranges.windows(2).any(|w| w[1].0 <= w[0].1)
+}
+
+/// The segments to remove: taken newest first (then most rows), a segment is
+/// redundant when every offset it holds is already held by segments kept
+/// before it. A segment that could not be read is kept and covers nothing; an
+/// empty segment holds nothing and is redundant.
+fn plan_redundant_segments(mut files: Vec<DedupCandidate>) -> Vec<String> {
+    files.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.rows.cmp(&a.rows)).then(a.id.cmp(&b.id)));
+    let mut covered: Vec<(i64, i64)> = Vec::new();
+    let mut redundant = Vec::new();
+    for file in files {
+        let Some(runs) = file.runs else { continue };
+        if runs.iter().all(|&(lo, hi)| {
+            let i = covered.partition_point(|(clo, _)| *clo <= lo);
+            i > 0 && covered[i - 1].1 >= hi
+        }) {
+            redundant.push(file.id);
+        } else {
+            covered.extend(runs);
+            covered = merge_ranges(covered);
+        }
+    }
+    redundant
+}
+
+#[cfg(test)]
+mod parquet_dedup_tests {
+    use super::*;
+
+    fn c(id: &str, created_at: i64, runs: Option<Vec<(i64, i64)>>) -> DedupCandidate {
+        let rows = runs.as_ref().map(|r| r.iter().map(|(lo, hi)| (hi - lo + 1) as usize).sum()).unwrap_or(0);
+        DedupCandidate { id: id.into(), created_at, rows, runs }
+    }
+
+    #[test]
+    fn an_older_copy_of_the_same_offsets_is_redundant() {
+        let plan = plan_redundant_segments(vec![c("old", 1, Some(vec![(0, 99)])), c("new", 2, Some(vec![(0, 99)]))]);
+        assert_eq!(plan, vec!["old"]);
+    }
+
+    #[test]
+    fn a_partial_overlap_keeps_both() {
+        let plan = plan_redundant_segments(vec![c("a", 1, Some(vec![(0, 99)])), c("b", 2, Some(vec![(50, 149)]))]);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn a_segment_covered_by_two_others_together_is_redundant() {
+        let plan = plan_redundant_segments(vec![
+            c("wide", 1, Some(vec![(0, 199)])),
+            c("lo", 2, Some(vec![(0, 99)])),
+            c("hi", 3, Some(vec![(100, 199)])),
+        ]);
+        assert_eq!(plan, vec!["wide"]);
+    }
+
+    #[test]
+    fn holes_inside_a_range_are_respected() {
+        // "holey" spans 0-199 by name but holds only 0-49 and 150-199; the
+        // newer segment holds 0-99, so 150-199 exists only in "holey".
+        let plan = plan_redundant_segments(vec![
+            c("holey", 1, Some(vec![(0, 49), (150, 199)])),
+            c("new", 2, Some(vec![(0, 99)])),
+        ]);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_segment_is_kept_and_vouches_for_nothing() {
+        let plan = plan_redundant_segments(vec![c("old", 1, Some(vec![(0, 99)])), c("broken", 2, None)]);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn seven_copies_leave_one() {
+        let files: Vec<_> = (0..7).map(|i| c(&format!("copy{i}"), i, Some(vec![(0, 999)]))).collect();
+        let plan = plan_redundant_segments(files);
+        assert_eq!(plan.len(), 6);
+        assert!(!plan.contains(&"copy6".to_string()));
+    }
+
+    #[test]
+    fn overlap_detection() {
+        assert!(ranges_overlap(vec![(100, 199), (0, 100)]));
+        assert!(!ranges_overlap(vec![(100, 199), (0, 99)]));
+    }
+}
+
+/// Order-independent fingerprint of a partition's segment ids.
+fn segment_set_fingerprint(segments: &[chronik_common::metadata::ParquetSegmentMetadata]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut ids: Vec<&str> = segments.iter().map(|s| s.segment_id.as_str()).collect();
+    ids.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ids.hash(&mut h);
+    h.finish()
 }

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.18.2.
+Chronik Stream is a high-performance Kafka-compatible streaming platform written in Rust that implements the Kafka wire protocol with comprehensive Write-Ahead Log (WAL) durability and automatic recovery. Current version: v2.18.3.
 
 **Key Differentiators:**
 - Full Kafka protocol compatibility tested with real clients (kafka-python, confluent-kafka, KSQL, Apache Flink)
@@ -1068,6 +1068,7 @@ Key environment variables:
 - Per-topic `vector.hot.enabled=false` - Disable NRT enqueue for a specific topic while keeping cold-path embedding intact. Useful for cost-sensitive topics on OpenAI. Defaults to `true` for vector-enabled topics.
 - `CHRONIK_VECTOR_CATCHUP` - Embed archived records a vector index is missing (default: `true`): records whose seal-time embed failed (provider down, out of credit) and partitions a node received by re-replication or repair. Reads them back from the node's own log; only offsets the indexer has archived; progress advances only on embeds with no failure. `CHRONIK_VECTOR_CATCHUP_DELAY_SECS` (180) after boot, then every `CHRONIK_VECTOR_CATCHUP_INTERVAL_SECS` (600), at most `CHRONIK_VECTOR_CATCHUP_MAX_RECORDS` (20000) per pass. Also removes the vector index of a topic absent from the catalog on two passes in a row.
 - `CHRONIK_COLUMNAR_CATCHUP` - Write archived records Parquet is missing (default: `true`): ranges the flush before v2.18.2 dropped when WAL segments were indexed out of order, and history archived before `columnar.enabled` was set. Reads them back from the node's own log and writes them as Parquet files of about 200K records, skipping offsets a concurrent seal-time write covered (writes per partition are serialized). `CHRONIK_COLUMNAR_CATCHUP_DELAY_SECS` (120) after boot, then every `CHRONIK_COLUMNAR_CATCHUP_INTERVAL_SECS` (300), at most `CHRONIK_COLUMNAR_CATCHUP_MAX_RECORDS` (1000000) per pass.
+- `CHRONIK_PARQUET_DEDUP` - Remove Parquet segments every offset of which another segment of the partition also holds (default: `true`; `dry-run` logs what it would remove; `false` off). Legacy duplicates from before the idempotent flush (v2.13.3) made `{topic}_cold` read up to 7 copies of each record (signal-stream: 40M rows for 5.4M records, 44 GB). Only partitions whose segment ranges overlap are examined; each candidate's offsets are read from the file (`_offset` only), newest kept first; an unreadable file is kept and vouches for nothing. Runs at the start of each columnar catch-up pass; a partition already examined with no change is skipped. Files are deleted `CHRONIK_PARQUET_DEDUP_GRACE_SECS` (60) after being unregistered.
 - Cold-path reuse - When the hot path is enabled, WalIndexer's cold embedding pipeline automatically reuses hot-cached vectors before calling the embedder, cutting embedding-API cost ~to zero for offsets that the hot path already embedded.
 
 ## CRC and Checksum Architecture

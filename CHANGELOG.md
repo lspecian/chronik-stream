@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.18.3] - 2026-11-18
+
+### Fixed
+
+- **`{topic}_cold` counted legacy duplicate Parquet copies.** Before the
+  idempotent flush (v2.13.3), the same offsets were written to Parquet more
+  than once; on signal-stream each partition leader held up to 7 copies
+  (`default_traces_cold` read 40.4M rows for 5.45M records, 44 GB of files).
+  The topic's view de-duplicated them on every query, and still dropped 3 real
+  rows of `default_logs`; the `_cold` table and the disk carried every copy. A
+  dedup pass (`CHRONIK_PARQUET_DEDUP`, default on, `dry-run` to preview) now
+  removes each segment whose every offset (read from the file, not its name)
+  another segment holds, newest kept first. On a copy of a signal-stream node:
+  40 of 261 files removed, `default_logs_cold` 2,575,239 → 845,037 rows, equal
+  to the view, as is every other topic.
+
 ## [2.18.2] - 2026-11-18
 
 ### Added

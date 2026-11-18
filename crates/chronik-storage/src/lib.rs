@@ -66,7 +66,7 @@ pub use extended_segment::{
 };
 // v2.2.7 Phase 5: Removed WalMetadataAdapter export (deleted file)
 pub use wal_indexer::{
-    WalIndexer, WalIndexerConfig, IndexingStats, BackfillStats, EmbedOutcome, TopicPartition as WalIndexerTopicPartition,
+    WalIndexer, WalIndexerConfig, IndexingStats, BackfillStats, EmbedOutcome, ParquetDedupOutcome, TopicPartition as WalIndexerTopicPartition,
 };
 pub use segment_index::{
     SegmentIndex, SegmentMetadata as SegmentIndexMetadata, TopicPartition as SegmentIndexTopicPartition, IndexStats,

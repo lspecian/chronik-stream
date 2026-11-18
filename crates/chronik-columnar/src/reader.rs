@@ -53,6 +53,49 @@ impl ParquetSegmentReader {
     }
 }
 
+/// The offsets a Parquet segment actually holds, as sorted runs of
+/// consecutive offsets (inclusive). Reads only the `_offset` column.
+///
+/// A segment's name and metadata give its min and max offset, but not which
+/// offsets lie between: a flush that skipped offsets already in cold leaves
+/// holes. Anything deciding that a segment is redundant must look here.
+pub fn offset_runs(path: &Path) -> Result<Vec<(i64, i64)>> {
+    use arrow_array::Int64Array;
+    use parquet::arrow::ProjectionMask;
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let index = builder
+        .parquet_schema()
+        .columns()
+        .iter()
+        .position(|c| c.path().parts() == ["_offset"])
+        .ok_or_else(|| anyhow!("{} has no _offset column", path.display()))?;
+    let mask = ProjectionMask::leaves(builder.parquet_schema(), [index]);
+    let reader = builder.with_projection(mask).with_batch_size(65_536).build()?;
+
+    let mut offsets: Vec<i64> = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow!("{}: _offset is not Int64", path.display()))?;
+        offsets.extend(column.iter().flatten());
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for o in offsets {
+        match runs.last_mut() {
+            Some(last) if o == last.1 + 1 => last.1 = o,
+            _ => runs.push((o, o)),
+        }
+    }
+    Ok(runs)
+}
+
 /// Statistics about a Parquet file.
 #[derive(Debug, Clone)]
 pub struct ParquetFileStats {
@@ -127,6 +170,24 @@ mod tests {
         let batch = converter.convert(&records).unwrap();
 
         writer.write_to_file(&[batch], path).unwrap();
+    }
+
+    #[test]
+    fn offset_runs_reports_the_offsets_actually_held() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("holey.parquet");
+        // Offsets 0-49 and 150-199: a segment named 0-199 with a hole.
+        let records: Vec<KafkaRecord> =
+            make_test_records(200).into_iter().filter(|r| r.offset < 50 || r.offset >= 150).collect();
+        let batch = RecordBatchConverter::new().convert(&records).unwrap();
+        ParquetSegmentWriter::new(kafka_message_schema(), ColumnarConfig::default())
+            .write_to_file(&[batch], &path)
+            .unwrap();
+        assert_eq!(offset_runs(&path).unwrap(), vec![(0, 49), (150, 199)]);
+
+        let full = dir.path().join("full.parquet");
+        write_test_file(&full, 100);
+        assert_eq!(offset_runs(&full).unwrap(), vec![(0, 99)]);
     }
 
     #[test]
