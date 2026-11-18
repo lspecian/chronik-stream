@@ -30,8 +30,8 @@ FAIL=0
 say()  { printf '%s\n' "$*"; }
 fail() { say "FAIL: $*"; FAIL=1; }
 
-[ -x "$BIN" ] || { say "SKIP: build first (cargo build --release --bin chronik-server)"; exit 0; }
-command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
+[ -x "$BIN" ] || { say "SKIP: build first (cargo build --release --bin chronik-server)"; exit 77; }
+command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 77; }
 
 start_node() {
   mkdir -p "$LOGS" "$DIR/data/alt-node$1"

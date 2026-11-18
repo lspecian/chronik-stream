@@ -51,7 +51,7 @@ say() { printf '%s\n' "$*"; }
 sshq() { timeout 120 ssh -o ConnectTimeout=8 -o BatchMode=yes "ubuntu@$1" "$2"; }
 
 deploy() {
-  [ -x "$BIN" ] || { say "SKIP: cargo build --release --bin chronik-server"; exit 0; }
+  [ -x "$BIN" ] || { say "SKIP: cargo build --release --bin chronik-server"; exit 77; }
   local n=0
   for host in "${HOSTS[@]}"; do
     n=$((n + 1))
@@ -178,7 +178,7 @@ nic_peak() { # $1=host, $2=seconds
 }
 
 bench() {
-  [ -x "$BENCH" ] || { say "SKIP: cargo build --release --bin chronik-bench"; exit 0; }
+  [ -x "$BENCH" ] || { say "SKIP: cargo build --release --bin chronik-bench"; exit 77; }
   say "== bare metal: 3x Dell R630, 1 GbE, client on $(hostname) =="
   say "   $CONCURRENCY producers, ${DURATION}, median of $RUNS, client is NOT on a broker"
   say ""
@@ -230,7 +230,7 @@ bench() {
 # `kcat` pipes records in without waiting on any of them, so librdkafka batches
 # them for real. Same method as `perf_replication.sh`, pointed at the Dells.
 batched() {
-  command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
+  command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 77; }
   # Five million, not the 200,000 `perf_replication.sh` uses.
   #
   # 200,000 x 256B finishes in about half a second at these rates, and half a

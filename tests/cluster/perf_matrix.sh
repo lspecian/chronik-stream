@@ -37,8 +37,8 @@ RUNS="${PERF_RUNS:-3}"
 
 say() { printf '%s\n' "$*"; }
 
-[ -x "$BIN" ] || { say "SKIP: cargo build --release --bin chronik-server"; exit 0; }
-[ -x "$BENCH" ] || { say "SKIP: cargo build --release --bin chronik-bench"; exit 0; }
+[ -x "$BIN" ] || { say "SKIP: cargo build --release --bin chronik-server"; exit 77; }
+[ -x "$BENCH" ] || { say "SKIP: cargo build --release --bin chronik-bench"; exit 77; }
 
 SINGLE_DIR="$DIR/data/perf-single"
 single_up() {

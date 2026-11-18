@@ -31,7 +31,7 @@ FAIL=0
 say()  { printf '%s\n' "$*"; }
 fail() { say "FAIL: $*"; FAIL=1; }
 
-command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
+command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 77; }
 
 say "== regression_scale: $N topics, per-node RSS budget ${MAX_RSS_MB}MB =="
 "$SCRIPT_DIR/stop.sh" >/dev/null 2>&1
