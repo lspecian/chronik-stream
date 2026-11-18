@@ -48,6 +48,7 @@ pub mod ranker;
 pub mod profiles;
 pub mod orchestrator;
 pub mod features;
+pub mod merge;
 
 // Re-exports (existing)
 pub use search::{SearchEngine, SearchQuery, SearchResult};

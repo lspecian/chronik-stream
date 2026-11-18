@@ -264,6 +264,7 @@ impl QueryOrchestrator {
             },
             results: final_results,
             grouped_results,
+            incomplete_nodes: Vec::new(),
         };
 
         // Log features (non-blocking)

@@ -53,8 +53,8 @@ FAIL=0
 say()  { printf '%s\n' "$*"; }
 fail() { say "FAIL: $*"; FAIL=1; }
 
-[ -x "$BIN" ] || { say "SKIP: build first (cargo build --release --bin chronik-server)"; exit 0; }
-command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
+[ -x "$BIN" ] || { say "SKIP: build first (cargo build --release --bin chronik-server)"; exit 77; }
+command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 77; }
 
 pid_of() { cat "$LOGS/alt-node$1.pid" 2>/dev/null; }
 

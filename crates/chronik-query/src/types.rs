@@ -150,7 +150,7 @@ fn default_profile() -> String {
 }
 
 /// Unified query response
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
     /// Unique query identifier
     pub query_id: String,
@@ -161,10 +161,14 @@ pub struct QueryResponse {
     pub grouped_results: Option<HashMap<String, Vec<RankedResult>>>,
     /// Query execution statistics
     pub stats: QueryStats,
+    /// Nodes of a cluster that were asked and did not answer, with the reason.
+    /// Non-empty means the results may be missing hits those nodes held.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_nodes: Vec<String>,
 }
 
 /// A single ranked result from the unified query
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RankedResult {
     /// Source topic
     pub topic: String,
@@ -195,7 +199,7 @@ pub struct RankedResult {
 }
 
 /// Query execution statistics
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryStats {
     /// Total candidates collected from all backends
     pub candidates: usize,
@@ -204,12 +208,12 @@ pub struct QueryStats {
     /// Total query latency in milliseconds
     pub latency_ms: u64,
     /// Per-backend statistics
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<BackendStats>,
 }
 
 /// Statistics for a single backend execution
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendStats {
     /// Backend type (text, vector, sql, fetch)
     pub backend: String,

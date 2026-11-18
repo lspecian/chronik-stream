@@ -26,8 +26,13 @@ impl TopicCreator {
         // creation and the response all see the counts the topic really gets.
         let topic = handler.resolve_topic_counts(topic);
 
-        // Phase 1: Validate topic parameters
-        let error_code = match Self::validate_topic(&topic) {
+        // Phase 1: Validate topic parameters (and configs owned by other crates)
+        let error_code = match Self::validate_topic(&topic).and_then(|_| {
+            handler.check_topic_config(&topic.configs).map_err(|msg| {
+                error!(topic = %topic.name, "CreateTopics: invalid config: {}", msg);
+                error_codes::INVALID_CONFIG
+            })
+        }) {
             Ok(_) => {
                 // Phase 2: Validate replication factor against available brokers
                 match handler.validate_replication_factor(&topic).await {

@@ -34,9 +34,9 @@ FAIL=0
 say()  { printf '%s\n' "$*"; }
 fail() { say "FAIL: $*"; FAIL=1; }
 
-[ -x "$BIN" ] || { say "SKIP: build first (cargo build --release --bin chronik-server)"; exit 0; }
-command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
-command -v curl >/dev/null || { say "SKIP: curl not installed"; exit 0; }
+[ -x "$BIN" ] || { say "SKIP: build first (cargo build --release --bin chronik-server)"; exit 77; }
+command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 77; }
+command -v curl >/dev/null || { say "SKIP: curl not installed"; exit 77; }
 
 trap '"$DIR"/stop.sh >/dev/null 2>&1' EXIT
 

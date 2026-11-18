@@ -101,7 +101,16 @@ pub struct ProtocolHandler {
     sasl_authenticator: Arc<Mutex<crate::sasl::SaslAuthenticator>>,
     /// What CreateTopics uses when a client leaves the counts to the broker.
     topic_defaults: TopicDefaults,
+    /// Checks for topic configs owned by crates this one does not depend on
+    /// (the columnar projection, chronik-columnar). Run on the final config of
+    /// CreateTopics, AlterConfigs and IncrementalAlterConfigs; an `Err` is
+    /// answered with INVALID_CONFIG and its message, and nothing is changed.
+    topic_config_check: Option<TopicConfigCheck>,
 }
+
+/// See [`ProtocolHandler::set_topic_config_check`].
+pub type TopicConfigCheck =
+    Arc<dyn Fn(&HashMap<String, String>) -> std::result::Result<(), String> + Send + Sync>;
 
 /// The partition count and replication factor a topic gets when CreateTopics
 /// sends -1 for them (KIP-464: "use the broker default"), as kafka-topics.sh
@@ -194,6 +203,7 @@ impl ProtocolHandler {
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
             topic_defaults: TopicDefaults::default(),
+            topic_config_check: None,
         }
     }
 
@@ -209,6 +219,7 @@ impl ProtocolHandler {
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
             topic_defaults: TopicDefaults::default(),
+            topic_config_check: None,
         }
     }
 
@@ -227,6 +238,7 @@ impl ProtocolHandler {
             advertised_port: 9092,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
             topic_defaults: TopicDefaults::default(),
+            topic_config_check: None,
         }
     }
 
@@ -247,6 +259,7 @@ impl ProtocolHandler {
             advertised_port,
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
             topic_defaults: TopicDefaults::default(),
+            topic_config_check: None,
         }
     }
 
@@ -254,6 +267,20 @@ impl ProtocolHandler {
     pub fn with_topic_defaults(mut self, defaults: TopicDefaults) -> Self {
         self.topic_defaults = defaults;
         self
+    }
+
+    /// Check topic configs this crate cannot (see [`TopicConfigCheck`]).
+    pub fn with_topic_config_check(mut self, check: TopicConfigCheck) -> Self {
+        self.topic_config_check = Some(check);
+        self
+    }
+
+    /// Run the topic config check, if one is set.
+    pub fn check_topic_config(&self, config: &HashMap<String, String>) -> std::result::Result<(), String> {
+        match &self.topic_config_check {
+            Some(check) => check(config),
+            None => Ok(()),
+        }
     }
 
     /// The topic as it will be created: a count the client sent as -1 becomes
@@ -3345,6 +3372,12 @@ impl ProtocolHandler {
                                         // If value is None, the config is not set (removed)
                                     }
 
+                                    if error_code == error_codes::NONE {
+                                        if let Err(msg) = self.check_topic_config(&new_config.config) {
+                                            error_code = error_codes::INVALID_CONFIG;
+                                            error_message = Some(msg);
+                                        }
+                                    }
                                     // Persist if no validation errors
                                     if error_code == error_codes::NONE {
                                         match metadata_store.update_topic(&resource.resource_name, new_config).await {
@@ -3535,6 +3568,12 @@ impl ProtocolHandler {
                                         }
                                     }
 
+                                    if error_code == 0 {
+                                        if let Err(msg) = self.check_topic_config(&config.config) {
+                                            error_code = crate::error_codes::INVALID_CONFIG;
+                                            error_message = Some(msg);
+                                        }
+                                    }
                                     // Persist the updated configuration if no errors
                                     if error_code == 0 {
                                         match metadata_store.update_topic(&resource.resource_name, config).await {
@@ -6019,57 +6058,6 @@ impl ProtocolHandler {
         Ok(())
     }
 
-    fn validate_topic_configs(&self, configs: &HashMap<String, String>, replication_factor: i16) -> Result<()> {
-        for (key, value) in configs {
-            match key.as_str() {
-                "retention.ms" => {
-                    if let Ok(ms) = value.parse::<i64>() {
-                        if ms < -1 {
-                            return Err(Error::Protocol("retention.ms must be >= -1".into()));
-                        }
-                    } else {
-                        return Err(Error::Protocol(format!("Invalid retention.ms value: {}", value)));
-                    }
-                }
-                "segment.bytes" => {
-                    if let Ok(bytes) = value.parse::<i64>() {
-                        if bytes < 14 {
-                            return Err(Error::Protocol("segment.bytes must be >= 14".into()));
-                        }
-                    } else {
-                        return Err(Error::Protocol(format!("Invalid segment.bytes value: {}", value)));
-                    }
-                }
-                "compression.type" => {
-                    if !["none", "gzip", "snappy", "lz4", "zstd"].contains(&value.as_str()) {
-                        return Err(Error::Protocol(format!("Invalid compression.type: {}", value)));
-                    }
-                }
-                "cleanup.policy" => {
-                    if !["delete", "compact", "delete,compact", "compact,delete"].contains(&value.as_str()) {
-                        return Err(Error::Protocol(format!("Invalid cleanup.policy: {}", value)));
-                    }
-                }
-                "min.insync.replicas" => {
-                    if let Ok(replicas) = value.parse::<i32>() {
-                        if replicas < 1 || replicas > replication_factor as i32 {
-                            return Err(Error::Protocol(format!(
-                                "min.insync.replicas must be between 1 and replication factor ({})", 
-                                replication_factor
-                            )));
-                        }
-                    } else {
-                        return Err(Error::Protocol(format!("Invalid min.insync.replicas value: {}", value)));
-                    }
-                }
-                _ => {
-                    // Other configs are allowed without validation
-                }
-            }
-        }
-        Ok(())
-    }
-    
     /// Get topics from metadata store
     async fn get_topics_from_metadata(&self, requested_topics: &Option<Vec<String>>) -> Result<Vec<crate::types::MetadataTopic>> {
         use crate::types::{MetadataTopic, MetadataPartition};

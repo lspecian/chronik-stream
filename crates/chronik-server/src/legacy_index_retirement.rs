@@ -17,7 +17,7 @@
 //!
 //! `CHRONIK_LEGACY_INDEX_RETIREMENT=false` leaves the old indexes alone.
 
-use crate::fetch_handler::FetchHandler;
+use crate::fetch_handler::{record_batches, FetchHandler};
 use chronik_search::legacy_index::{coverage, legacy_index_dirs, read_index};
 use chronik_storage::canonical_record::CanonicalRecord;
 use chronik_storage::WalIndexer;
@@ -203,29 +203,6 @@ async fn holds_any(
         let base = i64::from_be_bytes(raw[..8].try_into().expect("8 bytes"));
         base <= hi
     }))
-}
-
-/// The v2 record batches in a fetch's record bytes (`baseOffset` i64,
-/// `batchLength` i32, then `batchLength` bytes; magic at byte 16). Older
-/// message sets are skipped.
-fn record_batches(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut at = 0usize;
-    while at + 17 <= bytes.len() {
-        let len = i32::from_be_bytes(bytes[at + 8..at + 12].try_into().expect("4 bytes"));
-        if len <= 0 {
-            break;
-        }
-        let end = at + 12 + len as usize;
-        if end > bytes.len() {
-            break; // a partial batch at the end of a size-bounded read
-        }
-        if bytes[at + 16] == 2 {
-            out.push(&bytes[at..end]);
-        }
-        at = end;
-    }
-    out
 }
 
 /// Move the old index out of `index/` first, so a crash mid-delete never

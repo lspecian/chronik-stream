@@ -10,7 +10,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Schema};
 use std::sync::Arc;
 
-use crate::json_schema::{InferredJsonSchema, JsonFieldType};
+use crate::json_schema::InferredJsonSchema;
+use crate::projection::{ColumnSpec, ColumnType, Projected};
 use crate::schema::kafka_message_schema;
 
 /// A minimal representation of a Kafka record for conversion.
@@ -157,113 +158,85 @@ impl RecordBatchConverter {
         records: &[KafkaRecord],
         json_schema: &InferredJsonSchema,
     ) -> Result<RecordBatch> {
+        let columns: Vec<ColumnSpec> = json_schema
+            .fields
+            .iter()
+            .filter_map(crate::projection::column_from_inferred)
+            .collect();
+        self.convert_with_columns(records, &columns)
+    }
+
+    /// Convert records to a RecordBatch carrying the envelope plus one typed
+    /// column per projected column (issue #73). Each value is parsed once; a
+    /// value that is not JSON, or lacks a column, yields NULL there.
+    pub fn convert_with_columns(
+        &self,
+        records: &[KafkaRecord],
+        columns: &[ColumnSpec],
+    ) -> Result<RecordBatch> {
+        use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, TimestampNanosecondBuilder};
+
         if records.is_empty() {
             return Err(anyhow!("Cannot convert empty record batch"));
         }
-
-        // Build base batch first (standard Kafka columns)
         let base_batch = self.convert(records)?;
-
-        if json_schema.fields.is_empty() {
+        if columns.is_empty() {
             return Ok(base_batch);
         }
 
-        // Parse all values as JSON upfront
-        let parsed: Vec<Option<serde_json::Map<String, serde_json::Value>>> = records
+        enum Builder {
+            Str(StringBuilder),
+            Int(Int64Builder),
+            Float(Float64Builder),
+            Bool(BooleanBuilder),
+            Ts(TimestampNanosecondBuilder),
+        }
+        let mut builders: Vec<Builder> = columns
             .iter()
-            .map(|r| {
-                serde_json::from_slice::<serde_json::Value>(&r.value)
-                    .ok()
-                    .and_then(|v| v.as_object().cloned())
+            .map(|c| match c.ty {
+                ColumnType::String | ColumnType::Json => Builder::Str(StringBuilder::with_capacity(records.len(), records.len() * 16)),
+                ColumnType::Int64 => Builder::Int(Int64Builder::with_capacity(records.len())),
+                ColumnType::Float64 => Builder::Float(Float64Builder::with_capacity(records.len())),
+                ColumnType::Boolean => Builder::Bool(BooleanBuilder::with_capacity(records.len())),
+                ColumnType::Timestamp => Builder::Ts(
+                    TimestampNanosecondBuilder::with_capacity(records.len())
+                        .with_timezone(crate::projection::TIMESTAMP_TZ),
+                ),
             })
             .collect();
 
-        // Build extra columns from JSON fields
-        let mut extra_columns: Vec<(String, ArrayRef)> = Vec::new();
-
-        for field in &json_schema.fields {
-            let array: ArrayRef = match field.field_type {
-                JsonFieldType::String | JsonFieldType::Object | JsonFieldType::Array => {
-                    let arr: StringArray = parsed
-                        .iter()
-                        .map(|obj| {
-                            obj.as_ref().and_then(|o| o.get(&field.name)).and_then(|v| {
-                                match v {
-                                    serde_json::Value::String(s) => Some(s.clone()),
-                                    serde_json::Value::Null => None,
-                                    other => Some(other.to_string()),
-                                }
-                            })
-                        })
-                        .collect();
-                    Arc::new(arr)
+        for record in records {
+            let parsed: Option<serde_json::Value> = serde_json::from_slice(&record.value).ok();
+            for (spec, builder) in columns.iter().zip(builders.iter_mut()) {
+                let value = parsed.as_ref().and_then(|v| spec.extract(v));
+                match (builder, value) {
+                    (Builder::Str(b), Some(Projected::Str(s))) => b.append_value(s),
+                    (Builder::Int(b), Some(Projected::Int(i))) => b.append_value(i),
+                    (Builder::Float(b), Some(Projected::Float(f))) => b.append_value(f),
+                    (Builder::Bool(b), Some(Projected::Bool(x))) => b.append_value(x),
+                    (Builder::Ts(b), Some(Projected::TimestampNanos(n))) => b.append_value(n),
+                    (Builder::Str(b), _) => b.append_null(),
+                    (Builder::Int(b), _) => b.append_null(),
+                    (Builder::Float(b), _) => b.append_null(),
+                    (Builder::Bool(b), _) => b.append_null(),
+                    (Builder::Ts(b), _) => b.append_null(),
                 }
-                JsonFieldType::Int64 => {
-                    let arr: Int64Array = parsed
-                        .iter()
-                        .map(|obj| {
-                            obj.as_ref()
-                                .and_then(|o| o.get(&field.name))
-                                .and_then(|v| v.as_i64())
-                        })
-                        .collect();
-                    Arc::new(arr)
-                }
-                JsonFieldType::Float64 => {
-                    use arrow_array::Float64Array;
-                    let arr: Float64Array = parsed
-                        .iter()
-                        .map(|obj| {
-                            obj.as_ref()
-                                .and_then(|o| o.get(&field.name))
-                                .and_then(|v| v.as_f64())
-                        })
-                        .collect();
-                    Arc::new(arr)
-                }
-                JsonFieldType::Boolean => {
-                    use arrow_array::BooleanArray;
-                    let arr: BooleanArray = parsed
-                        .iter()
-                        .map(|obj| {
-                            obj.as_ref()
-                                .and_then(|o| o.get(&field.name))
-                                .and_then(|v| v.as_bool())
-                        })
-                        .collect();
-                    Arc::new(arr)
-                }
-            };
-            extra_columns.push((field.name.clone(), array));
+            }
         }
 
-        // Build extended schema = base schema + JSON fields
-        let mut all_fields: Vec<arrow_schema::FieldRef> =
-            base_batch.schema().fields().iter().cloned().collect();
-        for (name, _) in &extra_columns {
-            let field_def = json_schema
-                .fields
-                .iter()
-                .find(|f| f.name == *name)
-                .unwrap();
-            all_fields.push(Arc::new(arrow_schema::Field::new(
-                name,
-                field_def.field_type.to_arrow_type(),
-                true, // JSON fields are always nullable (value might not be JSON)
-            )));
+        let mut fields: Vec<arrow_schema::FieldRef> = base_batch.schema().fields().iter().cloned().collect();
+        let mut arrays: Vec<ArrayRef> = base_batch.columns().to_vec();
+        for (spec, builder) in columns.iter().zip(builders) {
+            fields.push(Arc::new(spec.arrow_field()));
+            arrays.push(match builder {
+                Builder::Str(mut b) => Arc::new(b.finish()),
+                Builder::Int(mut b) => Arc::new(b.finish()),
+                Builder::Float(mut b) => Arc::new(b.finish()),
+                Builder::Bool(mut b) => Arc::new(b.finish()),
+                Builder::Ts(mut b) => Arc::new(b.finish()),
+            });
         }
-
-        let extended_schema = Arc::new(Schema::new(all_fields));
-
-        // Combine base columns + extra columns
-        let mut all_columns: Vec<ArrayRef> = (0..base_batch.num_columns())
-            .map(|i| base_batch.column(i).clone())
-            .collect();
-        for (_, col) in extra_columns {
-            all_columns.push(col);
-        }
-
-        RecordBatch::try_new(extended_schema, all_columns)
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
             .map_err(|e| anyhow!("Failed to create extended RecordBatch: {}", e))
     }
 

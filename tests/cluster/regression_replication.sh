@@ -61,9 +61,9 @@ fail() { say "FAIL: $*"; FAIL=1; }
 
 # ---------------------------------------------------------------- local mode --
 local_setup() {
-  command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 0; }
+  command -v kcat >/dev/null || { say "SKIP: kcat not installed"; exit 77; }
   [ -x "${CHRONIK_BIN:-$SCRIPT_DIR/../../target/release/chronik-server}" ] \
-    || { say "SKIP: ${CHRONIK_BIN:-target/release/chronik-server} not built"; exit 0; }
+    || { say "SKIP: ${CHRONIK_BIN:-target/release/chronik-server} not built"; exit 77; }
   "$SCRIPT_DIR/stop.sh" >/dev/null 2>&1
   "$SCRIPT_DIR/start.sh" >/dev/null 2>&1 &
   sleep 25
@@ -136,7 +136,7 @@ detect_quote_level() {
 }
 
 k8s_setup() {
-  [ -n "$NS" ] && [ -n "$PODS" ] || { say "SKIP: k8s mode needs REPL_NS and REPL_PODS"; exit 0; }
+  [ -n "$NS" ] && [ -n "$PODS" ] || { say "SKIP: k8s mode needs REPL_NS and REPL_PODS"; exit 77; }
   local ready; ready=$($KUBECTL get pods -n "$NS" --no-headers 2>/dev/null | grep -c "^$PODS.* 1/1 *Running")
   [ "$ready" -ge 3 ] || { say "SKIP: need 3 running $PODS pods in $NS (found $ready)"; exit 1; }
 

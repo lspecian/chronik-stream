@@ -1046,7 +1046,12 @@ impl WalIndexer {
             "Found sealed WAL segments to index"
         );
 
-        // Limit number of segments per run
+        // Oldest first within each partition, then limit the run. The WAL lists
+        // sealed segments in no particular order, so a backlog was indexed —
+        // and cut to `max_segments_per_run` — in arbitrary order, and the hot
+        // buffer's flushed offset (the contiguous run cold holds) jumped ahead
+        // of segments still waiting.
+        segments_to_index.sort_by_cached_key(|segment| segment_order_key(segment));
         segments_to_index.truncate(config.max_segments_per_run);
 
         if segments_to_index.is_empty() {
@@ -1257,22 +1262,25 @@ impl WalIndexer {
         (!topic.is_empty()).then(|| (topic.to_string(), partition))
     }
 
-    /// Highest offset already written to a cold Parquet segment for this
-    /// partition, or `None` if it has no cold segments yet.
+    /// The offset ranges this partition's cold Parquet segments cover, sorted
+    /// and merged (touching ranges joined), or empty if it has none.
     ///
-    /// This is the durable, restart-surviving record of what cold already holds,
-    /// used to keep Parquet flushing idempotent (a segment is never written for
-    /// offsets a prior one covers). `None` vs `Some(-1)` do not need
-    /// distinguishing here — both mean "nothing to skip".
-    async fn cold_high_water_mark(
+    /// This is the durable, restart-surviving record of what cold already
+    /// holds, used to keep Parquet flushing idempotent (#41): a segment is
+    /// never written for offsets a prior one covers. It used to be reduced to
+    /// the highest offset, and everything at or below it was skipped — so when
+    /// sealed segments were indexed out of order (a backlog, a segment held
+    /// back by a failure backoff), the first high one written made every lower
+    /// one look done, and their records never reached Parquet.
+    async fn cold_ranges(
         metadata_store: &Arc<dyn MetadataStore>,
         tp: &TopicPartition,
-    ) -> Option<i64> {
+    ) -> Result<Vec<(i64, i64)>> {
         let segments = metadata_store
             .list_parquet_segments(&tp.topic, Some(tp.partition))
             .await
-            .ok()?;
-        segments.iter().map(|s| s.max_offset).max()
+            .map_err(|e| Error::Internal(format!("Failed to list Parquet segments: {}", e)))?;
+        Ok(merge_ranges(segments.iter().map(|s| (s.min_offset, s.max_offset)).collect()))
     }
 
     /// Which of this pass's missing topics may actually have their WAL deleted.
@@ -1990,9 +1998,30 @@ impl WalIndexer {
     /// Converts CanonicalRecords to Arrow RecordBatches and writes to Parquet format.
     /// Uses time-based partitioning (hourly by default) for efficient query pruning.
     /// Registers the new Parquet segment with the SegmentIndex for SQL query planning.
+    ///
+    /// Writes for one partition are serialized (`parquet_flush_lock`) from
+    /// reading what cold covers to registering the new segment: the indexer
+    /// and the columnar catch-up both write here, and two writers that each
+    /// saw a range uncovered would both write it — two files for one range,
+    /// every row counted twice (#41).
+    ///
+    /// Returns (bytes_written, end of the contiguous run cold now holds).
     #[instrument(skip(config, object_store, metadata_store, segment_index, canonical_records))]
-    /// Returns (bytes_written, max_offset) on success.
     async fn create_parquet_segment(
+        config: &WalIndexerConfig,
+        object_store: &Arc<dyn ObjectStore>,
+        metadata_store: &Arc<dyn MetadataStore>,
+        segment_index: &Arc<SegmentIndex>,
+        tp: &TopicPartition,
+        canonical_records: Vec<CanonicalRecord>,
+    ) -> Result<(u64, i64)> {
+        let lock = parquet_flush_lock(tp);
+        let _held = lock.lock().await;
+        Self::create_parquet_segment_locked(config, object_store, metadata_store, segment_index, tp, canonical_records)
+            .await
+    }
+
+    async fn create_parquet_segment_locked(
         config: &WalIndexerConfig,
         object_store: &Arc<dyn ObjectStore>,
         metadata_store: &Arc<dyn MetadataStore>,
@@ -2054,33 +2083,31 @@ impl WalIndexer {
         // flushed; a follower that re-pulled a partition re-seals overlapping
         // ranges. Writing those again created a *second* Parquet segment covering
         // offsets an older one already held, and the cold scan counted each
-        // offset once per copy. The cold high-water mark lives in the metadata
-        // store (it survives restarts), so trim to offsets strictly above it.
+        // offset once per copy. The ranges cold covers live in the metadata
+        // store (they survive restarts), so drop exactly the offsets inside
+        // them — not everything below the highest, which lost whole segments
+        // whenever they were indexed out of order.
         //
-        // `highest_offset` (before trimming) is still returned so the hot buffer
-        // evicts up to it: those rows are in cold either way, whether this pass
-        // wrote them or a previous one did.
-        let highest_offset = kafka_records.iter().map(|r| r.offset).max().unwrap_or(0);
-        let cold_watermark = Self::cold_high_water_mark(metadata_store, tp).await;
-        if let Some(wm) = cold_watermark {
-            let before = kafka_records.len();
-            kafka_records.retain(|r| r.offset > wm);
-            let dropped = before - kafka_records.len();
-            if dropped > 0 {
-                debug!(
-                    topic = %tp.topic,
-                    partition = tp.partition,
-                    cold_watermark = wm,
-                    dropped,
-                    remaining = kafka_records.len(),
-                    "Skipping offsets already present in cold Parquet (idempotent flush)"
-                );
-            }
-            if kafka_records.is_empty() {
-                // Everything here is already in cold. Nothing to write, but the
-                // data is durable in cold, so report the high offset for eviction.
-                return Ok((0, highest_offset));
-            }
+        // What is returned for the hot buffer is the end of the contiguous run
+        // cold holds from its lowest offset (`cold_prefix_end`): the hot buffer
+        // hides every offset at or below it, so it must never move past a gap
+        // a segment indexed later will fill.
+        let mut cold = Self::cold_ranges(metadata_store, tp).await?;
+        let before = kafka_records.len();
+        kafka_records.retain(|r| !range_covers(&cold, r.offset));
+        let dropped = before - kafka_records.len();
+        if dropped > 0 {
+            debug!(
+                topic = %tp.topic,
+                partition = tp.partition,
+                dropped,
+                remaining = kafka_records.len(),
+                "Skipping offsets already present in cold Parquet (idempotent flush)"
+            );
+        }
+        if kafka_records.is_empty() {
+            // Everything here is already in cold. Nothing to write.
+            return Ok((0, cold_prefix_end(&cold)));
         }
 
         // Calculate offset and timestamp ranges for naming
@@ -2089,55 +2116,63 @@ impl WalIndexer {
         let min_timestamp = kafka_records.iter().map(|r| r.timestamp_ms).min().unwrap_or(0);
         let max_timestamp = kafka_records.iter().map(|r| r.timestamp_ms).max().unwrap_or(0);
 
-        // Check if topic has JSON schema for columnar extraction
-        let json_schema = if let Some(ref tc) = topic_config {
-            if let Some(schema_str) = tc.config.json_schema() {
-                InferredJsonSchema::from_config_string(schema_str)
-            } else {
-                // First time: infer schema from sample values and persist
-                let sample_values: Vec<&[u8]> = kafka_records
-                    .iter()
-                    .take(100)
-                    .map(|r| r.value.as_slice())
-                    .collect();
-                if let Some(inferred) = InferredJsonSchema::infer(&sample_values, 64) {
-                    let config_str = inferred.to_config_string();
-                    debug!(
+        // The typed columns this topic projects out of its values (issue #73;
+        // chronik-columnar/src/projection.rs). In `auto` mode (the default)
+        // they are the top-level fields inferred from the data, stored in the
+        // topic config as `columnar.json_schema` so every node and every
+        // segment agree. The stored list only grows: a field first seen now is
+        // appended. It used to be inferred once, from the first flush's first
+        // 100 records, and never again, so a field that appeared later was
+        // never a column.
+        let mut topic_cfg: std::collections::HashMap<String, String> =
+            topic_config.as_ref().map(|tc| tc.config.config.clone()).unwrap_or_default();
+        if topic_config.is_some()
+            && chronik_columnar::projection::ProjectionMode::of(&topic_cfg).ok()
+                == Some(chronik_columnar::projection::ProjectionMode::Auto)
+        {
+            // A sample spread across the batch, not just its head.
+            let step = (kafka_records.len() / 100).max(1);
+            let sample_values: Vec<&[u8]> =
+                kafka_records.iter().step_by(step).take(100).map(|r| r.value.as_slice()).collect();
+            let stored = topic_cfg
+                .get(chronik_columnar::projection::INFERRED_KEY)
+                .and_then(|s| InferredJsonSchema::from_config_string(s));
+            let grown = match (&stored, InferredJsonSchema::infer(&sample_values, 64)) {
+                (None, Some(inferred)) => Some(inferred),
+                (Some(stored), Some(inferred)) => stored.extended_with(&inferred, 64),
+                _ => None,
+            };
+            if let (Some(grown), Some(tc)) = (grown, topic_config.as_ref()) {
+                let config_str = grown.to_config_string();
+                info!(
+                    topic = %tp.topic,
+                    schema = %config_str,
+                    "Columnar fields inferred from the data (columnar.json_schema)"
+                );
+                let mut updated_config = tc.config.clone();
+                updated_config
+                    .config
+                    .insert(chronik_columnar::projection::INFERRED_KEY.to_string(), config_str.clone());
+                if let Err(e) = metadata_store.update_topic(&tp.topic, updated_config).await {
+                    warn!(
                         topic = %tp.topic,
-                        schema = %config_str,
-                        "Inferred JSON schema for columnar storage"
+                        error = %e,
+                        "Failed to persist inferred JSON schema (will re-infer next time)"
                     );
-                    // Persist to topic config (best-effort, don't block on failure)
-                    let mut updated_config = tc.config.clone();
-                    updated_config.config.insert(
-                        "columnar.json_schema".to_string(),
-                        config_str,
-                    );
-                    if let Err(e) = metadata_store.update_topic(&tp.topic, updated_config).await {
-                        warn!(
-                            topic = %tp.topic,
-                            error = %e,
-                            "Failed to persist inferred JSON schema (will re-infer next time)"
-                        );
-                    }
-                    Some(inferred)
-                } else {
-                    None
                 }
+                topic_cfg.insert(chronik_columnar::projection::INFERRED_KEY.to_string(), config_str);
             }
-        } else {
-            None
-        };
+        }
+        let (columns, problem) = chronik_columnar::projection::effective_columns(&topic_cfg);
+        if let Some(problem) = problem {
+            warn!(topic = %tp.topic, "columnar projection config ignored in part: {}", problem);
+        }
 
-        // Convert to Arrow RecordBatch (with JSON columns if schema available)
+        // Convert to Arrow RecordBatch (envelope + projected columns)
         let converter = RecordBatchConverter::new();
-        let batch = if let Some(ref js) = json_schema {
-            converter.convert_with_json(&kafka_records, js)
-                .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?
-        } else {
-            converter.convert(&kafka_records)
-                .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?
-        };
+        let batch = converter
+            .convert_with_columns(&kafka_records, &columns)
+            .map_err(|e| Error::Internal(format!("Failed to convert to RecordBatch: {}", e)))?;
 
         // Create Parquet writer and write to bytes
         let schema = (*batch.schema()).clone();
@@ -2308,7 +2343,8 @@ impl WalIndexer {
             "Registered Parquet segment in index and metadata store"
         );
 
-        Ok((bytes_written, max_offset))
+        cold.push((min_offset, max_offset));
+        Ok((bytes_written, cold_prefix_end(&merge_ranges(cold))))
     }
 
     /// v2.2.22: Process vector embeddings for CanonicalRecords
@@ -2332,6 +2368,7 @@ impl WalIndexer {
         Self::process_vector_embeddings_with_model(
             config, metadata_store, vector_index_manager, tp, canonical_records, None, hot_vector_index,
         ).await
+        .map(|o| o.embedded)
     }
 
     /// Process vector embeddings with an optional model ID override.
@@ -2347,9 +2384,9 @@ impl WalIndexer {
         canonical_records: Vec<CanonicalRecord>,
         model_id: Option<&str>,
         hot_vector_index: Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>,
-    ) -> Result<usize> {
+    ) -> Result<EmbedOutcome> {
         if canonical_records.is_empty() {
-            return Ok(0);
+            return Ok(EmbedOutcome::default());
         }
 
         // Get topic config to read vector settings
@@ -2360,7 +2397,7 @@ impl WalIndexer {
             Some(t) => t,
             None => {
                 warn!(topic = %tp.topic, "Topic not found for vector processing");
-                return Ok(0);
+                return Ok(EmbedOutcome::default());
             }
         };
 
@@ -2391,7 +2428,7 @@ impl WalIndexer {
                 partition = tp.partition,
                 "No text extracted from records for embedding"
             );
-            return Ok(0);
+            return Ok(EmbedOutcome::default());
         }
 
         let text_count = texts.len();
@@ -2425,7 +2462,7 @@ impl WalIndexer {
                      for 'external', or OPENAI_API_KEY for 'openai') on the topic, \
                      or CHRONIK_EMBEDDING_PROVIDER/_ENDPOINT on the server"
                 );
-                return Ok(0);
+                return Ok(EmbedOutcome { texts: text_count, failed: text_count, ..Default::default() });
             }
         };
 
@@ -2460,7 +2497,16 @@ impl WalIndexer {
                     tokens = stats.total_tokens,
                     "Embedding pipeline completed"
                 );
-                Ok(stats.embedded)
+                if stats.failed > 0 {
+                    warn!(
+                        topic = %tp.topic,
+                        partition = tp.partition,
+                        failed = stats.failed,
+                        embedded = stats.embedded,
+                        "records not embedded (provider error); the vector catch-up retries them from the log"
+                    );
+                }
+                Ok(EmbedOutcome { texts: text_count, embedded: stats.embedded, failed: stats.failed })
             }
             Err(e) => {
                 error!(
@@ -2674,6 +2720,63 @@ impl WalIndexer {
     /// embedding pipeline, skipping offsets already in the HNSW index.
     ///
     /// Returns stats about the backfill operation.
+    /// Embed `records` of a vector-enabled topic into its default-model index,
+    /// skipping offsets the index already holds. Used by the vector catch-up
+    /// (chronik-server `vector_catchup`), which re-reads from the log what the
+    /// seal-time pass failed to embed or never saw.
+    pub async fn embed_records(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: Vec<CanonicalRecord>,
+    ) -> Result<EmbedOutcome> {
+        let tp = TopicPartition::new(topic.to_string(), partition);
+        let hot_vec = self.hot_vector_index.read().await.clone();
+        Self::process_vector_embeddings_with_model(
+            &self.config,
+            &self.metadata_store,
+            &self.vector_index_manager,
+            &tp,
+            records,
+            None,
+            hot_vec,
+        )
+        .await
+    }
+
+    /// Write records read back from the log to this partition's Parquet, as
+    /// the seal-time pass would have, skipping offsets cold already covers.
+    /// Used by the columnar catch-up. Returns (bytes written, end of the
+    /// contiguous run cold now holds); the SQL hot buffer is told that end.
+    pub async fn write_parquet_records(
+        &self,
+        topic: &str,
+        partition: i32,
+        records: Vec<CanonicalRecord>,
+    ) -> Result<(u64, i64)> {
+        let tp = TopicPartition::new(topic.to_string(), partition);
+        let (bytes, flushed) = Self::create_parquet_segment(
+            &self.config,
+            &self.object_store,
+            &self.metadata_store,
+            &self.segment_index,
+            &tp,
+            records,
+        )
+        .await?;
+        if flushed >= 0 {
+            if let Some(hb) = self.hot_buffer.read().await.as_ref() {
+                hb.set_flushed_offset(topic, partition, flushed);
+            }
+        }
+        Ok((bytes, flushed))
+    }
+
+    /// The offset ranges this partition's Parquet segments cover, merged.
+    pub async fn parquet_coverage(&self, topic: &str, partition: i32) -> Result<Vec<(i64, i64)>> {
+        Self::cold_ranges(&self.metadata_store, &TopicPartition::new(topic.to_string(), partition)).await
+    }
+
     pub async fn backfill_vector_embeddings(
         &self,
         topic: &str,
@@ -2790,7 +2893,8 @@ impl WalIndexer {
                 model_id,
                 hot_vec,
             ).await {
-                Ok(embeddings_generated) => {
+                Ok(outcome) => {
+                    let embeddings_generated = outcome.embedded;
                     info!(
                         topic = %topic,
                         partition = segment.partition,
@@ -2827,6 +2931,17 @@ impl WalIndexer {
 
         Ok(stats)
     }
+}
+
+/// What one embedding step did with a batch of records.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedOutcome {
+    /// Records that yielded text to embed (the rest have nothing to embed).
+    pub texts: usize,
+    /// Vectors added.
+    pub embedded: usize,
+    /// Texts not embedded: provider errors, or no provider at all.
+    pub failed: usize,
 }
 
 /// Statistics for a vector embedding backfill operation
@@ -3805,4 +3920,88 @@ mod tests {
 
         assert_eq!(local_suffix, s3_suffix, "S3 and local paths should have identical structure after prefix");
     }
+}
+
+/// Sort key for a sealed segment id (`topic:partition:sequence`): by topic and
+/// partition, then by sequence numerically, so each partition's segments come
+/// oldest first. An id of another shape sorts after, by its text.
+fn segment_order_key(segment: &str) -> (String, i64, u64, String) {
+    let mut parts = segment.rsplitn(3, ':');
+    let seq = parts.next().and_then(|s| s.parse::<u64>().ok());
+    let partition = parts.next().and_then(|p| p.parse::<i64>().ok());
+    match (parts.next(), partition, seq) {
+        (Some(topic), Some(partition), Some(seq)) => (topic.to_string(), partition, seq, String::new()),
+        _ => (String::from("\u{10FFFF}"), i64::MAX, u64::MAX, segment.to_string()),
+    }
+}
+
+/// Inclusive offset ranges sorted and merged; ranges that overlap or touch
+/// (`next.min == prev.max + 1`) become one.
+fn merge_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    ranges.retain(|(lo, hi)| lo <= hi);
+    ranges.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+/// Whether `offset` lies inside one of the merged ranges.
+fn range_covers(merged: &[(i64, i64)], offset: i64) -> bool {
+    let i = merged.partition_point(|(lo, _)| *lo <= offset);
+    i > 0 && offset <= merged[i - 1].1
+}
+
+/// End of the contiguous run the merged ranges hold from their lowest offset,
+/// or -1 if there are none.
+fn cold_prefix_end(merged: &[(i64, i64)]) -> i64 {
+    merged.first().map(|(_, hi)| *hi).unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod cold_range_tests {
+    use super::*;
+
+    #[test]
+    fn ranges_merge_when_they_overlap_or_touch() {
+        assert_eq!(merge_ranges(vec![(10, 19), (0, 9), (30, 39), (35, 50)]), vec![(0, 19), (30, 50)]);
+        assert_eq!(merge_ranges(vec![]), vec![]);
+    }
+
+    #[test]
+    fn a_lower_segment_indexed_after_a_higher_one_is_not_covered() {
+        // Segment 7 written first: offsets of segments 0..6 must still be written.
+        let cold = merge_ranges(vec![(700, 799)]);
+        assert!(!range_covers(&cold, 0));
+        assert!(!range_covers(&cold, 699));
+        assert!(range_covers(&cold, 700));
+        assert!(range_covers(&cold, 799));
+        assert!(!range_covers(&cold, 800));
+    }
+
+    #[test]
+    fn the_flushed_offset_stops_at_the_first_gap() {
+        assert_eq!(cold_prefix_end(&merge_ranges(vec![(0, 99), (200, 299)])), 99);
+        assert_eq!(cold_prefix_end(&merge_ranges(vec![(0, 99), (100, 199), (200, 299)])), 299);
+        assert_eq!(cold_prefix_end(&[]), -1);
+    }
+
+    #[test]
+    fn sealed_segments_sort_oldest_first_per_partition() {
+        let mut ids = vec!["t:0:51", "t:0:7", "t:1:2", "s:0:10", "t:0:10", "odd"];
+        ids.sort_by_cached_key(|s| segment_order_key(s));
+        assert_eq!(ids, vec!["s:0:10", "t:0:7", "t:0:10", "t:0:51", "t:1:2", "odd"]);
+    }
+}
+
+/// The lock serializing Parquet writes for one partition (see
+/// `WalIndexer::create_parquet_segment`).
+fn parquet_flush_lock(tp: &TopicPartition) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<dashmap::DashMap<(String, i32), Arc<tokio::sync::Mutex<()>>>> =
+        std::sync::LazyLock::new(dashmap::DashMap::new);
+    LOCKS.entry((tp.topic.clone(), tp.partition)).or_default().clone()
 }

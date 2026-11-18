@@ -212,6 +212,7 @@ mod tests {
 
     fn sample_response() -> QueryResponse {
         QueryResponse {
+            incomplete_nodes: Vec::new(),
             query_id: "test-query-123".into(),
             results: vec![RankedResult {
                 topic: "logs".into(),

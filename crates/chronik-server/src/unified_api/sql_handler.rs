@@ -441,6 +441,8 @@ enum JsonColKind {
     Int,
     Float,
     Bool,
+    /// A projected `timestamp` column (UTC, nanoseconds).
+    Timestamp,
 }
 
 impl JsonColKind {
@@ -452,6 +454,7 @@ impl JsonColKind {
             D::UInt8 | D::UInt16 | D::UInt32 => Some(Self::Int),
             D::Float16 | D::Float32 | D::Float64 => Some(Self::Float),
             D::Boolean => Some(Self::Bool),
+            D::Timestamp(_, _) => Some(Self::Timestamp),
             // Anything else (lists, structs, decimals, timestamps) is not
             // something the JSON inference produces, so it is not a message
             // field and is left out rather than guessed at.
@@ -462,12 +465,28 @@ impl JsonColKind {
     /// The canonical SQL type. Both union inputs are cast to it, for the reason
     /// in the `common_cols` comment below: letting DataFusion coerce the two
     /// sides itself breaks every query touching the column.
-    fn sql_type(self) -> &'static str {
+    fn cast(self, expr: &str) -> String {
         match self {
-            Self::Text => "VARCHAR",
-            Self::Int => "BIGINT",
-            Self::Float => "DOUBLE",
-            Self::Bool => "BOOLEAN",
+            Self::Text => format!("CAST({expr} AS VARCHAR)"),
+            Self::Int => format!("CAST({expr} AS BIGINT)"),
+            Self::Float => format!("CAST({expr} AS DOUBLE)"),
+            Self::Bool => format!("CAST({expr} AS BOOLEAN)"),
+            // SQL has no spelling for a zoned nanosecond timestamp; DataFusion's
+            // `arrow_cast` names the exact type projected columns carry.
+            Self::Timestamp => {
+                format!("arrow_cast({expr}, 'Timestamp(Nanosecond, Some(\"UTC\"))')")
+            }
+        }
+    }
+
+    fn of_projected(ty: chronik_columnar::projection::ColumnType) -> Self {
+        use chronik_columnar::projection::ColumnType as T;
+        match ty {
+            T::String | T::Json => Self::Text,
+            T::Int64 => Self::Int,
+            T::Float64 => Self::Float,
+            T::Boolean => Self::Bool,
+            T::Timestamp => Self::Timestamp,
         }
     }
 
@@ -478,7 +497,7 @@ impl JsonColKind {
     /// not, so every aggregate over recent data would come back quietly short.
     fn extract_from_value(self, path_literal: &str) -> String {
         let f = match self {
-            Self::Text | Self::Bool => "json_extract_string",
+            Self::Text | Self::Bool | Self::Timestamp => "json_extract_string",
             Self::Int => "json_extract_int",
             Self::Float => "json_extract_float",
         };
@@ -508,19 +527,56 @@ fn cold_json_columns(
         .collect()
 }
 
-/// Order-independent fingerprint of a column set, for [`ViewComposition`].
-fn json_cols_fingerprint(cols: &[(String, JsonColKind)]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut total: u64 = 0;
-    for (name, kind) in cols {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        name.hash(&mut h);
-        (*kind as u8).hash(&mut h);
-        // Sum, so the fingerprint does not depend on the field order a given
-        // Parquet file happens to use.
-        total = total.wrapping_add(h.finish());
+/// One message column of a topic's unified view, and how the hot side
+/// computes it.
+#[derive(Debug, Clone, PartialEq)]
+struct ViewColumn {
+    name: String,
+    kind: JsonColKind,
+    hot_expr: String,
+}
+
+/// The message columns of a topic's unified view: its projected columns
+/// (issue #73), plus any column the cold schema carries that the projection
+/// does not name — written under an earlier projection, read back by name.
+fn view_columns(
+    projected: &[chronik_columnar::projection::ColumnSpec],
+    cold_schema: Option<&datafusion::arrow::datatypes::Schema>,
+) -> Vec<ViewColumn> {
+    let mut cols: Vec<ViewColumn> = projected
+        .iter()
+        .map(|spec| ViewColumn {
+            name: spec.name.clone(),
+            kind: JsonColKind::of_projected(spec.ty),
+            hot_expr: format!(
+                "{}(_value, '{}')",
+                chronik_columnar::udfs::json_project_udf_name(spec.ty),
+                sql_escape(&spec.paths_literal(), '\'')
+            ),
+        })
+        .collect();
+    if let Some(schema) = cold_schema {
+        for (name, kind) in cold_json_columns(schema) {
+            if !cols.iter().any(|c| c.name == name) {
+                let hot_expr = kind.extract_from_value(&sql_escape(&name, '\''));
+                cols.push(ViewColumn { name, kind, hot_expr });
+            }
+        }
     }
-    total
+    cols
+}
+
+/// Order-independent fingerprint of a view's message columns, for
+/// [`ViewComposition`].
+fn view_columns_fingerprint(cols: &[ViewColumn]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    cols.iter().fold(0u64, |total, c| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        c.name.hash(&mut h);
+        (c.kind as u8).hash(&mut h);
+        c.hot_expr.hash(&mut h);
+        total.wrapping_add(h.finish())
+    })
 }
 
 /// Double a character to escape it, for SQL identifiers (`"`) and string
@@ -667,6 +723,10 @@ async fn hot_cold_overlap(state: &UnifiedApiState, topic: &str) -> bool {
 pub struct SqlTableRegistry {
     topics: dashmap::DashMap<String, ViewComposition>,
     last_cold_probe_ms: dashmap::DashMap<String, u64>,
+    /// The projection fingerprint each topic's cold table was registered with.
+    /// The cold schema carries the projected columns, so a changed projection
+    /// (a declared column, a new inferred field) re-registers it.
+    cold_projection: dashmap::DashMap<String, u64>,
 }
 
 impl SqlTableRegistry {
@@ -750,14 +810,26 @@ impl SqlHandler {
             let cold_table_name = format!("{}_cold", base_table_name);
             let hot_table_name = format!("{}_hot", base_table_name);
 
+            // The typed columns this topic projects (issue #73), from its config.
+            let (projected, _) =
+                chronik_columnar::projection::effective_columns(&topic_meta.config.config);
+            let projection_fp = chronik_columnar::projection::fingerprint(&projected);
+
             // ============================================================
             // Register COLD table (live Parquet listing)
             // ============================================================
             let mut has_cold = registered_set.contains(&cold_table_name);
+            // Registered with another projection: register it again, so the new
+            // or changed columns are part of its schema.
+            let reproject = has_cold
+                && state.sql_tables.cold_projection.get(topic).map(|v| *v) != Some(projection_fp);
+            if reproject {
+                has_cold = false;
+            }
 
             // Only probe while the topic has no cold table yet: afterwards the
             // provider keeps itself current and this scan would be wasted work.
-            if !has_cold && state.sql_tables.should_probe_cold(topic, probe_interval) {
+            if !has_cold && (reproject || state.sql_tables.should_probe_cold(topic, probe_interval)) {
                 let paths = resolve_parquet_paths(state.metadata_store.as_ref(), topic).await;
 
                 if let Some(sample) = paths.first() {
@@ -773,10 +845,12 @@ impl SqlHandler {
                             source,
                             sample,
                             chronik_columnar::DEFAULT_PARQUET_REFRESH_MS,
+                            &projected,
                         )
                         .await
                     {
                         Ok(()) => {
+                            state.sql_tables.cold_projection.insert(topic.clone(), projection_fp);
                             info!(
                                 topic = %topic,
                                 table_name = %cold_table_name,
@@ -790,6 +864,13 @@ impl SqlHandler {
                         }
                     }
                 }
+            }
+
+            // A failed re-registration leaves the previous cold table in place
+            // (the old provider is only replaced once the new one is built): keep
+            // serving it rather than dropping cold data from the view.
+            if reproject && !has_cold {
+                has_cold = true;
             }
 
             // ============================================================
@@ -856,30 +937,32 @@ impl SqlHandler {
                 && (cold_segments_overlap(state.metadata_store.as_ref(), topic).await
                     || (has_hot && hot_cold_overlap(state, topic).await));
 
-            // The typed JSON columns live only on the cold side. Read them off
-            // the cold schema so the view can name them; without this the
-            // inferred columns are written to Parquet and then dropped by the
-            // one table callers actually query.
-            let json_cols: Vec<(String, JsonColKind)> = if has_cold {
+            // The message columns, named one by one by the view: the projected
+            // columns from the topic's config, plus any column a cold segment
+            // carries that the config no longer names (segments written under an
+            // earlier projection). Without this they would be written to Parquet
+            // and dropped by the one table callers actually query.
+            let cold_schema = if has_cold {
                 match engine.get_table_schema(&cold_table_name).await {
-                    Ok(schema) => cold_json_columns(&schema),
+                    Ok(schema) => Some(schema),
                     Err(e) => {
                         debug!(
                             topic = %topic,
                             error = %e,
-                            "Could not read cold schema; unified view will carry the envelope only"
+                            "Could not read cold schema; unified view will carry the projected columns only"
                         );
-                        Vec::new()
+                        None
                     }
                 }
             } else {
-                Vec::new()
+                None
             };
+            let view_cols = view_columns(&projected, cold_schema.as_deref());
             let composition = ViewComposition {
                 has_hot,
                 has_cold,
                 cold_dedup,
-                json_cols: json_cols_fingerprint(&json_cols),
+                json_cols: view_columns_fingerprint(&view_cols),
             };
             let current = state.sql_tables.topics.get(topic).map(|c| *c);
             let view_exists =
@@ -904,22 +987,18 @@ impl SqlHandler {
                                  _timestamp, _timestamp_type, CAST(_key AS BYTEA) AS _key, \
                                  CAST(_value AS BYTEA) AS _value";
 
-                // The inferred JSON columns, spelled three ways: read off the
-                // typed column on the cold side, extracted from `_value` on the
-                // hot side, and named plainly on the way out. The casts are
-                // identical on both sides for the same reason as above.
+                // The message columns, spelled three ways: read off the typed
+                // column on the cold side, computed from `_value` on the hot side
+                // (the same extraction the Parquet writer uses), and named
+                // plainly on the way out. The casts are identical on both sides
+                // for the same reason as above.
                 let mut hot_cols = String::from(core_cols);
                 let mut cold_cols = String::from(core_cols);
                 let mut out_extra = String::new();
-                for (name, kind) in &json_cols {
-                    let ident = sql_escape(name, '"');
-                    let literal = sql_escape(name, '\'');
-                    let ty = kind.sql_type();
-                    hot_cols.push_str(&format!(
-                        ", CAST({} AS {ty}) AS \"{ident}\"",
-                        kind.extract_from_value(&literal)
-                    ));
-                    cold_cols.push_str(&format!(", CAST(\"{ident}\" AS {ty}) AS \"{ident}\""));
+                for col in &view_cols {
+                    let ident = sql_escape(&col.name, '"');
+                    hot_cols.push_str(&format!(", {} AS \"{ident}\"", col.kind.cast(&col.hot_expr)));
+                    cold_cols.push_str(&format!(", {} AS \"{ident}\"", col.kind.cast(&format!("\"{ident}\""))));
                     out_extra.push_str(&format!(", \"{ident}\""));
                 }
                 let hot_cols = hot_cols.as_str();
@@ -1059,6 +1138,7 @@ impl SqlHandler {
                         source,
                         sample,
                         chronik_columnar::DEFAULT_PARQUET_REFRESH_MS,
+                        &[],
                     )
                     .await
                 {
@@ -1709,6 +1789,10 @@ pub async fn list_tables(State(state): State<UnifiedApiState>) -> impl IntoRespo
         }
     };
 
+    // Tables are registered lazily, by the first query that needs them; without
+    // this a node that had not been queried since boot listed no tables at all
+    // (signal-stream: `{"tables":[]}` while `SELECT ... FROM default_logs` worked).
+    SqlHandler::ensure_topics_registered(&state, engine).await;
     let tables = engine.list_registered_topics().await;
 
     let response = ListTablesResponse {
@@ -1757,6 +1841,7 @@ pub async fn describe_table(
         }
     };
 
+    SqlHandler::ensure_topics_registered(&state, engine).await;
     match engine.get_table_schema(&table).await {
         Ok(schema) => {
             let columns: Vec<ColumnInfo> = schema
@@ -2365,27 +2450,41 @@ mod cold_json_column_tests {
     /// Parquet file lists the same fields in a different order.
     #[test]
     fn the_fingerprint_tracks_the_column_set_not_its_order() {
-        let a = vec![
-            ("sev".to_string(), JsonColKind::Text),
-            ("n".to_string(), JsonColKind::Int),
-        ];
-        let reordered = vec![
-            ("n".to_string(), JsonColKind::Int),
-            ("sev".to_string(), JsonColKind::Text),
-        ];
-        let gained = vec![
-            ("sev".to_string(), JsonColKind::Text),
-            ("n".to_string(), JsonColKind::Int),
-            ("grp".to_string(), JsonColKind::Text),
-        ];
-        let retyped = vec![
-            ("sev".to_string(), JsonColKind::Text),
-            ("n".to_string(), JsonColKind::Float),
-        ];
-        assert_eq!(json_cols_fingerprint(&a), json_cols_fingerprint(&reordered));
-        assert_ne!(json_cols_fingerprint(&a), json_cols_fingerprint(&gained));
-        assert_ne!(json_cols_fingerprint(&a), json_cols_fingerprint(&retyped));
-        assert_eq!(json_cols_fingerprint(&[]), 0);
+        use chronik_columnar::projection::parse_columns;
+        let fp = |list: &str| view_columns_fingerprint(&view_columns(&parse_columns(list).unwrap(), None));
+        assert_eq!(fp("sev;n:int64"), fp("n:int64;sev"));
+        assert_ne!(fp("sev;n:int64"), fp("sev;n:int64;grp"), "a column gained");
+        assert_ne!(fp("sev;n:int64"), fp("sev;n:float64"), "a column retyped");
+        assert_ne!(fp("svc:/resource/service.name"), fp("svc:/resource/name"), "a column re-pathed");
+        assert_eq!(view_columns_fingerprint(&[]), 0);
+    }
+
+    /// Projected columns are computed on the hot side by the same extraction
+    /// the writer uses; columns only the cold schema has (an earlier
+    /// projection) are kept and read by name.
+    #[test]
+    fn the_view_names_projected_columns_and_legacy_cold_ones() {
+        use chronik_columnar::projection::parse_columns;
+        let cold = schema(vec![
+            Field::new("_offset", DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("legacy", DataType::Int64, true),
+        ]);
+        let cols = view_columns(&parse_columns("svc:/resource/service.name;ts:timestamp:/t").unwrap(), Some(&cold));
+        let got: Vec<(&str, JsonColKind, &str)> =
+            cols.iter().map(|c| (c.name.as_str(), c.kind, c.hot_expr.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("svc", JsonColKind::Text, "json_project_string(_value, '/resource/service.name')"),
+                ("ts", JsonColKind::Timestamp, "json_project_timestamp(_value, '/t')"),
+                ("legacy", JsonColKind::Int, "json_extract_int(_value, '$.legacy')"),
+            ]
+        );
+        assert_eq!(
+            JsonColKind::Timestamp.cast("x"),
+            r#"arrow_cast(x, 'Timestamp(Nanosecond, Some("UTC"))')"#
+        );
     }
 
     /// A hot row must carry the real value. Projecting NULL would be cheaper
@@ -2410,7 +2509,7 @@ mod cold_json_column_tests {
             JsonColKind::Bool.extract_from_value("ok"),
             "json_extract_string(_value, '$.ok')"
         );
-        assert_eq!(JsonColKind::Bool.sql_type(), "BOOLEAN");
+        assert_eq!(JsonColKind::Bool.cast("x"), "CAST(x AS BOOLEAN)");
     }
 
     /// A JSON key may contain a quote. Splicing it in raw would produce SQL

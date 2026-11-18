@@ -1471,6 +1471,19 @@ impl VectorIndexManager {
         indexes.get(&key).map(|index| index.stats())
     }
 
+    /// The offsets the default-model index of a partition holds, ascending.
+    /// Empty when there is no index.
+    pub async fn embedded_offsets(&self, topic: &str, partition: i32) -> Vec<u64> {
+        let key = TopicPartitionKey::new(topic, partition);
+        let indexes = self.indexes.read().await;
+        let mut offsets: Vec<u64> = indexes
+            .get(&key)
+            .map(|index| index.known_offsets.iter().copied().collect())
+            .unwrap_or_default();
+        offsets.sort_unstable();
+        offsets
+    }
+
     /// Get statistics for all partitions of a topic (aggregated across all models).
     ///
     /// VO-5: The `partitions` map is keyed by partition number. If multiple models
@@ -1619,7 +1632,10 @@ impl VectorIndexManager {
                     info!("Deleted vector snapshot: {}", entry.path().display());
                 }
             }
+            // The directory itself, when nothing else is in it.
+            let _ = fs::remove_dir(&topic_dir).await;
         }
+        self.unregister_topic(topic).await;
 
         Ok(count)
     }

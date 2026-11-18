@@ -51,7 +51,7 @@ FAIL=0
 say()  { printf '%s\n' "$*"; }
 fail() { say "FAIL: $*"; FAIL=1; }
 
-[ -n "$NS" ] || { say "SKIP: set REPL_NS"; exit 0; }
+[ -n "$NS" ] || { say "SKIP: set REPL_NS"; exit 77; }
 BOOT="${PODS}-headless:9092"
 TOPIC="diverge-$$"
 POLICY="isolate-leader-$$"

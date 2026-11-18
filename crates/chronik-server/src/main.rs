@@ -70,6 +70,9 @@ mod produce_order;  // Per-connection write order for pipelined Produce requests
 mod connection;  // Security Phase 0: per-connection identity + SASL enforcement
 mod inter_broker;  // Broker-to-broker SASL as __chronik_broker
 mod authorizer;  // Security Phase 3: maps Kafka requests onto ACL checks
+mod txn_authorization;  // ACL checks for the transactional APIs
+mod vector_catchup;  // embeds archived records a vector index is missing
+mod columnar_catchup;  // writes archived records Parquet is missing
 mod schema_registry;  // Phase 5: Confluent-compatible Schema Registry
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, IntegratedKafkaServerBuilder};

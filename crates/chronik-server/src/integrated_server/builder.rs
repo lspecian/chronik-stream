@@ -1639,6 +1639,15 @@ impl IntegratedKafkaServerBuilder {
             );
         }
 
+        // Embed archived records the vector indexes are missing: failed
+        // seal-time embeds, and partitions this node received by repair.
+        if let Some(fetch_handler) = self.fetch_handler.clone() {
+            crate::vector_catchup::spawn(metadata_store.clone(), wal_indexer.clone(), fetch_handler.clone());
+            // Write archived records Parquet is missing: ranges the pre-2.18.2
+            // flush dropped as out of order, history from before columnar.enabled.
+            crate::columnar_catchup::spawn(metadata_store.clone(), wal_indexer.clone(), fetch_handler);
+        }
+
         // Merge runs of small archives into larger ones, in the background
         // (CHRONIK_ARCHIVE_MERGE=false turns it off).
         chronik_storage::archive_merge::spawn(wal_indexer.object_store(), wal_indexer.segment_index().clone());
@@ -1902,14 +1911,26 @@ impl IntegratedKafkaServerBuilder {
             return;
         };
         let index = self.wal_indexer.as_ref().map(|indexer| indexer.segment_index().clone());
+        let vectors = self.wal_indexer.as_ref().map(|indexer| indexer.vector_index_manager().clone());
         let runtime = tokio::runtime::Handle::current();
 
         metadata.on_topic_deleted(Arc::new(move |topic: String| {
+            let vectors = vectors.clone();
             let (store, index, wal_manager, produce_handler) =
                 (store.clone(), index.clone(), wal_manager.clone(), produce_handler.clone());
             runtime.spawn(async move {
                 produce_handler.forget_topic(&topic);
                 wal_manager.cleanup_topic(&topic).await;
+                // Its vector indexes too: left behind they were listed by
+                // `/_vector/topics` forever, and a topic recreated under the
+                // same name would have served the old one's vectors.
+                if let Some(vectors) = &vectors {
+                    match vectors.clear_topic_with_snapshots(&topic).await {
+                        Ok(n) if n > 0 => info!("Deleted topic {}: removed its vector index ({} vectors)", topic, n),
+                        Ok(_) => {}
+                        Err(e) => warn!("Deleted topic {}: could not remove its vector index: {}", topic, e),
+                    }
+                }
 
                 let partitions = match chronik_storage::archive::archived_partitions(
                     store.as_ref(),
