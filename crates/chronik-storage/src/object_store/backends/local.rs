@@ -278,6 +278,13 @@ impl ObjectStore for LocalBackend {
         options: ListOptions,
     ) -> ObjectStoreResult<Vec<ObjectMetadata>> {
         let mut objects = Vec::new();
+        // A leading '/' names the same objects as without it — `build_path`
+        // ignores empty components, so get/put/delete already treat
+        // "/a/b" and "a/b" as one key — but listed keys never carry it, so
+        // `starts_with` below matched nothing for a "/"-prefixed listing.
+        // Clusters whose archive keys are absolute ("/data/tantivy_indexes/…")
+        // listed no archive at all.
+        let prefix = prefix.trim_start_matches('/');
 
         // Walk only the directory the prefix names. Every key under `prefix`
         // lives below the path of its directory part (up to the last '/'), so
@@ -651,6 +658,10 @@ mod tests {
                 vec!["segments/t/0/0-9.segment", "segments/t/0/10-19.segment", "segments/t/1/0-4.segment",
                     "segments/top.txt", "segments/tx/0/0-1.segment"]);
             assert_eq!(listed(&backend, "segments/t/0/1").await, vec!["segments/t/0/10-19.segment"]);
+            // A leading '/' names the same keys, as it does for get/put/delete
+            // (thunderbird's archive keys are absolute: "/data/tantivy_indexes/…").
+            assert_eq!(listed(&backend, "/segments/t/0/").await,
+                vec!["segments/t/0/0-9.segment", "segments/t/0/10-19.segment"]);
             assert_eq!(listed(&backend, "ro").await, vec!["root.txt"]);
             assert_eq!(listed(&backend, "").await.len(), 7);
             // Nothing stored there: empty, not an error.

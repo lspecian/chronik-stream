@@ -4,8 +4,9 @@
 //! them as an extra source, and they hold two kinds of records the archives do
 //! not: records of topics or partitions that have since been deleted, emptied
 //! or recreated — data that is gone everywhere else and must not be searchable
-//! — and a few records the archiver of the time skipped (every archive of an
-//! old topic starts at offset 1, missing offset 0).
+//! — and, for early topics, a document at offset 0 that the log itself does
+//! not hold (consuming from 0 starts at offset 1 on thunderbird; the archives
+//! rightly start at 1). Re-reading the log is what tells the two apart.
 //!
 //! Once per boot, for each old index: the offsets no local archive covers are
 //! read back from this node's own log (`FetchHandler::read_local_range`), and
