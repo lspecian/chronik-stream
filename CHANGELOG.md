@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   said the limit counted produce batches; the WAL read has counted messages
   since v2.16.4.) `tests/cluster/e2e/hot_buffer_limit.sh` fails on v2.18.1 and
   passes now.
+- **Duplicate vectors in index snapshots were kept forever** (#67). Adds have
+  been deduplicated by offset since v2.4.1, but a snapshot written before that
+  could hold several vectors per offset (168K on one thunderbird node), and
+  loading copied them as they were — so searches returned repeated hits and
+  the next snapshot saved the duplicates again. Loading now keeps one vector
+  per offset (the last stored) and logs how many it dropped. A count taken
+  on thunderbird before this release found none above its partition's record
+  count, so the old duplicates appear to have been rebuilt away already.
 
 ## [2.18.1] - 2026-11-18
 

@@ -1768,11 +1768,22 @@ impl VectorIndexManager {
         };
 
         let key = TopicPartitionKey::with_model(topic, partition, &effective_model);
-        let vector_count = snapshot.vectors.len();
+        // Snapshots written before adds were deduplicated by offset (v2.4.1)
+        // can hold several vectors for one offset — 168K on one thunderbird
+        // node (#67). Loading copied them as they were, and the next snapshot
+        // saved them again, so they never went away. Keep one per offset.
+        let (vectors, duplicates) = dedup_by_offset(snapshot.vectors);
+        if duplicates > 0 {
+            warn!(
+                topic, partition, duplicates, kept = vectors.len(),
+                "dropped duplicate vectors from the index snapshot (one is kept per offset)"
+            );
+        }
+        let vector_count = vectors.len();
         let mut index = PartitionIndex::with_model_id(snapshot.config, effective_model.clone());
         // VO-2: Load into built_vectors (pending starts empty). build() below
         // will construct the HNSW graph over them.
-        index.built_vectors = snapshot.vectors;
+        index.built_vectors = vectors;
         index.last_offset = snapshot.last_offset;
         // VO-3: Restore quantizer from snapshot (if present)
         index.quantizer = snapshot.quantizer;
@@ -2010,6 +2021,27 @@ pub struct PartitionIndexSnapshot {
     /// Backward compat: old snapshots without this field get it reconstructed from vectors.
     #[serde(default)]
     pub known_offsets: Vec<u64>,
+}
+
+/// One vector per offset, keeping the last one stored for it (the most
+/// recent embedding), in the original order. Returns how many were dropped.
+fn dedup_by_offset(vectors: Vec<(u64, Vec<f32>)>) -> (Vec<(u64, Vec<f32>)>, usize) {
+    let before = vectors.len();
+    let mut last = std::collections::HashMap::with_capacity(before);
+    for (i, (offset, _)) in vectors.iter().enumerate() {
+        last.insert(*offset, i);
+    }
+    if last.len() == before {
+        return (vectors, 0);
+    }
+    let kept: Vec<_> = vectors
+        .into_iter()
+        .enumerate()
+        .filter(|(i, (offset, _))| last.get(offset) == Some(i))
+        .map(|(_, v)| v)
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
 }
 
 fn default_model_id() -> String {
@@ -4095,5 +4127,66 @@ mod loading_flag_tests {
         } else {
             panic!("the build finished before the search ran; make it bigger so the test measures something");
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_dedup_tests {
+    use super::*;
+
+    /// #67: a snapshot written before adds were deduplicated holds several
+    /// vectors per offset. Loading must keep one per offset (the last), and
+    /// the next snapshot must not carry the duplicates on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_vectors_in_a_snapshot_are_dropped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = VectorIndexManager::new(VectorIndexConfig {
+            base_path: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let config = HnswIndexConfig { dimensions: 3, ..Default::default() };
+        // 150 offsets, each stored twice (a stale copy, then the newest one),
+        // as replays of an undeduplicated index left them.
+        let mut vectors = Vec::new();
+        for o in 0..150u64 {
+            vectors.push((o, vec![0.0, 1.0, 0.0]));
+        }
+        for o in 0..150u64 {
+            vectors.push((o, vec![1.0, 0.0, o as f32 / 1000.0]));
+        }
+        let snapshot = PartitionIndexSnapshot {
+            config,
+            vectors,
+            last_offset: Some(149),
+            quantizer: None,
+            model_id: DEFAULT_MODEL_ID.to_string(),
+            known_offsets: Vec::new(),
+        };
+        let path = manager.index_path("t", 0);
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&path, bincode::serialize(&snapshot).unwrap()).await.unwrap();
+
+        manager.load_partition_index("t", 0).await.unwrap();
+        assert_eq!(manager.get_topic_stats("t").await.total_vectors, 150);
+        let hits = manager.search("t", 0, &[1.0, 0.0, 0.0], 20).await.unwrap();
+        let mut offsets: Vec<i64> = hits.iter().map(|(o, _)| *o).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), hits.len(), "a search returns each offset once");
+        // The newest copy was kept: every offset matches [1, 0, ~0] closely.
+        assert!(hits.iter().all(|(_, d)| *d < 0.01), "{hits:?}");
+
+        manager.save_partition_index("t", 0).await.unwrap();
+        let saved: PartitionIndexSnapshot = bincode::deserialize(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(saved.vectors.len(), 150, "the duplicates are not saved again");
+    }
+
+    #[test]
+    fn dedup_keeps_the_last_copy_in_order() {
+        let (kept, dropped) = dedup_by_offset(vec![(1, vec![1.0]), (2, vec![2.0]), (1, vec![3.0]), (3, vec![4.0])]);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept, vec![(2, vec![2.0]), (1, vec![3.0]), (3, vec![4.0])]);
+        let (same, none) = dedup_by_offset(vec![(5, vec![0.0])]);
+        assert_eq!((same.len(), none), (1, 0));
     }
 }
