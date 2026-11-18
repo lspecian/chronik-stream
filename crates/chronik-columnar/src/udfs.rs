@@ -48,6 +48,9 @@ pub fn register_udfs(ctx: &SessionContext) -> Result<()> {
     ctx.register_udf(ScalarUDF::from(DecodeUtf8Udf::new()));
     ctx.register_udf(ScalarUDF::from(DecodeBase64Udf::new()));
     ctx.register_udf(ScalarUDF::from(VectorDistanceUdf::new()));
+    for udf in json_project_udfs() {
+        ctx.register_udf(ScalarUDF::from(udf));
+    }
     Ok(())
 }
 
@@ -840,5 +843,185 @@ mod tests {
         let v2: Vec<f32> = vec![];
         let distance = cosine_distance(&v1, &v2);
         assert!(distance.is_nan());
+    }
+}
+
+/// `json_project_<type>(value, paths)`: the value a projected column (issue
+/// #73) has for a message, computed exactly as the Parquet writer computes it
+/// (`ColumnSpec::extract`). The unified SQL view uses these on the hot side,
+/// where records are not yet in Parquet, so a column reads the same whichever
+/// tier holds the record. `paths` is the column's pointer list, `/a/b|/c`.
+#[derive(Debug)]
+struct JsonProjectUdf {
+    name: &'static str,
+    ty: crate::projection::ColumnType,
+    signature: Signature,
+}
+
+impl JsonProjectUdf {
+    fn new(name: &'static str, ty: crate::projection::ColumnType) -> Self {
+        Self { name, ty, signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable) }
+    }
+}
+
+/// The name of the projection UDF for a column type.
+pub fn json_project_udf_name(ty: crate::projection::ColumnType) -> &'static str {
+    use crate::projection::ColumnType::*;
+    match ty {
+        String => "json_project_string",
+        Int64 => "json_project_int",
+        Float64 => "json_project_float",
+        Boolean => "json_project_bool",
+        Timestamp => "json_project_timestamp",
+        Json => "json_project_json",
+    }
+}
+
+fn json_project_udfs() -> Vec<JsonProjectUdf> {
+    use crate::projection::ColumnType::*;
+    [String, Int64, Float64, Boolean, Timestamp, Json]
+        .into_iter()
+        .map(|ty| JsonProjectUdf::new(json_project_udf_name(ty), ty))
+        .collect()
+}
+
+impl ScalarUDFImpl for JsonProjectUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(self.ty.sql_arrow_type())
+    }
+
+    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+        use crate::projection::ColumnSpec;
+
+        use datafusion::common::ScalarValue;
+
+        let paths = match &args[1] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(p)))
+            | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(p)))
+            | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(p))) => p.clone(),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Plan(format!(
+                    "{}: the second argument must be a string literal of JSON pointers",
+                    self.name
+                )))
+            }
+        };
+        let spec = ColumnSpec::parse(&format!("c:{}:{}", self.ty.as_str(), paths))
+            .map_err(datafusion::error::DataFusionError::Plan)?;
+        let values = args[0].clone().into_array(1)?;
+        let array = project_binary_array(values.as_ref(), &spec).ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(format!(
+                "{}: expected a binary column, got {}",
+                self.name,
+                values.data_type()
+            ))
+        })?;
+        Ok(ColumnarValue::Array(array))
+    }
+}
+
+
+/// The column `spec` computed from a binary column of message values, in the
+/// column's SQL type: NULL where a value is not JSON or does not convert.
+/// `None` when `values` is not binary. Shared by the `json_project_*` UDFs and
+/// the cold-side schema adapter, so both compute exactly what the writer does.
+pub fn project_binary_array(values: &dyn Array, spec: &crate::projection::ColumnSpec) -> Option<ArrayRef> {
+    use crate::projection::{ColumnType, Projected};
+    use datafusion::arrow::array::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, TimestampNanosecondBuilder};
+    let len = get_binary_len(values)?;
+    let extracted = (0..len).map(|i| {
+        get_binary_value(values, i)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .and_then(|v| spec.extract(&v))
+    });
+    Some(match spec.ty {
+        ColumnType::String | ColumnType::Json => {
+            let mut b = StringBuilder::new();
+            for v in extracted {
+                match v {
+                    Some(Projected::Str(s)) => b.append_value(s),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        ColumnType::Int64 => {
+            let mut b = Int64Builder::new();
+            for v in extracted {
+                match v {
+                    Some(Projected::Int(x)) => b.append_value(x),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        ColumnType::Float64 => {
+            let mut b = Float64Builder::new();
+            for v in extracted {
+                match v {
+                    Some(Projected::Float(x)) => b.append_value(x),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        ColumnType::Boolean => {
+            let mut b = BooleanBuilder::new();
+            for v in extracted {
+                match v {
+                    Some(Projected::Bool(x)) => b.append_value(x),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        ColumnType::Timestamp => {
+            let mut b = TimestampNanosecondBuilder::new().with_timezone(crate::projection::TIMESTAMP_TZ);
+            for v in extracted {
+                match v {
+                    Some(Projected::TimestampNanos(x)) => b.append_value(x),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+    })
+}
+
+#[cfg(test)]
+mod json_project_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_hot_side_projects_exactly_like_the_writer() {
+        let ctx = SessionContext::new();
+        register_udfs(&ctx).unwrap();
+        let df = ctx
+            .sql(
+                r#"SELECT json_project_string(v, '/resource/service.name') AS svc,
+                          json_project_int(v, '/n|/m') AS n,
+                          json_project_timestamp(v, '/ts') AS ts
+                   FROM (VALUES (CAST('{"resource":{"service.name":"api"},"m":"7","ts":"2026-07-07T03:09:27.978+00:00"}' AS BYTEA)),
+                                (CAST('not json' AS BYTEA))) AS t(v)"#,
+            )
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let out = datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string();
+        assert!(out.contains("| api | 7 | 2026-07-07T03:09:27.978Z |"), "{out}");
+        assert_eq!(batches[0].schema().field(2).data_type(), &crate::projection::ColumnType::Timestamp.sql_arrow_type());
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
     }
 }

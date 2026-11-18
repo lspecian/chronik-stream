@@ -62,8 +62,32 @@ pub struct MergeOutcome {
     pub merges: usize,
     /// Archives merged away.
     pub archives_merged: usize,
-    /// Runs abandoned: a source vanished, or the sources could not be merged.
-    pub abandoned: usize,
+    /// Runs given up because a source left the catalogue while they were being
+    /// merged (a truncation, a topic delete). The next pass plans afresh.
+    pub raced: usize,
+    /// Runs that can never merge as planned: their archives were written in
+    /// different index schemas and no single-schema stretch is long enough.
+    /// Remembered, so later passes do not reopen them; any change to the
+    /// partition's archives yields a different run, which is planned anew.
+    pub ineligible: usize,
+    /// Runs that failed (download, merge or upload error).
+    pub failed: usize,
+}
+
+/// What became of one run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RunOutcome {
+    /// `merges` merged archives replaced `archives` sources.
+    Merged { merges: usize, archives: usize },
+    /// A source left the catalogue during the merge; nothing was changed.
+    Raced,
+    /// Archives of different schemas, no stretch of one schema long enough.
+    Ineligible,
+}
+
+/// The identity of a planned run: its sources' segment ids.
+fn run_key(run: &[SegmentMetadata]) -> String {
+    run.iter().map(|s| s.segment_id.as_str()).collect::<Vec<_>>().join("|")
 }
 
 /// The runs worth merging among a partition's archives: consecutive,
@@ -277,7 +301,17 @@ fn abort_if_testing(point: &str) {
 }
 
 /// Merge what `plan` finds in every partition. Returns what was done.
-pub async fn merge_all(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentIndex>, policy: &MergePolicy) -> MergeOutcome {
+///
+/// `ineligible` carries, from pass to pass, the runs found unmergeable: they
+/// are skipped instead of being reopened every pass. Thunderbird node 3 reopened
+/// one mixed-schema run of four archives every 15 minutes, reported only as
+/// `abandoned=1`, with no partition and no reason.
+pub async fn merge_all(
+    store: &Arc<dyn ObjectStore>,
+    index: &Arc<SegmentIndex>,
+    policy: &MergePolicy,
+    ineligible: &mut std::collections::HashSet<String>,
+) -> MergeOutcome {
     sweep_orphans(store, index, policy.orphan_age).await;
     let mut outcome = MergeOutcome::default();
     let all = index.get_all_segments().await.unwrap_or_default();
@@ -287,42 +321,69 @@ pub async fn merge_all(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentIndex>, 
     }
     for ((topic, partition), archives) in by_partition {
         for run in plan(archives, policy) {
+            let key = run_key(&run);
+            if ineligible.contains(&key) {
+                continue;
+            }
+            let (lo, hi) = (run[0].min_offset, run[run.len() - 1].max_offset);
             match merge_run(store, index, &run, policy).await {
-                Ok((0, _)) => outcome.abandoned += 1,
-                Ok((merges, archives)) => {
+                Ok(RunOutcome::Merged { merges, archives }) => {
                     outcome.merges += merges;
                     outcome.archives_merged += archives;
                 }
+                Ok(RunOutcome::Raced) => {
+                    outcome.raced += 1;
+                    info!(
+                        topic = %topic, partition, min_offset = lo, max_offset = hi,
+                        "archive merge given up: a source left the catalogue during the merge"
+                    );
+                }
+                Ok(RunOutcome::Ineligible) => {
+                    outcome.ineligible += 1;
+                    info!(
+                        topic = %topic, partition, min_offset = lo, max_offset = hi, archives = run.len(),
+                        "archives not merged: written in different index schemas and no stretch of one \
+                         schema is long enough; not retried until the partition's archives change"
+                    );
+                    ineligible.insert(key);
+                }
                 Err(e) => {
-                    outcome.abandoned += 1;
-                    warn!(topic = %topic, partition, "archive merge failed: {}", e);
+                    outcome.failed += 1;
+                    warn!(topic = %topic, partition, min_offset = lo, max_offset = hi, "archive merge failed: {}", e);
                 }
             }
         }
     }
+    // Forget runs whose archives are gone, so the set holds only runs the
+    // catalogue still has.
+    if !ineligible.is_empty() {
+        let live: std::collections::HashSet<String> =
+            index.get_all_segments().await.unwrap_or_default().into_iter().map(|s| s.segment_id).collect();
+        ineligible.retain(|k| k.split('|').all(|id| live.contains(id)));
+    }
     // What was not merged is brought to the current format (plain tar, with
     // a term filter).
     upgrade_archives(store, index, policy).await;
-    if outcome.merges > 0 || outcome.abandoned > 0 {
+    if outcome.merges > 0 || outcome.raced > 0 || outcome.ineligible > 0 || outcome.failed > 0 {
         info!(
             merges = outcome.merges,
             archives_merged = outcome.archives_merged,
-            abandoned = outcome.abandoned,
+            raced = outcome.raced,
+            ineligible = outcome.ineligible,
+            failed = outcome.failed,
             "archive merge pass"
         );
     }
     outcome
 }
 
-/// Merge one run: `(merged archives created, archives merged away)`, `(0, 0)`
-/// when it was abandoned (a source no longer
-/// registered, or sources of different schemas).
+/// Merge one run. See [`RunOutcome`].
 pub async fn merge_run(
     store: &Arc<dyn ObjectStore>,
     index: &Arc<SegmentIndex>,
     run: &[SegmentMetadata],
     policy: &MergePolicy,
-) -> Result<(usize, usize)> {
+) -> Result<RunOutcome> {
     let (first, last) = (run.first().expect("a run"), run.last().expect("a run"));
     let topic = first.topic.clone();
     let partition = first.partition;
@@ -340,19 +401,31 @@ pub async fn merge_run(
         // time) cannot be merged together: merge each stretch of one schema.
         let schemas: Vec<_> = readers.iter().map(|r| r.index().schema()).collect();
         drop(readers);
-        let mut done = (0, 0);
+        let (mut merges, mut archives, mut raced) = (0, 0, false);
         let mut start = 0;
         for i in 1..=run.len() {
             if i == run.len() || schemas[i] != schemas[start] {
                 if i - start >= policy.min_run {
-                    let (m, a) = Box::pin(merge_run(store, index, &run[start..i], policy)).await?;
-                    done = (done.0 + m, done.1 + a);
+                    match Box::pin(merge_run(store, index, &run[start..i], policy)).await? {
+                        RunOutcome::Merged { merges: m, archives: a } => {
+                            merges += m;
+                            archives += a;
+                        }
+                        RunOutcome::Raced => raced = true,
+                        RunOutcome::Ineligible => {}
+                    }
                 }
                 start = i;
             }
         }
-        debug!(topic = %topic, partition, merges = done.0, "archives of different schemas merged by stretch");
-        return Ok(done);
+        debug!(topic = %topic, partition, merges, "archives of different schemas merged by stretch");
+        return Ok(if merges > 0 {
+            RunOutcome::Merged { merges, archives }
+        } else if raced {
+            RunOutcome::Raced
+        } else {
+            RunOutcome::Ineligible
+        });
     }
 
     let meta = ArchiveMetadata {
@@ -422,7 +495,7 @@ pub async fn merge_run(
         // its records back.
         let _ = store.delete(&key).await;
         let _ = store.delete(&term_filter_key(&key)).await;
-        return Ok((0, 0));
+        return Ok(RunOutcome::Raced);
     }
     abort_if_testing("after-swap");
     info!(topic = %topic, partition, archives = run.len(), min_offset = first.min_offset, max_offset = last.max_offset, size_bytes, "merged archives");
@@ -438,7 +511,7 @@ pub async fn merge_run(
             let _ = store.delete(&term_filter_key(&path)).await;
         }
     });
-    Ok((1, run.len()))
+    Ok(RunOutcome::Merged { merges: 1, archives: run.len() })
 }
 
 /// The merged archive's key: the sources' directory, `segment-<min>-<max>.tar`.
@@ -497,8 +570,9 @@ pub fn spawn(store: Arc<dyn ObjectStore>, index: Arc<SegmentIndex>) {
     let interval = Duration::from_secs(secs("CHRONIK_ARCHIVE_MERGE_INTERVAL_SECS", 900));
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
+        let mut ineligible = std::collections::HashSet::new();
         loop {
-            merge_all(&store, &index, &policy).await;
+            merge_all(&store, &index, &policy, &mut ineligible).await;
             tokio::time::sleep(interval).await;
         }
     });
@@ -630,8 +704,8 @@ mod tests {
             let index = Arc::new(SegmentIndex::new());
             archives(&store, &index, 6, gzip).await;
 
-            let outcome = merge_all(&store, &index, &policy()).await;
-            assert_eq!(outcome, MergeOutcome { merges: 1, archives_merged: 6, abandoned: 0 }, "gzip={gzip}");
+            let outcome = merge_all(&store, &index, &policy(), &mut Default::default()).await;
+            assert_eq!(outcome, MergeOutcome { merges: 1, archives_merged: 6, ..Default::default() }, "gzip={gzip}");
             let segs = index.get_segments_for_partition("t", 0).await.unwrap();
             assert_eq!(segs.len(), 1);
             let merged = &segs[0];
@@ -673,7 +747,7 @@ mod tests {
         let run = plan(index.get_segments_for_partition("t", 0).await.unwrap(), &policy()).remove(0);
         index.remove_segment("t", 0, &run[2].segment_id).await.unwrap();
 
-        assert_eq!(merge_run(&store, &index, &run, &policy()).await.unwrap(), (0, 0));
+        assert_eq!(merge_run(&store, &index, &run, &policy()).await.unwrap(), RunOutcome::Raced);
         assert_eq!(index.get_segments_for_partition("t", 0).await.unwrap().len(), 3, "untouched");
         assert!(store.get("idx/t/partition-0/segment-0-39.tar").await.is_err(), "no merged archive left");
         assert!(store.get("idx/t/partition-0/segment-0-9.tar").await.is_ok(), "sources kept");
@@ -735,7 +809,7 @@ mod tests {
         for base in [40, 50, 60, 70] {
             old_schema_archive(&store, &index, base).await; // 40-79, older schema
         }
-        let outcome = merge_all(&store, &index, &policy()).await;
+        let outcome = merge_all(&store, &index, &policy(), &mut Default::default()).await;
         assert_eq!((outcome.merges, outcome.archives_merged), (2, 8));
         let spans: Vec<(i64, i64)> = index
             .get_segments_for_partition("t", 0)
@@ -745,6 +819,45 @@ mod tests {
             .map(|s| (s.min_offset, s.max_offset))
             .collect();
         assert_eq!(spans, vec![(0, 39), (40, 79)]);
+    }
+
+    /// Thunderbird node 3: three archives in an older schema and one in the
+    /// current one. No stretch is long enough, so the run is reported as
+    /// ineligible (not as a failure or a race), and the next pass skips it
+    /// without reopening it.
+    #[tokio::test]
+    async fn a_mixed_schema_run_too_short_to_split_is_ineligible_and_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(dir.path()).await;
+        let index = Arc::new(SegmentIndex::new());
+        for base in [0, 10, 20] {
+            old_schema_archive(&store, &index, base).await;
+        }
+        let current = tempfile::tempdir().unwrap();
+        let current_store = local_store(current.path()).await;
+        let scratch = Arc::new(SegmentIndex::new());
+        archives(&current_store, &scratch, 4, false).await; // 0-39 in the current schema
+        let src = scratch.get_segments_for_partition("t", 0).await.unwrap().pop().unwrap(); // 30-39
+        store.put(&src.object_store_path, current_store.get(&src.object_store_path).await.unwrap()).await.unwrap();
+        index.add_segment(src.clone()).await.unwrap();
+        let p = MergePolicy { min_run: 4, ..policy() };
+
+        let mut ineligible = std::collections::HashSet::new();
+        let first = merge_all(&store, &index, &p, &mut ineligible).await;
+        assert_eq!(first, MergeOutcome { ineligible: 1, ..Default::default() });
+        assert_eq!(ineligible.len(), 1);
+        assert_eq!(index.get_segments_for_partition("t", 0).await.unwrap().len(), 4, "untouched");
+
+        // The second pass must not reopen it: delete a source file, and a pass
+        // that tried would fail on it.
+        store.delete(&src.object_store_path).await.unwrap();
+        let second = merge_all(&store, &index, &p, &mut ineligible).await;
+        assert_eq!(second, MergeOutcome::default());
+
+        // Once the partition's archives change, the memory lets go of the run.
+        index.remove_segment("t", 0, &src.segment_id).await.unwrap();
+        merge_all(&store, &index, &p, &mut ineligible).await;
+        assert!(ineligible.is_empty());
     }
 
     #[tokio::test]

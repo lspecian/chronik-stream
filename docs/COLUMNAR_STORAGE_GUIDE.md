@@ -98,6 +98,9 @@ Configure columnar storage via topic configuration:
 | `columnar.bloom_filter` | `true`, `false` | `true` | Enable bloom filters |
 | `columnar.bloom_filter.columns` | comma-separated | `offset,timestamp,key` | Columns with bloom filters |
 | `columnar.partitioning` | `none`, `hourly`, `daily` | `daily` | Time-based partitioning |
+| `columnar.projection` | `auto`, `otlp-logs`, `none` | `auto` | Which typed columns are projected out of JSON values (see [Projected Columns](#projected-columns)) |
+| `columnar.columns` | `name:type:/pointer;...` | none | Declared projected columns |
+| `columnar.projection.attributes` | `key;key` | none | `otlp-logs`: attributes projected as `attr_<key>` |
 
 ### Example: Full Configuration
 
@@ -179,17 +182,20 @@ GET /_sql/tables
 GET /_sql/describe/orders
 ```
 
-**Response:**
+**Response** (abridged):
 ```json
 {
   "table": "orders",
-  "schema": [
-    {"name": "offset", "type": "Int64", "nullable": false},
-    {"name": "partition", "type": "Int32", "nullable": false},
-    {"name": "timestamp", "type": "Timestamp(Millisecond, UTC)", "nullable": false},
-    {"name": "key", "type": "Binary", "nullable": true},
-    {"name": "value", "type": "Binary", "nullable": false},
-    {"name": "headers", "type": "Map(Utf8, Binary)", "nullable": true}
+  "columns": [
+    {"name": "_topic", "data_type": "Utf8", "nullable": false},
+    {"name": "_partition", "data_type": "Int32", "nullable": false},
+    {"name": "_offset", "data_type": "Int64", "nullable": false},
+    {"name": "_timestamp", "data_type": "Timestamp(Millisecond, Some(\"UTC\"))", "nullable": false},
+    {"name": "_timestamp_type", "data_type": "Int8", "nullable": false},
+    {"name": "_key", "data_type": "Binary", "nullable": true},
+    {"name": "_value", "data_type": "Binary", "nullable": false},
+    {"name": "order_id", "data_type": "Utf8", "nullable": true},
+    {"name": "amount", "data_type": "Float64", "nullable": true}
   ]
 }
 ```
@@ -198,38 +204,113 @@ GET /_sql/describe/orders
 
 ## Schema
 
-Each Kafka message is converted to a row with these columns:
+Every row carries the Kafka envelope:
 
 | Column | Arrow Type | Nullable | Description |
 |--------|------------|----------|-------------|
-| `offset` | Int64 | No | Kafka message offset |
-| `partition` | Int32 | No | Kafka partition number |
-| `timestamp` | Timestamp(ms, UTC) | No | Message timestamp |
-| `key` | Binary | Yes | Message key |
-| `value` | Binary | No | Message value |
-| `headers` | Map<Utf8, Binary> | Yes | Kafka headers |
-| `_embedding` | FixedSizeList<Float32> | Yes | Vector embedding (if vector.enabled) |
+| `_topic` | Utf8 | No | Topic name |
+| `_partition` | Int32 | No | Partition |
+| `_offset` | Int64 | No | Offset |
+| `_timestamp` | Timestamp(ms, UTC) | No | Record timestamp |
+| `_timestamp_type` | Int8 | No | 0 = CreateTime, 1 = LogAppendTime |
+| `_key` | Binary | Yes | Record key |
+| `_value` | Binary | No | Record value, exactly as produced |
+| `_headers` | Map<Utf8, Binary> | Yes | Headers (`{topic}_cold` only) |
 
-### Querying JSON Values
+plus the topic's **projected columns**, described next. `{topic}` is the
+unified table (recent records from the hot buffer plus Parquet);
+`{topic}_hot` and `{topic}_cold` are its two halves.
 
-If your messages are JSON, use DataFusion's JSON functions:
+### Projected Columns
+
+A JSON value's fields can be stored as typed columns of their own, written into
+the Parquet segments beside `_value`. A filter or aggregate on such a column
+reads that one narrow column (with Parquet min/max pruning) instead of decoding
+every `_value`:
 
 ```sql
--- Extract JSON field
-SELECT json_extract_scalar(value, '$.order_id') as order_id FROM orders
-
--- Filter by JSON field
-SELECT * FROM orders
-WHERE CAST(json_extract_scalar(value, '$.amount') AS DOUBLE) > 100
-
--- Aggregate
-SELECT
-  json_extract_scalar(value, '$.customer_id') as customer,
-  COUNT(*) as order_count,
-  SUM(CAST(json_extract_scalar(value, '$.amount') AS DOUBLE)) as total
-FROM orders
-GROUP BY json_extract_scalar(value, '$.customer_id')
+SELECT count(*) FROM default_logs WHERE severity = 'ERROR';
+SELECT service_name, count(*) FROM default_logs GROUP BY service_name;
 ```
+
+Which columns a topic projects is set by topic configs:
+
+| Config | Values | Default |
+|--------|--------|---------|
+| `columnar.projection` | `auto`, `otlp-logs`, `none` | `auto` |
+| `columnar.columns` | declared columns, `;`-separated (below) | none |
+| `columnar.projection.attributes` | `otlp-logs` only: attribute keys, `;`-separated | none |
+
+- **`auto`** infers the top-level fields of the values (up to 64) and projects
+  each as its JSON type; nested objects and arrays become their JSON text. The
+  list is kept in the topic config as `columnar.json_schema` and only grows: a
+  field first seen later is added; a field keeps the type it was first given.
+- **`otlp-logs`** projects one OpenTelemetry log record per message:
+  `timestamp`, `observed_timestamp` (timestamp), `severity`, `severity_text`,
+  `severity_number` (int64), `body`, `service_name` (from
+  `resource."service.name"`), `trace_id`, `span_id`, `scope_name`, and
+  `attributes` / `resource` as JSON text, plus `attr_<key>` for each key in
+  `columnar.projection.attributes`. It reads both the flattened shape
+  chronik-signal writes and the OTLP/JSON `LogRecord` names (`severityText`,
+  `timeUnixNano`, `body.stringValue`, ...).
+- **`none`** projects only declared columns.
+
+**Declared columns** (`columnar.columns`) are added to the mode's columns, and
+replace one of the same name. Each is `name[:type][:/path[|/path...]]` (no `=`: `kafka-configs.sh` refuses values containing one):
+
+- `name`: a letter first, then letters, digits and `_` (the `_` prefix is the
+  envelope's).
+- `type`: `string`, `int64`, `float64`, `boolean`, `timestamp` (UTC,
+  nanoseconds), `json` (the value's JSON text). Omitted: `string`.
+- `path`: a JSON Pointer — `/resource/service.name` reads key `service.name`
+  of object `resource`; `~1` stands for `/` and `~0` for `~`; a number indexes
+  an array. Alternatives separated by `|` are tried in order and the first
+  present, non-null one wins. Omitted: `/<name>`.
+
+```bash
+kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type topics --entity-name default-logs \
+  --add-config 'columnar.projection=otlp-logs,columnar.projection.attributes=http.status_code;user.id'
+
+kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type topics --entity-name orders \
+  --add-config 'columnar.columns=region:string:/customer/address/region;amount:float64:/amount|/total'
+```
+
+An invalid declaration is refused by the admin call (`INVALID_CONFIG`, naming
+the entry).
+
+**Conversions.** Numbers and booleans read as text in a `string` column;
+numeric strings read as numbers in `int64` / `float64` (OTLP/JSON writes 64-bit
+integers as strings); a `timestamp` reads RFC 3339 text, or epoch time as a
+number or numeric string, the unit taken from its magnitude (seconds below
+1e11, milliseconds below 1e14, microseconds below 1e17, else nanoseconds).
+Anything that does not convert is NULL. `_value` is never changed.
+
+**History.** A column applies to every record of the topic, not just those
+written after it was configured. Segments written earlier do not carry it;
+for those, the scan reads `_value` and computes the column exactly as the
+writer would have, so counts over the whole topic are complete. Only those
+older segments pay for decoding `_value`. A column whose type changed reads
+older segments through a cast (text to timestamp works for RFC 3339 text).
+
+**Checking pushdown.** `POST /_sql/explain` returns the physical plan; a
+filter on a projected column shows a Parquet scan whose `projection=[...]`
+lists that column and not `_value`.
+
+### Querying fields that are not projected
+
+Any field can still be read from `_value` with the JSON functions:
+
+```sql
+SELECT json_extract_string(_value, '$.order_id') AS order_id FROM orders;
+SELECT count(*) FROM orders WHERE json_extract_float(_value, '$.amount') > 100;
+```
+
+`json_extract_string`, `json_extract_int`, `json_extract_float` and
+`json_extract` (JSON text) take `$.a.b` paths. `json_project_string`,
+`json_project_int`, `json_project_float`, `json_project_bool`,
+`json_project_timestamp` and `json_project_json` take a projected column's
+pointer list (`'/resource/service.name'`) and convert exactly as projected
+columns do. These decode `_value` row by row; a projected column does not.
 
 ---
 
@@ -430,7 +511,7 @@ If lag grows consistently, consider:
 DataFusion provides extensive SQL support:
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, etc.
 - String: `CONCAT`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, etc.
-- JSON: `json_extract_scalar`, `json_extract`
+- JSON: `json_extract_string`, `json_extract_int`, `json_extract_float`, `json_extract`, `json_project_*` (see Projected Columns)
 - Time: `DATE_TRUNC`, `EXTRACT`, `TO_TIMESTAMP`, etc.
 
 See [DataFusion SQL Reference](https://datafusion.apache.org/user-guide/sql/index.html) for full documentation.

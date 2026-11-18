@@ -98,7 +98,13 @@ impl KafkaProtocolHandler {
             .with_topic_defaults(chronik_protocol::handler::TopicDefaults {
                 partitions: default_num_partitions.max(1) as i32,
                 replication_factor: default_replication_factor.max(1) as i16,
-            }),
+            })
+            // The columnar projection (issue #73) is checked when it is set, so a
+            // typo is refused by the admin call instead of being found later in
+            // the indexer's log.
+            .with_topic_config_check(std::sync::Arc::new(|config| {
+                chronik_columnar::projection::validate_config(config)
+            })),
             produce_handler,
             wal_handler,
             segment_reader,
@@ -185,6 +191,15 @@ impl KafkaProtocolHandler {
                 crate::error_handler::AUTH_REQUIRED_MARKER,
                 rejection.message
             )));
+        }
+
+        // The transactional APIs are authorized here, before routing, because
+        // most of them are served by the protocol handler, which has no
+        // connection identity to check against.
+        if let Some(denial) =
+            crate::txn_authorization::check(&self.authorizer, ctx, &header, &buf).await?
+        {
+            return Ok(denial);
         }
 
         // Save a copy of the buffer for metadata processing

@@ -49,6 +49,7 @@ pub mod live_parquet;
 pub mod hot_vector_index;
 pub mod hot_vector_batcher;
 pub mod json_schema;
+pub mod projection;
 
 #[cfg(feature = "flight")]
 pub mod flight;

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::provider::{EmbeddingBatch, EmbeddingProvider, EmbeddingResult};
 
@@ -115,6 +115,12 @@ impl OpenAIProvider {
     }
 
     /// Parse Retry-After header from response.
+    /// Whether a 429 body says the account is out of credit rather than
+    /// rate-limited (`insufficient_quota`, `credit_balance_exhausted`).
+    fn is_quota_exhausted(body: &str) -> bool {
+        body.contains("insufficient_quota") || body.contains("credit_balance_exhausted")
+    }
+
     fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
         response
             .headers()
@@ -178,8 +184,21 @@ impl EmbeddingProvider for OpenAIProvider {
 
             // Handle rate limiting (429 Too Many Requests)
             if status.as_u16() == 429 {
+                // OpenAI answers an account out of credit with a 429 too. That
+                // is not a rate limit: waiting does not help, and backing off
+                // five times per batch reported it, much later, as "rate limit
+                // exceeded" (thunderbird embedded nothing for months that way).
+                let retry_after = Self::parse_retry_after(&response);
+                let error_text = response.text().await.unwrap_or_default();
+                if Self::is_quota_exhausted(&error_text) {
+                    error!(
+                        "OpenAI quota exhausted: the account has no credit left, so nothing \
+                         can be embedded until it is topped up: {}",
+                        error_text
+                    );
+                    return Err(anyhow!("OpenAI quota exhausted (no credit left): {}", error_text));
+                }
                 if attempt >= self.rate_limit_config.max_retries {
-                    let error_text = response.text().await.unwrap_or_default();
                     warn!(
                         "OpenAI rate limit exceeded after {} retries: {}",
                         attempt, error_text
@@ -192,7 +211,7 @@ impl EmbeddingProvider for OpenAIProvider {
                 }
 
                 // Use Retry-After header if available, otherwise use exponential backoff
-                let backoff = Self::parse_retry_after(&response)
+                let backoff = retry_after
                     .unwrap_or_else(|| self.calculate_backoff(attempt));
 
                 info!(
@@ -658,5 +677,19 @@ mod mock_tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("empty"));
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::OpenAIProvider;
+
+    #[test]
+    fn an_exhausted_account_is_told_apart_from_a_rate_limit() {
+        // The body thunderbird received.
+        let exhausted = r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"credit_balance_exhausted"}}"#;
+        assert!(OpenAIProvider::is_quota_exhausted(exhausted));
+        let limited = r#"{"error":{"message":"Rate limit reached for requests","type":"requests","code":"rate_limit_exceeded"}}"#;
+        assert!(!OpenAIProvider::is_quota_exhausted(limited));
     }
 }

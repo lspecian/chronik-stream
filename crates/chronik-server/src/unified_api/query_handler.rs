@@ -350,9 +350,21 @@ impl BackendAdapter for ServerBackendAdapter {
             let schema = batch.schema();
 
             // Try to find offset and partition columns
-            let offset_col_idx = schema.index_of("offset").or_else(|_| schema.index_of("kafka_offset")).ok();
-            let partition_col_idx = schema.index_of("partition").or_else(|_| schema.index_of("kafka_partition")).ok();
-            let timestamp_col_idx = schema.index_of("timestamp").or_else(|_| schema.index_of("kafka_timestamp")).ok();
+            // A hit is a record: its coordinates come from the envelope columns
+            // the tables expose (`_partition`, `_offset`, `_timestamp`), or the
+            // plain names a query may alias them to. They used to be looked up
+            // only as `offset` / `partition`, which no table has, so every SQL
+            // hit came back as partition 0 at offset = its rank.
+            let col = |names: &[&str]| names.iter().find_map(|n| schema.index_of(n).ok());
+            let offset_col_idx = col(&["_offset", "offset", "kafka_offset"]);
+            let partition_col_idx = col(&["_partition", "partition", "kafka_partition"]);
+            let timestamp_col_idx = col(&["_timestamp", "kafka_timestamp"]);
+            if batch.num_rows() > 0 && (offset_col_idx.is_none() || partition_col_idx.is_none()) {
+                return Err(BackendError::ExecutionFailed(
+                    "a /_query SQL source must select _partition and _offset, so each row names its record"
+                        .into(),
+                ));
+            }
 
             for row_idx in 0..batch.num_rows() {
                 if rank >= limit {
@@ -389,6 +401,11 @@ impl BackendAdapter for ServerBackendAdapter {
                 if let Some(ts_idx) = timestamp_col_idx {
                     let col = batch.column(ts_idx);
                     if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                        candidate = candidate.with_timestamp(arr.value(row_idx));
+                    } else if let Some(arr) = col
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
+                    {
                         candidate = candidate.with_timestamp(arr.value(row_idx));
                     }
                 }
@@ -773,10 +790,95 @@ fn detect_topic_capabilities(
 /// Handle `POST /_query` — unified query endpoint.
 pub async fn handle_query(
     State(state): State<UnifiedApiState>,
-    Json(request): Json<QueryRequest>,
-) -> impl IntoResponse {
+    headers: axum::http::HeaderMap,
+    Json(raw): Json<serde_json::Value>,
+) -> axum::response::Response {
     // Record metrics
     chronik_monitoring::MetricsRecorder::record_query_request();
+
+    let request: QueryRequest = match serde_json::from_value(raw.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": e.to_string(), "type": "invalid_request" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Every backend answers from this node only: the vector and hot text
+    // indexes are per node, and the SQL tables serve the partitions this node
+    // leads. In a cluster the request goes to every peer as well (once: a
+    // forwarded request carries the depth header and is answered locally) and
+    // the answers are merged. A peer that does not answer is named in
+    // `incomplete_nodes` instead of being silently missing from the hits.
+    let router = match (&state.query_router, super::query_router::is_forwarded_request(&headers)) {
+        (Some(router), false) if !router.all_peers().is_empty() => router.clone(),
+        _ => {
+            return match run_local_query(&state, &request).await {
+                Ok(response) => query_response_json(response),
+                Err(error) => error,
+            };
+        }
+    };
+    let peers = router.all_peers();
+    let (local, fan_out) = tokio::join!(
+        run_local_query(&state, &request),
+        router.fan_out_post::<_, QueryResponse>("/_query", &raw, &peers)
+    );
+    let mut missing: Vec<String> = fan_out
+        .failures
+        .iter()
+        .map(|f| format!("node {}: {}", f.node_id, f.reason))
+        .collect();
+    let local = match local {
+        Ok(response) => response,
+        // The request itself is at fault (a planning or filter error): every
+        // node refuses it the same way.
+        Err(error) if fan_out.responses.is_empty() => return error,
+        Err(_) => {
+            missing.push("this node: its local query failed".to_string());
+            empty_query_response()
+        }
+    };
+    if !missing.is_empty() {
+        warn!(missing = %missing.join("; "), "Serving a partial /_query: some nodes did not answer");
+    }
+    let mut merged = chronik_query::merge::merge_responses(local, fan_out.responses, request.k);
+    merged.incomplete_nodes.extend(missing);
+    query_response_json(merged)
+}
+
+fn empty_query_response() -> QueryResponse {
+    QueryResponse {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        results: Vec::new(),
+        grouped_results: None,
+        stats: QueryStats { candidates: 0, ranked: 0, latency_ms: 0, backends: Vec::new() },
+        incomplete_nodes: Vec::new(),
+    }
+}
+
+fn query_response_json(response: QueryResponse) -> axum::response::Response {
+    match serde_json::to_value(&response) {
+        Ok(json) => (StatusCode::OK, Json(json)).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to serialize query response");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Response serialization failed",
+                "type": "internal_error"
+            }))).into_response()
+        }
+    }
+}
+
+/// Run `request` against this node's backends.
+async fn run_local_query(
+    state: &UnifiedApiState,
+    request: &QueryRequest,
+) -> Result<QueryResponse, axum::response::Response> {
+    let state = state.clone();
 
     // Ensure SQL tables are registered (same as /_sql handler does)
     // This registers Parquet files + hot buffer as DataFusion tables
@@ -796,14 +898,14 @@ pub async fn handle_query(
         Ok(plan) => plan,
         Err(e) => {
             chronik_monitoring::MetricsRecorder::record_query_error("planning");
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": e.to_string(),
                     "type": "planning_error"
                 })),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -834,41 +936,32 @@ pub async fn handle_query(
                 latency_ms = response.stats.latency_ms,
                 "Query executed"
             );
-            match serde_json::to_value(&response) {
-                Ok(json) => (StatusCode::OK, Json(json)).into_response(),
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to serialize query response");
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                        "error": "Response serialization failed",
-                        "type": "internal_error"
-                    }))).into_response()
-                }
-            }
+            Ok(response)
         }
         // A filter the server cannot honour is the caller's to fix, so it is a
         // 400 naming the filter — not a 500, and not the silent 200 it used to
         // be.
         Err(chronik_query::orchestrator::OrchestratorError::UnsupportedFilter(msg)) => {
             chronik_monitoring::MetricsRecorder::record_query_error("unsupported_filter");
-            (
+            Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": msg,
                     "type": "unsupported_filter"
                 })),
             )
-                .into_response()
+                .into_response())
         }
         Err(e) => {
             chronik_monitoring::MetricsRecorder::record_query_error("execution");
-            (
+            Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": e.to_string(),
                     "type": "execution_error"
                 })),
             )
-                .into_response()
+                .into_response())
         }
     }
 }

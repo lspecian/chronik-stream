@@ -150,6 +150,25 @@ impl InferredJsonSchema {
         Some(InferredJsonSchema { fields })
     }
 
+    /// This schema with the fields of `newer` it does not have appended, up to
+    /// `max_fields` in all, or `None` when `newer` adds nothing. A field already
+    /// here keeps its type: segments already written carry it, and a column
+    /// whose type changed between segments would not read as one column. New
+    /// fields are nullable, since earlier records lack them.
+    pub fn extended_with(&self, newer: &InferredJsonSchema, max_fields: usize) -> Option<Self> {
+        let max_fields = if max_fields == 0 { DEFAULT_MAX_FIELDS } else { max_fields };
+        let mut fields = self.fields.clone();
+        for f in &newer.fields {
+            if fields.len() >= max_fields {
+                break;
+            }
+            if !fields.iter().any(|e| e.name == f.name) {
+                fields.push(InferredField { nullable: true, ..f.clone() });
+            }
+        }
+        (fields.len() > self.fields.len()).then_some(InferredJsonSchema { fields })
+    }
+
     /// Convert to Arrow fields for schema extension.
     pub fn to_arrow_fields(&self) -> Vec<Field> {
         self.fields
@@ -415,5 +434,23 @@ mod tests {
         let by_name: BTreeMap<_, _> = schema.fields.iter().map(|f| (f.name.as_str(), f)).collect();
         // null widens with String → String
         assert_eq!(by_name["value"].field_type, JsonFieldType::String);
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+
+    #[test]
+    fn a_field_seen_later_is_appended_and_known_ones_keep_their_type() {
+        let first = InferredJsonSchema::infer(&[br#"{"a":1,"b":"x"}"#.as_slice()], 64).unwrap();
+        let later = InferredJsonSchema::infer(&[br#"{"a":"now text","c":true}"#.as_slice()], 64).unwrap();
+        let grown = first.extended_with(&later, 64).unwrap();
+        let got: Vec<(String, JsonFieldType, bool)> =
+            grown.fields.iter().map(|f| (f.name.clone(), f.field_type.clone(), f.nullable)).collect();
+        assert_eq!(got[0], ("a".into(), JsonFieldType::Int64, false));
+        assert_eq!(got[2], ("c".into(), JsonFieldType::Boolean, true));
+        assert!(grown.extended_with(&later, 64).is_none(), "nothing new the second time");
+        assert!(first.extended_with(&later, 2).is_none(), "the cap holds");
     }
 }

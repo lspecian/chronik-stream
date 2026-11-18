@@ -256,12 +256,18 @@ impl ColumnarQueryEngine {
     ///
     /// `schema_sample_path` is read once to infer the table schema, so it must
     /// point at an existing Parquet file for this topic.
+    ///
+    /// `projected` are the topic's projected columns (issue #73). The table
+    /// carries each one with its configured type whether or not the sample file
+    /// has it: segments written before a column was declared read NULL there,
+    /// and a column whose type changed reads through a cast.
     pub async fn register_live_parquet_table(
         &self,
         table_name: &str,
         source: Arc<dyn crate::live_parquet::ParquetPathSource>,
         schema_sample_path: &str,
         refresh_interval_ms: u64,
+        projected: &[crate::projection::ColumnSpec],
     ) -> Result<()> {
         let table_url = ListingTableUrl::parse(schema_sample_path)
             .map_err(|e| anyhow!("Invalid path '{}': {}", schema_sample_path, e))?;
@@ -273,12 +279,13 @@ impl ColumnarQueryEngine {
             .infer_schema(&self.ctx.state(), &table_url)
             .await
             .map_err(|e| anyhow!("Failed to infer schema from '{}': {}", schema_sample_path, e))?;
+        let schema = with_projected_columns(schema, projected);
 
         let provider = Arc::new(crate::live_parquet::LiveParquetTableProvider::new(
             source,
             schema,
             refresh_interval_ms,
-        ));
+        ).with_projected_columns(projected.to_vec()));
 
         self.register_table_provider(table_name, provider)?;
         debug!("Registered live Parquet table '{}'", table_name);
@@ -518,8 +525,22 @@ impl ColumnarQueryEngine {
             .await
             .map_err(|e| anyhow!("SQL parse error: {}", e))?;
 
-        let plan = df.logical_plan();
-        Ok(format!("{}", plan.display_indent()))
+        // The optimized logical plan and the physical plan: the latter is where
+        // a scan's column projection and pushed-down predicate show, which is
+        // what a caller checking that a filter reads one column wants to see.
+        let logical = df
+            .clone()
+            .into_optimized_plan()
+            .map_err(|e| anyhow!("SQL planning error: {}", e))?;
+        let physical = df
+            .create_physical_plan()
+            .await
+            .map_err(|e| anyhow!("SQL planning error: {}", e))?;
+        Ok(format!(
+            "logical plan:\n{}\n\nphysical plan:\n{}",
+            logical.display_indent(),
+            datafusion::physical_plan::displayable(physical.as_ref()).indent(true)
+        ))
     }
 
     /// List all registered tables.
@@ -932,4 +953,27 @@ mod tests {
 
         writer.write_to_file(&[batch], path).unwrap();
     }
+}
+
+/// `schema` (a sample segment's) with every projected column present at its
+/// configured type: replaced where the sample has it under another type,
+/// appended where it does not.
+fn with_projected_columns(
+    schema: datafusion::arrow::datatypes::SchemaRef,
+    projected: &[crate::projection::ColumnSpec],
+) -> datafusion::arrow::datatypes::SchemaRef {
+    use datafusion::arrow::datatypes::{Field, Schema};
+    if projected.is_empty() {
+        return schema;
+    }
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    for spec in projected {
+        let field = Arc::new(Field::new(&spec.name, spec.ty.sql_arrow_type(), true));
+        match fields.iter_mut().find(|f| f.name() == &spec.name) {
+            Some(existing) if existing.data_type() == field.data_type() => {}
+            Some(existing) => *existing = field,
+            None => fields.push(field),
+        }
+    }
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }

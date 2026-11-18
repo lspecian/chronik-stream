@@ -7,8 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Typed columns projected out of JSON values** (#73). A columnar topic can
+  store fields of its JSON values as typed Parquet columns beside `_value`, so
+  `WHERE severity = 'ERROR'` or `GROUP BY service_name` reads one narrow column
+  instead of decoding every value. `columnar.projection=otlp-logs` maps one
+  OpenTelemetry log record per message (`timestamp`, `severity`,
+  `severity_number`, `body`, `service_name`, `trace_id`, `span_id`, ...,
+  `attr_<key>` for `columnar.projection.attributes`), in chronik-signal's shape
+  or OTLP/JSON's. `columnar.columns` declares columns of any topic:
+  `name:type:/json/pointer` with types string, int64, float64, boolean,
+  timestamp and json. The default (`auto`) keeps inferring top-level fields,
+  but the list now grows when a new field appears (it was frozen at the first
+  flush). Records written before a column existed answer for it too: for those
+  segments the scan computes it from `_value`, so counts cover the whole topic.
+  An invalid declaration is refused by the admin call. `_value` is unchanged.
+  `POST /_sql/explain` now shows the physical plan, where a Parquet scan's
+  column projection is visible. See docs/COLUMNAR_STORAGE_GUIDE.md.
+  Measured (one node, `tests/cluster/bench_projection.sh`, median of 5):
+
+  | Query | 1M: projected | 1M: `_value` | 10M: projected | 10M: `_value` |
+  |---|---:|---:|---:|---:|
+  | `COUNT(*) WHERE severity = 'ERROR'` | 4 ms | 186 ms | 18 ms | 1,226 ms |
+  | `GROUP BY service_name` | 5 ms | 186 ms | 27 ms | 1,217 ms |
+- **Columnar catch-up.** Archived records Parquet is missing are written in
+  the background (`CHRONIK_COLUMNAR_CATCHUP*`): the ranges the old flush
+  dropped (see Fixed), and history archived before `columnar.enabled` was set.
+  On a node upgraded with such gaps, `{topic}_cold` fills in within a few
+  passes; each offset is written once (writes per partition are serialized).
+- **Vector catch-up.** Archived records a vector index is missing are embedded
+  in the background (`CHRONIK_VECTOR_CATCHUP*`): records whose seal-time embed
+  failed, and partitions a node received by re-replication or repair, which
+  were embedded once at that moment and never again.
+
+
 ### Fixed
 
+- **Records indexed out of order never reached Parquet.** The idempotent
+  flush (#41) skipped every offset at or below the highest one already in
+  Parquet, and the indexer took sealed WAL segments in no particular order.
+  On a backlog the first high segment written made every lower one look done:
+  of 10M records produced to a columnar topic, 1.06M reached `{topic}_cold`
+  (46 of 52 segments written as 0 bytes, no error). Flushing now skips exactly
+  the offset ranges Parquet segments cover, each partition's segments are
+  indexed oldest first, and the SQL hot buffer's flushed offset stops at the
+  first gap in cold instead of jumping past segments still waiting. The data
+  was never lost from the log or raw segments, only from `/_sql`'s cold table;
+  the columnar catch-up (see Added) writes the gaps a node already has.
 - **acks=0 produces were answered** (#66). A Kafka broker writes nothing back
   for acks=0, and the Java client completes such a request as soon as it is
   sent, so each response Chronik wrote arrived with no request waiting for it:
@@ -36,6 +82,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per offset (the last stored) and logs how many it dropped. A count taken
   on thunderbird before this release found none above its partition's record
   count, so the old duplicates appear to have been rebuilt away already.
+
+- **Failed embeddings were never retried.** The seal-time pass logged a failed
+  embed, deleted the WAL segment anyway, and nothing tried again: thunderbird's
+  OpenAI account ran out of credit and 8 vector topics (up to 42,793 records)
+  had no index on any node while every signal looked healthy. The vector
+  catch-up (above) now embeds them once the provider answers; the indexer logs
+  the records it could not embed. `tests/cluster/e2e/vector_catchup.sh`.
+- **An exhausted OpenAI account was reported as a rate limit**, after five
+  back-offs per batch. A 429 with `insufficient_quota` now fails at once with
+  an error that says the account has no credit.
+- **Deleting a topic left its vector index on disk**, loaded at every boot,
+  listed by `/_vector/topics`, and served to a topic later created with the
+  same name. It is now removed with the topic; indexes of topics already gone
+  are removed by the catch-up.
+- **The transactional APIs were not authorized** with ACLs on. InitProducerId,
+  AddPartitionsToTxn, AddOffsetsToTxn, EndTxn and TxnOffsetCommit now need
+  Write on the TransactionalId, plus Write on each topic (AddPartitionsToTxn)
+  or Read on the group and topics (AddOffsetsToTxn, TxnOffsetCommit), as in
+  Kafka. Before, any principal could fence another application's transactional
+  producer, and commit a group's offsets through TxnOffsetCommit without the
+  group right OffsetCommit requires. `tests/cluster/e2e/txn_acl.sh`.
+- **`/_query` answered from one node.** Its text, vector and SQL backends read
+  only the node that received the request — that node's vector index, and only
+  the partitions it leads — and returned that fraction as the whole answer. It
+  now asks every node and merges, de-duplicating hits found on several
+  replicas; nodes that did not answer are listed in `incomplete_nodes`.
+- **`/_sql/tables` and `/_sql/describe` were empty until a query ran** on the
+  node (tables are registered lazily); they now register first.
+- **Archive merge reported a permanent condition as `abandoned` every 15
+  minutes.** A run whose archives were written in two index schemas, with no
+  single-schema stretch long enough, was reopened and given up on every pass,
+  with no partition and no reason logged. It is now reported once, as
+  `ineligible`, with its partition and offsets, and not retried until the
+  partition's archives change; races and failures are counted apart.
+- Test scripts that skip now exit 77 instead of 0, so a skip is not read as a
+  pass.
+- The CreateTopics vs auto-create race parked in v2.16 cannot recur with the
+  Raft catalog: `tests/cluster/e2e/create_race.sh` races both, in both orders,
+  and every round ends with one partition count on every node and every
+  acknowledged record readable.
 
 ## [2.18.1] - 2026-11-18
 

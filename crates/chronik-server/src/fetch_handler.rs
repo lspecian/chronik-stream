@@ -3722,3 +3722,26 @@ mod tier_merge_tests {
         assert_eq!(offsets(&records), vec![0]);
     }
 }
+
+/// The v2 record batches in a fetch's record bytes (`baseOffset` i64,
+/// `batchLength` i32, then `batchLength` bytes; magic at byte 16). Older
+/// message sets are skipped.
+pub fn record_batches(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 17 <= bytes.len() {
+        let len = i32::from_be_bytes(bytes[at + 8..at + 12].try_into().expect("4 bytes"));
+        if len <= 0 {
+            break;
+        }
+        let end = at + 12 + len as usize;
+        if end > bytes.len() {
+            break; // a partial batch at the end of a size-bounded read
+        }
+        if bytes[at + 16] == 2 {
+            out.push(&bytes[at..end]);
+        }
+        at = end;
+    }
+    out
+}

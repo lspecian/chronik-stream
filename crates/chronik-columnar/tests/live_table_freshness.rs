@@ -78,7 +78,7 @@ async fn live_parquet_table_sees_segments_written_after_registration() {
 
     // Refresh interval 0: every scan re-resolves, so the test does not sleep.
     engine
-        .register_live_parquet_table("t", source.clone(), &first, 0)
+        .register_live_parquet_table("t", source.clone(), &first, 0, &[])
         .await
         .unwrap();
 
@@ -108,7 +108,7 @@ async fn view_over_live_table_stays_current() {
     source.push(first.clone());
 
     engine
-        .register_live_parquet_table("t_cold", source.clone(), &first, 0)
+        .register_live_parquet_table("t_cold", source.clone(), &first, 0, &[])
         .await
         .unwrap();
     engine
@@ -158,7 +158,7 @@ async fn registering_a_table_name_twice_replaces_it() {
     let source_a = Arc::new(MutablePaths::default());
     source_a.push(a.clone());
     engine
-        .register_live_parquet_table("t", source_a, &a, 0)
+        .register_live_parquet_table("t", source_a, &a, 0, &[])
         .await
         .unwrap();
     assert_eq!(count(&engine, "SELECT COUNT(*) FROM t").await, 3);
@@ -167,7 +167,7 @@ async fn registering_a_table_name_twice_replaces_it() {
     let source_b = Arc::new(MutablePaths::default());
     source_b.push(b.clone());
     engine
-        .register_live_parquet_table("t", source_b, &b, 0)
+        .register_live_parquet_table("t", source_b, &b, 0, &[])
         .await
         .expect("re-registering an existing name must replace it, not error");
     assert_eq!(count(&engine, "SELECT COUNT(*) FROM t").await, 2);

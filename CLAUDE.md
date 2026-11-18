@@ -885,6 +885,9 @@ curl http://localhost:6092/_sql/describe/orders
 | `columnar.format` | `parquet`, `arrow` | `parquet` | Storage format |
 | `columnar.compression` | `zstd`, `snappy`, `lz4`, `none` | `zstd` | Compression codec |
 | `columnar.partitioning` | `none`, `hourly`, `daily` | `daily` | Time partitioning |
+| `columnar.projection` | `auto`, `otlp-logs`, `none` | `auto` | Typed columns projected out of JSON values (#73) |
+| `columnar.columns` | `name:type:/json/pointer;...` | none | Declared projected columns (string, int64, float64, boolean, timestamp, json) |
+| `columnar.projection.attributes` | `key;key` | none | `otlp-logs`: attributes projected as `attr_<key>` |
 
 **See [docs/COLUMNAR_STORAGE_GUIDE.md](docs/COLUMNAR_STORAGE_GUIDE.md) for full documentation.**
 
@@ -1063,6 +1066,8 @@ Key environment variables:
 - `CHRONIK_HOT_VECTOR_BATCH_WINDOW_MS_OPENAI` - Flush window for OpenAI (default: `200`). Larger window stays within tier-1 RPM for sustained high throughput.
 - `CHRONIK_HOT_VECTOR_QUEUE_SIZE` - Bounded channel capacity between the produce path and the embedder worker (default: local 10K / OpenAI 20K). Overflow drops new entries — the cold path still embeds them from WAL, only freshness suffers.
 - Per-topic `vector.hot.enabled=false` - Disable NRT enqueue for a specific topic while keeping cold-path embedding intact. Useful for cost-sensitive topics on OpenAI. Defaults to `true` for vector-enabled topics.
+- `CHRONIK_VECTOR_CATCHUP` - Embed archived records a vector index is missing (default: `true`): records whose seal-time embed failed (provider down, out of credit) and partitions a node received by re-replication or repair. Reads them back from the node's own log; only offsets the indexer has archived; progress advances only on embeds with no failure. `CHRONIK_VECTOR_CATCHUP_DELAY_SECS` (180) after boot, then every `CHRONIK_VECTOR_CATCHUP_INTERVAL_SECS` (600), at most `CHRONIK_VECTOR_CATCHUP_MAX_RECORDS` (20000) per pass. Also removes the vector index of a topic absent from the catalog on two passes in a row.
+- `CHRONIK_COLUMNAR_CATCHUP` - Write archived records Parquet is missing (default: `true`): ranges the flush before v2.18.2 dropped when WAL segments were indexed out of order, and history archived before `columnar.enabled` was set. Reads them back from the node's own log and writes them as Parquet files of about 200K records, skipping offsets a concurrent seal-time write covered (writes per partition are serialized). `CHRONIK_COLUMNAR_CATCHUP_DELAY_SECS` (120) after boot, then every `CHRONIK_COLUMNAR_CATCHUP_INTERVAL_SECS` (300), at most `CHRONIK_COLUMNAR_CATCHUP_MAX_RECORDS` (1000000) per pass.
 - Cold-path reuse - When the hot path is enabled, WalIndexer's cold embedding pipeline automatically reuses hot-cached vectors before calling the embedder, cutting embedding-API cost ~to zero for offsets that the hot path already embedded.
 
 ## CRC and Checksum Architecture
