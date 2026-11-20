@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uninitialized memory), `h2` 0.4 (unbounded empty DATA frames), `rustls`
   0.23 and `rustls-webpki` 0.103 (handshake and certificate checks), `bytes`,
   `openssl`, `tar`, `time`, `aws-lc-sys` and `webpki-roots` 1.x.
+- **Three more advisories cleared by dependency bumps**: `prometheus` 0.14
+  (drops `protobuf` 2, crash on deeply nested input), `validator` 0.21 (drops
+  `idna` 0.4), `reqwest` 0.12 (drops `webpki-roots` 0.25). The S3 client no
+  longer enables the AWS SDK's legacy connector (hyper 0.14, rustls 0.21) and
+  uses the SDK's current HTTPS client. Still open, all needing larger
+  upgrades: `zstd` (held by `parquet` 53 under DataFusion 44), `thrift`
+  (DataFusion), `quick-xml` and `rsa` (`opendal` 0.45), `h2` 0.3 and `rustls`
+  0.21 (`opendal` 0.45, `kube` 0.87 in the operator), `crypto-bigint` (no
+  upstream fix).
 
 ## [2.18.2] - 2026-11-18
 

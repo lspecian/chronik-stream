@@ -14,7 +14,7 @@ chronik-embeddings = { path = "../chronik-embeddings" }
 
 # Storage backends
 opendal = { workspace = true }
-aws-sdk-s3 = "1.15"
+aws-sdk-s3 = { version = "1.15", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-credential-types = "1.1"
 aws-types = "1.1"
 aws-config = "1.1"

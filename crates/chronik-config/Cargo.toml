@@ -28,7 +28,7 @@ arc-swap = "1.6"
 dashmap = { workspace = true }
 
 # Validation
-validator = { version = "0.16", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 regex = "1.10"
 
 # Error handling

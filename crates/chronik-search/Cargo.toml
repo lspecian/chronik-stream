@@ -51,11 +51,11 @@ bytes = "1.5"
 # Other
 uuid = { workspace = true }
 sha2 = "0.10"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 flate2 = { workspace = true }
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-test = "0.4"
 tempfile = "3.8"
 # axum-test 13.x is the last line that targets axum 0.6 (14+ requires axum 0.7). Pinned
