@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.18.3] - 2026-11-20
+
 ### Security
 
 - **Dependency updates clear 40 RustSec advisories** (lock file only, no
