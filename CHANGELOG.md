@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency updates clear 40 RustSec advisories** (lock file only, no
+  manifest change). Among them, the ones on paths that handle untrusted
+  input: `lz4_flex` (decompressing invalid LZ4 batches could leak
+  uninitialized memory), `h2` 0.4 (unbounded empty DATA frames), `rustls`
+  0.23 and `rustls-webpki` 0.103 (handshake and certificate checks), `bytes`,
+  `openssl`, `tar`, `time`, `aws-lc-sys` and `webpki-roots` 1.x.
+
 ## [2.18.2] - 2026-11-18
 
 ### Added
