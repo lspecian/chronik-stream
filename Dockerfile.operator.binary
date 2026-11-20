@@ -6,8 +6,15 @@ FROM ubuntu:24.04
 # Automatically selects the right architecture
 ARG TARGETARCH
 
-# Install minimal runtime dependencies
+# The release tag. Declared before the apt layer so that layer is rebuilt for
+# every release instead of being reused from the build cache, which would keep
+# shipping whatever package versions were current when it was first cached.
+ARG VERSION
+
+# Install minimal runtime dependencies, plus the security updates published
+# since the base image was built (ubuntu:24.04 is refreshed only every few weeks)
 RUN apt-get update && \
+    apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
