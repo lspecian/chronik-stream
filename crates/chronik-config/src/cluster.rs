@@ -14,15 +14,15 @@ use crate::{ConfigError, Result};
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct NodeBindAddresses {
     /// Kafka API bind address (e.g., "0.0.0.0:9092")
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub kafka: String,
 
     /// WAL receiver bind address (e.g., "0.0.0.0:9291")
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub wal: String,
 
     /// Raft gRPC bind address (e.g., "0.0.0.0:5001")
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub raft: String,
 
     /// Metrics endpoint bind address (optional)
@@ -36,15 +36,15 @@ pub struct NodeBindAddresses {
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct NodeAdvertiseAddresses {
     /// Kafka API advertised address (e.g., "node1.example.com:9092")
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub kafka: String,
 
     /// WAL receiver advertised address (e.g., "node1.example.com:9291")
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub wal: String,
 
     /// Raft gRPC advertised address (e.g., "node1.example.com:5001")
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub raft: String,
 }
 
@@ -55,7 +55,7 @@ pub struct ClusterConfig {
     pub enabled: bool,
 
     /// This node's unique identifier
-    #[validate(custom = "validate_node_id")]
+    #[validate(custom(function = "validate_node_id"))]
     pub node_id: u64,
 
     /// Data directory for this node's storage
@@ -99,7 +99,7 @@ pub struct ClusterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct GossipConfig {
     /// Gossip bind address (e.g., "0.0.0.0:7946")
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub bind_addr: String,
 
     /// Seed nodes for initial gossip (comma-separated addresses)
@@ -115,19 +115,19 @@ pub struct GossipConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct NodeConfig {
     /// Unique node identifier
-    #[validate(custom = "validate_node_id")]
+    #[validate(custom(function = "validate_node_id"))]
     pub id: u64,
 
     /// Kafka API address (advertised, for clients)
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub kafka: String,
 
     /// WAL receiver address (advertised, for followers)
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub wal: String,
 
     /// Raft gRPC address (advertised, for peers)
-    #[validate(custom = "validate_addr")]
+    #[validate(custom(function = "validate_addr"))]
     pub raft: String,
 
     /// Optional address a *follower* fetches this node's partitions from.
