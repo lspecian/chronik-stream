@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Container images install the base OS security updates.** The server and
+  operator images installed their few packages on top of `ubuntu:24.04` without
+  upgrading it, and the release build reused that layer from its cache, so
+  2.18.3 shipped glibc 2.39-0ubuntu8.9 with six fixed CVEs (operator: also
+  `perl-base`). The images now run `apt-get upgrade`, and the layer is rebuilt
+  for every release tag. A Trivy scan of the rebuilt images finds no fixable
+  vulnerability and none rated HIGH or CRITICAL.
+
 ## [2.18.3] - 2026-11-20
 
 ### Security
