@@ -30,7 +30,7 @@ csv = "1.3"
 
 # Prometheus metrics (optional)
 prometheus = { version = "0.14", optional = true }
-warp = { version = "0.3", optional = true }
+axum = { workspace = true, optional = true }
 lazy_static = { version = "1.5", optional = true }
 
 # Utilities
@@ -46,7 +46,7 @@ uuid = { version = "1.0", features = ["v4"] }
 
 [features]
 default = []
-prometheus = ["dep:prometheus", "dep:warp", "dep:lazy_static"]
+prometheus = ["dep:prometheus", "dep:axum", "dep:lazy_static"]
 
 [dev-dependencies]
 tempfile = "3.12"

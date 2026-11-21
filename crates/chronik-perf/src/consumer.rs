@@ -176,8 +176,8 @@ pub async fn run(
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("Metrics server listening on {addr}");
 
-    let server = axum::Server::bind(&addr.parse()?)
-        .serve(app.into_make_service());
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let server = std::future::IntoFuture::into_future(axum::serve(listener, app));
 
     tokio::select! {
         result = server => result?,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 async fn create_test_server() -> TestServer {
     let api = Arc::new(SearchApi::new().unwrap());
     let app = api.router();
-    TestServer::new(app).unwrap()
+    TestServer::new(app)
 }
 
 #[tokio::test]

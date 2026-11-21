@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New `tests/cluster/e2e/s3_roundtrip.sh` (SeaweedFS): 20,000 records archived
   to S3, local copies removed, all read back byte for byte from offset 0, and
   none readable with the bucket stopped. 2.18.3 and this build both pass.
+- **HTTP and gRPC stacks moved to hyper 1**: axum 0.6 → 0.8 (Unified API,
+  admin and Schema Registry, search, metrics), tonic 0.11 → 0.14 and prost
+  0.12 → 0.14 (catalog Raft endpoint, vendored raft), and the bench metrics
+  endpoint off warp. Drops `h2` 0.3 (RUSTSEC-2026-0258: a peer sending empty
+  DATA frames without end kept the server busy, reachable on the Raft port and
+  over HTTP/2 to the Unified API). `cargo audit`: 1 vulnerability left, `rsa`
+  (above). Raft messages travel as protobuf bytes, the same encoding under
+  either prost, so nodes on either version form one cluster during a roll.
+  Route paths use axum 0.8 syntax (`/{topic}`); the URLs are unchanged.
 
 ### Known issues
 

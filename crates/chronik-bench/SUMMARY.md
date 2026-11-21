@@ -77,7 +77,7 @@ serde_json = "1.0"      # JSON export
 
 # Optional
 prometheus = "0.13"     # Metrics (feature: prometheus)
-warp = "0.3"            # HTTP server for Prometheus
+axum = "0.8"            # HTTP server for Prometheus
 ```
 
 #### Architecture
@@ -376,7 +376,7 @@ Cargo.toml                     # Added chronik-bench to workspace members
 
 ### Optional Dependencies (feature: prometheus)
 - `prometheus` (0.13) - Metrics library
-- `warp` (0.3) - HTTP server
+- `axum` (0.8) - HTTP server
 - `lazy_static` (1.5) - Static metrics
 
 ## Testing Strategy

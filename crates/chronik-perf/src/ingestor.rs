@@ -217,9 +217,8 @@ pub async fn run(bootstrap_servers: String, topic: String, port: u16) -> anyhow:
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("Listening on {addr}");
-    axum::Server::bind(&addr.parse()?)
-        .serve(app.into_make_service())
-        .await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }

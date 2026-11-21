@@ -616,19 +616,19 @@ pub fn create_router_full(
             .route("/_sql", post(sql_handler::execute_sql))
             .route("/_sql/explain", post(sql_handler::explain_sql))
             .route("/_sql/tables", get(sql_handler::list_tables))
-            .route("/_sql/describe/:table", get(sql_handler::describe_table));
+            .route("/_sql/describe/{table}", get(sql_handler::describe_table));
     }
 
     // Vector search endpoints
     if state.config.enable_vector {
         router = router
-            .route("/_vector/:topic/search", post(vector_handler::search))
-            .route("/_vector/:topic/search_by_vector", post(vector_handler::search_by_vector))
-            .route("/_vector/:topic/hybrid", post(vector_handler::hybrid_search))
-            .route("/_vector/:topic/stats", get(vector_handler::get_stats))
+            .route("/_vector/{topic}/search", post(vector_handler::search))
+            .route("/_vector/{topic}/search_by_vector", post(vector_handler::search_by_vector))
+            .route("/_vector/{topic}/hybrid", post(vector_handler::hybrid_search))
+            .route("/_vector/{topic}/stats", get(vector_handler::get_stats))
             .route("/_vector/topics", get(vector_handler::list_topics))
-            .route("/_vector/:topic/backfill", post(vector_handler::backfill))
-            .route("/_vector/:topic/index", delete(vector_handler::clear_vector_index));
+            .route("/_vector/{topic}/backfill", post(vector_handler::backfill))
+            .route("/_vector/{topic}/index", delete(vector_handler::clear_vector_index));
     }
 
     // Unified query endpoint (always enabled — orchestrates across all backends)
@@ -654,8 +654,8 @@ pub fn create_router_full(
         .route("/memory/v1/admin/init-namespace", post(memory::admin_init_namespace))
         .route("/memory/v1/compact", post(memory::compact))
         .route("/memory/v1/recall/stream", post(memory::recall_stream))
-        .route("/memory/v1/:memory_id/source", get(memory::source))
-        .route("/memory/v1/:memory_id/lineage", get(memory::lineage))
+        .route("/memory/v1/{memory_id}/source", get(memory::source))
+        .route("/memory/v1/{memory_id}/lineage", get(memory::lineage))
         // O-0 Ontology (Object Types)
         .route("/ontology/v1/get_object", post(ontology::get_object))
         .route("/ontology/v1/query_objects", post(ontology::query_objects))
@@ -1000,10 +1000,14 @@ async fn spawn_api_server(
                 addr
             );
             Ok(tokio::spawn(async move {
-                if let Err(e) = axum::Server::bind(&addr)
-                    .serve(app.into_make_service())
-                    .await
-                {
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!("Unified API cannot bind {}: {}", addr, e);
+                        return;
+                    }
+                };
+                if let Err(e) = axum::serve(listener, app).await {
                     tracing::error!("Unified API server error: {}", e);
                 }
             }))
@@ -1097,7 +1101,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Parse response body
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let health: HealthResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(health.status, "ok");
@@ -1251,7 +1255,7 @@ mod tests {
 
 /// Serve the Unified API over TLS.
 ///
-/// Written against hyper directly because axum 0.6's `Server` has no TLS entry
+/// Written against hyper directly because `axum::serve` has no TLS entry
 /// point and `axum-server` would introduce a second, incompatible rustls
 /// version alongside the one `crate::tls` already uses for the Kafka listener.
 ///
@@ -1283,13 +1287,9 @@ async fn serve_https(
                 }
             };
 
-            let service = hyper::service::service_fn(move |request| {
-                use tower::ServiceExt;
-                app.clone().oneshot(request)
-            });
-
-            if let Err(e) = hyper::server::conn::Http::new()
-                .serve_connection(tls_stream, service)
+            let service = hyper_util::service::TowerToHyperService::new(app);
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), service)
                 .await
             {
                 tracing::debug!("Unified API connection from {} ended: {}", peer, e);

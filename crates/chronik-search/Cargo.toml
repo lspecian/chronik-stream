@@ -13,7 +13,6 @@ chronik-monitoring = { path = "../chronik-monitoring" }
 
 # Web framework (use workspace axum 0.6.20)
 axum = { workspace = true }
-hyper = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 
@@ -58,9 +57,8 @@ flate2 = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-test = "0.4"
 tempfile = "3.8"
-# axum-test 13.x is the last line that targets axum 0.6 (14+ requires axum 0.7). Pinned
-# so the api_test/geo_search_test integration suites compile against our workspace axum 0.6.
-axum-test = "13"
+# axum-test 21 targets axum 0.8, the workspace version.
+axum-test = "21"
 criterion = { workspace = true }
 
 # NOTE: the `realtime_indexing_bench` target was removed here because its source

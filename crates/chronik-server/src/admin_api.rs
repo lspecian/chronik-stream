@@ -41,7 +41,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router, Server,
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -886,7 +886,7 @@ async fn auth_middleware(
     State(state): State<AdminApiState>,
     headers: HeaderMap,
     request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Result<Response, Response> {
     // Skip auth if no API key is configured
     let Some(expected_key) = &state.api_key else {
@@ -927,7 +927,7 @@ async fn schema_registry_auth_middleware(
     State(state): State<AdminApiState>,
     headers: HeaderMap,
     request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Result<Response, Response> {
     // Skip auth if not required
     if !state.schema_registry.is_auth_required() {
@@ -1095,18 +1095,18 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
     let schema_registry_routes = Router::new()
         // Subject management
         .route("/subjects", get(handle_list_subjects))
-        .route("/subjects/:subject/versions", get(handle_list_versions))
-        .route("/subjects/:subject/versions", post(handle_register_schema))
-        .route("/subjects/:subject/versions/:version", get(handle_get_subject_version))
-        .route("/subjects/:subject/versions/:version", delete(handle_delete_version))
-        .route("/subjects/:subject", delete(handle_delete_subject))
+        .route("/subjects/{subject}/versions", get(handle_list_versions))
+        .route("/subjects/{subject}/versions", post(handle_register_schema))
+        .route("/subjects/{subject}/versions/{version}", get(handle_get_subject_version))
+        .route("/subjects/{subject}/versions/{version}", delete(handle_delete_version))
+        .route("/subjects/{subject}", delete(handle_delete_subject))
         // Schema by ID
-        .route("/schemas/ids/:id", get(handle_get_schema_by_id))
+        .route("/schemas/ids/{id}", get(handle_get_schema_by_id))
         // Compatibility configuration
         .route("/config", get(handle_get_global_config))
         .route("/config", put(handle_set_global_config))
-        .route("/config/:subject", get(handle_get_subject_config))
-        .route("/config/:subject", put(handle_set_subject_config))
+        .route("/config/{subject}", get(handle_get_subject_config))
+        .route("/config/{subject}", put(handle_set_subject_config))
         // Apply HTTP Basic Auth middleware (no-op if auth not enabled)
         .layer(middleware::from_fn_with_state(state.clone(), schema_registry_auth_middleware));
 
@@ -1191,10 +1191,14 @@ pub async fn start_admin_api(
     info!("Schema Registry endpoints available at /subjects, /schemas/ids, /config");
 
     tokio::spawn(async move {
-        if let Err(e) = Server::bind(&addr)
-            .serve(app.into_make_service())
-            .await
-        {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!("Admin API cannot bind {}: {}", addr, e);
+                return;
+            }
+        };
+        if let Err(e) = axum::serve(listener, app).await {
             error!("Admin API server error: {}", e);
         }
     });

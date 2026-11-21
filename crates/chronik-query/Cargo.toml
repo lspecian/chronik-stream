@@ -19,7 +19,6 @@ async-trait = { workspace = true }
 
 # API framework
 axum = { workspace = true }
-hyper = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 

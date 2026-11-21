@@ -92,22 +92,22 @@ pub fn search_router_with_fanout(
     // Fan-out-aware search endpoints
     let search_routes = axum::Router::new()
         .route("/_search", get(search_all_fanout).post(search_all_fanout))
-        .route("/:index/_search", get(search_index_fanout).post(search_index_fanout))
+        .route("/{index}/_search", get(search_index_fanout).post(search_index_fanout))
         .with_state(fanout_state);
 
     // Original CRUD/management endpoints (no fan-out needed for writes)
     let crud_routes = axum::Router::new()
         .route("/metrics", get(chronik_search::handlers::metrics_handler))
         .route(
-            "/:index/_doc/:id",
+            "/{index}/_doc/{id}",
             post(chronik_search::handlers::index_document)
                 .put(chronik_search::handlers::index_document)
                 .get(chronik_search::handlers::get_document)
                 .delete(chronik_search::handlers::delete_document),
         )
-        .route("/:index", put(chronik_search::handlers::create_index))
-        .route("/:index", delete(chronik_search::handlers::delete_index))
-        .route("/:index/_mapping", get(chronik_search::handlers::get_mapping))
+        .route("/{index}", put(chronik_search::handlers::create_index))
+        .route("/{index}", delete(chronik_search::handlers::delete_index))
+        .route("/{index}/_mapping", get(chronik_search::handlers::get_mapping))
         .route("/_cat/indices", get(chronik_search::handlers::cat_indices))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(search_api);
@@ -136,7 +136,7 @@ async fn local_search_response(
 
     let (parts, body) = response.into_parts();
     let status = parts.status;
-    let body_bytes = match hyper::body::to_bytes(body).await {
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
             return Err((
@@ -151,7 +151,7 @@ async fn local_search_response(
             return Ok(parsed);
         }
     }
-    Err(axum::response::Response::from_parts(parts, axum::body::boxed(axum::body::Full::from(body_bytes))))
+    Err(axum::response::Response::from_parts(parts, axum::body::Body::from(body_bytes)))
 }
 
 #[cfg(feature = "search")]

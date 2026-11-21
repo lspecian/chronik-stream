@@ -30,7 +30,7 @@
 //! the finer-grained half exists.
 
 use axum::{
-    body::BoxBody,
+    body::Body,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -119,11 +119,11 @@ fn unauthorized(message: &str) -> Response {
 }
 
 /// Axum middleware enforcing [`DataAuthConfig`] on the routes it wraps.
-pub async fn require_api_key<B>(
+pub async fn require_api_key(
     config: DataAuthConfig,
-    request: Request<B>,
-    next: Next<B>,
-) -> Response<BoxBody> {
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     if !config.is_enabled() {
         return next.run(request).await;
     }

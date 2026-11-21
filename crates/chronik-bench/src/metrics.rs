@@ -9,9 +9,6 @@ use std::sync::Arc;
 #[cfg(feature = "prometheus")]
 use tracing::info;
 #[cfg(feature = "prometheus")]
-use warp::Filter;
-
-#[cfg(feature = "prometheus")]
 lazy_static::lazy_static! {
     static ref REGISTRY: Registry = Registry::new();
 
@@ -71,18 +68,22 @@ pub async fn start_prometheus_exporter(port: u16) -> Result<tokio::task::JoinHan
 
     let registry = Arc::new(REGISTRY.clone());
 
-    let metrics_route = warp::path!("metrics").map(move || {
-        let encoder = TextEncoder::new();
-        let metric_families = registry.gather();
-        let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer).unwrap();
-        String::from_utf8(buffer).unwrap()
-    });
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let registry = registry.clone();
+            async move {
+                let encoder = TextEncoder::new();
+                let mut buffer = Vec::new();
+                encoder.encode(&registry.gather(), &mut buffer).unwrap();
+                String::from_utf8(buffer).unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], port))).await?;
 
     let handle = tokio::spawn(async move {
-        warp::serve(metrics_route)
-            .run(([0, 0, 0, 0], port))
-            .await;
+        let _ = axum::serve(listener, app).await;
     });
 
     Ok(handle)
