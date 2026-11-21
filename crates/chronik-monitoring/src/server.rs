@@ -8,7 +8,6 @@ use axum::{
     response::IntoResponse,
     routing::get,
     Router,
-    Server,
 };
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
@@ -69,13 +68,11 @@ impl MetricsServer {
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
 
-        // `Server::bind` PANICS if the address is taken, and this runs inside a
-        // spawned task, so the panic aborted the whole broker: a second instance
-        // on one host, or anything else already on the metrics port, killed a
-        // healthy Kafka broker with SIGABRT and a core dump rather than a message
-        // naming the port. `try_bind` returns the error instead, and metrics are
-        // auxiliary — the broker keeps serving Kafka without them.
-        let server = Server::try_bind(&addr).map_err(|e| {
+        // A bind failure must not take the broker down (a panic here once
+        // aborted a healthy broker with SIGABRT when a second instance shared
+        // the host): return the error, and metrics are auxiliary — the broker
+        // keeps serving Kafka without them.
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
             anyhow::anyhow!(
                 "metrics server cannot bind {}: {}. Kafka is unaffected; set a free port \
                  to restore /metrics",
@@ -85,7 +82,7 @@ impl MetricsServer {
         })?;
 
         tracing::info!("Metrics server listening on {}", addr);
-        server.serve(app.into_make_service()).await?;
+        axum::serve(listener, app).await?;
 
         Ok(())
     }

@@ -515,17 +515,17 @@ impl SearchApi {
 
             // Search endpoints
             .route("/_search", get(search_all).post(search_all))
-            .route("/:index/_search", get(search_index).post(search_index))
+            .route("/{index}/_search", get(search_index).post(search_index))
 
             // Document endpoints
-            .route("/:index/_doc/:id", post(index_document).put(index_document))
-            .route("/:index/_doc/:id", get(get_document))
-            .route("/:index/_doc/:id", delete(delete_document))
+            .route("/{index}/_doc/{id}", post(index_document).put(index_document))
+            .route("/{index}/_doc/{id}", get(get_document))
+            .route("/{index}/_doc/{id}", delete(delete_document))
 
             // Index management
-            .route("/:index", put(create_index))
-            .route("/:index", delete(delete_index))
-            .route("/:index/_mapping", get(get_mapping))
+            .route("/{index}", put(create_index))
+            .route("/{index}", delete(delete_index))
+            .route("/{index}/_mapping", get(get_mapping))
             .route("/_cat/indices", get(cat_indices))
 
             .layer(CorsLayer::permissive())
@@ -543,17 +543,17 @@ impl SearchApi {
 
             // Search endpoints
             .route("/_search", get(search_all).post(search_all))
-            .route("/:index/_search", get(search_index).post(search_index))
+            .route("/{index}/_search", get(search_index).post(search_index))
 
             // Document endpoints
-            .route("/:index/_doc/:id", post(index_document).put(index_document))
-            .route("/:index/_doc/:id", get(get_document))
-            .route("/:index/_doc/:id", delete(delete_document))
+            .route("/{index}/_doc/{id}", post(index_document).put(index_document))
+            .route("/{index}/_doc/{id}", get(get_document))
+            .route("/{index}/_doc/{id}", delete(delete_document))
 
             // Index management
-            .route("/:index", put(create_index))
-            .route("/:index", delete(delete_index))
-            .route("/:index/_mapping", get(get_mapping))
+            .route("/{index}", put(create_index))
+            .route("/{index}", delete(delete_index))
+            .route("/{index}/_mapping", get(get_mapping))
             .route("/_cat/indices", get(cat_indices))
 
             .layer(CorsLayer::permissive())

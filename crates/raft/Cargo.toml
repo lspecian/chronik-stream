@@ -4,7 +4,7 @@ version = "0.7.0"
 authors = ["The TiKV Project Developers"]
 license = "Apache-2.0"
 keywords = ["raft", "distributed-systems", "ha"]
-description = "Vendored raft crate with prost 0.12 compatibility"
+description = "Vendored raft crate with prost 0.14 compatibility"
 edition = "2021"
 
 # Keep out of workspace - used via [patch]
@@ -21,7 +21,7 @@ bytes = "1"
 fxhash = "0.2.1"
 fail = { version = "0.5", optional = true }
 getset = "0.1.1"
-prost = "0.12"
+prost = "0.14"
 thiserror = "1.0"
 raft-proto = { path = "../raft-proto", version = "0.7.0", default-features = false }
 rand = "0.8"

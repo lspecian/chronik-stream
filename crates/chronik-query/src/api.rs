@@ -66,10 +66,8 @@ impl QueryApi {
         
         tracing::info!("Starting Query API on {}", listen_addr);
 
-        axum::Server::bind(&listen_addr)
-            .serve(app.into_make_service())
-            .await
-            .map_err(|e| chronik_common::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let listener = tokio::net::TcpListener::bind(listen_addr).await.map_err(chronik_common::Error::Io)?;
+        axum::serve(listener, app).await.map_err(chronik_common::Error::Io)?;
         
         Ok(())
     }
@@ -86,8 +84,8 @@ impl QueryApi {
             .route("/search", get(search_handler))
             .route("/search", post(search_post_handler))
             .route("/aggregations", post(create_aggregation_handler))
-            .route("/aggregations/:id", get(get_aggregation_handler))
-            .route("/aggregations/:id", delete(delete_aggregation_handler))
+            .route("/aggregations/{id}", get(get_aggregation_handler))
+            .route("/aggregations/{id}", delete(delete_aggregation_handler))
             .with_state(state);
         
         // Add middleware

@@ -40,7 +40,7 @@ async fn test_geo_point_indexing() {
 async fn test_geo_distance_query() {
     let api = Arc::new(SearchApi::new().unwrap());
     let app = api.router();
-    let server = TestServer::new(app).unwrap();
+    let server = TestServer::new(app);
     
     // Create index with geo mapping
     let mapping = json!({
@@ -94,7 +94,7 @@ async fn test_geo_distance_query() {
 async fn test_geo_bounding_box_query() {
     let api = Arc::new(SearchApi::new().unwrap());
     let app = api.router();
-    let server = TestServer::new(app).unwrap();
+    let server = TestServer::new(app);
     
     // Create index
     server.put("/test_bbox")
@@ -130,7 +130,7 @@ async fn test_geo_bounding_box_query() {
 async fn test_geo_polygon_query() {
     let api = Arc::new(SearchApi::new().unwrap());
     let app = api.router();
-    let server = TestServer::new(app).unwrap();
+    let server = TestServer::new(app);
     
     // Create index
     server.put("/test_polygon")
