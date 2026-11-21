@@ -46,7 +46,7 @@ use datafusion::catalog::Session;
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::error::Result as DFResult;
-use datafusion::physical_plan::memory::MemoryExec;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -229,8 +229,6 @@ impl PartitionedMemTable {
 
 #[async_trait::async_trait]
 impl TableProvider for PartitionedMemTable {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-
     fn schema(&self) -> SchemaRef { self.schema.clone() }
 
     fn table_type(&self) -> TableType { TableType::Temporary }
@@ -262,11 +260,8 @@ impl TableProvider for PartitionedMemTable {
             self.partition_batches.len()
         );
 
-        MemoryExec::try_new(
-            &[batches],
-            self.schema.clone(),
-            projection.cloned(),
-        ).map(|e| Arc::new(e) as Arc<dyn ExecutionPlan>)
+        MemorySourceConfig::try_new_exec(&[batches], self.schema.clone(), projection.cloned())
+            .map(|e| e as Arc<dyn ExecutionPlan>)
     }
 
     fn supports_filters_pushdown(
@@ -363,8 +358,8 @@ impl LiveHotTableProvider {
 
     /// Empty scan result honouring the requested projection.
     fn empty_scan(&self, projection: Option<&Vec<usize>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        MemoryExec::try_new(&[vec![]], self.schema.clone(), projection.cloned())
-            .map(|e| Arc::new(e) as Arc<dyn ExecutionPlan>)
+        MemorySourceConfig::try_new_exec(&[vec![]], self.schema.clone(), projection.cloned())
+            .map(|e| e as Arc<dyn ExecutionPlan>)
     }
 }
 
@@ -378,8 +373,6 @@ impl std::fmt::Debug for LiveHotTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for LiveHotTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-
     fn schema(&self) -> SchemaRef { self.schema.clone() }
 
     fn table_type(&self) -> TableType { TableType::Base }
@@ -435,7 +428,7 @@ fn extract_partition_filters(filters: &[Expr]) -> Vec<i32> {
     for filter in filters {
         match filter {
             Expr::BinaryExpr(binary) => {
-                if let (Expr::Column(col), Expr::Literal(lit)) = (binary.left.as_ref(), binary.right.as_ref()) {
+                if let (Expr::Column(col), Expr::Literal(lit, _)) = (binary.left.as_ref(), binary.right.as_ref()) {
                     if col.name == "_partition" && binary.op == Operator::Eq {
                         if let Some(val) = scalar_to_i32(lit) {
                             partitions.push(val);
@@ -443,7 +436,7 @@ fn extract_partition_filters(filters: &[Expr]) -> Vec<i32> {
                     }
                 }
                 // Also handle N = _partition (reversed)
-                if let (Expr::Literal(lit), Expr::Column(col)) = (binary.left.as_ref(), binary.right.as_ref()) {
+                if let (Expr::Literal(lit, _), Expr::Column(col)) = (binary.left.as_ref(), binary.right.as_ref()) {
                     if col.name == "_partition" && binary.op == Operator::Eq {
                         if let Some(val) = scalar_to_i32(lit) {
                             partitions.push(val);
@@ -455,7 +448,7 @@ fn extract_partition_filters(filters: &[Expr]) -> Vec<i32> {
                 if let Expr::Column(col) = &*in_list.expr {
                     if col.name == "_partition" && !in_list.negated {
                         for val in &in_list.list {
-                            if let Expr::Literal(lit) = val {
+                            if let Expr::Literal(lit, _) = val {
                                 if let Some(v) = scalar_to_i32(lit) {
                                     partitions.push(v);
                                 }

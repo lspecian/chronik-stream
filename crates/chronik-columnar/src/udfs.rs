@@ -5,9 +5,8 @@
 use anyhow::Result;
 use datafusion::arrow::array::{Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, StringArray};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
-use std::any::Any;
 use std::sync::Arc;
 
 /// Extract bytes from any binary-like Arrow array type at a given index.
@@ -56,7 +55,7 @@ pub fn register_udfs(ctx: &SessionContext) -> Result<()> {
 
 /// Generic JSON extract UDF - returns raw JSON value as string.
 /// Usage: json_extract(binary_column, '$.field.path') -> string (JSON)
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonExtractUdf {
     signature: Signature,
 }
@@ -73,10 +72,6 @@ impl JsonExtractUdf {
 }
 
 impl ScalarUDFImpl for JsonExtractUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "json_extract"
     }
@@ -89,7 +84,11 @@ impl ScalarUDFImpl for JsonExtractUdf {
         Ok(DataType::Utf8)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        func_args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = func_args.args.as_slice();
         let args = ColumnarValue::values_to_arrays(args)?;
 
         let bin_arr = args[0].as_ref();
@@ -127,7 +126,7 @@ impl ScalarUDFImpl for JsonExtractUdf {
 }
 
 /// JSON extract string UDF implementation.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonExtractStringUdf {
     signature: Signature,
 }
@@ -144,10 +143,6 @@ impl JsonExtractStringUdf {
 }
 
 impl ScalarUDFImpl for JsonExtractStringUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "json_extract_string"
     }
@@ -160,7 +155,11 @@ impl ScalarUDFImpl for JsonExtractStringUdf {
         Ok(DataType::Utf8)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        func_args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = func_args.args.as_slice();
         let args = ColumnarValue::values_to_arrays(args)?;
 
         let bin_arr = args[0].as_ref();
@@ -198,7 +197,7 @@ impl ScalarUDFImpl for JsonExtractStringUdf {
 }
 
 /// JSON extract int UDF implementation.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonExtractIntUdf {
     signature: Signature,
 }
@@ -215,10 +214,6 @@ impl JsonExtractIntUdf {
 }
 
 impl ScalarUDFImpl for JsonExtractIntUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "json_extract_int"
     }
@@ -231,7 +226,11 @@ impl ScalarUDFImpl for JsonExtractIntUdf {
         Ok(DataType::Int64)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        func_args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = func_args.args.as_slice();
         let args = ColumnarValue::values_to_arrays(args)?;
 
         let bin_arr = args[0].as_ref();
@@ -269,7 +268,7 @@ impl ScalarUDFImpl for JsonExtractIntUdf {
 }
 
 /// JSON extract float UDF implementation.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonExtractFloatUdf {
     signature: Signature,
 }
@@ -286,10 +285,6 @@ impl JsonExtractFloatUdf {
 }
 
 impl ScalarUDFImpl for JsonExtractFloatUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "json_extract_float"
     }
@@ -302,7 +297,11 @@ impl ScalarUDFImpl for JsonExtractFloatUdf {
         Ok(DataType::Float64)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        func_args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = func_args.args.as_slice();
         let args = ColumnarValue::values_to_arrays(args)?;
 
         let bin_arr = args[0].as_ref();
@@ -340,7 +339,7 @@ impl ScalarUDFImpl for JsonExtractFloatUdf {
 }
 
 /// Decode UTF-8 UDF implementation.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DecodeUtf8Udf {
     signature: Signature,
 }
@@ -357,10 +356,6 @@ impl DecodeUtf8Udf {
 }
 
 impl ScalarUDFImpl for DecodeUtf8Udf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "decode_utf8"
     }
@@ -373,7 +368,11 @@ impl ScalarUDFImpl for DecodeUtf8Udf {
         Ok(DataType::Utf8)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        func_args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = func_args.args.as_slice();
         let args = ColumnarValue::values_to_arrays(args)?;
 
         let bin_arr = args[0].as_ref();
@@ -401,7 +400,7 @@ impl ScalarUDFImpl for DecodeUtf8Udf {
 }
 
 /// Decode base64 UDF implementation.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DecodeBase64Udf {
     signature: Signature,
 }
@@ -418,10 +417,6 @@ impl DecodeBase64Udf {
 }
 
 impl ScalarUDFImpl for DecodeBase64Udf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "decode_base64"
     }
@@ -434,7 +429,11 @@ impl ScalarUDFImpl for DecodeBase64Udf {
         Ok(DataType::Binary)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        func_args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = func_args.args.as_slice();
         use base64::Engine;
 
         let args = ColumnarValue::values_to_arrays(args)?;
@@ -466,7 +465,7 @@ impl ScalarUDFImpl for DecodeBase64Udf {
 /// Vector distance UDF - calculates distance between two embedding vectors.
 /// Usage: vector_distance(vec1, vec2, 'cosine') -> float
 /// Supported metrics: 'cosine', 'euclidean', 'dot'
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct VectorDistanceUdf {
     signature: Signature,
 }
@@ -484,10 +483,6 @@ impl VectorDistanceUdf {
 }
 
 impl ScalarUDFImpl for VectorDistanceUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "vector_distance"
     }
@@ -500,7 +495,11 @@ impl ScalarUDFImpl for VectorDistanceUdf {
         Ok(DataType::Float64)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        func_args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = func_args.args.as_slice();
         use datafusion::arrow::array::{Float32Array, Float64Builder, FixedSizeListArray};
 
         let args = ColumnarValue::values_to_arrays(args)?;
@@ -851,7 +850,7 @@ mod tests {
 /// (`ColumnSpec::extract`). The unified SQL view uses these on the hot side,
 /// where records are not yet in Parquet, so a column reads the same whichever
 /// tier holds the record. `paths` is the column's pointer list, `/a/b|/c`.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct JsonProjectUdf {
     name: &'static str,
     ty: crate::projection::ColumnType,
@@ -886,10 +885,6 @@ fn json_project_udfs() -> Vec<JsonProjectUdf> {
 }
 
 impl ScalarUDFImpl for JsonProjectUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -902,7 +897,11 @@ impl ScalarUDFImpl for JsonProjectUdf {
         Ok(self.ty.sql_arrow_type())
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(
+        &self,
+        func_args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let args = func_args.args.as_slice();
         use crate::projection::ColumnSpec;
 
         use datafusion::common::ScalarValue;

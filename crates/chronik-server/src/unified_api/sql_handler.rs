@@ -95,8 +95,15 @@ impl SqlRequest {
 fn sql_statement_limit(sql: &str) -> Option<usize> {
     use chronik_columnar::datafusion::sql::parser::{DFParser, Statement};
     use chronik_columnar::datafusion::sql::sqlparser::ast::{
-        Expr as SqlExpr, SetExpr, Statement as AstStatement, Value,
+        Expr as SqlExpr, LimitClause, Query, SetExpr, Statement as AstStatement, Value, ValueWithSpan,
     };
+
+    fn limit_of(query: &Query) -> Option<&SqlExpr> {
+        match query.limit_clause.as_ref()? {
+            LimitClause::LimitOffset { limit, .. } => limit.as_ref(),
+            LimitClause::OffsetCommaLimit { limit, .. } => Some(limit),
+        }
+    }
 
     let statements = DFParser::parse_sql(sql).ok()?;
     let statement = statements.front()?;
@@ -109,16 +116,16 @@ fn sql_statement_limit(sql: &str) -> Option<usize> {
 
     // A parenthesised query carries its own LIMIT; unwrap one level so
     // `(SELECT ... LIMIT 5000)` is not mistaken for "no limit".
-    let limit = match query.limit.as_ref() {
+    let limit = match limit_of(query) {
         Some(limit) => Some(limit),
         None => match query.body.as_ref() {
-            SetExpr::Query(inner) => inner.limit.as_ref(),
+            SetExpr::Query(inner) => limit_of(inner),
             _ => None,
         },
     }?;
 
     match limit {
-        SqlExpr::Value(Value::Number(n, _)) => n.parse::<usize>().ok(),
+        SqlExpr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => n.parse::<usize>().ok(),
         _ => None,
     }
 }
@@ -161,7 +168,7 @@ fn referenced_base_tables(sql: &str) -> Option<Vec<String>> {
     fn walk_table_factor(tf: &TableFactor, out: &mut Vec<String>) {
         match tf {
             TableFactor::Table { name, .. } => {
-                if let Some(ident) = name.0.last() {
+                if let Some(ident) = name.0.last().and_then(|p| p.as_ident()) {
                     out.push(ident.value.clone());
                 }
             }

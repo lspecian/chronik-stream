@@ -16,6 +16,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `perl-base`). The images now run `apt-get upgrade`, and the layer is rebuilt
   for every release tag. A Trivy scan of the rebuilt images finds no fixable
   vulnerability and none rated HIGH or CRITICAL.
+- **SQL engine upgraded to DataFusion 55 (Arrow and Parquet 59)**, from
+  DataFusion 44. Clears the last `zstd`, `zstd-safe` and `zstd-sys`
+  advisories (use-after-free, double free and uninitialized-memory reads in
+  the streaming and dictionary APIs) and `thrift` (unbounded allocation reading
+  Parquet metadata), which the old Parquet held back. Queries answer as
+  before: the same 20 `/_sql` shapes (aggregates, `HAVING`, `ORDER BY` by name,
+  ordinal and aggregate, `LIMIT`/`OFFSET` above the row cap, subqueries, CTEs)
+  were run against 2.18.3 and the new build on identical data and agree on
+  every node (`tests/cluster/sql_differential.sh`).
+
+### Changed
+
+- **Projected columns over older segments** (#73) are derived through
+  DataFusion's expression adapter, which replaced the schema adapter the
+  previous implementation used. The SQL engine no longer collects per-file
+  statistics (DataFusion 44 did not either; 48 turned it on by default): they
+  described a projected column as all NULL in segments written before it, so
+  DataFusion folded it away before it could be derived from `_value`.
 
 ## [2.18.3] - 2026-11-20
 

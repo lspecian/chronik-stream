@@ -14,22 +14,22 @@ chronik-embeddings = { path = "../chronik-embeddings" }
 chronik-monitoring = { path = "../chronik-monitoring" }
 
 # Arrow ecosystem
-arrow = { version = "54", default-features = false, features = ["ffi", "prettyprint"] }
-arrow-schema = "54"
-arrow-array = "54"
-arrow-buffer = "54"
-arrow-cast = "54"
-arrow-json = "54"
-parquet = { version = "54", features = ["snap", "zstd", "lz4", "async"] }
+arrow = { version = "59", default-features = false, features = ["ffi", "prettyprint"] }
+arrow-schema = "59"
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-cast = "59"
+arrow-json = "59"
+parquet = { version = "59", features = ["snap", "zstd", "lz4", "async"] }
 
 # SQL query engine
-datafusion = "44"
-datafusion-common = "44"
-datafusion-expr = "44"
+datafusion = "55"
+datafusion-common = "55"
+datafusion-expr = "55"
 
 # Arrow Flight for streaming (optional feature)
-arrow-flight = { version = "54", features = ["flight-sql-experimental"], optional = true }
-arrow-ipc = { version = "54", optional = true }
+arrow-flight = { version = "59", features = ["flight-sql-experimental"], optional = true }
+arrow-ipc = { version = "59", optional = true }
 tonic = { workspace = true, optional = true }
 
 # Serialization

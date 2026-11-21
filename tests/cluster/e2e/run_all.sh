@@ -9,6 +9,8 @@
 # Logs go to tests/cluster/data/e2e/<label>/.
 # Each check starts and stops the local 3-node cluster (tests/cluster/), so
 # nothing else may use it meanwhile.
+# E2E_FROM=<check> resumes an interrupted run at that check, skipping the ones
+# before it.
 set -u
 BIN=${1:?binary}; LABEL=${2:?label}
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -22,6 +24,10 @@ cd "$REPO"
 failed=0
 run() { # name, command...
   local name=$1; shift
+  if [ -n "${E2E_FROM:-}" ]; then
+    [ "$name" = "$E2E_FROM" ] || return 0
+    E2E_FROM=
+  fi
   local start=$SECONDS
   "$@" > "$OUT/$name.log" 2>&1; local rc=$?
   ./tests/cluster/stop.sh >/dev/null 2>&1

@@ -65,11 +65,11 @@ impl ParquetSegmentWriter {
 
         Ok(ParquetWriteStats {
             num_rows: total_rows,
-            num_row_groups: metadata.row_groups.len(),
+            num_row_groups: metadata.row_groups().len(),
             file_size_bytes: metadata
-                .row_groups
+                .row_groups()
                 .iter()
-                .map(|rg| rg.total_byte_size as u64)
+                .map(|rg| rg.total_byte_size() as u64)
                 .sum(),
         })
     }
@@ -85,7 +85,7 @@ impl ParquetSegmentWriter {
     fn build_writer_properties(&self) -> Result<WriterProperties> {
         let mut builder = WriterProperties::builder()
             .set_compression(self.map_compression())
-            .set_max_row_group_size(self.config.row_group_size)
+            .set_max_row_group_row_count(Some(self.config.row_group_size))
             .set_data_page_size_limit(self.config.page_size)
             .set_dictionary_enabled(self.config.dictionary_enabled)
             .set_encoding(Encoding::PLAIN);
