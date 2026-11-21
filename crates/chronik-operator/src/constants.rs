@@ -34,7 +34,7 @@ pub mod ports {
 
 /// Default resource values.
 pub mod defaults {
-    pub const IMAGE: &str = "ghcr.io/chronik-stream/chronik-server:latest";
+    pub const IMAGE: &str = "ghcr.io/lspecian/chronik-stream:latest";
     pub const DATA_DIR: &str = "/data";
     pub const STORAGE_SIZE: &str = "50Gi";
     pub const WAL_PROFILE: &str = "medium";

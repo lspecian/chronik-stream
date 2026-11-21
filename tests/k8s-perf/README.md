@@ -14,7 +14,7 @@ k6 TestRun (3 pods) ──HTTP POST──→ Ingestor Deployment (3 replicas) �
 ## Prerequisites
 
 - MicroK8s cluster with k6 operator installed
-- `ghcr.io/chronik-stream/chronik-server:latest` image on all nodes
+- `ghcr.io/lspecian/chronik-stream:latest` image on all nodes
 - `chronik-operator` binary built
 - Docker for building the perf image
 

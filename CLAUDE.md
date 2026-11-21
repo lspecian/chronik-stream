@@ -164,9 +164,9 @@ tail -f tests/cluster/logs/node*.log
 
 See [tests/cluster/README.md](tests/cluster/README.md) for details.
 
-## Layered Storage Architecture with Full Disaster Recovery
+## Layered Storage Architecture
 
-Chronik implements a 3-tier storage system for infinite retention with automatic disaster recovery (v1.3.65+):
+Chronik implements a 3-tier storage system for infinite retention:
 
 **Tier 1 (Hot - WAL)**: `<1ms` latency, local disk, GroupCommitWal with bincode
 **Tier 2 (Warm - Segments)**: `1-10ms` latency, S3/GCS/Azure/local, raw message data
@@ -185,9 +185,9 @@ Chronik implements a 3-tier storage system for infinite retention with automatic
 
 **Write**: Producer → WAL (fsync) → Segments (background) → Tantivy (indexer, every 30s)
 **Read**: Try WAL → Try Segments (cached) → Try Tantivy (S3 download) → Metadata fallback
-**Metadata DR**: WAL metadata auto-uploads to S3/GCS/Azure every 60s (local: persists on disk)
+**Metadata DR**: NOT working — the uploader reads paths no longer written (uploads nothing) and the restore is never called; see the status note in docs/DISASTER_RECOVERY.md
 
-**Disaster Recovery (v1.3.65+)**: Automatic metadata + data backup to S3/GCS/Azure. Complete cluster recovery from object storage on cold start. See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md).
+**Disaster Recovery**: message data is archived to S3/GCS/Azure and read back from it (`tests/cluster/e2e/s3_roundtrip.sh`). Recovering a node from an empty data directory does NOT work yet (no catalog restore). See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md).
 
 **vs. Kafka Tiered Storage**: Chronik Tier 3 provides full-text search on archived data (Tantivy indexes), not just offset-based retrieval. Query old messages by content without scanning.
 

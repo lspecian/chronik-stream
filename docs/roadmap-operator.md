@@ -139,7 +139,7 @@ kind: ChronikStandalone
 metadata:
   name: my-chronik
 spec:
-  image: ghcr.io/chronik-stream/chronik-server:v2.2.23
+  image: ghcr.io/lspecian/chronik-stream:2.18.3
   imagePullPolicy: IfNotPresent
   imagePullSecrets: []
 
@@ -215,7 +215,7 @@ metadata:
   name: prod-cluster
 spec:
   replicas: 3              # Minimum 3 for Raft quorum
-  image: ghcr.io/chronik-stream/chronik-server:v2.2.23
+  image: ghcr.io/lspecian/chronik-stream:2.18.3
   imagePullPolicy: IfNotPresent
 
   resources:

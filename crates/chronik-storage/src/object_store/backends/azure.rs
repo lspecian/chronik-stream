@@ -24,23 +24,33 @@ pub struct AzureBackend {
     config: ObjectStoreConfig,
 }
 
+/// Azurite's development account key (account `devstoreaccount1`). Public by
+/// design; used only with `use_emulator` and no configured credentials.
+const AZURITE_ACCOUNT_KEY: &str =
+    "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+
 impl AzureBackend {
     /// Create a new Azure backend
     pub async fn new(config: ObjectStoreConfig) -> ObjectStoreResult<Self> {
+        // OpenDAL 0.59 sends nothing until an HTTP transport is installed
+        // (its auto-registration feature is off here). Idempotent.
+        opendal::install_default();
         let mut builder = Azblob::default();
         
         // Configure container/bucket
-        builder.container(&config.bucket);
+        builder = builder.container(&config.bucket);
         
         // Extract Azure-specific configuration
         match &config.backend {
-            crate::object_store::config::StorageBackend::Azure { account_name, endpoint, .. } => {
-                // Configure account name
-                builder.account_name(account_name);
-                
-                // Configure endpoint if provided
-                if let Some(endpoint) = endpoint {
-                    builder.endpoint(endpoint);
+            crate::object_store::config::StorageBackend::Azure { account_name, endpoint, use_emulator } => {
+                builder = builder.account_name(account_name);
+                match endpoint {
+                    Some(endpoint) => builder = builder.endpoint(endpoint),
+                    // Azurite's blob service is path-style: account in the path.
+                    None if *use_emulator => {
+                        builder = builder.endpoint(&format!("http://127.0.0.1:10000/{account_name}"));
+                    }
+                    None => {}
                 }
             }
             _ => {
@@ -56,20 +66,29 @@ impl AzureBackend {
                 use crate::object_store::auth::AzureCredentials;
                 match creds {
                     AzureCredentials::AccountKey { account_key, .. } => {
-                        builder.account_key(account_key);
+                        builder = builder.account_key(account_key);
                     }
                     AzureCredentials::SasToken { sas_token, .. } => {
-                        builder.sas_token(sas_token);
+                        builder = builder.sas_token(sas_token);
                     }
-                    AzureCredentials::ConnectionString { connection_string: _ } => {
-                        // OpenDAL doesn't support connection strings directly
-                        // Would need to parse it for account and key
-                        return Err(ObjectStoreError::InvalidConfiguration {
-                            message: "Connection string authentication not yet implemented".to_string(),
-                        });
+                    AzureCredentials::ConnectionString { connection_string } => {
+                        // The connection string carries account, key or SAS,
+                        // and endpoint; only the container comes from config.
+                        builder = Azblob::from_connection_string(connection_string)
+                            .map_err(|e| ObjectStoreError::InvalidConfiguration {
+                                message: format!("Invalid Azure connection string: {e}"),
+                            })?
+                            .container(&config.bucket);
                     }
                     AzureCredentials::DefaultChain => {
-                        // Use default Azure credential chain
+                        // Against the emulator, its fixed development key.
+                        let emulator = matches!(
+                            &config.backend,
+                            crate::object_store::config::StorageBackend::Azure { use_emulator: true, .. }
+                        );
+                        if emulator {
+                            builder = builder.account_key(AZURITE_ACCOUNT_KEY);
+                        }
                     }
                     _ => {
                         return Err(ObjectStoreError::InvalidConfiguration {
@@ -85,14 +104,17 @@ impl AzureBackend {
             }
         }
         
+        // The configured prefix (AZURE_PREFIX), the way S3 applies its prefix.
+        // Set last: a connection string starts a fresh builder.
+        builder = builder.root(&super::opendal_root(&[config.prefix.as_deref()]));
+
         // Build operator with retry layer
         let operator = Operator::new(builder)
             .map_err(|e| ObjectStoreError::ConnectionError {
                 backend: "azure".to_string(),
                 details: e.to_string(),
             })?
-            .layer(RetryLayer::new())
-            .finish();
+            .layer(RetryLayer::new());
         
         Ok(Self { operator, config })
     }
@@ -106,7 +128,6 @@ impl ObjectStore for AzureBackend {
         data: Bytes,
         _options: PutOptions,
     ) -> ObjectStoreResult<()> {
-        // OpenDAL v0.45 uses a simpler API for writing
         self.operator.write(key, data).await
             .map_err(|e| ObjectStoreError::WriteError {
                 key: key.to_string(),
@@ -117,11 +138,10 @@ impl ObjectStore for AzureBackend {
     }
 
     async fn get_with_options(&self, key: &str, options: GetOptions) -> ObjectStoreResult<Bytes> {
-        // OpenDAL v0.45 uses read with range directly
         let data = if let Some((start, end)) = options.range {
-            self.operator.read_with(key).range(start..=end).await
+            self.operator.read_with(key).range(start..=end).await.map(|b| b.to_bytes())
         } else {
-            self.operator.read(key).await
+            self.operator.read(key).await.map(|b| b.to_bytes())
         }.map_err(|e| match e.kind() {
             opendal::ErrorKind::NotFound => ObjectStoreError::NotFound {
                 key: key.to_string(),
@@ -164,8 +184,12 @@ impl ObjectStore for AzureBackend {
         prefix: &str,
         options: ListOptions,
     ) -> ObjectStoreResult<Vec<ObjectMetadata>> {
+        // Recursive by prefix, like S3 and local: a plain `lister` stops at
+        // one level and returns the directories in it as entries. A delimiter
+        // asks for one level.
         let mut lister = self.operator
-            .lister(prefix)
+            .lister_with(prefix)
+            .recursive(options.delimiter.is_none())
             .await
             .map_err(|e| ObjectStoreError::ListError {
                 prefix: prefix.to_string(),  
@@ -188,12 +212,15 @@ impl ObjectStore for AzureBackend {
             
             // Get metadata for the entry
             let metadata = entry.metadata();
+            if options.delimiter.is_none() && metadata.is_dir() {
+                continue;
+            }
             
             results.push(ObjectMetadata {
                 key: entry.path().to_string(),
                 size: metadata.content_length() as u64,
                 last_modified: metadata.last_modified()
-                    .map(|t| t.timestamp_millis() as u64)
+                    .map(|t| t.into_inner().as_millisecond() as u64)
                     .unwrap_or(0),
                 etag: metadata.etag().map(|s| s.to_string()),
                 content_type: metadata.content_type().map(|s| s.to_string()),
@@ -212,7 +239,7 @@ impl ObjectStore for AzureBackend {
     }
 
     async fn exists(&self, key: &str) -> ObjectStoreResult<bool> {
-        let exists = self.operator.is_exist(key).await
+        let exists = self.operator.exists(key).await
             .map_err(|e| ObjectStoreError::AccessError {
                 key: key.to_string(),
                 operation: "exists".to_string(),
@@ -239,7 +266,7 @@ impl ObjectStore for AzureBackend {
             key: key.to_string(),
             size: stat.content_length() as u64,
             last_modified: stat.last_modified()
-                .map(|t| t.timestamp_millis() as u64)
+                .map(|t| t.into_inner().as_millisecond() as u64)
                 .unwrap_or(0),
             etag: stat.etag().map(|s| s.to_string()),
             content_type: stat.content_type().map(|s| s.to_string()),

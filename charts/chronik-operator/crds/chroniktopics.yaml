@@ -5,7 +5,6 @@ metadata:
 spec:
   group: chronik.io
   names:
-    categories: []
     kind: ChronikTopic
     plural: chroniktopics
     shortNames:

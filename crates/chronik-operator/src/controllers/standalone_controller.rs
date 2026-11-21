@@ -369,8 +369,5 @@ fn error_policy(_csa: Arc<ChronikStandalone>, error: &OperatorError, _ctx: Arc<C
 
 /// Check if a kube::Error is a 404 Not Found.
 fn is_not_found(e: &kube::Error) -> bool {
-    matches!(
-        e,
-        kube::Error::Api(kube::core::ErrorResponse { code: 404, .. })
-    )
+    matches!(e, kube::Error::Api(status) if status.code == 404)
 }

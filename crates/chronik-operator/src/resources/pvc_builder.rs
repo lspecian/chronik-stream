@@ -41,7 +41,7 @@ pub fn build_standalone_pvc(
         spec: Some(K8sPvcSpec {
             storage_class_name: Some(storage_class),
             access_modes: Some(access_modes),
-            resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
+            resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
                 requests: Some(BTreeMap::from([("storage".into(), Quantity(size))])),
                 ..Default::default()
             }),
@@ -86,7 +86,7 @@ pub fn build_cluster_node_pvc(
         spec: Some(K8sPvcSpec {
             storage_class_name: Some(storage_class),
             access_modes: Some(access_modes),
-            resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
+            resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
                 requests: Some(BTreeMap::from([("storage".into(), Quantity(size))])),
                 ..Default::default()
             }),

@@ -229,7 +229,7 @@ pub fn build_standalone_pod(
                     name: "OPENAI_API_KEY".into(),
                     value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
                         secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
-                            name: Some(secret_ref.name.clone()),
+                            name: secret_ref.name.clone(),
                             key: secret_ref.key.clone(),
                             ..Default::default()
                         }),
@@ -254,7 +254,7 @@ pub fn build_standalone_pod(
                 name: user_env.name.clone(),
                 value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
                     secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
-                        name: Some(secret_ref.name.clone()),
+                        name: secret_ref.name.clone(),
                         key: secret_ref.key.clone(),
                         ..Default::default()
                     }),
@@ -398,7 +398,7 @@ pub fn build_standalone_pod(
                 spec.image_pull_secrets
                     .iter()
                     .map(|s| LocalObjectReference {
-                        name: Some(s.name.clone()),
+                        name: s.name.clone(),
                     })
                     .collect(),
             )
@@ -520,7 +520,7 @@ pub fn build_cluster_node_pod(
             name: "CHRONIK_ADMIN_API_KEY".into(),
             value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
                 secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
-                    name: Some(secret_ref.name.clone()),
+                    name: secret_ref.name.clone(),
                     key: secret_ref.key.clone(),
                     ..Default::default()
                 }),
@@ -539,7 +539,7 @@ pub fn build_cluster_node_pod(
             name: crate::crds::cluster::INTER_BROKER_SECRET_ENV.into(),
             value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
                 secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
-                    name: Some(secret_ref.name),
+                    name: secret_ref.name,
                     key: secret_ref.key,
                     ..Default::default()
                 }),
@@ -593,7 +593,7 @@ pub fn build_cluster_node_pod(
                     name: "OPENAI_API_KEY".into(),
                     value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
                         secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
-                            name: Some(secret_ref.name.clone()),
+                            name: secret_ref.name.clone(),
                             key: secret_ref.key.clone(),
                             ..Default::default()
                         }),
@@ -618,7 +618,7 @@ pub fn build_cluster_node_pod(
                 name: user_env.name.clone(),
                 value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
                     secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
-                        name: Some(secret_ref.name.clone()),
+                        name: secret_ref.name.clone(),
                         key: secret_ref.key.clone(),
                         ..Default::default()
                     }),
@@ -809,7 +809,7 @@ pub fn build_cluster_node_pod(
                 spec.image_pull_secrets
                     .iter()
                     .map(|s| LocalObjectReference {
-                        name: Some(s.name.clone()),
+                        name: s.name.clone(),
                     })
                     .collect(),
             )
@@ -863,7 +863,7 @@ pub fn build_cluster_node_pod(
                 Volume {
                     name: "config".into(),
                     config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
-                        name: Some(cm_name),
+                        name: cm_name,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1042,11 +1042,11 @@ mod tests {
 
     #[test]
     fn test_standalone_labels() {
-        let labels = standalone_labels("my-app", "ghcr.io/chronik-stream/chronik-server:v2.2.23");
+        let labels = standalone_labels("my-app", "ghcr.io/lspecian/chronik-stream:2.18.3");
         assert_eq!(labels.get(labels::NAME).unwrap(), "chronik-stream");
         assert_eq!(labels.get(labels::INSTANCE).unwrap(), "my-app");
         assert_eq!(labels.get(labels::COMPONENT).unwrap(), "standalone");
-        assert_eq!(labels.get(labels::VERSION).unwrap(), "v2.2.23");
+        assert_eq!(labels.get(labels::VERSION).unwrap(), "2.18.3");
     }
 
     #[test]
@@ -1494,7 +1494,7 @@ mod tests {
             .as_ref()
             .and_then(|v| v.secret_key_ref.as_ref())
             .expect("must come from a secretKeyRef");
-        (sel.name.clone().unwrap(), sel.key.clone())
+        (sel.name.clone(), sel.key.clone())
     }
 
     #[test]

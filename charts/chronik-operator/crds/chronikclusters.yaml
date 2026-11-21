@@ -5,7 +5,6 @@ metadata:
 spec:
   group: chronik.io
   names:
-    categories: []
     kind: ChronikCluster
     plural: chronikclusters
     shortNames:
@@ -102,13 +101,19 @@ spec:
                 description: |-
                   Repair ownership of the data volume before the broker starts.
 
-                  Defaults to `true`. An init container chowns anything under the data dir not already owned by the broker's UID (1001). `fsGroup` alone does not cover this: the kubelet does not apply ownership management to `hostPath` volumes, which is what microk8s' `standard` class provisions, so an upgrade can leave data owned by `root` and every write fails with `Permission denied` while reads keep working (issue #51).
+                  Defaults to `true`. An init container chowns anything under the data dir
+                  not already owned by the broker's UID (1001). `fsGroup` alone does not
+                  cover this: the kubelet does not apply ownership management to
+                  `hostPath` volumes, which is what microk8s' `standard` class provisions,
+                  so an upgrade can leave data owned by `root` and every write fails with
+                  `Permission denied` while reads keep working (issue #51).
 
-                  Set `false` where a root init container is not permitted; the data must then be made writable by UID 1001 some other way.
+                  Set `false` where a root init container is not permitted; the data must
+                  then be made writable by UID 1001 some other way.
                 nullable: true
                 type: boolean
               image:
-                default: ghcr.io/chronik-stream/chronik-server:latest
+                default: ghcr.io/lspecian/chronik-stream:latest
                 description: Container image for Chronik server.
                 type: string
               imagePullPolicy:
@@ -129,11 +134,21 @@ spec:
                 type: array
               interBrokerSecret:
                 description: |-
-                  Secret holding the broker-to-broker SASL secret (`CHRONIK_INTER_BROKER_SECRET`).
+                  Secret holding the broker-to-broker SASL secret
+                  (`CHRONIK_INTER_BROKER_SECRET`).
 
-                  With SASL required (`CHRONIK_SASL_ENABLED` = `true`/`1`/`yes`/`required` in `env`) a cluster broker refuses to start without this secret, and replica fetchers use it to authenticate to the partition leader. It must be at least 16 characters and identical on every broker.
+                  With SASL required (`CHRONIK_SASL_ENABLED` = `true`/`1`/`yes`/`required`
+                  in `env`) a cluster broker refuses to start without this secret, and
+                  replica fetchers use it to authenticate to the partition leader. It
+                  must be at least 16 characters and identical on every broker.
 
-                  Leave it unset and the operator generates one in a Secret named `<cluster>-inter-broker` (key `secret`), once, and never rotates it. Set it to supply your own. Either way it is only injected while SASL is enabled: a broker with SASL disabled cannot accept the broker login, so handing it the secret would break replication. If `CHRONIK_SASL_ENABLED` itself comes from a Secret the operator cannot tell whether SASL is on, so it injects only a secret set here, and generates none.
+                  Leave it unset and the operator generates one in a Secret named
+                  `<cluster>-inter-broker` (key `secret`), once, and never rotates it.
+                  Set it to supply your own. Either way it is only injected while SASL is
+                  enabled: a broker with SASL disabled cannot accept the broker login, so
+                  handing it the secret would break replication. If `CHRONIK_SASL_ENABLED`
+                  itself comes from a Secret the operator cannot tell whether SASL is on,
+                  so it injects only a secret set here, and generates none.
                 nullable: true
                 properties:
                   key:
@@ -250,16 +265,25 @@ spec:
                 description: |-
                   Pod-level security context applied to every broker Pod.
 
-                  When omitted, the controller defaults to `fsGroup: 1001` so the official `ghcr.io/lspecian/chronik-stream` image (which runs as `chronik` UID/GID 1001) can write to RWO PVCs that ship as `root:root`. Set explicitly to override (e.g. when running a custom image with a different UID, or to harden the broker).
+                  When omitted, the controller defaults to `fsGroup: 1001` so the
+                  official `ghcr.io/lspecian/chronik-stream` image (which runs as
+                  `chronik` UID/GID 1001) can write to RWO PVCs that ship as
+                  `root:root`. Set explicitly to override (e.g. when running a
+                  custom image with a different UID, or to harden the broker).
                 nullable: true
                 properties:
                   fsGroup:
-                    description: Special supplemental group that applies to all containers in the Pod. Kubelet `chown`s the volume to this GID when the volume plugin supports it (Longhorn, EBS, GCE-PD, AzureDisk, NFS-CSI, …).
+                    description: |-
+                      Special supplemental group that applies to all containers in the
+                      Pod. Kubelet `chown`s the volume to this GID when the volume
+                      plugin supports it (Longhorn, EBS, GCE-PD, AzureDisk, NFS-CSI, …).
                     format: int64
                     nullable: true
                     type: integer
                   fsGroupChangePolicy:
-                    description: 'Policy for when the volume is chowned to fsGroup. Valid: `OnRootMismatch`, `Always`. When unset, kubelet picks the default.'
+                    description: |-
+                      Policy for when the volume is chowned to fsGroup. Valid:
+                      `OnRootMismatch`, `Always`. When unset, kubelet picks the default.
                     nullable: true
                     type: string
                   runAsGroup:
@@ -268,7 +292,9 @@ spec:
                     nullable: true
                     type: integer
                   runAsNonRoot:
-                    description: When `true`, the kubelet validates that the container's effective UID is non-zero and refuses to start the Pod otherwise.
+                    description: |-
+                      When `true`, the kubelet validates that the container's effective
+                      UID is non-zero and refuses to start the Pod otherwise.
                     nullable: true
                     type: boolean
                   runAsUser:

@@ -564,7 +564,7 @@ async fn ensure_inter_broker_secret(
     match secret_api.create(&PostParams::default(), &secret).await {
         Ok(_) => Ok(()),
         // Another reconcile created it between our get and create. Keep theirs.
-        Err(kube::Error::Api(kube::core::ErrorResponse { code: 409, .. })) => Ok(()),
+        Err(kube::Error::Api(status)) if status.code == 409 => Ok(()),
         Err(e) => Err(e.into()),
     }
 }
@@ -864,10 +864,7 @@ fn error_policy(
 
 /// Check if a kube::Error is a 404 Not Found.
 fn is_not_found(e: &kube::Error) -> bool {
-    matches!(
-        e,
-        kube::Error::Api(kube::core::ErrorResponse { code: 404, .. })
-    )
+    matches!(e, kube::Error::Api(status) if status.code == 404)
 }
 
 #[cfg(test)]
@@ -1061,7 +1058,15 @@ mod tests {
             // fix had to reach them: a supervised rolling restart now is better
             // than each cluster discovering the crash-loop at its next restart.
             // Was "4a01ffeff1524553" at generation 1.
-            "a754f5cb9f9a4558",
+            //
+            // Changed again, deliberately, when the default image moved from
+            // ghcr.io/chronik-stream/chronik-server:latest, which was never
+            // published, to ghcr.io/lspecian/chronik-stream:latest. A cluster
+            // that left `image` unset pulled nothing and has no running broker
+            // to restart; recreating its Pods is what fixes it. Clusters that
+            // set `image` (all known ones) keep their hash.
+            // Was "a754f5cb9f9a4558" with the unpublished default.
+            "d0307e0bbda03cd2",
             "the hash of a default spec changed — every broker Pod under this \
              operator would be recreated on upgrade"
         );
@@ -1121,7 +1126,8 @@ mod tests {
     #[test]
     fn inter_broker_secret_support_leaves_non_sasl_hashes_unchanged() {
         let cases = [
-            ("{}", "a754f5cb9f9a4558"),
+            // Default image corrected; see the_default_spec_hash_is_stable_across_operator_versions.
+            ("{}", "d0307e0bbda03cd2"),
             // Explicitly disabled SASL, plus unrelated env and an admin key.
             (
                 r#"{"image":"chronik-server:v2.16.0","walProfile":"high",

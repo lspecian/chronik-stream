@@ -27,23 +27,29 @@ pub struct GcsBackend {
 impl GcsBackend {
     /// Create a new GCS backend
     pub async fn new(config: ObjectStoreConfig) -> ObjectStoreResult<Self> {
+        // OpenDAL 0.59 sends nothing until an HTTP transport is installed
+        // (its auto-registration feature is off here). Idempotent.
+        opendal::install_default();
         let mut builder = Gcs::default();
         
         // Configure bucket
-        builder.bucket(&config.bucket);
+        builder = builder.bucket(&config.bucket);
         
         // Extract GCS-specific configuration
         match &config.backend {
             crate::object_store::config::StorageBackend::Gcs { project_id, endpoint } => {
-                // Configure project ID if provided
-                if let Some(project_id) = project_id {
-                    // Project ID is handled differently in OpenDAL
-                    builder.root(project_id);
-                }
-                
-                // Configure endpoint if provided
+                // Objects have always been stored under `<project_id>/` when a
+                // project is set (odd for GCS, where a bucket already belongs
+                // to a project, but changing it would hide existing objects).
+                // The configured prefix (GCS_PREFIX) goes under it, the way
+                // S3 applies its prefix.
+                builder = builder.root(&super::opendal_root(&[
+                    project_id.as_deref(),
+                    config.prefix.as_deref(),
+                ]));
+
                 if let Some(endpoint) = endpoint {
-                    builder.endpoint(endpoint);
+                    builder = builder.endpoint(endpoint);
                 }
             }
             _ => {
@@ -59,16 +65,28 @@ impl GcsBackend {
                 use crate::object_store::auth::GcsCredentials;
                 match creds {
                     GcsCredentials::ServiceAccountKey { key_file } => {
-                        builder.credential_path(&key_file.to_string_lossy());
+                        builder = builder.credential_path(&key_file.to_string_lossy());
                     }
-                    GcsCredentials::ServiceAccount { client_email, private_key, .. } => {
-                        // For inline credentials, create a JSON string
-                        let creds_json = serde_json::json!({
+                    GcsCredentials::ServiceAccount { client_email, private_key, private_key_id } => {
+                        // Inline key: OpenDAL takes the service-account JSON
+                        // base64-encoded. (These were once put in an env var
+                        // nothing reads, so they were silently ignored.)
+                        use base64::Engine as _;
+                        let mut creds_json = serde_json::json!({
                             "type": "service_account",
                             "client_email": client_email,
-                            "private_key": private_key
+                            "private_key": private_key,
                         });
-                        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS_JSON", creds_json.to_string());
+                        if let Some(id) = private_key_id {
+                            creds_json["private_key_id"] = serde_json::Value::String(id.clone());
+                        }
+                        let encoded = base64::engine::general_purpose::STANDARD
+                            .encode(creds_json.to_string());
+                        builder = builder.credential(&encoded);
+                    }
+                    GcsCredentials::WorkloadIdentity { service_account } => {
+                        // Token from the metadata server for this account.
+                        builder = builder.service_account(service_account);
                     }
                     GcsCredentials::FromEnvironment => {
                         // Credentials will be loaded from GOOGLE_APPLICATION_CREDENTIALS env var
@@ -76,10 +94,8 @@ impl GcsBackend {
                     GcsCredentials::Default => {
                         // Use default GCS credential chain
                     }
-                    _ => {
-                        return Err(ObjectStoreError::InvalidConfiguration {
-                            message: "Unsupported GCS authentication method".to_string(),
-                        });
+                    GcsCredentials::Anonymous => {
+                        builder = builder.skip_signature();
                     }
                 }
             }
@@ -96,8 +112,7 @@ impl GcsBackend {
                 backend: "gcs".to_string(),
                 details: e.to_string(),
             })?
-            .layer(RetryLayer::new())
-            .finish();
+            .layer(RetryLayer::new());
         
         Ok(Self { operator, config })
     }
@@ -111,7 +126,6 @@ impl ObjectStore for GcsBackend {
         data: Bytes,
         _options: PutOptions,
     ) -> ObjectStoreResult<()> {
-        // OpenDAL v0.45 uses a simpler API for writing
         self.operator.write(key, data).await
             .map_err(|e| ObjectStoreError::WriteError {
                 key: key.to_string(),
@@ -122,11 +136,10 @@ impl ObjectStore for GcsBackend {
     }
 
     async fn get_with_options(&self, key: &str, options: GetOptions) -> ObjectStoreResult<Bytes> {
-        // OpenDAL v0.45 uses read with range directly
         let data = if let Some((start, end)) = options.range {
-            self.operator.read_with(key).range(start..=end).await
+            self.operator.read_with(key).range(start..=end).await.map(|b| b.to_bytes())
         } else {
-            self.operator.read(key).await
+            self.operator.read(key).await.map(|b| b.to_bytes())
         }.map_err(|e| match e.kind() {
             opendal::ErrorKind::NotFound => ObjectStoreError::NotFound {
                 key: key.to_string(),
@@ -169,8 +182,12 @@ impl ObjectStore for GcsBackend {
         prefix: &str,
         options: ListOptions,
     ) -> ObjectStoreResult<Vec<ObjectMetadata>> {
+        // Recursive by prefix, like S3 and local: a plain `lister` stops at
+        // one level and returns the directories in it as entries. A delimiter
+        // asks for one level.
         let mut lister = self.operator
-            .lister(prefix)
+            .lister_with(prefix)
+            .recursive(options.delimiter.is_none())
             .await
             .map_err(|e| ObjectStoreError::ListError {
                 prefix: prefix.to_string(),
@@ -193,12 +210,15 @@ impl ObjectStore for GcsBackend {
             
             // Get metadata for the entry
             let metadata = entry.metadata();
+            if options.delimiter.is_none() && metadata.is_dir() {
+                continue;
+            }
             
             results.push(ObjectMetadata {
                 key: entry.path().to_string(),
                 size: metadata.content_length() as u64,
                 last_modified: metadata.last_modified()
-                    .map(|t| t.timestamp_millis() as u64)
+                    .map(|t| t.into_inner().as_millisecond() as u64)
                     .unwrap_or(0),
                 etag: metadata.etag().map(|s| s.to_string()),
                 content_type: metadata.content_type().map(|s| s.to_string()),
@@ -217,7 +237,7 @@ impl ObjectStore for GcsBackend {
     }
 
     async fn exists(&self, key: &str) -> ObjectStoreResult<bool> {
-        let exists = self.operator.is_exist(key).await
+        let exists = self.operator.exists(key).await
             .map_err(|e| ObjectStoreError::AccessError {
                 key: key.to_string(),
                 operation: "exists".to_string(),
@@ -244,7 +264,7 @@ impl ObjectStore for GcsBackend {
             key: key.to_string(),
             size: stat.content_length() as u64,
             last_modified: stat.last_modified()
-                .map(|t| t.timestamp_millis() as u64)
+                .map(|t| t.into_inner().as_millisecond() as u64)
                 .unwrap_or(0),
             etag: stat.etag().map(|s| s.to_string()),
             content_type: stat.content_type().map(|s| s.to_string()),
