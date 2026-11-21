@@ -58,9 +58,17 @@ impl ColumnarQueryEngine {
 
     /// Create a new query engine with custom configuration.
     pub fn with_config(config: QueryEngineConfig) -> Self {
+        // No file statistics. A topic's Parquet set grows continuously, so each
+        // scan of a live table would re-read the footers of files it has not
+        // seen; and the statistics of a segment written before a projected
+        // column existed describe that column as all NULL, which DataFusion
+        // folds to a NULL literal (and answers `count(col)` from) before the
+        // projection adapter can derive the column from `_value` (issue #73).
+        // Row-group pruning from each file's own metadata is unaffected.
         let session_config = SessionConfig::new()
             .with_target_partitions(config.target_partitions)
-            .with_batch_size(8192);
+            .with_batch_size(8192)
+            .with_collect_statistics(false);
 
         let ctx = SessionContext::new_with_config(session_config);
 

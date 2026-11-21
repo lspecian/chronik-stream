@@ -112,7 +112,7 @@ pub fn referenced_tables(sql: &str) -> Result<Vec<String>, String> {
 
     let mut tables = Vec::new();
     for statement in &statements {
-        let (refs, ctes) = datafusion::catalog_common::resolve_table_references(statement, true)
+        let (refs, ctes) = datafusion::sql::resolve::resolve_table_references(statement, true)
             .map_err(|e| format!("{}", e))?;
         let cte_names: HashSet<String> = ctes.iter().map(|c| c.table().to_string()).collect();
         for reference in refs {

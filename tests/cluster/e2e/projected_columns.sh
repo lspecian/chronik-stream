@@ -100,7 +100,7 @@ expect "_value unchanged" "$(grep -c -F "\"v\":\"$want\"" <<<"$r")" "1"
 
 plan=$(curl -s -m 30 -X POST localhost:6092/_sql/explain -H 'Content-Type: application/json' \
   -d "{\"query\":\"SELECT COUNT(*) FROM ${V}_cold WHERE severity = 'ERROR'\"}")
-scan=$(grep -o 'ParquetExec[^\\]*' <<<"$plan" | head -1)
+scan=$(grep -oE '(ParquetExec|DataSourceExec)[^\\]*' <<<"$plan" | head -1)
 echo "  cold scan: ${scan:0:220}"
 expect "the cold scan reads severity only" "$(grep -c 'projection=\[severity\]' <<<"$scan")" "1"
 

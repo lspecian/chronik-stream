@@ -135,7 +135,7 @@ pub enum Projected {
 }
 
 /// One projected column.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnSpec {
     pub name: String,
     pub ty: ColumnType,

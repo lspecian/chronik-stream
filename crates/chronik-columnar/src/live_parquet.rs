@@ -15,11 +15,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch, RecordBatchOptions};
-use datafusion::arrow::compute::{can_cast_types, cast};
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
-use datafusion::datasource::physical_plan::ParquetExec;
-use datafusion::datasource::schema_adapter::{SchemaAdapter, SchemaAdapterFactory, SchemaMapper};
+use datafusion::arrow::array::{new_null_array, RecordBatch};
+use datafusion::arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::catalog::Session;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
@@ -27,11 +25,18 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_plan::memory::MemoryExec;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::logical_expr::{ColumnarValue, Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr_adapter::{
+    DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
+};
 use datafusion::physical_plan::ExecutionPlan;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+use crate::projection::ColumnSpec;
 
 /// Default interval between file-set re-resolutions, in milliseconds.
 pub const DEFAULT_PARQUET_REFRESH_MS: u64 = 1_000;
@@ -76,7 +81,7 @@ pub struct LiveParquetTableProvider {
     refresh_interval_ms: u64,
     listing: RwLock<Listing>,
     /// Derives projected columns for segments written before them.
-    adapter: Option<Arc<ProjectingSchemaAdapterFactory>>,
+    adapter: Option<Arc<ProjectingExprAdapterFactory>>,
 }
 
 impl fmt::Debug for LiveParquetTableProvider {
@@ -109,9 +114,9 @@ impl LiveParquetTableProvider {
     }
 
     /// Derive these projected columns for segments that lack them (issue #73).
-    pub fn with_projected_columns(mut self, projected: Vec<crate::projection::ColumnSpec>) -> Self {
+    pub fn with_projected_columns(mut self, projected: Vec<ColumnSpec>) -> Self {
         if !projected.is_empty() {
-            self.adapter = Some(Arc::new(ProjectingSchemaAdapterFactory::new(projected)));
+            self.adapter = Some(Arc::new(ProjectingExprAdapterFactory::new(projected)));
         }
         self
     }
@@ -147,9 +152,12 @@ impl LiveParquetTableProvider {
             return Ok(None);
         }
 
-        let config = ListingTableConfig::new_with_multi_paths(urls)
+        let mut config = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(Self::listing_options())
             .with_schema(self.schema.clone());
+        if let Some(adapter) = &self.adapter {
+            config = config.with_expr_adapter_factory(adapter.clone() as Arc<dyn PhysicalExprAdapterFactory>);
+        }
 
         Ok(Some(Arc::new(ListingTable::try_new(config)?)))
     }
@@ -205,10 +213,6 @@ impl LiveParquetTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for LiveParquetTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -225,18 +229,9 @@ impl TableProvider for LiveParquetTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         match self.current_table().await? {
-            Some(table) => {
-                let plan = table.scan(state, projection, filters, limit).await?;
-                match (&self.adapter, plan.as_any().downcast_ref::<ParquetExec>()) {
-                    (Some(adapter), Some(exec)) => Ok(Arc::new(
-                        exec.clone().with_schema_adapter_factory(adapter.clone() as Arc<dyn SchemaAdapterFactory>),
-                    ) as Arc<dyn ExecutionPlan>),
-                    _ => Ok(plan),
-                }
-            }
-            None => MemoryExec::try_new(&[vec![]], self.schema.clone(), projection.cloned())
-                .map(|e| Arc::new(e) as Arc<dyn ExecutionPlan>)
-                .map_err(DataFusionError::from),
+            Some(table) => table.scan(state, projection, filters, limit).await,
+            None => MemorySourceConfig::try_new_exec(&[vec![]], self.schema.clone(), projection.cloned())
+                .map(|e| e as Arc<dyn ExecutionPlan>),
         }
     }
 
@@ -260,161 +255,130 @@ impl TableProvider for LiveParquetTableProvider {
 /// configured; segments written earlier lack it. Reading those as NULL would
 /// make every filter or aggregate on the column quietly short over the topic's
 /// history — present and wrong. Instead, for a segment that lacks a projected
-/// column, this adapter also reads that segment's `_value` and computes the
-/// column exactly as the writer would have (`project_binary_array`). A segment
-/// that has the column is read as usual, so only old segments pay for decoding
-/// `_value`, and only when the query uses the column.
+/// column, every reference to it (in the projection and in pushed-down
+/// predicates alike) is rewritten to compute the column from that segment's
+/// `_value`, exactly as the writer would have (`project_binary_array`). A
+/// segment that has the column is read as usual, so only old segments pay for
+/// decoding `_value`, and only when the query uses the column. Everything else
+/// (casts, columns that are simply absent) is left to DataFusion's default
+/// adapter.
 #[derive(Debug)]
-pub struct ProjectingSchemaAdapterFactory {
-    projected: Arc<Vec<crate::projection::ColumnSpec>>,
+pub struct ProjectingExprAdapterFactory {
+    projected: Arc<Vec<ColumnSpec>>,
 }
 
-impl ProjectingSchemaAdapterFactory {
-    pub fn new(projected: Vec<crate::projection::ColumnSpec>) -> Self {
+impl ProjectingExprAdapterFactory {
+    pub fn new(projected: Vec<ColumnSpec>) -> Self {
         Self { projected: Arc::new(projected) }
     }
 }
 
-impl SchemaAdapterFactory for ProjectingSchemaAdapterFactory {
-    fn create(&self, projected_table_schema: SchemaRef, table_schema: SchemaRef) -> Box<dyn SchemaAdapter> {
-        Box::new(ProjectingSchemaAdapter {
-            projected_table_schema,
-            table_schema,
+impl PhysicalExprAdapterFactory for ProjectingExprAdapterFactory {
+    fn create(
+        &self,
+        logical_file_schema: SchemaRef,
+        physical_file_schema: SchemaRef,
+    ) -> DFResult<Arc<dyn PhysicalExprAdapter>> {
+        Ok(Arc::new(ProjectingExprAdapter {
             projected: self.projected.clone(),
-        })
+            value_idx: physical_file_schema.index_of("_value").ok(),
+            physical_file_schema: physical_file_schema.clone(),
+            default: DefaultPhysicalExprAdapterFactory.create(logical_file_schema, physical_file_schema)?,
+        }))
     }
-}
-
-struct ProjectingSchemaAdapter {
-    projected_table_schema: SchemaRef,
-    table_schema: SchemaRef,
-    projected: Arc<Vec<crate::projection::ColumnSpec>>,
-}
-
-impl SchemaAdapter for ProjectingSchemaAdapter {
-    fn map_column_index(&self, index: usize, file_schema: &Schema) -> Option<usize> {
-        let field = self.projected_table_schema.field(index);
-        Some(file_schema.fields.find(field.name())?.0)
-    }
-
-    fn map_schema(&self, file_schema: &Schema) -> DFResult<(Arc<dyn SchemaMapper>, Vec<usize>)> {
-        let mut projection = Vec::with_capacity(file_schema.fields().len());
-        let mut sources = vec![Source::Null; self.projected_table_schema.fields().len()];
-        for (file_idx, file_field) in file_schema.fields().iter().enumerate() {
-            if let Some((table_idx, table_field)) = self.projected_table_schema.fields().find(file_field.name()) {
-                if !can_cast_types(file_field.data_type(), table_field.data_type()) {
-                    return Err(DataFusionError::Plan(format!(
-                        "Cannot cast file schema field {} of type {:?} to table schema field of type {:?}",
-                        file_field.name(),
-                        file_field.data_type(),
-                        table_field.data_type()
-                    )));
-                }
-                sources[table_idx] = Source::File(projection.len());
-                projection.push(file_idx);
-            }
-        }
-        // Projected columns this file lacks: computed from its `_value`.
-        let value_idx = file_schema.index_of("_value").ok();
-        let mut value_pos = None;
-        for (table_idx, field) in self.projected_table_schema.fields().iter().enumerate() {
-            if !matches!(sources[table_idx], Source::Null) {
-                continue;
-            }
-            let (Some(spec), Some(file_value)) =
-                (self.projected.iter().find(|s| s.name == *field.name()), value_idx)
-            else {
-                continue;
-            };
-            let pos = *value_pos.get_or_insert_with(|| {
-                projection.iter().position(|&i| i == file_value).unwrap_or_else(|| {
-                    projection.push(file_value);
-                    projection.len() - 1
-                })
-            });
-            sources[table_idx] = Source::Derived(pos, spec.clone());
-        }
-        Ok((
-            Arc::new(ProjectingSchemaMapper {
-                projected_table_schema: self.projected_table_schema.clone(),
-                table_schema: self.table_schema.clone(),
-                sources,
-                projected: self.projected.clone(),
-            }),
-            projection,
-        ))
-    }
-}
-
-#[derive(Debug, Clone)]
-enum Source {
-    /// The column at this position of the file projection.
-    File(usize),
-    /// Computed from `_value` at this position of the file projection.
-    Derived(usize, crate::projection::ColumnSpec),
-    /// Not in the file and not derivable: NULL.
-    Null,
 }
 
 #[derive(Debug)]
-struct ProjectingSchemaMapper {
-    projected_table_schema: SchemaRef,
-    table_schema: SchemaRef,
-    sources: Vec<Source>,
-    projected: Arc<Vec<crate::projection::ColumnSpec>>,
+struct ProjectingExprAdapter {
+    projected: Arc<Vec<ColumnSpec>>,
+    physical_file_schema: SchemaRef,
+    /// Position of `_value` in this file; without it nothing can be derived.
+    value_idx: Option<usize>,
+    default: Arc<dyn PhysicalExprAdapter>,
 }
 
-impl SchemaMapper for ProjectingSchemaMapper {
-    fn map_batch(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
-        let rows = batch.num_rows();
-        let cols = self
-            .projected_table_schema
-            .fields()
-            .iter()
-            .zip(&self.sources)
-            .map(|(field, source)| match source {
-                Source::File(i) => cast(batch.column(*i), field.data_type()).map_err(DataFusionError::from),
-                Source::Derived(i, spec) => derive(batch.column(*i).as_ref(), spec, rows),
-                Source::Null => Ok(new_null_array(field.data_type(), rows)),
-            })
-            .collect::<DFResult<Vec<_>>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(rows));
-        Ok(RecordBatch::try_new_with_options(self.projected_table_schema.clone(), cols, &options)?)
-    }
-
-    /// Used by Parquet filter pushdown, on a batch holding whichever file
-    /// columns a predicate needs: each is cast to its table type, and a
-    /// projected column the file lacks is derived when `_value` is present.
-    fn map_partial_batch(&self, batch: RecordBatch) -> DFResult<RecordBatch> {
-        let schema = batch.schema();
-        let rows = batch.num_rows();
-        let mut fields = Vec::new();
-        let mut cols = Vec::new();
-        for (field, col) in schema.fields().iter().zip(batch.columns()) {
-            if let Ok(table_field) = self.table_schema.field_with_name(field.name()) {
-                cols.push(cast(col, table_field.data_type())?);
-                fields.push(table_field.clone());
-            }
-        }
-        if let Ok(value_idx) = schema.index_of("_value") {
-            for spec in self.projected.iter() {
-                if schema.index_of(&spec.name).is_ok() {
-                    continue;
-                }
-                if let Ok(table_field) = self.table_schema.field_with_name(&spec.name) {
-                    cols.push(derive(batch.column(value_idx).as_ref(), spec, rows)?);
-                    fields.push(table_field.clone());
-                }
-            }
-        }
-        let options = RecordBatchOptions::new().with_row_count(Some(rows));
-        Ok(RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cols, &options)?)
+impl PhysicalExprAdapter for ProjectingExprAdapter {
+    fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> DFResult<Arc<dyn PhysicalExpr>> {
+        let expr = match self.value_idx {
+            None => expr,
+            Some(value_idx) => expr
+                .transform(|e| {
+                    let derived = e.downcast_ref::<Column>().and_then(|col| {
+                        if self.physical_file_schema.index_of(col.name()).is_ok() {
+                            return None;
+                        }
+                        let spec = self.projected.iter().find(|s| s.name == col.name())?;
+                        Some(Arc::new(DerivedColumnExpr {
+                            value: Arc::new(Column::new("_value", value_idx)),
+                            spec: spec.clone(),
+                        }) as Arc<dyn PhysicalExpr>)
+                    });
+                    Ok(match derived {
+                        Some(d) => Transformed::yes(d),
+                        None => Transformed::no(e),
+                    })
+                })
+                .data()?,
+        };
+        self.default.rewrite(expr)
     }
 }
 
-fn derive(values: &dyn datafusion::arrow::array::Array, spec: &crate::projection::ColumnSpec, rows: usize) -> DFResult<ArrayRef> {
-    match crate::udfs::project_binary_array(values, spec) {
-        Some(array) => Ok(array),
-        None => Ok(new_null_array(&spec.ty.sql_arrow_type(), rows)),
+/// A projected column computed from the message value column.
+#[derive(Debug, Eq)]
+struct DerivedColumnExpr {
+    value: Arc<dyn PhysicalExpr>,
+    spec: ColumnSpec,
+}
+
+impl PartialEq for DerivedColumnExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.value.eq(&other.value) && self.spec == other.spec
+    }
+}
+
+impl std::hash::Hash for DerivedColumnExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+        self.spec.hash(state);
+    }
+}
+
+impl fmt::Display for DerivedColumnExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({})", crate::udfs::json_project_udf_name(self.spec.ty), self.value)
+    }
+}
+
+impl PhysicalExpr for DerivedColumnExpr {
+    fn return_field(&self, _input_schema: &Schema) -> DFResult<FieldRef> {
+        Ok(Arc::new(Field::new(&self.spec.name, self.spec.ty.sql_arrow_type(), true)))
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        let values = self.value.evaluate(batch)?.into_array(batch.num_rows())?;
+        let array = match crate::udfs::project_binary_array(values.as_ref(), &self.spec) {
+            Some(array) => array,
+            None => new_null_array(&self.spec.ty.sql_arrow_type(), batch.num_rows()),
+        };
+        Ok(ColumnarValue::Array(array))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.value]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+        match (children.pop(), children.is_empty()) {
+            (Some(value), true) => Ok(Arc::new(DerivedColumnExpr { value, spec: self.spec.clone() })),
+            _ => Err(DataFusionError::Internal(format!("{self}: expected exactly one child"))),
+        }
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }

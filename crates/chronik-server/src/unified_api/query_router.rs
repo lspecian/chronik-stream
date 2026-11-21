@@ -1518,8 +1518,7 @@ fn plan_quantile(
 
     let mut rewritten = query.clone();
     rewritten.order_by = None;
-    rewritten.limit = None;
-    rewritten.offset = None;
+    rewritten.limit_clause = None;
     strip_having(&mut rewritten);
     let SetExpr::Select(inner) = rewritten.body.as_mut() else {
         return Err(UNREWRITABLE.to_string());
@@ -1635,8 +1634,7 @@ fn plan_distinct_count(
     // them. The grouping is gone because the counting has moved here.
     let mut rewritten = query.clone();
     rewritten.order_by = None;
-    rewritten.limit = None;
-    rewritten.offset = None;
+    rewritten.limit_clause = None;
     strip_having(&mut rewritten);
     let SetExpr::Select(inner) = rewritten.body.as_mut() else {
         return Err(UNREWRITABLE.to_string());
@@ -1773,8 +1771,7 @@ fn sql_with_projection(
     if !keep_order {
         rewritten.order_by = None;
     }
-    rewritten.limit = None;
-    rewritten.offset = None;
+    rewritten.limit_clause = None;
     strip_having(&mut rewritten);
     let SetExpr::Select(select) = rewritten.body.as_mut() else {
         return None;
@@ -2215,6 +2212,7 @@ fn function_bare_name(f: &chronik_columnar::datafusion::sql::sqlparser::ast::Fun
     f.name
         .0
         .last()
+        .and_then(|p| p.as_ident())
         .map(|i| i.value.to_ascii_lowercase())
         .unwrap_or_default()
 }
@@ -2364,6 +2362,14 @@ pub fn sql_merge_strategy(sql: &str) -> SqlMerge {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) => expr,
             SelectItem::ExprWithAlias { expr, .. } => expr,
+            // `expr AS (a, b)` yields several columns from one expression;
+            // nothing below knows which merges apply to each.
+            SelectItem::ExprWithAliases { .. } => {
+                return SqlMerge::Unsupported(
+                    "a projection with several aliases (`expr AS (a, b)`) cannot be merged across nodes"
+                        .to_string(),
+                )
+            }
             // `*` is never an aggregate.
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                 columns.push(ColumnMerge::RowWise);
@@ -2720,6 +2726,7 @@ fn distinct_relation_count(
         let text = name
             .0
             .last()
+            .and_then(|p| p.as_ident())
             .map(|i| i.value.to_ascii_lowercase())
             .unwrap_or_default();
         if !ctes.0.contains(&text) {
@@ -2788,11 +2795,33 @@ fn query_has_nested_dedup(
     scan.found
 }
 
+/// The `LIMIT` expression, however the query spelled it.
+fn query_limit_expr(
+    query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+) -> Option<&chronik_columnar::datafusion::sql::sqlparser::ast::Expr> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::LimitClause;
+    match query.limit_clause.as_ref()? {
+        LimitClause::LimitOffset { limit, .. } => limit.as_ref(),
+        LimitClause::OffsetCommaLimit { limit, .. } => Some(limit),
+    }
+}
+
+/// The `OFFSET` expression, however the query spelled it.
+fn query_offset_expr(
+    query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
+) -> Option<&chronik_columnar::datafusion::sql::sqlparser::ast::Expr> {
+    use chronik_columnar::datafusion::sql::sqlparser::ast::LimitClause;
+    match query.limit_clause.as_ref()? {
+        LimitClause::LimitOffset { offset, .. } => offset.as_ref().map(|o| &o.value),
+        LimitClause::OffsetCommaLimit { offset, .. } => Some(offset),
+    }
+}
+
 /// The query's own `OFFSET`, if it is a plain number.
 fn query_offset(query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query) -> Option<usize> {
-    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value};
-    match &query.offset.as_ref()?.value {
-        SqlExpr::Value(Value::Number(n, _)) => n.parse().ok(),
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value, ValueWithSpan};
+    match query_offset_expr(query)? {
+        SqlExpr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => n.parse().ok(),
         _ => None,
     }
 }
@@ -2804,13 +2833,13 @@ fn query_offset(query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query
 /// caller's SQL is already the right thing to send, and leaving it untouched
 /// keeps the common query byte-identical to what it was before.
 fn needs_rewrite(query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query) -> bool {
-    query.order_by.is_some() || query.limit.is_some() || query.offset.is_some()
+    query.order_by.is_some() || query.limit_clause.is_some()
 }
 /// The query's own `LIMIT`, if it is a plain number.
 fn query_limit(query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query) -> Option<usize> {
-    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value};
-    match query.limit.as_ref()? {
-        SqlExpr::Value(Value::Number(n, _)) => n.parse().ok(),
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value, ValueWithSpan};
+    match query_limit_expr(query)? {
+        SqlExpr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => n.parse().ok(),
         _ => None,
     }
 }
@@ -2969,20 +2998,23 @@ fn resolve_output_column(
 fn json_literal(
     expr: &chronik_columnar::datafusion::sql::sqlparser::ast::Expr,
 ) -> Option<serde_json::Value> {
-    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value};
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value, ValueWithSpan};
     match expr {
         SqlExpr::Nested(inner) => json_literal(inner),
-        SqlExpr::Value(Value::Number(n, _)) => n.parse::<f64>().ok().and_then(|f| {
+        SqlExpr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => n.parse::<f64>().ok().and_then(|f| {
             if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
                 Some(serde_json::Value::from(f as i64))
             } else {
                 serde_json::Number::from_f64(f).map(serde_json::Value::Number)
             }
         }),
-        SqlExpr::Value(Value::SingleQuotedString(s) | Value::DoubleQuotedString(s)) => {
+        SqlExpr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+            ..
+        }) => {
             Some(serde_json::Value::String(s.clone()))
         }
-        SqlExpr::Value(Value::Boolean(b)) => Some(serde_json::Value::Bool(*b)),
+        SqlExpr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) => Some(serde_json::Value::Bool(*b)),
         _ => None,
     }
 }
@@ -3010,6 +3042,7 @@ fn projection_names(
             }
             // A wildcard's columns are not known from the SQL alone.
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+            SelectItem::ExprWithAliases { .. } => return None,
         }
     }
     Some((names, by_expr_text))
@@ -3086,12 +3119,17 @@ fn resolve_order_by(
     query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
     select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
 ) -> Option<Vec<OrderKey>> {
-    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, SelectItem, Value};
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{
+        Expr as SqlExpr, OrderByKind, SelectItem, Value, ValueWithSpan,
+    };
 
     let Some(order_by) = query.order_by.as_ref() else {
         return Some(Vec::new());
     };
-    let exprs = &order_by.exprs;
+    // `ORDER BY ALL` names no column this can sort the merged rows by.
+    let OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return None;
+    };
 
     // Output name of each projected column, and the expression text it came
     // from, so `ORDER BY <same expression>` resolves as well as `ORDER BY alias`.
@@ -3114,6 +3152,7 @@ fn resolve_order_by(
             // below. Refusing here turned `SELECT * FROM t ORDER BY ts LIMIT 10`
             // away, which is the commonest query there is against a stream.
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => has_wildcard = true,
+            SelectItem::ExprWithAliases { .. } => return None,
         }
     }
 
@@ -3136,17 +3175,17 @@ fn resolve_order_by(
                 }
             }
             // ORDER BY 2 — an ordinal into the projection.
-            SqlExpr::Value(Value::Number(n, _)) => {
+            SqlExpr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => {
                 let idx: usize = n.parse().ok()?;
                 names.get(idx.checked_sub(1)?)?.clone()
             }
             other => by_expr_text.get(&other.to_string())?.clone(),
         };
-        let descending = term.asc == Some(false);
+        let descending = term.options.asc == Some(false);
         keys.push(OrderKey {
             // DataFusion and Postgres both default to NULLS LAST ascending and
             // NULLS FIRST descending; follow that unless the query says.
-            nulls_first: term.nulls_first.unwrap_or(descending),
+            nulls_first: term.options.nulls_first.unwrap_or(descending),
             descending,
             column,
         });
@@ -3318,17 +3357,18 @@ fn sql_for_row_wise_nodes(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> String {
-    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value};
+    use chronik_columnar::datafusion::sql::sqlparser::ast::{Expr as SqlExpr, LimitClause, Value};
 
     let mut rewritten = query.clone();
-    rewritten.offset = None;
     // Only a limit this understands is pushed down. A limit it cannot read is
     // not applied here either, so the nodes may as well return what they have.
-    rewritten.limit = limit.map(|n| {
-        SqlExpr::Value(Value::Number(
+    rewritten.limit_clause = limit.map(|n| LimitClause::LimitOffset {
+        limit: Some(SqlExpr::value(Value::Number(
             n.saturating_add(offset.unwrap_or(0)).to_string(),
             false,
-        ))
+        ))),
+        offset: None,
+        limit_by: Vec::new(),
     });
     strip_having(&mut rewritten);
     rewritten.to_string()
@@ -6085,6 +6125,7 @@ mod planner_name_tests {
                 // `SELECT *` returns columns this cannot enumerate; the engine
                 // validates the name instead, because the ORDER BY is left in.
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => return None,
+                SelectItem::ExprWithAliases { .. } => return None,
                 SelectItem::UnnamedExpr(_) => {}
             }
         }
