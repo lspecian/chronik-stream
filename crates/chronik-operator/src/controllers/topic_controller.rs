@@ -91,7 +91,9 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
                     desired = spec.partitions,
                     "Increasing partitions"
                 );
-                admin.increase_partitions(topic_name, spec.partitions).await?;
+                admin
+                    .increase_partitions(topic_name, spec.partitions)
+                    .await?;
                 updated = true;
             } else if spec.partitions < desc.partitions {
                 warn!(
@@ -111,7 +113,9 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
 
                 if config_changed {
                     info!(topic = %topic_name, "Updating topic config");
-                    admin.update_topic_config(topic_name, &desired_config).await?;
+                    admin
+                        .update_topic_config(topic_name, &desired_config)
+                        .await?;
                     updated = true;
                 }
             }
@@ -147,7 +151,12 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
 
             let config = build_topic_config(spec);
             let created = admin
-                .create_topic(topic_name, spec.partitions, spec.replication_factor, &config)
+                .create_topic(
+                    topic_name,
+                    spec.partitions,
+                    spec.replication_factor,
+                    &config,
+                )
                 .await;
 
             let (phase, topic_id, condition) = match created {
@@ -166,7 +175,11 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
                 ),
                 Err(e) => {
                     warn!(topic = %topic_name, "Create failed: {e}");
-                    ("Error", None, make_condition("Ready", "False", "CreateFailed", &e.to_string()))
+                    (
+                        "Error",
+                        None,
+                        make_condition("Ready", "False", "CreateFailed", &e.to_string()),
+                    )
                 }
             };
 

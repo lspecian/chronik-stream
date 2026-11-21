@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/chronik-common",
     "crates/chronik-protocol",
+    "crates/chronik-scram",
     "crates/chronik-storage",
     "crates/chronik-search",
     "crates/chronik-query",

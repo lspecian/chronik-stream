@@ -10,9 +10,7 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, Client};
 
 use crate::constants::ports;
-use crate::crds::cluster::{
-    sasl_setting_of, ChronikCluster, SaslSetting, INTER_BROKER_SECRET_ENV,
-};
+use crate::crds::cluster::{sasl_setting_of, ChronikCluster, SaslSetting, INTER_BROKER_SECRET_ENV};
 use crate::crds::common::{EnvVar, SecretKeyRef};
 use crate::crds::standalone::ChronikStandalone;
 use crate::crds::topic::ClusterRef;
@@ -20,7 +18,7 @@ use crate::error::OperatorError;
 use crate::kafka_admin::{Credentials, KafkaAccess};
 
 /// The broker-to-broker user, as the broker names it.
-const BROKER_USER: &str = chronik_protocol::sasl::INTER_BROKER_USER;
+const BROKER_USER: &str = chronik_scram::INTER_BROKER_USER;
 /// `CHRONIK_TLS_CERT` puts the Kafka port behind TLS.
 const KAFKA_TLS_ENV: &str = "CHRONIK_TLS_CERT";
 
@@ -86,7 +84,10 @@ pub async fn resolve_kafka_access(
 }
 
 fn broker_login(secret: String) -> Credentials {
-    Credentials { username: BROKER_USER.into(), password: secret.trim().to_string() }
+    Credentials {
+        username: BROKER_USER.into(),
+        password: secret.trim().to_string(),
+    }
 }
 
 fn refuse_tls(env: &[EnvVar]) -> Result<(), OperatorError> {
@@ -105,7 +106,9 @@ fn explicit_secret_env(env: &[EnvVar]) -> Option<&EnvVar> {
 
 fn no_secret(kind: &str, name: &str, setting: SaslSetting) -> OperatorError {
     let why = match setting {
-        SaslSetting::Unknown => "CHRONIK_SASL_ENABLED comes from a Secret, so no broker secret is generated",
+        SaslSetting::Unknown => {
+            "CHRONIK_SASL_ENABLED comes from a Secret, so no broker secret is generated"
+        }
         _ => "no broker secret is configured",
     };
     OperatorError::Config(format!(
@@ -114,15 +117,26 @@ fn no_secret(kind: &str, name: &str, setting: SaslSetting) -> OperatorError {
     ))
 }
 
-async fn env_value(client: &Client, namespace: &str, var: &EnvVar) -> Result<String, OperatorError> {
+async fn env_value(
+    client: &Client,
+    namespace: &str,
+    var: &EnvVar,
+) -> Result<String, OperatorError> {
     match (&var.value, &var.value_from_secret) {
         (Some(v), _) => Ok(v.clone()),
         (None, Some(r)) => read_secret(client, namespace, r).await,
-        (None, None) => Err(OperatorError::Config(format!("{} is set without a value", var.name))),
+        (None, None) => Err(OperatorError::Config(format!(
+            "{} is set without a value",
+            var.name
+        ))),
     }
 }
 
-async fn read_secret(client: &Client, namespace: &str, r: &SecretKeyRef) -> Result<String, OperatorError> {
+async fn read_secret(
+    client: &Client,
+    namespace: &str,
+    r: &SecretKeyRef,
+) -> Result<String, OperatorError> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let secret = api.get_opt(&r.name).await?.ok_or_else(|| {
         OperatorError::NotFound(format!("Secret '{}' (broker login) not found", r.name))
@@ -131,9 +145,12 @@ async fn read_secret(client: &Client, namespace: &str, r: &SecretKeyRef) -> Resu
         .data
         .as_ref()
         .and_then(|d| d.get(&r.key))
-        .ok_or_else(|| OperatorError::NotFound(format!("Secret '{}' has no key '{}'", r.name, r.key)))?;
-    String::from_utf8(bytes.0.clone())
-        .map_err(|_| OperatorError::Config(format!("Secret '{}' key '{}' is not UTF-8", r.name, r.key)))
+        .ok_or_else(|| {
+            OperatorError::NotFound(format!("Secret '{}' has no key '{}'", r.name, r.key))
+        })?;
+    String::from_utf8(bytes.0.clone()).map_err(|_| {
+        OperatorError::Config(format!("Secret '{}' key '{}' is not UTF-8", r.name, r.key))
+    })
 }
 
 #[cfg(test)]
@@ -141,7 +158,11 @@ mod tests {
     use super::*;
 
     fn env(name: &str, value: &str) -> EnvVar {
-        EnvVar { name: name.into(), value: Some(value.into()), value_from_secret: None }
+        EnvVar {
+            name: name.into(),
+            value: Some(value.into()),
+            value_from_secret: None,
+        }
     }
 
     #[test]
@@ -153,8 +174,14 @@ mod tests {
 
     #[test]
     fn the_last_secret_entry_wins() {
-        let vars = [env(INTER_BROKER_SECRET_ENV, "first"), env(INTER_BROKER_SECRET_ENV, "second")];
-        assert_eq!(explicit_secret_env(&vars).unwrap().value.as_deref(), Some("second"));
+        let vars = [
+            env(INTER_BROKER_SECRET_ENV, "first"),
+            env(INTER_BROKER_SECRET_ENV, "second"),
+        ];
+        assert_eq!(
+            explicit_secret_env(&vars).unwrap().value.as_deref(),
+            Some("second")
+        );
     }
 
     #[test]

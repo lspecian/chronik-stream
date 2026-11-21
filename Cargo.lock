@@ -1787,7 +1787,7 @@ version = "2.18.3"
 dependencies = [
  "anyhow",
  "bytes",
- "chronik-protocol",
+ "chronik-scram",
  "clap",
  "futures",
  "k8s-openapi",
@@ -1835,6 +1835,7 @@ dependencies = [
  "base64 0.21.7",
  "bytes",
  "chronik-common",
+ "chronik-scram",
  "crc32c",
  "crc32fast",
  "criterion",
@@ -1922,6 +1923,19 @@ dependencies = [
  "bytes",
  "prost 0.14.6",
  "raft",
+]
+
+[[package]]
+name = "chronik-scram"
+version = "2.18.3"
+dependencies = [
+ "base64 0.21.7",
+ "hmac 0.12.1",
+ "pbkdf2",
+ "rand 0.8.8",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

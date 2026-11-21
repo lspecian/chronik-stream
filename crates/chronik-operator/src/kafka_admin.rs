@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chronik_protocol::sasl::SaslMechanism;
-use chronik_protocol::scram::{salted_password, ScramClient, DEFAULT_ITERATIONS};
+use chronik_scram::scram::{salted_password, ScramClient, DEFAULT_ITERATIONS};
+use chronik_scram::SaslMechanism;
 use kafka_protocol::messages::alter_user_scram_credentials_request::{
     ScramCredentialDeletion, ScramCredentialUpsertion,
 };
@@ -35,7 +35,9 @@ use kafka_protocol::messages::{
     DescribeAclsRequest, DescribeConfigsRequest, IncrementalAlterConfigsRequest, MetadataRequest,
     RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslHandshakeRequest, TopicName,
 };
-use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes, VersionRange};
+use kafka_protocol::protocol::{
+    Decodable, Encodable, HeaderVersion, Request, StrBytes, VersionRange,
+};
 use kafka_protocol::ResponseError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -65,7 +67,9 @@ pub struct Credentials {
 
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials").field("username", &self.username).finish_non_exhaustive()
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
     }
 }
 
@@ -126,17 +130,24 @@ fn protocol_err(context: &str, e: impl std::fmt::Display) -> OperatorError {
 }
 
 /// `Ok` for error code 0 (or any code in `ok_codes`), else the error by name.
-fn check(context: &str, code: i16, message: Option<&StrBytes>, ok_codes: &[i16]) -> Result<(), OperatorError> {
+fn check(
+    context: &str,
+    code: i16,
+    message: Option<&StrBytes>,
+    ok_codes: &[i16],
+) -> Result<(), OperatorError> {
     if code == 0 || ok_codes.contains(&code) {
         return Ok(());
     }
     let name = ResponseError::try_from_code(code)
         .map(|e| format!("{e:?}"))
         .unwrap_or_else(|| format!("error code {code}"));
-    Err(OperatorError::AdminApi(match message.map(|m| m.as_str()).filter(|m| !m.is_empty()) {
-        Some(m) => format!("{context}: {name}: {m}"),
-        None => format!("{context}: {name}"),
-    }))
+    Err(OperatorError::AdminApi(
+        match message.map(|m| m.as_str()).filter(|m| !m.is_empty()) {
+            Some(m) => format!("{context}: {name}: {m}"),
+            None => format!("{context}: {name}"),
+        },
+    ))
 }
 
 fn code_of(e: ResponseError) -> i16 {
@@ -171,7 +182,11 @@ impl KafkaAdmin {
             .map_err(|_| protocol_err(&format!("connect {addr}"), "timed out"))?
             .map_err(|e| protocol_err(&format!("connect {addr}"), e))?;
         let _ = stream.set_nodelay(true);
-        let mut admin = Self { stream, correlation_id: 0, versions: HashMap::new() };
+        let mut admin = Self {
+            stream,
+            correlation_id: 0,
+            versions: HashMap::new(),
+        };
 
         // v0 is understood by every broker; it lists the supported ranges.
         let versions = admin.send_at(ApiVersionsRequest::default(), 0).await?;
@@ -179,7 +194,15 @@ impl KafkaAdmin {
         admin.versions = versions
             .api_keys
             .iter()
-            .map(|k| (k.api_key, VersionRange { min: k.min_version, max: k.max_version }))
+            .map(|k| {
+                (
+                    k.api_key,
+                    VersionRange {
+                        min: k.min_version,
+                        max: k.max_version,
+                    },
+                )
+            })
             .collect();
 
         if let Some(creds) = &access.credentials {
@@ -208,7 +231,11 @@ impl KafkaAdmin {
         self.send_at(request, version).await
     }
 
-    async fn send_at<R: Request>(&mut self, request: R, version: i16) -> Result<R::Response, OperatorError> {
+    async fn send_at<R: Request>(
+        &mut self,
+        request: R,
+        version: i16,
+    ) -> Result<R::Response, OperatorError> {
         self.correlation_id = self.correlation_id.wrapping_add(1);
         let header = RequestHeader::default()
             .with_request_api_key(R::KEY)
@@ -246,8 +273,9 @@ impl KafkaAdmin {
             .map_err(|_| protocol_err(&format!("API {}", R::KEY), "timed out"))?
             .map_err(|e| protocol_err(&format!("API {} (connection)", R::KEY), e))?;
 
-        let response_header = ResponseHeader::decode(&mut body, R::Response::header_version(version))
-            .map_err(|e| protocol_err("decode response header", e))?;
+        let response_header =
+            ResponseHeader::decode(&mut body, R::Response::header_version(version))
+                .map_err(|e| protocol_err("decode response header", e))?;
         if response_header.correlation_id != self.correlation_id {
             return Err(OperatorError::AdminApi(format!(
                 "correlation id {} answered {}",
@@ -257,7 +285,12 @@ impl KafkaAdmin {
         let response = R::Response::decode(&mut body, version)
             .map_err(|e| protocol_err(&format!("decode API {} v{version}", R::KEY), e))?;
         if body.has_remaining() {
-            debug!(api = R::KEY, version, left = body.remaining(), "response had trailing bytes");
+            debug!(
+                api = R::KEY,
+                version,
+                left = body.remaining(),
+                "response had trailing bytes"
+            );
         }
         Ok(response)
     }
@@ -271,28 +304,44 @@ impl KafkaAdmin {
 
         let mut scram = ScramClient::new(mechanism, &creds.username, &creds.password);
         let first = self
-            .send(SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(scram.client_first())))
+            .send(
+                SaslAuthenticateRequest::default()
+                    .with_auth_bytes(Bytes::from(scram.client_first())),
+            )
             .await?;
-        check("SASL login", first.error_code, first.error_message.as_ref(), &[])?;
+        check(
+            "SASL login",
+            first.error_code,
+            first.error_message.as_ref(),
+            &[],
+        )?;
         let client_final = scram
             .client_final(&first.auth_bytes)
             .map_err(|e| protocol_err("SASL login", format!("{e:?}")))?;
         let last = self
             .send(SaslAuthenticateRequest::default().with_auth_bytes(Bytes::from(client_final)))
             .await?;
-        check("SASL login", last.error_code, last.error_message.as_ref(), &[])?;
+        check(
+            "SASL login",
+            last.error_code,
+            last.error_message.as_ref(),
+            &[],
+        )?;
         scram
             .verify_server_final(&last.auth_bytes)
             .map_err(|e| protocol_err("SASL login: server proof", format!("{e:?}")))
     }
 
     /// The topic, or `None` when the broker does not know it. Never creates it.
-    pub async fn describe_topic(&mut self, name: &str) -> Result<Option<TopicDescription>, OperatorError> {
+    pub async fn describe_topic(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<TopicDescription>, OperatorError> {
         let metadata = self
             .send(
                 MetadataRequest::default()
                     .with_topics(Some(vec![
-                        MetadataRequestTopic::default().with_name(Some(TopicName(s(name)))),
+                        MetadataRequestTopic::default().with_name(Some(TopicName(s(name))))
                     ]))
                     .with_allow_auto_topic_creation(false),
             )
@@ -303,7 +352,12 @@ impl KafkaAdmin {
         if topic.error_code == code_of(ResponseError::UnknownTopicOrPartition) {
             return Ok(None);
         }
-        check(&format!("describe topic {name}"), topic.error_code, None, &[])?;
+        check(
+            &format!("describe topic {name}"),
+            topic.error_code,
+            None,
+            &[],
+        )?;
         let replication_factor = topic
             .partitions
             .iter()
@@ -322,7 +376,12 @@ impl KafkaAdmin {
             .await?;
         let mut config = BTreeMap::new();
         for result in configs.results {
-            check(&format!("describe configs of {name}"), result.error_code, result.error_message.as_ref(), &[])?;
+            check(
+                &format!("describe configs of {name}"),
+                result.error_code,
+                result.error_message.as_ref(),
+                &[],
+            )?;
             for entry in result.configs {
                 if let Some(value) = entry.value {
                     config.insert(entry.name.to_string(), value.to_string());
@@ -352,17 +411,23 @@ impl KafkaAdmin {
             .with_configs(
                 config
                     .iter()
-                    .map(|(k, v)| CreatableTopicConfig::default().with_name(s(k)).with_value(Some(s(v))))
+                    .map(|(k, v)| {
+                        CreatableTopicConfig::default()
+                            .with_name(s(k))
+                            .with_value(Some(s(v)))
+                    })
                     .collect(),
             );
         let response = self
-            .send(CreateTopicsRequest::default().with_topics(vec![topic]).with_timeout_ms(REQUEST_TIMEOUT_MS))
+            .send(
+                CreateTopicsRequest::default()
+                    .with_topics(vec![topic])
+                    .with_timeout_ms(REQUEST_TIMEOUT_MS),
+            )
             .await?;
-        let result = response
-            .topics
-            .into_iter()
-            .next()
-            .ok_or_else(|| OperatorError::AdminApi(format!("create topic {name}: empty response")))?;
+        let result = response.topics.into_iter().next().ok_or_else(|| {
+            OperatorError::AdminApi(format!("create topic {name}: empty response"))
+        })?;
         check(
             &format!("create topic {name}"),
             result.error_code,
@@ -378,7 +443,9 @@ impl KafkaAdmin {
         let request = DeleteTopicsRequest::default().with_timeout_ms(REQUEST_TIMEOUT_MS);
         // v6 names topics in `topics`; earlier versions in `topic_names`.
         let request = if version >= 6 {
-            request.with_topics(vec![DeleteTopicState::default().with_name(Some(TopicName(s(name))))])
+            request.with_topics(vec![
+                DeleteTopicState::default().with_name(Some(TopicName(s(name))))
+            ])
         } else {
             request.with_topic_names(vec![TopicName(s(name))])
         };
@@ -418,13 +485,22 @@ impl KafkaAdmin {
             .send(IncrementalAlterConfigsRequest::default().with_resources(vec![resource]))
             .await?;
         for result in response.responses {
-            check(&format!("alter configs of {name}"), result.error_code, result.error_message.as_ref(), &[])?;
+            check(
+                &format!("alter configs of {name}"),
+                result.error_code,
+                result.error_message.as_ref(),
+                &[],
+            )?;
         }
         Ok(())
     }
 
     /// Raise the partition count to `count`.
-    pub async fn increase_partitions(&mut self, name: &str, count: i32) -> Result<(), OperatorError> {
+    pub async fn increase_partitions(
+        &mut self,
+        name: &str,
+        count: i32,
+    ) -> Result<(), OperatorError> {
         let response = self
             .send(
                 CreatePartitionsRequest::default()
@@ -436,7 +512,12 @@ impl KafkaAdmin {
             )
             .await?;
         for result in response.results {
-            check(&format!("add partitions to {name}"), result.error_code, result.error_message.as_ref(), &[])?;
+            check(
+                &format!("add partitions to {name}"),
+                result.error_code,
+                result.error_message.as_ref(),
+                &[],
+            )?;
         }
         Ok(())
     }
@@ -462,7 +543,12 @@ impl KafkaAdmin {
             .send(AlterUserScramCredentialsRequest::default().with_upsertions(vec![upsertion]))
             .await?;
         for result in response.results {
-            check(&format!("set credential of {username}"), result.error_code, result.error_message.as_ref(), &[])?;
+            check(
+                &format!("set credential of {username}"),
+                result.error_code,
+                result.error_message.as_ref(),
+                &[],
+            )?;
         }
         Ok(())
     }
@@ -471,7 +557,11 @@ impl KafkaAdmin {
     pub async fn delete_scram_user(&mut self, username: &str) -> Result<(), OperatorError> {
         let deletions = [SCRAM_SHA_256, SCRAM_SHA_512]
             .into_iter()
-            .map(|m| ScramCredentialDeletion::default().with_name(s(username)).with_mechanism(m))
+            .map(|m| {
+                ScramCredentialDeletion::default()
+                    .with_name(s(username))
+                    .with_mechanism(m)
+            })
             .collect();
         let response = self
             .send(AlterUserScramCredentialsRequest::default().with_deletions(deletions))
@@ -489,14 +579,24 @@ impl KafkaAdmin {
 
     /// The ACL bindings `User:<username>` holds.
     /// `None` when the cluster has ACLs disabled.
-    pub async fn user_acls(&mut self, username: &str) -> Result<Option<Vec<AclEntry>>, OperatorError> {
+    pub async fn user_acls(
+        &mut self,
+        username: &str,
+    ) -> Result<Option<Vec<AclEntry>>, OperatorError> {
         let principal = format!("User:{username}");
-        Ok(self.wire_acls(&principal).await?.map(|set| set.iter().map(WireAcl::to_entry).collect()))
+        Ok(self
+            .wire_acls(&principal)
+            .await?
+            .map(|set| set.iter().map(WireAcl::to_entry).collect()))
     }
 
     /// Make `User:<username>`'s ACLs exactly `desired`: create the missing
     /// bindings, delete the ones no longer wanted. Returns how many it holds.
-    pub async fn set_user_acls(&mut self, username: &str, desired: &[AclEntry]) -> Result<usize, OperatorError> {
+    pub async fn set_user_acls(
+        &mut self,
+        username: &str,
+        desired: &[AclEntry],
+    ) -> Result<usize, OperatorError> {
         let principal = format!("User:{username}");
         let want: BTreeSet<WireAcl> = desired
             .iter()
@@ -518,7 +618,10 @@ impl KafkaAdmin {
     }
 
     /// `None` when the broker answers SECURITY_DISABLED (ACLs off).
-    async fn wire_acls(&mut self, principal: &str) -> Result<Option<BTreeSet<WireAcl>>, OperatorError> {
+    async fn wire_acls(
+        &mut self,
+        principal: &str,
+    ) -> Result<Option<BTreeSet<WireAcl>>, OperatorError> {
         let described = self
             .send(
                 DescribeAclsRequest::default()
@@ -534,7 +637,12 @@ impl KafkaAdmin {
         if described.error_code == code_of(ResponseError::SecurityDisabled) {
             return Ok(None);
         }
-        check(&format!("describe ACLs of {principal}"), described.error_code, described.error_message.as_ref(), &[])?;
+        check(
+            &format!("describe ACLs of {principal}"),
+            described.error_code,
+            described.error_message.as_ref(),
+            &[],
+        )?;
         let mut have = BTreeSet::new();
         for resource in described.resources {
             for acl in resource.acls {
@@ -561,42 +669,56 @@ impl KafkaAdmin {
         have: &BTreeSet<WireAcl>,
     ) -> Result<(), OperatorError> {
         let create: Vec<AclCreation> = want
-            .difference(&have)
+            .difference(have)
             .map(|a| {
                 AclCreation::default()
                     .with_resource_type(a.resource_type)
                     .with_resource_name(s(&a.resource_name))
                     .with_resource_pattern_type(a.pattern_type)
-                    .with_principal(s(&principal))
+                    .with_principal(s(principal))
                     .with_host(s(&a.host))
                     .with_operation(a.operation)
                     .with_permission_type(a.permission)
             })
             .collect();
         if !create.is_empty() {
-            let response = self.send(CreateAclsRequest::default().with_creations(create)).await?;
+            let response = self
+                .send(CreateAclsRequest::default().with_creations(create))
+                .await?;
             for result in response.results {
-                check(&format!("create ACLs for {principal}"), result.error_code, result.error_message.as_ref(), &[])?;
+                check(
+                    &format!("create ACLs for {principal}"),
+                    result.error_code,
+                    result.error_message.as_ref(),
+                    &[],
+                )?;
             }
         }
 
         let delete: Vec<DeleteAclsFilter> = have
-            .difference(&want)
+            .difference(want)
             .map(|a| {
                 DeleteAclsFilter::default()
                     .with_resource_type_filter(a.resource_type)
                     .with_resource_name_filter(Some(s(&a.resource_name)))
                     .with_pattern_type_filter(a.pattern_type)
-                    .with_principal_filter(Some(s(&principal)))
+                    .with_principal_filter(Some(s(principal)))
                     .with_host_filter(Some(s(&a.host)))
                     .with_operation(a.operation)
                     .with_permission_type(a.permission)
             })
             .collect();
         if !delete.is_empty() {
-            let response = self.send(DeleteAclsRequest::default().with_filters(delete)).await?;
+            let response = self
+                .send(DeleteAclsRequest::default().with_filters(delete))
+                .await?;
             for result in response.filter_results {
-                check(&format!("delete ACLs of {principal}"), result.error_code, result.error_message.as_ref(), &[])?;
+                check(
+                    &format!("delete ACLs of {principal}"),
+                    result.error_code,
+                    result.error_message.as_ref(),
+                    &[],
+                )?;
             }
         }
         Ok(())
@@ -624,16 +746,36 @@ struct WireAcl {
 impl WireAcl {
     fn to_entry(&self) -> AclEntry {
         let name = |table: &[(i8, &str)], code: i8| {
-            table.iter().find(|(c, _)| *c == code).map(|(_, n)| n.to_string()).unwrap_or_else(|| format!("code {code}"))
+            table
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_else(|| format!("code {code}"))
         };
         AclEntry {
-            resource_type: name(&[(2, "topic"), (3, "group"), (4, "cluster"), (5, "transactionalId")], self.resource_type),
+            resource_type: name(
+                &[
+                    (2, "topic"),
+                    (3, "group"),
+                    (4, "cluster"),
+                    (5, "transactionalId"),
+                ],
+                self.resource_type,
+            ),
             resource_name: self.resource_name.clone(),
             pattern_type: name(&[(3, "literal"), (4, "prefixed")], self.pattern_type),
             operation: name(
                 &[
-                    (2, "All"), (3, "Read"), (4, "Write"), (5, "Create"), (6, "Delete"), (7, "Alter"),
-                    (8, "Describe"), (9, "ClusterAction"), (10, "DescribeConfigs"), (11, "AlterConfigs"),
+                    (2, "All"),
+                    (3, "Read"),
+                    (4, "Write"),
+                    (5, "Create"),
+                    (6, "Delete"),
+                    (7, "Alter"),
+                    (8, "Describe"),
+                    (9, "ClusterAction"),
+                    (10, "DescribeConfigs"),
+                    (11, "AlterConfigs"),
                     (12, "IdempotentWrite"),
                 ],
                 self.operation,
@@ -714,19 +856,33 @@ mod tests {
     fn expand_acl_rules_one_entry_per_operation() {
         let rules = vec![
             AclRule {
-                resource: AclResource { type_: "topic".into(), name: "orders".into(), pattern_type: "literal".into() },
+                resource: AclResource {
+                    type_: "topic".into(),
+                    name: "orders".into(),
+                    pattern_type: "literal".into(),
+                },
                 operations: vec!["Read".into(), "Write".into()],
                 effect: "Allow".into(),
             },
             AclRule {
-                resource: AclResource { type_: "group".into(), name: "my-group".into(), pattern_type: "literal".into() },
+                resource: AclResource {
+                    type_: "group".into(),
+                    name: "my-group".into(),
+                    pattern_type: "literal".into(),
+                },
                 operations: vec!["Read".into()],
                 effect: "Allow".into(),
             },
         ];
         let entries = expand_acl_rules(&rules);
         assert_eq!(entries.len(), 3);
-        assert_eq!((entries[0].operation.as_str(), entries[0].resource_type.as_str()), ("Read", "topic"));
+        assert_eq!(
+            (
+                entries[0].operation.as_str(),
+                entries[0].resource_type.as_str()
+            ),
+            ("Read", "topic")
+        );
         assert_eq!(entries[1].operation, "Write");
         assert_eq!(entries[2].resource_type, "group");
     }
@@ -741,24 +897,43 @@ mod tests {
             effect: "Deny".into(),
         };
         let w = WireAcl::from_entry(&e).unwrap();
-        assert_eq!((w.resource_type, w.pattern_type, w.operation, w.permission), (5, 4, 10, 2));
+        assert_eq!(
+            (w.resource_type, w.pattern_type, w.operation, w.permission),
+            (5, 4, 10, 2)
+        );
         assert_eq!(w.host, "*");
-        let bad = AclEntry { operation: "Fly".into(), ..e };
+        let bad = AclEntry {
+            operation: "Fly".into(),
+            ..e
+        };
         assert!(WireAcl::from_entry(&bad).is_err());
     }
 
     #[test]
     fn acl_codes_round_trip() {
         for (rt, pt, op, perm) in [(2, 3, 3, 3), (3, 4, 8, 2), (4, 3, 9, 3), (5, 4, 12, 3)] {
-            let w = WireAcl { resource_type: rt, resource_name: "x".into(), pattern_type: pt, operation: op, permission: perm, host: "*".into() };
+            let w = WireAcl {
+                resource_type: rt,
+                resource_name: "x".into(),
+                pattern_type: pt,
+                operation: op,
+                permission: perm,
+                host: "*".into(),
+            };
             assert_eq!(WireAcl::from_entry(&w.to_entry()).unwrap(), w);
         }
     }
 
     #[test]
     fn authentication_types() {
-        assert_eq!(scram_mechanism("sasl-scram-sha-512").unwrap(), Some(SaslMechanism::ScramSha512));
-        assert_eq!(scram_mechanism("SASL-SCRAM-SHA-256").unwrap(), Some(SaslMechanism::ScramSha256));
+        assert_eq!(
+            scram_mechanism("sasl-scram-sha-512").unwrap(),
+            Some(SaslMechanism::ScramSha512)
+        );
+        assert_eq!(
+            scram_mechanism("SASL-SCRAM-SHA-256").unwrap(),
+            Some(SaslMechanism::ScramSha256)
+        );
         assert_eq!(scram_mechanism("tls").unwrap(), None);
         assert!(scram_mechanism("sasl-plain").is_err());
         assert!(scram_mechanism("kerberos").is_err());
@@ -766,7 +941,10 @@ mod tests {
 
     #[test]
     fn credentials_debug_hides_the_password() {
-        let c = Credentials { username: "__chronik_broker".into(), password: "hunter2-hunter2-hunter2".into() };
+        let c = Credentials {
+            username: "__chronik_broker".into(),
+            password: "hunter2-hunter2-hunter2".into(),
+        };
         assert!(!format!("{c:?}").contains("hunter2"));
     }
 }

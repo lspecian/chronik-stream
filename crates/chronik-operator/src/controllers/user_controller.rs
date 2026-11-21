@@ -78,7 +78,8 @@ async fn apply(client: Client, user: &ChronikUser) -> Result<Action, OperatorErr
     // A failure below leaves the user Pending with the reason, and retries.
     let pending = |reason: &'static str, message: String| {
         let client = client.clone();
-        let (cr_name, namespace, secret_name) = (cr_name.clone(), namespace.clone(), secret_name.clone());
+        let (cr_name, namespace, secret_name) =
+            (cr_name.clone(), namespace.clone(), secret_name.clone());
         let generation = user.metadata.generation;
         async move {
             warn!(user = %cr_name, "{reason}: {message}");
@@ -111,7 +112,12 @@ async fn apply(client: Client, user: &ChronikUser) -> Result<Action, OperatorErr
                 "Error",
                 Some(&secret_name),
                 None,
-                vec![make_condition("Ready", "False", "UnsupportedAuthentication", &e.to_string())],
+                vec![make_condition(
+                    "Ready",
+                    "False",
+                    "UnsupportedAuthentication",
+                    &e.to_string(),
+                )],
                 user.metadata.generation,
             )
             .await?;
@@ -119,7 +125,11 @@ async fn apply(client: Client, user: &ChronikUser) -> Result<Action, OperatorErr
         }
     };
     if mechanism.is_some() && password.is_empty() {
-        return pending("NoPassword", format!("Secret '{secret_name}' holds no password")).await;
+        return pending(
+            "NoPassword",
+            format!("Secret '{secret_name}' holds no password"),
+        )
+        .await;
     }
 
     // 3. Connect to the cluster's Kafka port.
@@ -138,7 +148,10 @@ async fn apply(client: Client, user: &ChronikUser) -> Result<Action, OperatorErr
         let key = credential_key(&namespace, &spec.cluster_ref.name, &cr_name, mechanism);
         let fingerprint = password_fingerprint(&password);
         if credential_cache().lock().unwrap().get(&key) != Some(&fingerprint) {
-            if let Err(e) = admin.upsert_scram_user(&cr_name, &password, mechanism).await {
+            if let Err(e) = admin
+                .upsert_scram_user(&cr_name, &password, mechanism)
+                .await
+            {
                 return pending("CredentialFailed", e.to_string()).await;
             }
             info!(user = %cr_name, mechanism = mechanism.as_str(), "SCRAM credential set");
@@ -188,9 +201,11 @@ type CredentialKey = (String, String, String, &'static str);
 /// Which credential this process last wrote, per (namespace, cluster, user,
 /// mechanism): the password's fingerprint. After a restart each credential is
 /// written once more, then only when its password changes.
-fn credential_cache() -> &'static std::sync::Mutex<std::collections::HashMap<CredentialKey, [u8; 32]>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<CredentialKey, [u8; 32]>>> =
-        std::sync::OnceLock::new();
+fn credential_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<CredentialKey, [u8; 32]>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<CredentialKey, [u8; 32]>>,
+    > = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -198,9 +213,14 @@ fn credential_key(
     namespace: &str,
     cluster: &str,
     user: &str,
-    mechanism: chronik_protocol::sasl::SaslMechanism,
+    mechanism: chronik_scram::SaslMechanism,
 ) -> CredentialKey {
-    (namespace.into(), cluster.into(), user.into(), mechanism.as_str())
+    (
+        namespace.into(),
+        cluster.into(),
+        user.into(),
+        mechanism.as_str(),
+    )
 }
 
 fn password_fingerprint(password: &str) -> [u8; 32] {
@@ -327,7 +347,9 @@ async fn cleanup(client: Client, user: &ChronikUser) -> Result<Action, OperatorE
     credential_cache()
         .lock()
         .unwrap()
-        .retain(|(ns, cluster, user, _), _| !(ns == &namespace && cluster == &spec.cluster_ref.name && user == &cr_name));
+        .retain(|(ns, cluster, user, _), _| {
+            !(ns == &namespace && cluster == &spec.cluster_ref.name && user == &cr_name)
+        });
 
     // Secret is owner-referenced and will be garbage collected.
 

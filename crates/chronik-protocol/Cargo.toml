@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 chronik-common = { path = "../chronik-common" }
+chronik-scram = { path = "../chronik-scram" }
 
 # Kafka protocol - temporarily disabled due to compatibility issues
 # kafka-protocol = { workspace = true }

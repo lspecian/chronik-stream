@@ -30,7 +30,7 @@ reqwest = { workspace = true }
 
 # Kafka admin protocol (topics, SCRAM users, ACLs) and SASL/SCRAM login
 kafka-protocol = { version = "0.18", default-features = false, features = ["client", "broker"] }
-chronik-protocol = { path = "../chronik-protocol" }
+chronik-scram = { path = "../chronik-scram" }
 bytes = { workspace = true }
 sha2 = { workspace = true }
 

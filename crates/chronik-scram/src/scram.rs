@@ -41,7 +41,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
 
-use crate::sasl::{SaslError, SaslMechanism};
+use crate::{SaslError, SaslMechanism};
 
 /// Default PBKDF2 iteration count for newly derived credentials.
 ///
@@ -383,7 +383,9 @@ impl ScramClient {
             .ok_or_else(|| SaslError::ProtocolError("server-first has no valid salt".into()))?;
         let iterations: u32 = attribute(server_first, 'i')
             .and_then(|i| i.parse().ok())
-            .ok_or_else(|| SaslError::ProtocolError("server-first has no iteration count".into()))?;
+            .ok_or_else(|| {
+                SaslError::ProtocolError("server-first has no iteration count".into())
+            })?;
         // A server asking for fewer iterations is asking for a cheaper-to-crack
         // proof; refuse rather than comply.
         if iterations < MIN_ITERATIONS {
@@ -433,8 +435,7 @@ impl ScramClient {
             .ok_or_else(|| SaslError::ProtocolError("server-final has no signature".into()))?;
         if offered.len() != expected.len() || offered.ct_eq(expected).unwrap_u8() != 1 {
             return Err(SaslError::AuthenticationFailed(
-                "server signature does not match: the server does not hold this credential"
-                    .into(),
+                "server signature does not match: the server does not hold this credential".into(),
             ));
         }
         Ok(())
@@ -576,9 +577,7 @@ mod tests {
         client_first_bare: &str,
         server_first: &str,
     ) -> String {
-        let salt = b64()
-            .decode(attribute(server_first, 's').unwrap())
-            .unwrap();
+        let salt = b64().decode(attribute(server_first, 's').unwrap()).unwrap();
         let iterations: u32 = attribute(server_first, 'i').unwrap().parse().unwrap();
         let nonce = attribute(server_first, 'r').unwrap();
 
@@ -587,10 +586,7 @@ mod tests {
         let stored_key = hash(&client_key, mechanism);
 
         let without_proof = format!("c=biws,r={}", nonce);
-        let auth_message = format!(
-            "{},{},{}",
-            client_first_bare, server_first, without_proof
-        );
+        let auth_message = format!("{},{},{}", client_first_bare, server_first, without_proof);
         let client_signature = hmac(&stored_key, auth_message.as_bytes(), mechanism).unwrap();
         let proof: Vec<u8> = client_key
             .iter()
@@ -606,8 +602,8 @@ mod tests {
         attempt_password: &str,
         mechanism: SaslMechanism,
     ) -> Result<Vec<u8>, SaslError> {
-        let credential = ScramCredential::derive(stored_password, mechanism, DEFAULT_ITERATIONS)
-            .unwrap();
+        let credential =
+            ScramCredential::derive(stored_password, mechanism, DEFAULT_ITERATIONS).unwrap();
 
         let client_first_bare = "n=alice,r=clientnonce123";
         let client_first = format!("n,,{}", client_first_bare);
@@ -629,15 +625,13 @@ mod tests {
 
     #[test]
     fn correct_password_authenticates_sha256() {
-        let server_final =
-            run_exchange("hunter2", "hunter2", SaslMechanism::ScramSha256).unwrap();
+        let server_final = run_exchange("hunter2", "hunter2", SaslMechanism::ScramSha256).unwrap();
         assert!(String::from_utf8(server_final).unwrap().starts_with("v="));
     }
 
     #[test]
     fn correct_password_authenticates_sha512() {
-        let server_final =
-            run_exchange("hunter2", "hunter2", SaslMechanism::ScramSha512).unwrap();
+        let server_final = run_exchange("hunter2", "hunter2", SaslMechanism::ScramSha512).unwrap();
         assert!(String::from_utf8(server_final).unwrap().starts_with("v="));
     }
 
@@ -658,8 +652,10 @@ mod tests {
     fn unknown_user_is_rejected() {
         let client_first = "n,,n=nobody,r=clientnonce123";
         let (exchange, server_first) =
-            ScramExchange::start(SaslMechanism::ScramSha256, client_first.as_bytes(), |_| None)
-                .unwrap();
+            ScramExchange::start(SaslMechanism::ScramSha256, client_first.as_bytes(), |_| {
+                None
+            })
+            .unwrap();
         let server_first = String::from_utf8(server_first).unwrap();
 
         // The exchange still proceeds (no user enumeration), then fails.
@@ -718,18 +714,16 @@ mod tests {
         let client_first_bare = "n=alice,r=clientnonce123";
         let client_first = format!("n,,{}", client_first_bare);
 
-        let (first, server_first_a) = ScramExchange::start(
-            SaslMechanism::ScramSha256,
-            client_first.as_bytes(),
-            |_| Some(credential.clone()),
-        )
-        .unwrap();
-        let (second, _server_first_b) = ScramExchange::start(
-            SaslMechanism::ScramSha256,
-            client_first.as_bytes(),
-            |_| Some(credential.clone()),
-        )
-        .unwrap();
+        let (first, server_first_a) =
+            ScramExchange::start(SaslMechanism::ScramSha256, client_first.as_bytes(), |_| {
+                Some(credential.clone())
+            })
+            .unwrap();
+        let (second, _server_first_b) =
+            ScramExchange::start(SaslMechanism::ScramSha256, client_first.as_bytes(), |_| {
+                Some(credential.clone())
+            })
+            .unwrap();
 
         // A valid final message for exchange `first`...
         let msg = client_final(
@@ -748,7 +742,10 @@ mod tests {
         let a = generate_nonce();
         let b = generate_nonce();
         assert_ne!(a, b);
-        assert!(!a.contains(','), "nonce must not contain the SCRAM separator");
+        assert!(
+            !a.contains(','),
+            "nonce must not contain the SCRAM separator"
+        );
     }
 
     #[test]
@@ -807,8 +804,7 @@ mod tests {
     #[test]
     fn librdkafka_double_prefixed_nonce_is_accepted() {
         let mechanism = SaslMechanism::ScramSha256;
-        let credential =
-            ScramCredential::derive("hunter2", mechanism, DEFAULT_ITERATIONS).unwrap();
+        let credential = ScramCredential::derive("hunter2", mechanism, DEFAULT_ITERATIONS).unwrap();
         let client_nonce = "clientnonce123";
         let client_first_bare = format!("n=alice,r={}", client_nonce);
 
@@ -824,17 +820,16 @@ mod tests {
         let combined = attribute(&server_first, 'r').unwrap();
         let doubled = format!("{}{}", client_nonce, combined);
 
-        let salt = b64().decode(attribute(&server_first, 's').unwrap()).unwrap();
+        let salt = b64()
+            .decode(attribute(&server_first, 's').unwrap())
+            .unwrap();
         let iterations: u32 = attribute(&server_first, 'i').unwrap().parse().unwrap();
         let salted = hi(b"hunter2", &salt, iterations, mechanism).unwrap();
         let client_key = hmac(&salted, CLIENT_KEY_LABEL, mechanism).unwrap();
         let stored_key = hash(&client_key, mechanism);
 
         let without_proof = format!("c=biws,r={}", doubled);
-        let auth_message = format!(
-            "{},{},{}",
-            client_first_bare, server_first, without_proof
-        );
+        let auth_message = format!("{},{},{}", client_first_bare, server_first, without_proof);
         let client_signature = hmac(&stored_key, auth_message.as_bytes(), mechanism).unwrap();
         let proof: Vec<u8> = client_key
             .iter()
@@ -854,14 +849,12 @@ mod tests {
     #[test]
     fn unrelated_nonce_is_still_rejected() {
         let mechanism = SaslMechanism::ScramSha256;
-        let credential =
-            ScramCredential::derive("hunter2", mechanism, DEFAULT_ITERATIONS).unwrap();
-        let (exchange, _server_first) = ScramExchange::start(
-            mechanism,
-            b"n,,n=alice,r=clientnonce123",
-            |_| Some(credential.clone()),
-        )
-        .unwrap();
+        let credential = ScramCredential::derive("hunter2", mechanism, DEFAULT_ITERATIONS).unwrap();
+        let (exchange, _server_first) =
+            ScramExchange::start(mechanism, b"n,,n=alice,r=clientnonce123", |_| {
+                Some(credential.clone())
+            })
+            .unwrap();
 
         let forged = format!(
             "c=biws,r=totally-different-nonce,p={}",
@@ -942,7 +935,10 @@ mod salted_password_tests {
         let client_final = client.client_final(&server_first)?;
         if tamper_server_key {
             credential.server_key[0] ^= 1;
-            let impostor = ScramExchange { credential, ..exchange };
+            let impostor = ScramExchange {
+                credential,
+                ..exchange
+            };
             let server_final = impostor.finish(&client_final)?;
             return client.verify_server_final(&server_final);
         }
@@ -965,8 +961,8 @@ mod salted_password_tests {
     /// is an impostor; the client must not treat the session as authenticated.
     #[test]
     fn client_rejects_a_server_that_does_not_hold_the_credential() {
-        let err = client_exchange("s3cret-s3cret-s3cret", "s3cret-s3cret-s3cret", true)
-            .unwrap_err();
+        let err =
+            client_exchange("s3cret-s3cret-s3cret", "s3cret-s3cret-s3cret", true).unwrap_err();
         assert!(err.to_string().contains("server signature"), "{err}");
     }
 
