@@ -91,6 +91,9 @@ pub enum GcsCredentials {
         private_key: String,
         private_key_id: Option<String>,
     },
+
+    /// Unsigned requests: a public bucket or a GCS emulator.
+    Anonymous,
 }
 
 /// Azure authentication methods

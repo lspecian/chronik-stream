@@ -278,6 +278,7 @@ async fn try_acquire_or_renew(
                     lease_transitions: Some(0),
                     acquire_time: None,
                     renew_time: None,
+                    ..Default::default()
                 }),
             };
 

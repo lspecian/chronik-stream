@@ -30,7 +30,7 @@ kind: ChronikStandalone
 metadata:
   name: my-chronik
 spec:
-  image: ghcr.io/chronik-stream/chronik-server:latest
+  image: ghcr.io/lspecian/chronik-stream:latest
   storage:
     size: 50Gi
 ```

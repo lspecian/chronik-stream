@@ -32,7 +32,6 @@ sha2 = "0.10"
 crc32fast = "1.4"
 
 # Storage
-opendal = { workspace = true }
 
 # Time
 chrono = { workspace = true }

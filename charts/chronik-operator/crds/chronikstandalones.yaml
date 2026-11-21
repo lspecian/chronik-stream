@@ -76,7 +76,7 @@ spec:
                 nullable: true
                 type: boolean
               image:
-                default: ghcr.io/chronik-stream/chronik-server:latest
+                default: ghcr.io/lspecian/chronik-stream:latest
                 description: Container image for Chronik server.
                 type: string
               imagePullPolicy:

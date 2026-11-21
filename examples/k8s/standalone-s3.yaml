@@ -5,7 +5,7 @@ metadata:
   name: chronik-s3
   namespace: default
 spec:
-  image: ghcr.io/chronik-stream/chronik-server:latest
+  image: ghcr.io/lspecian/chronik-stream:latest
   resources:
     requests:
       cpu: "1"

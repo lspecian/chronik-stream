@@ -1,5 +1,22 @@
 # Disaster Recovery Guide
 
+> **Status (2026-11): recovering a node from an empty data directory does not
+> work.** Message data is archived to object storage and read back from it
+> (`tests/cluster/e2e/s3_roundtrip.sh`), but the catalog of topics and
+> partitions is not:
+>
+> - the metadata uploader reads `wal/__meta/0` and `metadata_snapshots/`, which
+>   the server stopped writing when metadata moved to `metadata_wal/` and the
+>   cluster catalog to Raft (`catalog-raft/`, v2.17). It runs every 60 s and
+>   uploads nothing;
+> - the restore path described below (`recover_from_object_store`) is never
+>   called.
+>
+> A node whose data directory is lost does not know its topics, so it serves
+> none of the archived data. In a cluster, a replaced node is brought back by
+> the Raft catalog and by re-replication from the other replicas, not from the
+> bucket. The rest of this guide describes the intended design.
+
 ## Overview
 
 Chronik Stream implements comprehensive disaster recovery capabilities by automatically uploading both **data** and **metadata** to object storage (S3/GCS/Azure). This ensures that even if you completely lose a node, all topics, partitions, consumer offsets, and high watermarks can be reconstructed from object storage.

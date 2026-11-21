@@ -6,7 +6,7 @@ metadata:
   namespace: chronik
 spec:
   replicas: 5
-  image: ghcr.io/chronik-stream/chronik-server:2.2.23
+  image: ghcr.io/lspecian/chronik-stream:2.18.3
   imagePullPolicy: IfNotPresent
   resources:
     requests:

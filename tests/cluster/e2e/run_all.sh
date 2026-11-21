@@ -60,6 +60,7 @@ run vector_catchup "$E2E/vector_catchup.sh" "$BIN" "$LABEL"
 run create_race "$E2E/create_race.sh" "$BIN" "$LABEL"
 run txn_acl "$E2E/txn_acl.sh" "$BIN" "$LABEL"
 run query_fanout "$E2E/query_fanout.sh" "$BIN" "$LABEL"
+run s3_roundtrip "$E2E/s3_roundtrip.sh" "$BIN" "$LABEL"
 run regression_replication ./tests/cluster/regression_replication.sh
 run follower_catchup ./tests/cluster/follower_catchup.sh
 run concurrent_produce_order ./tests/test_concurrent_produce_order.sh

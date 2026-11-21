@@ -25,6 +25,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordinal and aggregate, `LIMIT`/`OFFSET` above the row cap, subqueries, CTEs)
   were run against 2.18.3 and the new build on identical data and agree on
   every node (`tests/cluster/sql_differential.sh`).
+- **AWS SDK, OpenDAL and kube upgraded.** AWS SDK for S3 1.161 (`aws-sigv4`
+  1.6) drops `crypto-bigint` 0.4/0.5 (timing variability in operations meant
+  to be constant-time). OpenDAL 0.45 → 0.59 for GCS and Azure drops `quick-xml`
+  0.31 (quadratic attribute checks, unbounded namespace allocation) and the
+  `reqwest` 0.11 / `rustls` 0.21 stack. The operator moves to kube 5 and
+  k8s-openapi 0.29, dropping `rustls` 0.21 and `rustls-webpki` 0.101 (CRL
+  parsing panic, name-constraint and distrusted-intermediate checks). Plus
+  patch releases of `anyhow`, `memmap2`, `oneshot`, `rand` and `rustix`.
+  `cargo audit`: 10 vulnerabilities → 2. Left: `h2` 0.3 (axum 0.6 and tonic
+  0.11; their upgrade is next) and `rsa` 0.9 (Marvin, timing on decryption;
+  pulled in by OpenDAL's request signer, which has no release on `rsa` 0.10).
+  The operator computes the same spec hashes as before for every live cluster,
+  so deploying it restarts no broker, and generates the same CRD schemas.
+  New `tests/cluster/e2e/s3_roundtrip.sh` (SeaweedFS): 20,000 records archived
+  to S3, local copies removed, all read back byte for byte from offset 0, and
+  none readable with the bucket stopped. 2.18.3 and this build both pass.
+
+### Known issues
+
+- **Recovering a node from an empty data directory does not work**, though
+  `docs/DISASTER_RECOVERY.md` described it as automatic since 1.3.65. The
+  metadata uploader reads paths the server no longer writes (it uploads
+  nothing) and the restore path is never called; message data is archived and
+  readable, but without the catalog a blank node does not know its topics. The
+  guide now says so at the top.
+
+### Fixed
+
+- **GCS and Azure object stores** (found porting them to OpenDAL 0.59):
+  - `GCS_PREFIX` and `AZURE_PREFIX` were read and never applied; objects went to
+    the bucket root. They are now applied, under the GCS project as before.
+  - Listing returned one level and its directories as objects, so nested keys
+    (every segment) were missing. It is now recursive by prefix, as on S3.
+  - Inline GCS service-account credentials were put in an environment variable
+    nothing reads, and workload identity was refused; both are now used.
+  - Azure connection strings were refused as unimplemented; they now work.
+  - `AZURE_USE_EMULATOR` was ignored; it now selects Azurite's endpoint and
+    development key.
+  - New `GcsCredentials::Anonymous` for public buckets and emulators.
+  - `crates/chronik-storage/tests/opendal_backends_test.rs` runs both backends
+    against fake-gcs-server and Azurite (ignored by default; see the file).
+- **Operator default image** was `ghcr.io/chronik-stream/chronik-server:latest`,
+  which was never published: a cluster or standalone that left `image` unset
+  could not pull. It is now `ghcr.io/lspecian/chronik-stream:latest`, which the
+  release publishes. Such a resource gets new Pods on the image that exists;
+  resources that set `image` are unaffected. Examples and docs fixed too.
 
 ### Changed
 

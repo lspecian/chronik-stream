@@ -92,7 +92,7 @@ kind: ChronikStandalone
 metadata:
   name: my-chronik
 spec:
-  image: ghcr.io/chronik-stream/chronik-server:latest
+  image: ghcr.io/lspecian/chronik-stream:latest
   resources:
     requests:
       cpu: "500m"
@@ -112,7 +112,7 @@ kind: ChronikStandalone
 metadata:
   name: chronik-s3
 spec:
-  image: ghcr.io/chronik-stream/chronik-server:latest
+  image: ghcr.io/lspecian/chronik-stream:latest
   storage:
     size: 100Gi
     storageClass: gp3
@@ -135,7 +135,7 @@ spec:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `image` | `ghcr.io/chronik-stream/chronik-server:latest` | Container image |
+| `image` | `ghcr.io/lspecian/chronik-stream:latest` | Container image |
 | `storage.size` | `50Gi` | PVC size |
 | `storage.storageClass` | `standard` | Storage class |
 | `kafkaPort` | `9092` | Kafka listener port |
