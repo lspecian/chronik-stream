@@ -14,7 +14,8 @@ use crate::constants::{self, FINALIZER};
 use crate::crds::common::Condition;
 use crate::crds::user::{ChronikUser, ChronikUserStatus};
 use crate::error::OperatorError;
-use crate::kafka_client::{self, CreateUserRequest, KafkaAdminClient, SetAclsRequest};
+use crate::kafka_access::resolve_kafka_access;
+use crate::kafka_admin::{self, KafkaAdmin};
 
 /// Shared context for the user reconciler.
 pub struct Context {
@@ -74,104 +75,13 @@ async fn apply(client: Client, user: &ChronikUser) -> Result<Action, OperatorErr
     let (secret_name, password) =
         ensure_credentials_secret(&secret_api, &cr_name, spec, user).await?;
 
-    // 2. Resolve clusterRef to get admin URL
-    let resolve_result = crate::controllers::topic_controller::resolve_cluster_ref(
-        &client,
-        &namespace,
-        &spec.cluster_ref,
-    )
-    .await;
-
-    match resolve_result {
-        Ok((admin_url, api_key)) => {
-            let admin_client = KafkaAdminClient::new(api_key);
-
-            // 3. Create/update user in Chronik
-            let create_req = CreateUserRequest {
-                username: cr_name.clone(),
-                password,
-                auth_type: spec.authentication.type_.clone(),
-            };
-
-            match admin_client.create_user(&admin_url, &create_req).await {
-                Ok(resp) => {
-                    if !resp.success {
-                        warn!(user = %cr_name, "User creation returned: {}", resp.message);
-                    }
-                }
-                Err(e) => {
-                    warn!(user = %cr_name, "Failed to create user in Chronik: {e}");
-                    update_status(
-                        &client,
-                        &cr_name,
-                        &namespace,
-                        "Pending",
-                        Some(&secret_name),
-                        None,
-                        vec![make_condition(
-                            "Ready",
-                            "False",
-                            "AdminApiUnreachable",
-                            &format!("Cannot create user: {e}"),
-                        )],
-                        user.metadata.generation,
-                    )
-                    .await?;
-                    return Ok(Action::requeue(Duration::from_secs(
-                        constants::defaults::REQUEUE_NOT_READY_SECS,
-                    )));
-                }
-            }
-
-            // 4. Set ACLs
-            let acl_count = if let Some(ref auth) = spec.authorization {
-                let acl_entries = kafka_client::expand_acl_rules(&auth.acls);
-                let acl_count = acl_entries.len() as i32;
-
-                let set_req = SetAclsRequest {
-                    username: cr_name.clone(),
-                    acls: acl_entries,
-                };
-
-                match admin_client.set_acls(&admin_url, &set_req).await {
-                    Ok(resp) => {
-                        if !resp.success {
-                            warn!(user = %cr_name, "ACL set returned: {}", resp.message);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(user = %cr_name, "Failed to set ACLs: {e}");
-                    }
-                }
-
-                acl_count
-            } else {
-                0
-            };
-
-            // 5. Update status — success
-            update_status(
-                &client,
-                &cr_name,
-                &namespace,
-                "Ready",
-                Some(&secret_name),
-                Some(acl_count),
-                vec![
-                    make_condition("Ready", "True", "UserReady", "User and ACLs configured"),
-                    make_condition(
-                        "CredentialsReady",
-                        "True",
-                        "SecretExists",
-                        &format!("Credentials stored in Secret '{secret_name}'"),
-                    ),
-                ],
-                user.metadata.generation,
-            )
-            .await?;
-        }
-        Err(e) => {
-            warn!(user = %cr_name, "Cannot resolve cluster: {e}");
+    // A failure below leaves the user Pending with the reason, and retries.
+    let pending = |reason: &'static str, message: String| {
+        let client = client.clone();
+        let (cr_name, namespace, secret_name) = (cr_name.clone(), namespace.clone(), secret_name.clone());
+        let generation = user.metadata.generation;
+        async move {
+            warn!(user = %cr_name, "{reason}: {message}");
             update_status(
                 &client,
                 &cr_name,
@@ -179,24 +89,123 @@ async fn apply(client: Client, user: &ChronikUser) -> Result<Action, OperatorErr
                 "Pending",
                 Some(&secret_name),
                 None,
-                vec![make_condition(
-                    "Ready",
-                    "False",
-                    "ClusterNotFound",
-                    &format!("Cannot resolve clusterRef: {e}"),
-                )],
+                vec![make_condition("Ready", "False", reason, &message)],
+                generation,
+            )
+            .await?;
+            Ok::<_, OperatorError>(Action::requeue(Duration::from_secs(
+                constants::defaults::REQUEUE_NOT_READY_SECS,
+            )))
+        }
+    };
+
+    // 2. Which credential the user gets (a TLS principal has none).
+    let mechanism = match kafka_admin::scram_mechanism(&spec.authentication.type_) {
+        Ok(m) => m,
+        Err(e) => {
+            // Not retryable until the spec changes.
+            update_status(
+                &client,
+                &cr_name,
+                &namespace,
+                "Error",
+                Some(&secret_name),
+                None,
+                vec![make_condition("Ready", "False", "UnsupportedAuthentication", &e.to_string())],
                 user.metadata.generation,
             )
             .await?;
-            return Ok(Action::requeue(Duration::from_secs(
-                constants::defaults::REQUEUE_NOT_READY_SECS,
-            )));
+            return Ok(Action::await_change());
+        }
+    };
+    if mechanism.is_some() && password.is_empty() {
+        return pending("NoPassword", format!("Secret '{secret_name}' holds no password")).await;
+    }
+
+    // 3. Connect to the cluster's Kafka port.
+    let access = match resolve_kafka_access(&client, &namespace, &spec.cluster_ref).await {
+        Ok(a) => a,
+        Err(e) => return pending("ClusterNotReachable", e.to_string()).await,
+    };
+    let mut admin = match KafkaAdmin::connect(&access).await {
+        Ok(a) => a,
+        Err(e) => return pending("KafkaUnreachable", e.to_string()).await,
+    };
+
+    // 4. The SCRAM credential, written only when it is new or the password
+    //    changed (each write replaces the stored salt and keys).
+    if let Some(mechanism) = mechanism {
+        let key = credential_key(&namespace, &spec.cluster_ref.name, &cr_name, mechanism);
+        let fingerprint = password_fingerprint(&password);
+        if credential_cache().lock().unwrap().get(&key) != Some(&fingerprint) {
+            if let Err(e) = admin.upsert_scram_user(&cr_name, &password, mechanism).await {
+                return pending("CredentialFailed", e.to_string()).await;
+            }
+            info!(user = %cr_name, mechanism = mechanism.as_str(), "SCRAM credential set");
+            credential_cache().lock().unwrap().insert(key, fingerprint);
         }
     }
+
+    // 5. ACLs: exactly the listed ones (none listed removes any left over).
+    let desired = spec
+        .authorization
+        .as_ref()
+        .map(|a| kafka_admin::expand_acl_rules(&a.acls))
+        .unwrap_or_default();
+    let acl_count = match admin.set_user_acls(&cr_name, &desired).await {
+        Ok(n) => n as i32,
+        Err(e) => return pending("AclsFailed", e.to_string()).await,
+    };
+
+    // 6. Ready.
+    update_status(
+        &client,
+        &cr_name,
+        &namespace,
+        "Ready",
+        Some(&secret_name),
+        Some(acl_count),
+        vec![
+            make_condition("Ready", "True", "UserReady", "User and ACLs configured"),
+            make_condition(
+                "CredentialsReady",
+                "True",
+                "SecretExists",
+                &format!("Credentials stored in Secret '{secret_name}'"),
+            ),
+        ],
+        user.metadata.generation,
+    )
+    .await?;
 
     Ok(Action::requeue(Duration::from_secs(
         constants::defaults::REQUEUE_USER_SECS,
     )))
+}
+
+type CredentialKey = (String, String, String, &'static str);
+
+/// Which credential this process last wrote, per (namespace, cluster, user,
+/// mechanism): the password's fingerprint. After a restart each credential is
+/// written once more, then only when its password changes.
+fn credential_cache() -> &'static std::sync::Mutex<std::collections::HashMap<CredentialKey, [u8; 32]>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<CredentialKey, [u8; 32]>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn credential_key(
+    namespace: &str,
+    cluster: &str,
+    user: &str,
+    mechanism: chronik_protocol::sasl::SaslMechanism,
+) -> CredentialKey {
+    (namespace.into(), cluster.into(), user.into(), mechanism.as_str())
+}
+
+fn password_fingerprint(password: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(password.as_bytes()).into()
 }
 
 /// Ensure the credentials Secret exists. If not, generate a random password
@@ -299,27 +308,26 @@ async fn cleanup(client: Client, user: &ChronikUser) -> Result<Action, OperatorE
 
     info!(user = %cr_name, "Cleaning up ChronikUser");
 
-    // Try to delete the user from Chronik
-    let resolve_result = crate::controllers::topic_controller::resolve_cluster_ref(
-        &client,
-        &namespace,
-        &spec.cluster_ref,
-    )
-    .await;
-
-    match resolve_result {
-        Ok((admin_url, api_key)) => {
-            let admin_client = KafkaAdminClient::new(api_key);
-            match admin_client.delete_user(&admin_url, &cr_name).await {
-                Ok(_) => info!(user = %cr_name, "User deleted from Chronik"),
-                Err(e) => warn!(user = %cr_name, "Failed to delete user: {e}"),
-            }
-        }
-        Err(e) => {
-            warn!(user = %cr_name, "Cannot resolve cluster for cleanup: {e}");
-            // Don't block finalizer removal if cluster is gone
-        }
+    // Remove the user's ACLs and credentials. A cluster that is gone or
+    // unreachable must not block finalizer removal.
+    let removed = match resolve_kafka_access(&client, &namespace, &spec.cluster_ref).await {
+        Ok(access) => match KafkaAdmin::connect(&access).await {
+            Ok(mut admin) => match admin.set_user_acls(&cr_name, &[]).await {
+                Ok(_) => admin.delete_scram_user(&cr_name).await,
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    match removed {
+        Ok(()) => info!(user = %cr_name, "User and its ACLs removed"),
+        Err(e) => warn!(user = %cr_name, "Could not remove the user: {e}"),
     }
+    credential_cache()
+        .lock()
+        .unwrap()
+        .retain(|(ns, cluster, user, _), _| !(ns == &namespace && cluster == &spec.cluster_ref.name && user == &cr_name));
 
     // Secret is owner-referenced and will be garbage collected.
 

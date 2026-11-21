@@ -354,15 +354,36 @@ spec:
 
 ### What the Operator Creates
 
-1. A Kubernetes **Secret** named `{user-name}-credentials` containing:
+1. A Kubernetes **Secret** named `{user-name}-credentials` (unless
+   `authentication.passwordSecret` names one) containing:
    - `username` — The user's name
    - `password` — Auto-generated 32-character password
-   - `sasl.mechanism` — Authentication mechanism
-   - `bootstrap.servers` — Kafka bootstrap address
 
-2. The SASL user in Chronik via the admin API
+2. The user's SCRAM credential in Chronik (`AlterUserScramCredentials`). It is
+   written when the user is new or its password changes.
 
-3. ACL entries for each rule (expanded: one entry per operation)
+3. Exactly the ACLs the rules list (one binding per operation), for principal
+   `User:{user-name}`: missing ones are created, ones no longer listed are
+   deleted. Deleting the ChronikUser removes its ACLs and credentials.
+
+Authentication types: `sasl-scram-sha-512`, `sasl-scram-sha-256`, and `tls`
+(ACLs only, no credential). `sasl-plain` is reported as unsupported: the broker
+accepts PLAIN only for users in `CHRONIK_SASL_USERS`, and Kafka has no API to
+create them; a SCRAM user logs in with the same username and password.
+
+### How the Operator Reaches the Cluster
+
+ChronikTopic and ChronikUser are reconciled over the **Kafka protocol** on port
+9092 (CreateTopics, DescribeConfigs, IncrementalAlterConfigs, CreatePartitions,
+DeleteTopics, AlterUserScramCredentials, CreateAcls/DescribeAcls/DeleteAcls),
+trying each broker in turn. On a cluster that requires SASL the operator logs
+in as the broker-to-broker user `__chronik_broker` with the same secret the
+broker Pods receive (the generated `<cluster>-inter-broker` Secret,
+`spec.interBrokerSecret`, or `CHRONIK_INTER_BROKER_SECRET` in `env`). A
+ChronikStandalone with SASL needs `CHRONIK_INTER_BROKER_SECRET` set in its
+`env`. Clusters whose Kafka port uses TLS (`CHRONIK_TLS_CERT`) are not managed
+yet: the operator cannot verify the broker certificate, and the resource's
+status says so.
 
 ### ACL Rule Structure
 

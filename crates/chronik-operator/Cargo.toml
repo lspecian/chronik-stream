@@ -28,6 +28,12 @@ toml = "0.8"
 # HTTP client (for Chronik Admin API)
 reqwest = { workspace = true }
 
+# Kafka admin protocol (topics, SCRAM users, ACLs) and SASL/SCRAM login
+kafka-protocol = { version = "0.18", default-features = false, features = ["client", "broker"] }
+chronik-protocol = { path = "../chronik-protocol" }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }

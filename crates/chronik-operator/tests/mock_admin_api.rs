@@ -1,4 +1,6 @@
-//! Integration tests for AdminClient and KafkaAdminClient against a mock HTTP server.
+//! Integration tests for AdminClient against a mock HTTP server. (Topic and user
+//! management go over the Kafka protocol; see kafka_admin_test.rs, which runs
+//! against a real broker.)
 
 use std::sync::Arc;
 
@@ -7,9 +9,6 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use chronik_operator::admin_client::{AddNodeRequest, AdminClient, RemoveNodeRequest};
-use chronik_operator::kafka_client::{
-    CreateTopicRequest, CreateUserRequest, KafkaAdminClient, SetAclsRequest,
-};
 
 /// A minimal mock HTTP server that records requests and returns canned responses.
 struct MockServer {
@@ -191,148 +190,4 @@ async fn test_admin_find_leader() {
     let (url, node_id) = leader.unwrap();
     assert_eq!(node_id, 2);
     assert_eq!(url, server2.url());
-}
-
-// ========== KafkaAdminClient Tests ==========
-
-#[tokio::test]
-async fn test_kafka_create_topic() {
-    let server = MockServer::start(vec![(
-        "/admin/topics",
-        r#"{"success":true,"message":"Topic created","topic_id":"t-001"}"#,
-    )])
-    .await;
-
-    let client = KafkaAdminClient::new(Some("key".into()));
-    let req = CreateTopicRequest {
-        name: "orders".into(),
-        partitions: 6,
-        replication_factor: 3,
-        config: Default::default(),
-    };
-    let resp = client.create_topic(&server.url(), &req).await.unwrap();
-
-    assert!(resp.success);
-    assert_eq!(resp.topic_id.as_deref(), Some("t-001"));
-
-    let reqs = server.recorded().await;
-    assert_eq!(reqs[0].0, "POST");
-    assert!(reqs[0].2.contains("\"name\":\"orders\""));
-}
-
-#[tokio::test]
-async fn test_kafka_describe_topic() {
-    let server = MockServer::start(vec![(
-        "/admin/topics/orders",
-        r#"{"name":"orders","partitions":6,"replication_factor":3,"config":{}}"#,
-    )])
-    .await;
-
-    let client = KafkaAdminClient::new(None);
-    let desc = client
-        .describe_topic(&server.url(), "orders")
-        .await
-        .unwrap();
-
-    assert!(desc.is_some());
-    let d = desc.unwrap();
-    assert_eq!(d.name, "orders");
-    assert_eq!(d.partitions, 6);
-}
-
-#[tokio::test]
-async fn test_kafka_delete_topic() {
-    let server = MockServer::start(vec![(
-        "/admin/topics",
-        r#"{"success":true,"message":"Deleted"}"#,
-    )])
-    .await;
-
-    let client = KafkaAdminClient::new(Some("key".into()));
-    let resp = client.delete_topic(&server.url(), "orders").await.unwrap();
-
-    assert!(resp.success);
-
-    let reqs = server.recorded().await;
-    assert_eq!(reqs[0].0, "DELETE");
-}
-
-#[tokio::test]
-async fn test_kafka_create_user() {
-    let server = MockServer::start(vec![(
-        "/admin/users",
-        r#"{"success":true,"message":"User created"}"#,
-    )])
-    .await;
-
-    let client = KafkaAdminClient::new(Some("key".into()));
-    let req = CreateUserRequest {
-        username: "app-producer".into(),
-        password: "secret123".into(),
-        auth_type: "sasl-scram-sha-256".into(),
-    };
-    let resp = client.create_user(&server.url(), &req).await.unwrap();
-
-    assert!(resp.success);
-
-    let reqs = server.recorded().await;
-    assert!(reqs[0].2.contains("\"username\":\"app-producer\""));
-}
-
-#[tokio::test]
-async fn test_kafka_delete_user() {
-    let server = MockServer::start(vec![(
-        "/admin/users",
-        r#"{"success":true,"message":"User deleted"}"#,
-    )])
-    .await;
-
-    let client = KafkaAdminClient::new(Some("key".into()));
-    let resp = client
-        .delete_user(&server.url(), "app-producer")
-        .await
-        .unwrap();
-
-    assert!(resp.success);
-
-    let reqs = server.recorded().await;
-    assert_eq!(reqs[0].0, "DELETE");
-    assert!(reqs[0].1.contains("app-producer"));
-}
-
-#[tokio::test]
-async fn test_kafka_set_acls() {
-    let server = MockServer::start(vec![(
-        "/admin/users",
-        r#"{"success":true,"acl_count":2,"message":"ACLs set"}"#,
-    )])
-    .await;
-
-    let client = KafkaAdminClient::new(Some("key".into()));
-    let req = SetAclsRequest {
-        username: "app".into(),
-        acls: vec![
-            chronik_operator::kafka_client::AclEntry {
-                resource_type: "topic".into(),
-                resource_name: "orders".into(),
-                pattern_type: "literal".into(),
-                operation: "Read".into(),
-                effect: "Allow".into(),
-            },
-            chronik_operator::kafka_client::AclEntry {
-                resource_type: "topic".into(),
-                resource_name: "orders".into(),
-                pattern_type: "literal".into(),
-                operation: "Write".into(),
-                effect: "Allow".into(),
-            },
-        ],
-    };
-    let resp = client.set_acls(&server.url(), &req).await.unwrap();
-
-    assert!(resp.success);
-    assert_eq!(resp.acl_count, 2);
-
-    let reqs = server.recorded().await;
-    assert_eq!(reqs[0].0, "PUT");
 }

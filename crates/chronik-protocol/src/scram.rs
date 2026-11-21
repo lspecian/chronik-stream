@@ -533,6 +533,19 @@ fn hmac(key: &[u8], data: &[u8], mechanism: SaslMechanism) -> Result<Vec<u8>, Sa
     }
 }
 
+/// The salted password `AlterUserScramCredentials` carries: `Hi(password,
+/// salt, iterations)`, computed by the client so the plaintext never crosses
+/// the wire. The same derivation [`ScramCredential::derive_with_salt`] uses,
+/// so a credential set this way verifies against the password.
+pub fn salted_password(
+    password: &str,
+    salt: &[u8],
+    iterations: u32,
+    mechanism: SaslMechanism,
+) -> Result<Vec<u8>, SaslError> {
+    hi(password.as_bytes(), salt, iterations, mechanism)
+}
+
 /// `Hi(str, salt, i)` — PBKDF2 with the mechanism's hash.
 fn hi(
     password: &[u8],

@@ -231,6 +231,22 @@ impl InterBrokerSecretSource {
     }
 }
 
+/// SASL mode of a container `env`, as the broker parses `CHRONIK_SASL_ENABLED`
+/// (the last entry wins, trimmed, case-insensitive).
+pub fn sasl_setting_of(env: &[EnvVar]) -> SaslSetting {
+    let Some(var) = env.iter().rev().find(|e| e.name == SASL_ENABLED_ENV) else {
+        return SaslSetting::Disabled;
+    };
+    match var.value.as_deref() {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "required" | "optional" | "warn" => SaslSetting::Enabled,
+            _ => SaslSetting::Disabled,
+        },
+        None if var.value_from_secret.is_some() => SaslSetting::Unknown,
+        None => SaslSetting::Disabled,
+    }
+}
+
 impl ChronikClusterSpec {
     /// The last `env` entry with this name — the one Kubernetes applies when a
     /// container lists a name twice.
@@ -241,17 +257,7 @@ impl ChronikClusterSpec {
     /// Read SASL mode from `env` exactly as the broker parses
     /// `CHRONIK_SASL_ENABLED` (trimmed, case-insensitive).
     pub fn sasl_setting(&self) -> SaslSetting {
-        let Some(var) = self.user_env(SASL_ENABLED_ENV) else {
-            return SaslSetting::Disabled;
-        };
-        match var.value.as_deref() {
-            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" | "required" | "optional" | "warn" => SaslSetting::Enabled,
-                _ => SaslSetting::Disabled,
-            },
-            None if var.value_from_secret.is_some() => SaslSetting::Unknown,
-            None => SaslSetting::Disabled,
-        }
+        sasl_setting_of(&self.env)
     }
 
     /// Where the operator should source `CHRONIK_INTER_BROKER_SECRET` from, or

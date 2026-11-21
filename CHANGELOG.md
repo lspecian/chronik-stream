@@ -62,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ChronikTopic and ChronikUser never reconciled.** The operator called
+  HTTP endpoints for topics and users (`/admin/topics`, `/admin/users`) that the
+  broker never had; every resource stayed `Pending` with "Cannot reach admin
+  API". Its tests passed against a mock of those endpoints. The operator now
+  manages them over the Kafka admin protocol the broker implements: topics
+  (create, describe, configs, partitions, delete), SCRAM credentials, and ACLs
+  reconciled to exactly the listed set. On SASL clusters it logs in as
+  `__chronik_broker` with the Pods' secret. `sasl-plain` users and TLS Kafka
+  ports are reported as unsupported in the status. Verified against a broker
+  with and without SASL+ACLs (`tests/cluster/e2e/operator_kafka_admin.sh`).
 - **GCS and Azure object stores** (found porting them to OpenDAL 0.59):
   - `GCS_PREFIX` and `AZURE_PREFIX` were read and never applied; objects went to
     the bucket root. They are now applied, under the GCS project as before.
