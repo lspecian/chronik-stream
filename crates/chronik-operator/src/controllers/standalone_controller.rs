@@ -10,7 +10,7 @@ use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{finalizer, Event as Finalizer};
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::constants::{self, FINALIZER};
 use crate::crds::common::Condition;
@@ -45,7 +45,7 @@ pub async fn run(client: Client) {
             match res {
                 Ok((_obj, _action)) => {}
                 Err(e) => {
-                    error!("Reconciliation error: {:?}", e);
+                    super::log_controller_error("Standalone", &e);
                 }
             }
         })

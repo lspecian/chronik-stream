@@ -7,7 +7,7 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::constants;
 use crate::crds::autoscaler::{
@@ -45,7 +45,7 @@ pub async fn run(client: Client) {
             match res {
                 Ok((_obj, _action)) => {}
                 Err(e) => {
-                    error!("AutoScaler reconciliation error: {:?}", e);
+                    super::log_controller_error("AutoScaler", &e);
                 }
             }
         })

@@ -8,6 +8,9 @@
 //!   [CHRONIK_ADMIN_TEST_SECRET=<CHRONIK_INTER_BROKER_SECRET>] \
 //!     cargo test -p chronik-operator --test kafka_admin_test -- --ignored
 //!
+//! CHRONIK_ADMIN_TEST_ACLS=1 when the broker enforces ACLs; otherwise the test
+//! expects SECURITY_DISABLED handling.
+//!
 //! With a secret, the broker must require SASL: the test logs in as the broker
 //! user, and checks a created user can log in and a deleted one cannot.
 
@@ -94,19 +97,28 @@ async fn topics_users_and_acls_round_trip() {
         acl("topic", "app-", "prefixed", "Write", "Allow"),
         acl("group", "g1", "literal", "Read", "Allow"),
     ];
-    assert_eq!(admin.set_user_acls(&user, &wanted).await.expect("set ACLs"), 3);
-    assert_eq!(admin.set_user_acls(&user, &wanted).await.expect("set ACLs again"), 3);
-    let mut have = admin.user_acls(&user).await.unwrap();
-    let mut want = wanted.clone();
-    have.sort();
-    want.sort();
-    assert_eq!(have, want, "the broker holds a different set");
+    if std::env::var("CHRONIK_ADMIN_TEST_ACLS").as_deref() == Ok("1") {
+        assert_eq!(admin.set_user_acls(&user, &wanted).await.expect("set ACLs"), 3);
+        assert_eq!(admin.set_user_acls(&user, &wanted).await.expect("set ACLs again"), 3);
+        let mut have = admin.user_acls(&user).await.unwrap().expect("ACLs are enabled");
+        let mut want = wanted.clone();
+        have.sort();
+        want.sort();
+        assert_eq!(have, want, "the broker holds a different set");
 
-    let narrowed = vec![acl("topic", &topic, "literal", "Write", "Deny")];
-    assert_eq!(admin.set_user_acls(&user, &narrowed).await.unwrap(), 1);
-    assert_eq!(admin.user_acls(&user).await.unwrap(), narrowed);
-    admin.set_user_acls(&user, &[]).await.unwrap();
-    assert!(admin.user_acls(&user).await.unwrap().is_empty());
+        let narrowed = vec![acl("topic", &topic, "literal", "Write", "Deny")];
+        assert_eq!(admin.set_user_acls(&user, &narrowed).await.unwrap(), 1);
+        assert_eq!(admin.user_acls(&user).await.unwrap(), Some(narrowed));
+        admin.set_user_acls(&user, &[]).await.unwrap();
+        assert_eq!(admin.user_acls(&user).await.unwrap(), Some(vec![]));
+    } else {
+        // ACLs off: the broker says so, and asking for ACLs is an error the
+        // user sees rather than a silent no-op; asking for none is fine.
+        assert_eq!(admin.user_acls(&user).await.unwrap(), None);
+        let e = admin.set_user_acls(&user, &wanted).await.expect_err("ACLs requested on a cluster without them");
+        assert!(e.to_string().contains("ACLs disabled"), "{e}");
+        assert_eq!(admin.set_user_acls(&user, &[]).await.unwrap(), 0);
+    }
 
     admin.delete_scram_user(&user).await.expect("delete user");
     admin.delete_scram_user(&user).await.expect("deleting a missing user is not an error");

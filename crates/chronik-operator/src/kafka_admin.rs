@@ -488,9 +488,10 @@ impl KafkaAdmin {
     }
 
     /// The ACL bindings `User:<username>` holds.
-    pub async fn user_acls(&mut self, username: &str) -> Result<Vec<AclEntry>, OperatorError> {
+    /// `None` when the cluster has ACLs disabled.
+    pub async fn user_acls(&mut self, username: &str) -> Result<Option<Vec<AclEntry>>, OperatorError> {
         let principal = format!("User:{username}");
-        Ok(self.wire_acls(&principal).await?.iter().map(WireAcl::to_entry).collect())
+        Ok(self.wire_acls(&principal).await?.map(|set| set.iter().map(WireAcl::to_entry).collect()))
     }
 
     /// Make `User:<username>`'s ACLs exactly `desired`: create the missing
@@ -501,12 +502,23 @@ impl KafkaAdmin {
             .iter()
             .map(WireAcl::from_entry)
             .collect::<Result<_, _>>()?;
-        let have = self.wire_acls(&principal).await?;
+        let Some(have) = self.wire_acls(&principal).await? else {
+            // ACLs are off: nothing to hold, and asking for some is a
+            // configuration error the user must see, not a silent no-op.
+            if want.is_empty() {
+                return Ok(0);
+            }
+            return Err(OperatorError::Config(format!(
+                "the cluster has ACLs disabled (CHRONIK_ACL_ENABLED is not true); the {} listed ACL(s) for {principal} are not applied",
+                want.len()
+            )));
+        };
         self.apply_acl_diff(&principal, &want, &have).await?;
         Ok(want.len())
     }
 
-    async fn wire_acls(&mut self, principal: &str) -> Result<BTreeSet<WireAcl>, OperatorError> {
+    /// `None` when the broker answers SECURITY_DISABLED (ACLs off).
+    async fn wire_acls(&mut self, principal: &str) -> Result<Option<BTreeSet<WireAcl>>, OperatorError> {
         let described = self
             .send(
                 DescribeAclsRequest::default()
@@ -519,6 +531,9 @@ impl KafkaAdmin {
                     .with_permission_type(ACL_ANY),
             )
             .await?;
+        if described.error_code == code_of(ResponseError::SecurityDisabled) {
+            return Ok(None);
+        }
         check(&format!("describe ACLs of {principal}"), described.error_code, described.error_message.as_ref(), &[])?;
         let mut have = BTreeSet::new();
         for resource in described.resources {
@@ -536,7 +551,7 @@ impl KafkaAdmin {
                 });
             }
         }
-        Ok(have)
+        Ok(Some(have))
     }
 
     async fn apply_acl_diff(

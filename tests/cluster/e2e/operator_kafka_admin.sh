@@ -47,7 +47,7 @@ run() { # <name> <test env...> -- <broker env...>
 
 echo "=== $LABEL ($BIN)"
 run plain -- CHRONIK_SASL_ENABLED=false
-run sasl-acl CHRONIK_ADMIN_TEST_SECRET="$SECRET" -- \
+run sasl-acl CHRONIK_ADMIN_TEST_SECRET="$SECRET" CHRONIK_ADMIN_TEST_ACLS=1 -- \
   CHRONIK_SASL_ENABLED=true CHRONIK_INTER_BROKER_SECRET="$SECRET" \
   CHRONIK_ACL_ENABLED=true CHRONIK_ACL_ALLOW_IF_NO_ACL=false
 
