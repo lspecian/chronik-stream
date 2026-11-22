@@ -107,6 +107,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticates as `__chronik_broker` too), and distributed `/_sql`,
   `/_search`, `/_vector` and `/_query` now reach peers over HTTPS when the
   Unified API serves it (they used plain HTTP against the HTTPS port).
+- **Every client certificate authenticated as its CA.** The mTLS principal was
+  the first Common Name found anywhere in the certificate, which is the
+  issuer's (it precedes the subject), so all certificates a CA signed shared one
+  principal, `User:<CA name>`: an ACL for one certificate user applied to all
+  of them, and one naming the real subject never matched. The principal is now
+  the subject's CN, read by walking the certificate structure. A peer whose
+  certificate names the same principal as the broker's own certificate
+  authenticates as the broker (`__chronik_broker`), which is how brokers
+  sharing a certificate replicate on an mTLS cluster without SASL; until now
+  every such replica fetch was refused with `CLUSTER_AUTHORIZATION_FAILED`.
+  Give client certificates names distinct from the brokers'.
 - **`CHRONIK_TLS_REQUIRE_CLIENT_CERT` was ignored**: setting a CA
   (`CHRONIK_TLS_CA_CERT`) made client certificates mandatory whatever it said.
   A client certificate is now verified when offered and required only with the

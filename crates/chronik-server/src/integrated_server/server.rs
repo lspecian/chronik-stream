@@ -785,7 +785,7 @@ impl IntegratedKafkaServer {
                     let is_tls = stream.is_tls();
                     // Must be read BEFORE into_split(): the rustls session lives on
                     // the whole stream, not on either half.
-                    let certificate_principal = stream.peer_principal();
+                    let certificate_principal = crate::inter_broker::certificate_identity(stream.peer_principal());
                     if let Some(ref principal) = certificate_principal {
                         debug!("mTLS client {} presented certificate for {}", addr, principal);
                     }

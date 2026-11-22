@@ -98,6 +98,30 @@ pub fn tls() -> Option<&'static tokio_rustls::TlsConnector> {
     TLS.get().and_then(Option::as_ref)
 }
 
+/// The identity of a connection that presented a verified client certificate.
+/// A peer whose certificate names the same principal as this broker's own
+/// (`CHRONIK_TLS_CERT`) is a broker: the handshake proved it holds a key the CA
+/// certified under that name, which is how brokers sharing one certificate (the
+/// operator's `spec.tls`) recognise each other. It authenticates as the broker
+/// principal, so it may replicate. Before, an mTLS cluster without SASL
+/// refused every replica fetch (CLUSTER_AUTHORIZATION_FAILED) and replicated
+/// nothing. The name, not the exact certificate, is compared, so brokers keep
+/// replicating while they restart one by one onto a renewed certificate.
+pub fn certificate_identity(certificate_principal: Option<String>) -> Option<String> {
+    static OWN: OnceLock<Option<String>> = OnceLock::new();
+    let own = OWN.get_or_init(|| {
+        crate::tls::TlsConfig::from_env().and_then(|c| crate::tls::certificate_file_principal(&c.cert_path))
+    });
+    identity_for(own.as_deref(), certificate_principal)
+}
+
+fn identity_for(own: Option<&str>, certificate_principal: Option<String>) -> Option<String> {
+    match certificate_principal {
+        Some(p) if own == Some(p.as_str()) => Some(principal()),
+        other => other,
+    }
+}
+
 /// The broker user the server accepts, or `None` when no secret is set.
 ///
 /// SCRAM-SHA-512 only. PLAIN would send the secret in the clear on every
@@ -156,6 +180,17 @@ pub fn check_cluster_startup(mode: SaslMode, secret: Option<&str>) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer presenting a certificate under this broker's name is a broker;
+    /// any other certificate keeps its own principal.
+    #[test]
+    fn a_certificate_under_the_broker_name_is_the_broker() {
+        let own = Some("User:chronik-broker");
+        assert_eq!(identity_for(own, Some("User:chronik-broker".into())), Some(principal()));
+        assert_eq!(identity_for(own, Some("User:alice".into())).as_deref(), Some("User:alice"));
+        assert_eq!(identity_for(own, None), None);
+        assert_eq!(identity_for(None, Some("User:alice".into())).as_deref(), Some("User:alice"));
+    }
 
     #[test]
     fn required_sasl_without_a_secret_refuses_to_start() {
