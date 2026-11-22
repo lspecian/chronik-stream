@@ -158,7 +158,7 @@ async fn produce_test_messages(stats: &mut TestStatistics) -> Result<Vec<TestMes
         match timeout(Duration::from_secs(5), producer.send(record, Duration::from_secs(0))).await {
             Ok(Ok(delivery)) => {
                 debug!("Message {} delivered to partition {} offset {}", 
-                       i, delivery.0, delivery.1);
+                       i, delivery.partition, delivery.offset);
                 produced_messages.push(message);
                 stats.messages_produced += 1;
             }

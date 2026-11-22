@@ -15,7 +15,7 @@ path = "src/main.rs"
 tokio = { version = "1.40", features = ["full"] }
 
 # Kafka client
-rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "gssapi", "libz"] }
+rdkafka = { version = "0.40", features = ["cmake-build", "ssl", "gssapi", "libz", "zstd"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

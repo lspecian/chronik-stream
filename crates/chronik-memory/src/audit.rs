@@ -162,7 +162,7 @@ pub async fn emit_audit(
         .send(record, Timeout::After(Duration::from_secs(5)))
         .await
     {
-        Ok((partition, offset)) => {
+        Ok(rdkafka::producer::future_producer::Delivery { partition, offset, .. }) => {
             tracing::debug!(
                 topic = %topic,
                 op = %event.op,
