@@ -37,26 +37,44 @@ fn all_peers(init_config: &ClusterInitConfig) -> Vec<(u64, String)> {
     peers
 }
 
+/// `CHRONIK_CLUSTER_JOIN`: this node was added to a running cluster.
+pub fn is_joining() -> bool {
+    std::env::var("CHRONIK_CLUSTER_JOIN").map(|v| v == "true" || v == "1").unwrap_or(false)
+}
+
 /// Open this node's catalog log and start its raft node. A brand-new cluster
 /// is founded by the nodes in the config; every founding node must list the
 /// same set.
-pub fn start_cluster_catalog(init_config: &ClusterInitConfig) -> Result<Arc<ClusterCatalog>> {
+pub async fn start_cluster_catalog(
+    init_config: &ClusterInitConfig,
+    object_store: Option<&chronik_storage::object_store::ObjectStoreConfig>,
+) -> Result<Arc<ClusterCatalog>> {
     let peers = all_peers(init_config);
     // A node added to a running cluster (`cluster add-node`) must not found a
     // cluster of its own: it starts blank and the leader sends it a snapshot.
-    let joining = std::env::var("CHRONIK_CLUSTER_JOIN").map(|v| v == "true" || v == "1").unwrap_or(false);
+    let joining = is_joining();
     let voters: Vec<u64> = if joining { Vec::new() } else { peers.iter().map(|(id, _)| *id).collect() };
+    // Whole-cluster loss: with CHRONIK_DR_RESTORE=true every blank founding
+    // node founds the cluster on the same catalog image from the object store.
+    let bootstrap = if joining {
+        None
+    } else {
+        crate::metadata_dr::restore_if_blank(&init_config.data_dir, init_config.node_id, Some(&voters), object_store)
+            .await
+            .context("restoring metadata from the object store")?
+    };
     info!(
         "Starting cluster catalog (node {}, {})",
         init_config.node_id,
         if joining { "joining an existing cluster".to_string() } else { format!("founding voters {:?}", voters) }
     );
-    let config = ClusterCatalogConfig::new(
+    let mut config = ClusterCatalogConfig::new(
         init_config.node_id,
         init_config.data_dir.join("catalog-raft"),
         peers,
         voters,
     );
+    config.bootstrap = bootstrap;
     let catalog = ClusterCatalog::start(config, catalog_runtime().handle().clone())
         .context("starting the cluster catalog")?;
     Ok(Arc::new(catalog))

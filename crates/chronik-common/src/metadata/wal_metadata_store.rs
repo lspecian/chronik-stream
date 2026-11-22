@@ -1272,6 +1272,11 @@ impl MetadataStore for WalMetadataStore {
         Ok(offsets.get(&key).cloned())
     }
 
+    async fn list_consumer_offsets(&self, group_id: &str) -> Result<Vec<ConsumerOffset>> {
+        let offsets = self.state.consumer_offsets.read().await;
+        Ok(offsets.iter().filter(|((g, _, _), _)| g == group_id).map(|(_, o)| o.clone()).collect())
+    }
+
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()> {
         // v2.2.13 CRITICAL FIX: Deduplicate high watermark events to prevent event storm
         // Before publishing event, check if watermark has actually changed
@@ -1516,6 +1521,102 @@ impl MetadataStore for WalMetadataStore {
     }
 }
 
+/// The node-local metadata state as one serializable image.
+///
+/// Disaster recovery uploads it instead of the metadata WAL, which is never
+/// compacted (16 GB on a long-running node) while the state it builds is
+/// small. Restored, it is the base the WAL then replays on top of.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LocalStateImage {
+    version: u32,
+    topics: Vec<TopicMetadata>,
+    brokers: Vec<BrokerMetadata>,
+    consumer_groups: Vec<ConsumerGroupMetadata>,
+    consumer_offsets: Vec<((String, String, u32), ConsumerOffset)>,
+    partition_assignments: Vec<((String, u32), PartitionAssignment)>,
+    segments: Vec<((String, String), SegmentMetadata)>,
+    partition_offsets: Vec<((String, u32), (i64, i64))>,
+    parquet_segments: Vec<((String, i32, String), ParquetSegmentMetadata)>,
+    transactions: Vec<(String, TransactionMetadata)>,
+    next_producer_id: i64,
+    acls: Vec<AclBindingRecord>,
+    scram_credentials: Vec<((String, i8), ScramCredentialRecord)>,
+}
+
+const LOCAL_STATE_IMAGE_VERSION: u32 = 1;
+
+impl WalMetadataStore {
+    /// The whole node-local state, gzip-compressed JSON.
+    pub async fn export_state(&self) -> Result<Vec<u8>> {
+        use std::io::Write;
+        let s = &self.state;
+        let image = LocalStateImage {
+            version: LOCAL_STATE_IMAGE_VERSION,
+            topics: s.topics.read().await.values().cloned().collect(),
+            brokers: s.brokers.read().await.values().cloned().collect(),
+            consumer_groups: s.consumer_groups.read().await.values().cloned().collect(),
+            consumer_offsets: s.consumer_offsets.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            partition_assignments: s
+                .partition_assignments
+                .iter()
+                .map(|e| (e.key().clone(), e.value().clone()))
+                .collect(),
+            segments: s.segments.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            partition_offsets: s.partition_offsets.read().await.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            parquet_segments: s.parquet_segments.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            transactions: s.transactions.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            next_producer_id: s.next_producer_id.load(Ordering::SeqCst),
+            acls: s.acls.read().await.clone(),
+            scram_credentials: s.scram_credentials.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        };
+        let json = serde_json::to_vec(&image)
+            .map_err(|e| MetadataError::SerializationError(format!("local state image: {e}")))?;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&json)
+            .and_then(|_| gz.finish())
+            .map_err(|e| MetadataError::SerializationError(format!("compressing local state image: {e}")))
+    }
+
+    /// Replace the node-local state with an image from [`Self::export_state`].
+    pub async fn import_state(&self, bytes: &[u8]) -> Result<()> {
+        use std::io::Read;
+        let mut json = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut json)
+            .map_err(|e| MetadataError::SerializationError(format!("decompressing local state image: {e}")))?;
+        let image: LocalStateImage = serde_json::from_slice(&json)
+            .map_err(|e| MetadataError::SerializationError(format!("local state image: {e}")))?;
+        if image.version != LOCAL_STATE_IMAGE_VERSION {
+            return Err(MetadataError::SerializationError(format!(
+                "local state image version {} is not supported (expected {})",
+                image.version, LOCAL_STATE_IMAGE_VERSION
+            )));
+        }
+        let s = &self.state;
+        *s.topics.write().await = image.topics.into_iter().map(|t| (t.name.clone(), t)).collect();
+        *s.brokers.write().await = image.brokers.into_iter().map(|b| (b.broker_id, b)).collect();
+        *s.consumer_groups.write().await =
+            image.consumer_groups.into_iter().map(|g| (g.group_id.clone(), g)).collect();
+        *s.consumer_offsets.write().await = image.consumer_offsets.into_iter().collect();
+        s.partition_assignments.clear();
+        s.partitions_by_topic.clear();
+        for ((topic, partition), assignment) in image.partition_assignments {
+            // Index first, then the assignment, as on every insert.
+            s.partitions_by_topic.entry(topic.clone()).or_default().insert(partition);
+            s.partition_assignments.insert((topic, partition), assignment);
+        }
+        *s.segments.write().await = image.segments.into_iter().collect();
+        *s.partition_offsets.write().await = image.partition_offsets.into_iter().collect();
+        *s.parquet_segments.write().await = image.parquet_segments.into_iter().collect();
+        *s.transactions.write().await = image.transactions.into_iter().collect();
+        s.next_producer_id.fetch_max(image.next_producer_id, Ordering::SeqCst);
+        *s.acls.write().await = image.acls;
+        *s.scram_credentials.write().await = image.scram_credentials.into_iter().collect();
+        s.acl_generation.send_modify(|g| *g += 1);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod transaction_coordinator_tests {
     use super::*;
@@ -1525,6 +1626,53 @@ mod transaction_coordinator_tests {
         // in-memory apply path, which is exactly what recovery replays.
         let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
         WalMetadataStore::new(node_id, wal_append)
+    }
+
+    /// An exported image restores the state it was taken from, through the
+    /// same reads the broker uses (disaster recovery).
+    #[tokio::test]
+    async fn local_state_image_round_trips() {
+        let a = noop_store(1);
+        a.create_topic("orders", TopicConfig::default()).await.unwrap();
+        a.commit_offset(ConsumerOffset {
+            group_id: "g".into(),
+            topic: "orders".into(),
+            partition: 2,
+            offset: 41,
+            metadata: Some("m".into()),
+            commit_timestamp: Utc::now(),
+        })
+        .await
+        .unwrap();
+        a.update_partition_offset("orders", 2, 100, 7).await.unwrap();
+        a.persist_segment_metadata(SegmentMetadata {
+            segment_id: "seg-1".into(),
+            topic: "orders".into(),
+            partition: 2,
+            start_offset: 0,
+            end_offset: 99,
+            size: 1234,
+            record_count: 100,
+            path: "segments/orders/2/0-99.segment".into(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+        let pid = a.allocate_producer_id().await.unwrap();
+
+        let image = a.export_state().await.unwrap();
+        let b = noop_store(1);
+        b.import_state(&image).await.unwrap();
+
+        assert!(b.get_topic("orders").await.unwrap().is_some());
+        let off = b.get_consumer_offset("g", "orders", 2).await.unwrap().expect("offset restored");
+        assert_eq!((off.offset, off.metadata.as_deref()), (41, Some("m")));
+        assert_eq!(b.get_partition_offset("orders", 2).await.unwrap(), Some((100, 7)));
+        let segs = b.list_segments("orders", Some(2)).await.unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].path, "segments/orders/2/0-99.segment");
+        assert!(b.allocate_producer_id().await.unwrap() > pid, "a restored node re-issued a producer id");
+        assert!(b.import_state(b"not an image").await.is_err());
     }
 
     #[tokio::test]

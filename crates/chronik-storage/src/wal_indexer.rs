@@ -1831,7 +1831,10 @@ impl WalIndexer {
         // Gated by `is_leader` only when a caller passes one; the server passes
         // none, because segment records live in each node's own metadata WAL.
         if is_leader.load(Ordering::Relaxed) {
-            let segment_id = format!("{}-{}", min_offset, max_offset);
+            // The partition is part of the id: records are keyed by (topic, id),
+            // and two partitions archiving the same offset range (common with
+            // round-robin producers) otherwise replaced each other's record.
+            let segment_id = format!("p{}-{}-{}", tp.partition, min_offset, max_offset);
             let segment_metadata = MetadataSegmentMetadata {
                 segment_id,
                 topic: tp.topic.clone(),

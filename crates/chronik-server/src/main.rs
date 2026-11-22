@@ -1365,7 +1365,7 @@ async fn run_cluster_mode(
     let init_config = ClusterInitConfig::from_cli_and_config(cli, config.clone(), &bind, advertise.as_deref())?;
 
     // Phase 2: Start the cluster catalog (its raft node) and its endpoint
-    let catalog = start_cluster_catalog(&init_config)?;
+    let catalog = start_cluster_catalog(&init_config, object_store_config.as_ref()).await?;
 
     start_catalog_grpc_server(catalog.clone(), &init_config.raft_bind_addr).await?;
 
@@ -1685,7 +1685,7 @@ async fn run_single_node_mode(
         wal_indexing_interval_secs: 30,
         object_store_config,
         enable_metadata_dr: true,
-        metadata_upload_interval_secs: 60,
+        metadata_upload_interval_secs: crate::metadata_dr::upload_interval_secs(),
         cluster_config: None,
         tls_config: None, // TLS configured via env vars
     };

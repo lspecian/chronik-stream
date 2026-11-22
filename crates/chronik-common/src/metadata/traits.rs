@@ -471,6 +471,9 @@ pub trait MetadataStore: Send + Sync {
     async fn update_consumer_group(&self, metadata: ConsumerGroupMetadata) -> Result<()>;
     async fn commit_offset(&self, offset: ConsumerOffset) -> Result<()>;
     async fn get_consumer_offset(&self, group_id: &str, topic: &str, partition: u32) -> Result<Option<ConsumerOffset>>;
+    /// Every committed offset of a group (OffsetFetch with no topic list, as
+    /// `kafka-consumer-groups --describe` and lag monitors send it).
+    async fn list_consumer_offsets(&self, group_id: &str) -> Result<Vec<ConsumerOffset>>;
     async fn commit_transactional_offsets(
         &self,
         transactional_id: String,

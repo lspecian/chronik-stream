@@ -64,6 +64,20 @@ pub struct DriverConfig {
     /// Take a snapshot and compact the log after this many applied entries.
     pub snapshot_every: u64,
     pub log_store: LogStoreOptions,
+    /// State a brand-new founding node starts from instead of the empty one
+    /// (restore from a disaster-recovery image). Used only when the log is
+    /// blank and `initial_voters` is non-empty; every founding node must
+    /// pass the same one, or their logs disagree from the first index.
+    pub bootstrap: Option<BootstrapSnapshot>,
+}
+
+/// A snapshot to found a cluster on: the state machine's serialized state as
+/// of `index` (applied) in `term`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BootstrapSnapshot {
+    pub index: u64,
+    pub term: u64,
+    pub data: Vec<u8>,
 }
 
 impl DriverConfig {
@@ -75,6 +89,7 @@ impl DriverConfig {
             heartbeat_tick: 3,
             snapshot_every: 10_000,
             log_store: LogStoreOptions::default(),
+            bootstrap: None,
         }
     }
 }
@@ -272,10 +287,19 @@ impl RaftDriver {
         let blank = snap_index == 0 && store.last_index().unwrap_or(0) == 0;
         if blank && !initial_voters.is_empty() {
             let mut snap = Snapshot::default();
-            snap.data = state_machine.snapshot().into();
+            let (index, term) = match &config.bootstrap {
+                Some(b) => {
+                    snap.data = b.data.clone().into();
+                    (b.index.max(1), b.term.max(1))
+                }
+                None => {
+                    snap.data = state_machine.snapshot().into();
+                    (1, 1)
+                }
+            };
             let meta = snap.mut_metadata();
-            meta.index = 1;
-            meta.term = 1;
+            meta.index = index;
+            meta.term = term;
             meta.mut_conf_state().voters = initial_voters.to_vec();
             store
                 .apply_snapshot(snap)?
@@ -821,6 +845,7 @@ mod tests {
             heartbeat_tick: 2,
             snapshot_every: 10_000,
             log_store: LogStoreOptions::default(),
+            bootstrap: None,
         }
     }
 
@@ -901,6 +926,34 @@ mod tests {
 
     async fn create(h: &RaftHandle, name: &str) -> Result<Applied, ProposeError> {
         h.propose(format!("create:{}", name).into_bytes()).await
+    }
+
+    /// Founding nodes given the same bootstrap snapshot start from its state at
+    /// its index (disaster recovery), elect a leader, and commit after it; the
+    /// snapshot survives a restart.
+    #[tokio::test]
+    async fn founding_nodes_start_from_a_bootstrap_snapshot() {
+        fn seeded(id: u64) -> DriverConfig {
+            let data = serde_json::to_vec(&BTreeSet::from(["restored".to_string()])).unwrap();
+            DriverConfig { bootstrap: Some(BootstrapSnapshot { index: 50, term: 3, data }), ..config(id) }
+        }
+        let mut c = Cluster::new(&[1, 2, 3], seeded);
+        for id in [1, 2, 3] {
+            assert!(c.sms[&id].set().contains("restored"), "node {id} did not restore");
+        }
+        let leader = c.leader().await;
+        let applied = create(&c.h(leader), "after").await.unwrap();
+        assert!(applied.index > 50, "committed at {} inside the restored range", applied.index);
+        assert!(applied.term > 3);
+        c.settle(applied.index).await;
+        let want = BTreeSet::from(["after".to_string(), "restored".to_string()]);
+        for id in [1, 2, 3] {
+            assert_eq!(c.sms[&id].set(), want);
+        }
+        c.stop(3);
+        c.start(3);
+        c.settle(applied.index).await;
+        assert_eq!(c.sms[&3].set(), want, "restart lost the restored state");
     }
 
     #[tokio::test(flavor = "multi_thread")]

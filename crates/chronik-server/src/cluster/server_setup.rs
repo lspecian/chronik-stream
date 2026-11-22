@@ -40,7 +40,7 @@ pub async fn create_integrated_server(
         wal_indexing_interval_secs: 30,
         object_store_config,
         enable_metadata_dr: true,
-        metadata_upload_interval_secs: 60,
+        metadata_upload_interval_secs: crate::metadata_dr::upload_interval_secs(),
         cluster_config: Some(init_config.cluster_config.clone()),
         tls_config: None, // TLS configured via env vars
     };
@@ -109,7 +109,7 @@ mod tests {
             wal_indexing_interval_secs: 30,
             object_store_config: None,
             enable_metadata_dr: true,
-            metadata_upload_interval_secs: 60,
+            metadata_upload_interval_secs: crate::metadata_dr::upload_interval_secs(),
             cluster_config: Some(init_config.cluster_config.clone()),
             tls_config: None,
         };

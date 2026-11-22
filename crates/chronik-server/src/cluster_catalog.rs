@@ -117,6 +117,9 @@ pub struct ClusterCatalogConfig {
     pub snapshot_every: u64,
     /// How long `execute` keeps trying to reach a leader.
     pub propose_timeout: Duration,
+    /// Catalog state a blank founding node starts from (disaster recovery);
+    /// the empty catalog when `None`.
+    pub bootstrap: Option<chronik_raft::BootstrapSnapshot>,
 }
 
 impl ClusterCatalogConfig {
@@ -135,6 +138,7 @@ impl ClusterCatalogConfig {
                 .filter(|&n: &u64| n > 0)
                 .unwrap_or(10_000),
             propose_timeout: Duration::from_secs(30),
+            bootstrap: None,
         }
     }
 
@@ -190,6 +194,7 @@ impl ClusterCatalog {
             heartbeat_tick: config.heartbeat_tick,
             snapshot_every: config.snapshot_every,
             log_store: LogStoreOptions::default(),
+            bootstrap: config.bootstrap.clone(),
         };
         let driver = RaftDriver::start(&config.data_dir, driver_config, &config.initial_voters, sm, outbox)?;
         let handle = driver.handle();

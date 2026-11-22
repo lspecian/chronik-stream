@@ -490,6 +490,9 @@ mod tests {
         async fn get_consumer_offset(&self, _group_id: &str, _topic: &str, _partition: u32) -> chronik_common::metadata::traits::Result<Option<chronik_common::metadata::ConsumerOffset>> {
             unimplemented!()
         }
+        async fn list_consumer_offsets(&self, _group_id: &str) -> chronik_common::metadata::traits::Result<Vec<chronik_common::metadata::ConsumerOffset>> {
+            unimplemented!()
+        }
         async fn update_partition_offset(&self, _topic: &str, _partition: u32, _high_watermark: i64, _log_start_offset: i64) -> chronik_common::metadata::traits::Result<()> {
             unimplemented!()
         }
