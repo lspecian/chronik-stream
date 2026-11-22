@@ -64,7 +64,7 @@ axum = { workspace = true }
 hyper-util = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls-manual-roots-no-provider"] }
 
 # Core dependencies
 tokio = { workspace = true }
@@ -144,6 +144,7 @@ minimal = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rcgen = "0.13"
 
 [lints]
 workspace = true

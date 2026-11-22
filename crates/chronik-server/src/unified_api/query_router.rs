@@ -229,6 +229,11 @@ impl QueryRouter {
             .ok()
             .and_then(|v| v.parse().ok());
 
+        // Peers serve HTTPS when this node does (same configuration on every
+        // broker); plain HTTP to an HTTPS port answered nothing, so every
+        // distributed query silently lost the peers' share.
+        let api_tls = crate::inter_broker::api_tls();
+        let scheme = if api_tls.is_some() { "https" } else { "http" };
         let peers: Vec<PeerNode> = cluster_config
             .peers
             .iter()
@@ -246,7 +251,7 @@ impl QueryRouter {
                     .unwrap_or(6091 + peer.id as u16);
                 PeerNode {
                     node_id: peer.id,
-                    url: format!("http://{}:{}", host, port),
+                    url: format!("{scheme}://{host}:{port}"),
                 }
             })
             .collect();
@@ -258,9 +263,12 @@ impl QueryRouter {
             "QueryRouter initialized"
         );
 
-        let client = Client::builder()
-            .timeout(config.timeout)
-            .pool_max_idle_per_host(4)
+        let builder = Client::builder().timeout(config.timeout).pool_max_idle_per_host(4);
+        let builder = match api_tls {
+            Some(tls) => builder.use_preconfigured_tls(tls),
+            None => builder,
+        };
+        let client = builder
             .build()
             .expect("Failed to create reqwest client for QueryRouter");
 

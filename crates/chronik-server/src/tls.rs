@@ -159,6 +159,45 @@ fn ensure_crypto_provider() {
     });
 }
 
+/// Every certificate in a PEM file, as trust anchors.
+fn load_root_store(path: &Path) -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in load_certs(path)? {
+        root_store.add(cert).context("Failed to add CA certificate to root store")?;
+    }
+    Ok(root_store)
+}
+
+/// A TLS client for connecting to other brokers' Kafka ports (replica
+/// fetches): it trusts the CA in `ca_cert_path`, which must have signed every
+/// broker's certificate, and presents this broker's own certificate, which a
+/// leader that requires client certificates verifies against the same CA.
+pub fn create_tls_connector(config: &TlsConfig) -> Result<tokio_rustls::TlsConnector> {
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(client_config(config)?)))
+}
+
+/// The rustls client behind [`create_tls_connector`], also used for HTTPS to
+/// other brokers' Unified API (query fan-out).
+pub fn client_config(config: &TlsConfig) -> Result<rustls::ClientConfig> {
+    ensure_crypto_provider();
+    let ca_path = config.ca_cert_path.as_deref().context(
+        "no CA certificate to verify other brokers with: set CHRONIK_TLS_CA_CERT to the CA that signed every broker's certificate",
+    )?;
+    let roots = load_root_store(Path::new(ca_path))?;
+    let certs = load_certs(Path::new(&config.cert_path))?;
+    let key = load_private_key(Path::new(&config.key_path))?;
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .context("Failed to build the inter-broker TLS client config")
+}
+
+/// TLS for the Unified API: `CHRONIK_API_TLS_*`, falling back to the Kafka
+/// listener's `CHRONIK_TLS_*`.
+pub fn api_tls_config() -> Option<TlsConfig> {
+    TlsConfig::from_env_with_prefix("CHRONIK_API_TLS").or_else(TlsConfig::from_env)
+}
+
 /// Create a TLS acceptor from configuration
 pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     ensure_crypto_provider();
@@ -166,6 +205,11 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     info!("Loading TLS certificate from: {}", config.cert_path);
     info!("Loading TLS private key from: {}", config.key_path);
 
+    if config.require_client_cert && config.ca_cert_path.is_none() {
+        anyhow::bail!(
+            "client certificates are required (REQUIRE_CLIENT_CERT) but no CA is set (CA_CERT) to verify them against"
+        );
+    }
     let certs = load_certs(Path::new(&config.cert_path))?;
     let key = load_private_key(Path::new(&config.key_path))?;
 
@@ -173,21 +217,16 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
 
     // Build server config
     let server_config = if let Some(ref ca_path) = config.ca_cert_path {
-        // mTLS: require client certificates
+        // A client certificate is verified against this CA when offered, and
+        // required only with CHRONIK_TLS_REQUIRE_CLIENT_CERT. It used to be
+        // required whenever a CA was set, whatever that flag said.
         info!("Loading CA certificate for client auth from: {}", ca_path);
-        let ca_certs = load_certs(Path::new(ca_path))?;
-
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in ca_certs {
-            root_store.add(cert)
-                .context("Failed to add CA certificate to root store")?;
-        }
-
-        let client_cert_verifier = rustls::server::WebPkiClientVerifier::builder(
-            Arc::new(root_store)
-        )
-        .build()
-        .context("Failed to build client certificate verifier")?;
+        let root_store = load_root_store(Path::new(ca_path))?;
+        let builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+        let builder = if config.require_client_cert { builder } else { builder.allow_unauthenticated() };
+        let client_cert_verifier = builder
+            .build()
+            .context("Failed to build client certificate verifier")?;
 
         ServerConfig::builder()
             .with_client_cert_verifier(client_cert_verifier)
@@ -202,8 +241,10 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     };
 
     info!("TLS configuration loaded successfully");
-    if config.require_client_cert {
-        info!("mTLS enabled: client certificates required");
+    match (config.require_client_cert, config.ca_cert_path.is_some()) {
+        (true, true) => info!("mTLS enabled: client certificates required"),
+        (false, true) => info!("Client certificates are verified when offered (not required)"),
+        _ => {}
     }
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
@@ -299,43 +340,103 @@ impl MaybeTlsStream {
     }
 }
 
-/// Pull the subject Common Name out of a DER certificate.
+/// The principal (`User:<subject CN>`) a certificate file's first certificate
+/// names, as a client presenting it would authenticate.
+pub fn certificate_file_principal(path: &str) -> Option<String> {
+    let leaf = load_certs(Path::new(path)).ok()?.into_iter().next()?;
+    extract_common_name(leaf.as_ref()).map(|cn| format!("User:{cn}"))
+}
+
+/// The subject Common Name of a DER certificate.
 ///
-/// Deliberately a minimal scan rather than a full X.509 parse: the alternative
-/// is another dependency (`x509-parser`) for one field. It walks the DER looking
-/// for the CN attribute OID (2.5.4.3 = `55 04 03`) inside the subject and reads
-/// the string that follows.
+/// Walks the structure (Certificate → TBSCertificate → subject) instead of
+/// searching for the CN attribute anywhere: the issuer comes before the subject
+/// in a certificate, and the search this replaced returned the *issuer's* CN, so
+/// every client certificate a CA signed authenticated as one principal, the
+/// CA's name (an ACL for one certificate user applied to all of them, and one
+/// naming the real subject never matched).
 ///
-/// Returns `None` when the CN cannot be located, and callers treat that as "no
-/// principal" — the safe direction. A certificate whose name cannot be read must
-/// not authenticate as something else.
+/// Returns `None` when the certificate is malformed or its subject has no CN,
+/// and callers treat that as "no principal" — the safe direction.
 fn extract_common_name(der: &[u8]) -> Option<String> {
-    // OID 2.5.4.3 (commonName), DER-encoded as 06 03 55 04 03.
-    const CN_OID: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
+    const SEQUENCE: u8 = 0x30;
+    const SET: u8 = 0x31;
+    const CN_OID: &[u8] = &[0x55, 0x04, 0x03]; // 2.5.4.3
 
-    let start = der
-        .windows(CN_OID.len())
-        .position(|window| window == CN_OID)?;
-    let after_oid = start + CN_OID.len();
-
-    // The value follows as a tagged string: <tag> <len> <bytes>. Accept the
-    // string types an issuer realistically uses for a CN.
-    let tag = *der.get(after_oid)?;
-    let is_string = matches!(tag, 0x0c | 0x13 | 0x16 | 0x14 | 0x1e);
-    if !is_string {
+    let (tag, certificate, _) = der_tlv(der)?;
+    if tag != SEQUENCE {
         return None;
     }
-
-    let len = *der.get(after_oid + 1)? as usize;
-    // Long-form lengths (high bit set) would mean a CN over 127 bytes; refuse
-    // rather than misread the length byte as content.
-    if len & 0x80 != 0 {
+    let (tag, tbs, _) = der_tlv(certificate)?;
+    if tag != SEQUENCE {
         return None;
     }
+    // version [0] (optional), serialNumber, signature, issuer, validity, subject
+    let mut rest = tbs;
+    let (tag, _, after) = der_tlv(rest)?;
+    if tag == 0xa0 {
+        rest = after;
+    }
+    for _ in 0..4 {
+        rest = der_tlv(rest)?.2;
+    }
+    let (tag, mut rdns, _) = der_tlv(rest)?;
+    if tag != SEQUENCE {
+        return None;
+    }
+    // Name ::= SEQUENCE OF RelativeDistinguishedName (SET OF AttributeTypeAndValue)
+    while !rdns.is_empty() {
+        let (tag, mut attributes, next) = der_tlv(rdns)?;
+        if tag != SET {
+            return None;
+        }
+        while !attributes.is_empty() {
+            let (tag, attribute, next_attribute) = der_tlv(attributes)?;
+            if tag != SEQUENCE {
+                return None;
+            }
+            let (oid_tag, oid, value) = der_tlv(attribute)?;
+            if oid_tag == 0x06 && oid == CN_OID {
+                let (string_tag, bytes, _) = der_tlv(value)?;
+                return match string_tag {
+                    // UTF8String, PrintableString, IA5String, TeletexString
+                    0x0c | 0x13 | 0x16 | 0x14 => String::from_utf8(bytes.to_vec()).ok(),
+                    // BMPString: UTF-16BE
+                    0x1e if bytes.len() % 2 == 0 => String::from_utf16(
+                        &bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<_>>(),
+                    )
+                    .ok(),
+                    _ => None,
+                };
+            }
+            attributes = next_attribute;
+        }
+        rdns = next;
+    }
+    None
+}
 
-    let value_start = after_oid + 2;
-    let value = der.get(value_start..value_start + len)?;
-    String::from_utf8(value.to_vec()).ok()
+/// One DER TLV: (tag, contents, what follows). Single-byte tags (all a
+/// certificate's name uses); definite lengths up to four bytes.
+fn der_tlv(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *buf.first()?;
+    let first = *buf.get(1)? as usize;
+    let (len, header) = if first & 0x80 == 0 {
+        (first, 2)
+    } else {
+        let n = first & 0x7f;
+        if n == 0 || n > 4 {
+            return None;
+        }
+        let mut len = 0usize;
+        for i in 0..n {
+            len = (len << 8) | *buf.get(2 + i)? as usize;
+        }
+        (len, 2 + n)
+    };
+    let end = header.checked_add(len)?;
+    let contents = buf.get(header..end)?;
+    Some((tag, contents, &buf[end..]))
 }
 
 impl AsyncRead for MaybeTlsStream {
@@ -562,61 +663,173 @@ mod tests {
 mod principal_tests {
     use super::*;
 
-    /// Build a DER fragment shaped like the subject RDN a real certificate
-    /// carries: the CN OID followed by a UTF8String value.
-    fn der_with_cn(cn: &str, tag: u8) -> Vec<u8> {
-        let mut der = vec![0x30, 0x20, 0x31, 0x1e, 0x30, 0x1c];
-        der.extend_from_slice(&[0x06, 0x03, 0x55, 0x04, 0x03]); // CN OID
-        der.push(tag);
-        der.push(cn.len() as u8);
-        der.extend_from_slice(cn.as_bytes());
-        der
+    /// A certificate for `subject` signed by a CA named `issuer`.
+    fn certificate(subject: &str, issuer: &str) -> Vec<u8> {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.distinguished_name.push(DnType::CommonName, issuer);
+        ca.distinguished_name.push(DnType::OrganizationName, "chronik");
+        let ca = ca.self_signed(&ca_key).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut leaf = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        leaf.distinguished_name = rcgen::DistinguishedName::new();
+        leaf.distinguished_name.push(DnType::OrganizationName, "clients");
+        if !subject.is_empty() {
+            leaf.distinguished_name.push(DnType::CommonName, subject);
+        }
+        leaf.signed_by(&key, &ca, &ca_key).unwrap().der().to_vec()
     }
 
+    /// The subject's CN, not the issuer's (which comes first in the DER and is
+    /// what the old search returned: every client of a CA got one principal).
     #[test]
-    fn extracts_a_utf8_common_name() {
-        let der = der_with_cn("kafka-client", 0x0c);
-        assert_eq!(extract_common_name(&der).as_deref(), Some("kafka-client"));
-    }
-
-    /// PrintableString is what many CAs actually emit for a CN.
-    #[test]
-    fn extracts_a_printable_string_common_name() {
-        let der = der_with_cn("alice", 0x13);
+    fn the_principal_is_the_subject_not_the_issuer() {
+        let der = certificate("alice", "chronik-ca");
         assert_eq!(extract_common_name(&der).as_deref(), Some("alice"));
+        let der = certificate("bob", "chronik-ca");
+        assert_eq!(extract_common_name(&der).as_deref(), Some("bob"));
     }
 
-    /// A certificate whose name cannot be read must yield no principal rather
-    /// than a wrong one - the connection then authorizes as ANONYMOUS instead of
-    /// as somebody else.
+    /// A CN longer than 127 bytes (long-form length) is read, not refused.
     #[test]
-    fn returns_none_when_there_is_no_common_name() {
+    fn a_long_common_name_is_read() {
+        let long = "c".repeat(200);
+        assert_eq!(extract_common_name(&certificate(&long, "ca")).as_deref(), Some(long.as_str()));
+    }
+
+    /// No subject CN, or a malformed certificate, yields no principal rather
+    /// than a wrong one (the connection then authorizes as ANONYMOUS).
+    #[test]
+    fn no_subject_common_name_is_no_principal() {
+        assert_eq!(extract_common_name(&certificate("", "chronik-ca")), None, "fell back to the issuer");
         assert_eq!(extract_common_name(&[0x30, 0x03, 0x02, 0x01, 0x00]), None);
         assert_eq!(extract_common_name(&[]), None);
+        let der = certificate("alice", "ca");
+        assert_eq!(extract_common_name(&der[..der.len() / 2]), None, "a truncated certificate");
+    }
+}
+
+/// A throwaway CA and a `localhost` certificate it signed, for TLS tests.
+#[cfg(test)]
+pub(crate) mod test_pki {
+    use super::TlsConfig;
+
+    pub struct Pki {
+        pub dir: tempfile::TempDir,
+        pub ca: String,
+        pub cert: String,
+        pub key: String,
+    }
+
+    impl Pki {
+        pub fn new() -> Self {
+            use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+            let dir = tempfile::tempdir().unwrap();
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            ca_params.distinguished_name.push(DnType::CommonName, "chronik test ca");
+            let ca = ca_params.self_signed(&ca_key).unwrap();
+            let key = KeyPair::generate().unwrap();
+            let cert = CertificateParams::new(vec!["localhost".to_string()])
+                .unwrap()
+                .signed_by(&key, &ca, &ca_key)
+                .unwrap();
+            let write = |name: &str, pem: String| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, pem).unwrap();
+                path.to_string_lossy().into_owned()
+            };
+            let ca = write("ca.crt", ca.pem());
+            let cert = write("tls.crt", cert.pem());
+            let key = write("tls.key", key.serialize_pem());
+            Self { dir, ca, cert, key }
+        }
+
+        /// The listener config a broker with this PKI runs.
+        pub fn listener(&self, require_client_cert: bool) -> TlsConfig {
+            TlsConfig {
+                cert_path: self.cert.clone(),
+                key_path: self.key.clone(),
+                ca_cert_path: Some(self.ca.clone()),
+                require_client_cert,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::test_pki::Pki;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve one TLS connection that echoes 4 bytes; returns the address.
+    async fn echo_server(acceptor: TlsAcceptor) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            if let Ok(mut tls) = acceptor.accept(tcp).await {
+                let mut buf = [0u8; 4];
+                if tls.read_exact(&mut buf).await.is_ok() {
+                    let _ = tls.write_all(&buf).await;
+                    let _ = tls.flush().await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A client that trusts the CA and presents no certificate.
+    fn anonymous_client(pki: &Pki) -> tokio_rustls::TlsConnector {
+        ensure_crypto_provider();
+        let roots = load_root_store(Path::new(&pki.ca)).unwrap();
+        let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    async fn echo(connector: &tokio_rustls::TlsConnector, addr: std::net::SocketAddr) -> std::io::Result<[u8; 4]> {
+        let tcp = TcpStream::connect(addr).await?;
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(name, tcp).await?;
+        tls.write_all(b"ping").await?;
+        tls.flush().await?;
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    /// With a CA but without CHRONIK_TLS_REQUIRE_CLIENT_CERT, a client with no
+    /// certificate is served (it was refused: the flag was ignored).
+    #[tokio::test]
+    async fn a_client_certificate_is_optional_unless_required() {
+        let pki = Pki::new();
+        let addr = echo_server(create_tls_acceptor(&pki.listener(false)).unwrap()).await;
+        assert_eq!(&echo(&anonymous_client(&pki), addr).await.unwrap(), b"ping");
+
+        let addr = echo_server(create_tls_acceptor(&pki.listener(true)).unwrap()).await;
+        assert!(echo(&anonymous_client(&pki), addr).await.is_err(), "served a client without a certificate");
+    }
+
+    /// The broker-to-broker client verifies the leader against the CA and
+    /// presents its own certificate, so it reaches a leader that requires one.
+    #[tokio::test]
+    async fn the_inter_broker_client_reaches_a_leader_that_requires_certificates() {
+        let pki = Pki::new();
+        let addr = echo_server(create_tls_acceptor(&pki.listener(true)).unwrap()).await;
+        let connector = create_tls_connector(&pki.listener(true)).unwrap();
+        assert_eq!(&echo(&connector, addr).await.unwrap(), b"ping");
     }
 
     #[test]
-    fn refuses_a_truncated_value() {
-        // Claims 40 bytes of CN but supplies 3.
-        let mut der = vec![0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 40];
-        der.extend_from_slice(b"abc");
-        assert_eq!(extract_common_name(&der), None);
-    }
-
-    /// A long-form length byte must be refused, not misread as content.
-    #[test]
-    fn refuses_long_form_lengths() {
-        let der = vec![0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x81, 0x05, b'a'];
-        assert_eq!(extract_common_name(&der), None);
-    }
-
-    /// A plaintext connection has no certificate and therefore no principal.
-    #[test]
-    fn plain_connections_have_no_principal() {
-        // MaybeTlsStream::Plain cannot be constructed without a socket here, so
-        // the invariant is asserted through the code path that matters: the
-        // Plain arm returns None before touching any TLS state.
-        // (Exercised end-to-end by the SASL suite, where every plaintext
-        // connection authorizes as ANONYMOUS.)
+    fn requiring_client_certificates_without_a_ca_is_refused() {
+        let pki = Pki::new();
+        let mut config = pki.listener(true);
+        config.ca_cert_path = None;
+        assert!(create_tls_acceptor(&config).is_err());
+        assert!(create_tls_connector(&config).is_err(), "a broker client that verifies nothing");
     }
 }

@@ -1357,6 +1357,11 @@ async fn run_cluster_mode(
             chronik_protocol::sasl::INTER_BROKER_USER
         );
     }
+    let kafka_tls = tls::TlsConfig::from_env();
+    inter_broker::configure_tls(kafka_tls.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
+    if kafka_tls.is_some() {
+        info!("Inter-broker TLS: replica fetches connect to leaders over TLS");
+    }
 
     // Parse object store configuration
     let object_store_config = parse_object_store_config_from_env();

@@ -20,6 +20,70 @@ use crate::crds::standalone::ChronikStandaloneSpec;
 /// GCE-PD, AzureDisk, NFS-CSI, …). See chronik-stream issue #3.
 const CHRONIK_IMAGE_UID: i64 = 1001;
 
+/// What `spec.tls` adds to a broker Pod: the broker's TLS settings, and the
+/// Secret mounted where they point. Empty when unset, so the Pods of brokers
+/// without TLS are unchanged.
+#[derive(Default)]
+struct KafkaTlsParts {
+    env: Vec<EnvVar>,
+    mount: Option<VolumeMount>,
+    volume: Option<Volume>,
+}
+
+const KAFKA_TLS_VOLUME: &str = "kafka-tls";
+
+fn kafka_tls_parts(
+    tls: Option<&crate::crds::common::KafkaTlsSpec>,
+    security: Option<&PodSecurityContextSpec>,
+) -> KafkaTlsParts {
+    use crate::crds::common::KAFKA_TLS_MOUNT_PATH;
+    let Some(tls) = tls else {
+        return KafkaTlsParts::default();
+    };
+    let var = |name: &str, value: String| EnvVar {
+        name: name.into(),
+        value: Some(value),
+        ..Default::default()
+    };
+    let mut env = vec![
+        var(
+            "CHRONIK_TLS_CERT",
+            format!("{KAFKA_TLS_MOUNT_PATH}/tls.crt"),
+        ),
+        var("CHRONIK_TLS_KEY", format!("{KAFKA_TLS_MOUNT_PATH}/tls.key")),
+        var(
+            "CHRONIK_TLS_CA_CERT",
+            format!("{KAFKA_TLS_MOUNT_PATH}/ca.crt"),
+        ),
+    ];
+    if tls.require_client_cert {
+        env.push(var("CHRONIK_TLS_REQUIRE_CLIENT_CERT", "true".into()));
+    }
+    // Readable through the Pod's fsGroup (set unless the user's security
+    // context drops it); without one, readable by the container's user at all.
+    let has_fs_group = resolve_pod_security_context(security)
+        .and_then(|c| c.fs_group)
+        .is_some();
+    KafkaTlsParts {
+        env,
+        mount: Some(VolumeMount {
+            name: KAFKA_TLS_VOLUME.into(),
+            mount_path: KAFKA_TLS_MOUNT_PATH.into(),
+            read_only: Some(true),
+            ..Default::default()
+        }),
+        volume: Some(Volume {
+            name: KAFKA_TLS_VOLUME.into(),
+            secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                secret_name: Some(tls.secret_name.clone()),
+                default_mode: Some(if has_fs_group { 0o440 } else { 0o444 }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    }
+}
+
 /// How often the startup probe checks whether the Kafka port is open.
 const STARTUP_PROBE_PERIOD_SECONDS: i32 = 10;
 
@@ -241,6 +305,10 @@ pub fn build_standalone_pod(
         }
     }
 
+    // TLS on the Kafka port, before user env so an explicit setting wins.
+    let tls = kafka_tls_parts(spec.tls.as_ref(), spec.pod_security_context.as_ref());
+    env_vars.extend(tls.env.iter().cloned());
+
     // User-defined env vars
     for user_env in &spec.env {
         if let Some(ref val) = user_env.value {
@@ -365,11 +433,16 @@ pub fn build_standalone_pod(
         startup_probe: Some(startup_probe),
         liveness_probe: Some(liveness_probe),
         readiness_probe: Some(readiness_probe),
-        volume_mounts: Some(vec![VolumeMount {
-            name: "data".into(),
-            mount_path: constants::defaults::DATA_DIR.into(),
-            ..Default::default()
-        }]),
+        volume_mounts: Some(
+            [VolumeMount {
+                name: "data".into(),
+                mount_path: constants::defaults::DATA_DIR.into(),
+                ..Default::default()
+            }]
+            .into_iter()
+            .chain(tls.mount.clone())
+            .collect(),
+        ),
         ..Default::default()
     };
 
@@ -432,14 +505,19 @@ pub fn build_standalone_pod(
                 &spec.image,
                 &spec.image_pull_policy,
             ),
-            volumes: Some(vec![Volume {
-                name: "data".into(),
-                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: pvc_name,
+            volumes: Some(
+                [Volume {
+                    name: "data".into(),
+                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                        claim_name: pvc_name,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }]),
+                }]
+                .into_iter()
+                .chain(tls.volume.clone())
+                .collect(),
+            ),
             ..Default::default()
         }),
         ..Default::default()
@@ -605,6 +683,10 @@ pub fn build_cluster_node_pod(
         }
     }
 
+    // TLS on the Kafka port, before user env so an explicit setting wins.
+    let tls = kafka_tls_parts(spec.tls.as_ref(), spec.pod_security_context.as_ref());
+    env_vars.extend(tls.env.iter().cloned());
+
     // User-defined env vars
     for user_env in &spec.env {
         if let Some(ref val) = user_env.value {
@@ -768,19 +850,24 @@ pub fn build_cluster_node_pod(
         startup_probe: Some(startup_probe),
         liveness_probe: Some(liveness_probe),
         readiness_probe: Some(readiness_probe),
-        volume_mounts: Some(vec![
-            VolumeMount {
-                name: "data".into(),
-                mount_path: constants::defaults::DATA_DIR.into(),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "config".into(),
-                mount_path: "/config".into(),
-                read_only: Some(true),
-                ..Default::default()
-            },
-        ]),
+        volume_mounts: Some(
+            vec![
+                VolumeMount {
+                    name: "data".into(),
+                    mount_path: constants::defaults::DATA_DIR.into(),
+                    ..Default::default()
+                },
+                VolumeMount {
+                    name: "config".into(),
+                    mount_path: "/config".into(),
+                    read_only: Some(true),
+                    ..Default::default()
+                },
+            ]
+            .into_iter()
+            .chain(tls.mount.clone())
+            .collect(),
+        ),
         ..Default::default()
     };
 
@@ -851,24 +938,29 @@ pub fn build_cluster_node_pod(
                 &spec.image,
                 &spec.image_pull_policy,
             ),
-            volumes: Some(vec![
-                Volume {
-                    name: "data".into(),
-                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                        claim_name: pvc_name,
+            volumes: Some(
+                vec![
+                    Volume {
+                        name: "data".into(),
+                        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                            claim_name: pvc_name,
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                Volume {
-                    name: "config".into(),
-                    config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
-                        name: cm_name,
+                    },
+                    Volume {
+                        name: "config".into(),
+                        config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
+                            name: cm_name,
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            ]),
+                    },
+                ]
+                .into_iter()
+                .chain(tls.volume.clone())
+                .collect(),
+            ),
             ..Default::default()
         }),
         ..Default::default()
@@ -1315,6 +1407,84 @@ mod tests {
              volume costs one walk instead of a full recursive chown: {}",
             args
         );
+    }
+
+    /// `spec.tls` mounts the Secret read-only and points the broker at it; a
+    /// cluster without it gets neither (its Pods must stay as they were).
+    #[test]
+    fn kafka_tls_mounts_the_secret_and_configures_the_broker() {
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
+        let plain: crate::crds::cluster::ChronikClusterSpec = serde_json::from_str("{}").unwrap();
+        let tls: crate::crds::cluster::ChronikClusterSpec = serde_json::from_str(
+            r#"{"tls":{"secretName":"kafka-certs","requireClientCert":true}}"#,
+        )
+        .unwrap();
+
+        let pod = build_cluster_node_pod("c", "ns", 1, &tls, owner.clone(), None);
+        let spec = pod.spec.unwrap();
+        let c = &spec.containers[0];
+        let env: BTreeMap<_, _> = c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.clone()))
+            .collect();
+        assert_eq!(
+            env["CHRONIK_TLS_CERT"].as_deref(),
+            Some("/etc/chronik/tls/tls.crt")
+        );
+        assert_eq!(
+            env["CHRONIK_TLS_KEY"].as_deref(),
+            Some("/etc/chronik/tls/tls.key")
+        );
+        assert_eq!(
+            env["CHRONIK_TLS_CA_CERT"].as_deref(),
+            Some("/etc/chronik/tls/ca.crt")
+        );
+        assert_eq!(
+            env["CHRONIK_TLS_REQUIRE_CLIENT_CERT"].as_deref(),
+            Some("true")
+        );
+        let mount = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == KAFKA_TLS_VOLUME)
+            .expect("TLS mount");
+        assert_eq!(
+            (mount.mount_path.as_str(), mount.read_only),
+            ("/etc/chronik/tls", Some(true))
+        );
+        let volume = spec
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == KAFKA_TLS_VOLUME)
+            .expect("TLS volume");
+        let secret = volume.secret.as_ref().unwrap();
+        assert_eq!(secret.secret_name.as_deref(), Some("kafka-certs"));
+        assert_eq!(
+            secret.default_mode,
+            Some(0o440),
+            "readable through the default fsGroup"
+        );
+
+        let pod = build_cluster_node_pod("c", "ns", 1, &plain, owner, None);
+        let spec = pod.spec.unwrap();
+        assert!(spec
+            .volumes
+            .unwrap()
+            .iter()
+            .all(|v| v.name != KAFKA_TLS_VOLUME));
+        assert!(spec.containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|e| !e.name.starts_with("CHRONIK_TLS")));
     }
 
     #[test]

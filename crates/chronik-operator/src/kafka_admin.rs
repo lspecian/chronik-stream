@@ -11,6 +11,7 @@
 //! and forwards them to the catalog leader, so any broker that answers will do.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -79,7 +80,61 @@ pub struct KafkaAccess {
     /// Brokers to try, in order.
     pub bootstrap: Vec<String>,
     pub credentials: Option<Credentials>,
+    /// TLS, when the Kafka port uses it.
+    pub tls: Option<KafkaTls>,
 }
+
+/// TLS for the operator's connection: the CA that signed the brokers'
+/// certificates, and the certificate and key the operator presents (the
+/// brokers' own, which a broker requiring client certificates accepts).
+#[derive(Clone)]
+pub struct KafkaTls {
+    pub ca_pem: Vec<u8>,
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for KafkaTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaTls").finish_non_exhaustive()
+    }
+}
+
+impl KafkaTls {
+    fn connector(&self) -> Result<tokio_rustls::TlsConnector, OperatorError> {
+        let bad = |what: &str, e: &dyn std::fmt::Display| {
+            OperatorError::Config(format!("TLS {what}: {e}"))
+        };
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut self.ca_pem.as_slice()) {
+            let cert = cert.map_err(|e| bad("ca.crt", &e))?;
+            roots.add(cert).map_err(|e| bad("ca.crt", &e))?;
+        }
+        if roots.is_empty() {
+            return Err(bad("ca.crt", &"no certificate"));
+        }
+        let certs = rustls_pemfile::certs(&mut self.cert_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| bad("tls.crt", &e))?;
+        let key = rustls_pemfile::private_key(&mut self.key_pem.as_slice())
+            .map_err(|e| bad("tls.key", &e))?
+            .ok_or_else(|| bad("tls.key", &"no private key"))?;
+        // An explicit provider: the process may link more than one.
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| bad("protocol versions", &e))?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .map_err(|e| bad("client certificate", &e))?;
+        Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
+    }
+}
+
+/// The connection: plain TCP, or TLS over it.
+trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
 /// A topic as the broker reports it.
 #[derive(Debug, Clone, PartialEq)]
@@ -120,7 +175,7 @@ pub fn scram_mechanism(auth_type: &str) -> Result<Option<SaslMechanism>, Operato
 }
 
 pub struct KafkaAdmin {
-    stream: TcpStream,
+    stream: Box<dyn Io>,
     correlation_id: i32,
     versions: HashMap<i16, VersionRange>,
 }
@@ -182,6 +237,22 @@ impl KafkaAdmin {
             .map_err(|_| protocol_err(&format!("connect {addr}"), "timed out"))?
             .map_err(|e| protocol_err(&format!("connect {addr}"), e))?;
         let _ = stream.set_nodelay(true);
+        let stream: Box<dyn Io> = match &access.tls {
+            None => Box::new(stream),
+            Some(tls) => {
+                let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+                let name = rustls::pki_types::ServerName::try_from(host.to_string())
+                    .map_err(|e| protocol_err(&format!("TLS name of {addr}"), e))?;
+                let tls_stream =
+                    tokio::time::timeout(IO_TIMEOUT, tls.connector()?.connect(name, stream))
+                        .await
+                        .map_err(|_| {
+                            protocol_err(&format!("TLS handshake with {addr}"), "timed out")
+                        })?
+                        .map_err(|e| protocol_err(&format!("TLS handshake with {addr}"), e))?;
+                Box::new(tls_stream)
+            }
+        };
         let mut admin = Self {
             stream,
             correlation_id: 0,

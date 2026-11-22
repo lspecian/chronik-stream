@@ -115,7 +115,7 @@ pub struct ListenerSpec {
     #[serde(rename = "type")]
     pub type_: ListenerType,
 
-    /// Enable TLS for this listener.
+    /// Not used: the Kafka port's TLS is `spec.tls`.
     #[serde(default)]
     pub tls: bool,
 
@@ -123,7 +123,7 @@ pub struct ListenerSpec {
     #[serde(default)]
     pub node_port_base: Option<i32>,
 
-    /// TLS certificate secret name.
+    /// Not used: the Kafka port's TLS is `spec.tls`.
     #[serde(default)]
     pub tls_secret: Option<String>,
 }
@@ -290,3 +290,27 @@ pub struct PodSecurityContextSpec {
     #[serde(default)]
     pub fs_group_change_policy: Option<String>,
 }
+
+/// TLS on the Kafka port. The broker's Unified API (6092) serves HTTPS with
+/// the same certificate, and brokers reach each other (replica fetches, query
+/// fan-out) over TLS too.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaTlsSpec {
+    /// Secret with `tls.crt`, `tls.key` and `ca.crt` (the layout cert-manager
+    /// writes). The certificate must name every broker's address
+    /// (`<cluster>-<id>.<namespace>.svc.cluster.local`, or
+    /// `<name>.<namespace>.svc.cluster.local` for a standalone), and `ca.crt`
+    /// must be the CA that signed it: brokers and the operator verify each
+    /// other against it.
+    pub secret_name: String,
+
+    /// Require clients to present a certificate signed by `ca.crt` (mTLS).
+    /// Brokers and the operator present the broker certificate, so it must
+    /// allow client authentication (no extended key usage, or `clientAuth`).
+    #[serde(default)]
+    pub require_client_cert: bool,
+}
+
+/// Where a broker Pod mounts the [`KafkaTlsSpec`] Secret.
+pub const KAFKA_TLS_MOUNT_PATH: &str = "/etc/chronik/tls";

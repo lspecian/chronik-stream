@@ -70,6 +70,7 @@ run group_upgrade "$E2E/group_upgrade.sh" "$PREV_BIN" "$BIN" "$LABEL"
 run metadata_compaction "$E2E/metadata_compaction.sh" "$BIN" "$LABEL"
 run unified_api_routes "$E2E/unified_api_routes.sh" "$BIN" "$LABEL"
 run operator_kafka_admin "$E2E/operator_kafka_admin.sh" "$BIN" "$LABEL"
+run tls_cluster "$E2E/tls_cluster.sh" "$BIN" "$LABEL"
 run regression_replication ./tests/cluster/regression_replication.sh
 run follower_catchup ./tests/cluster/follower_catchup.sh
 run concurrent_produce_order ./tests/test_concurrent_produce_order.sh

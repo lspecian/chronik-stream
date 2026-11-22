@@ -256,6 +256,29 @@ spec:
                     description: Kubernetes StorageClass name.
                     type: string
                 type: object
+              tls:
+                description: 'TLS on the Kafka port (and the Unified API). Unset: plaintext.'
+                nullable: true
+                properties:
+                  requireClientCert:
+                    default: false
+                    description: |-
+                      Require clients to present a certificate signed by `ca.crt` (mTLS).
+                      Brokers and the operator present the broker certificate, so it must
+                      allow client authentication (no extended key usage, or `clientAuth`).
+                    type: boolean
+                  secretName:
+                    description: |-
+                      Secret with `tls.crt`, `tls.key` and `ca.crt` (the layout cert-manager
+                      writes). The certificate must name every broker's address
+                      (`<cluster>-<id>.<namespace>.svc.cluster.local`, or
+                      `<name>.<namespace>.svc.cluster.local` for a standalone), and `ca.crt`
+                      must be the CA that signed it: brokers and the operator verify each
+                      other against it.
+                    type: string
+                required:
+                - secretName
+                type: object
               tolerations:
                 default: []
                 description: Pod tolerations.

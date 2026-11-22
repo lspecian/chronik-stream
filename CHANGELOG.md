@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Operator: `spec.tls`** on ChronikCluster and ChronikStandalone. It mounts a
+  Secret with `tls.crt`, `tls.key` and `ca.crt` (cert-manager's layout) and
+  points the broker at it, optionally requiring client certificates
+  (`requireClientCert`). The operator then manages ChronikTopic and ChronikUser
+  over TLS, verifying the brokers against `ca.crt` and presenting the broker
+  certificate; before, there was no supported way to turn TLS on, and a
+  cluster with `CHRONIK_TLS_CERT` in `env` was refused. Clusters without
+  `spec.tls` keep their spec hash, so an operator upgrade restarts no broker.
+  The listener `tls`/`tlsSecret` fields, which nothing read, are documented as
+  unused. Verified by `tests/cluster/e2e/tls_cluster.sh` and a TLS + SASL + ACL
+  run of `operator_kafka_admin.sh`.
 - **DescribeClientQuotas** (API 48, v0-v1), answered with no quotas: the broker
   has none. `kafka-configs.sh --describe --entity-type users` calls it before
   listing SCRAM credentials and failed with "The node does not support
@@ -83,6 +94,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cluster whose Kafka port uses TLS replicated nothing.** Followers dialled
+  their leaders in plaintext; against a TLS port every replica fetch failed
+  (the TLS alert read as a 352 MB frame length, logged as "announced a
+  352518912-byte response frame"), every ISR shrank to its leader and
+  `acks=all` writes timed out, while clients saw a running cluster. Brokers now
+  connect to each other the way clients must: over TLS when `CHRONIK_TLS_CERT`
+  is set, verifying peers against `CHRONIK_TLS_CA_CERT` and presenting their own
+  certificate. A cluster node with TLS on and no CA refuses to start rather than
+  run without replicating. The same connection serves produce forwarding to a
+  partition leader, which over TLS or with SASL required also failed (it now
+  authenticates as `__chronik_broker` too), and distributed `/_sql`,
+  `/_search`, `/_vector` and `/_query` now reach peers over HTTPS when the
+  Unified API serves it (they used plain HTTP against the HTTPS port).
+- **Every client certificate authenticated as its CA.** The mTLS principal was
+  the first Common Name found anywhere in the certificate, which is the
+  issuer's (it precedes the subject), so all certificates a CA signed shared one
+  principal, `User:<CA name>`: an ACL for one certificate user applied to all
+  of them, and one naming the real subject never matched. The principal is now
+  the subject's CN, read by walking the certificate structure. A peer whose
+  certificate names the same principal as the broker's own certificate
+  authenticates as the broker (`__chronik_broker`), which is how brokers
+  sharing a certificate replicate on an mTLS cluster without SASL; until now
+  every such replica fetch was refused with `CLUSTER_AUTHORIZATION_FAILED`.
+  Give client certificates names distinct from the brokers'.
+- **`CHRONIK_TLS_REQUIRE_CLIENT_CERT` was ignored**: setting a CA
+  (`CHRONIK_TLS_CA_CERT`) made client certificates mandatory whatever it said.
+  A client certificate is now verified when offered and required only with the
+  flag; requiring one without a CA refuses to start.
 - **Consumer groups in a cluster are coordinated by one broker, with offsets
   replicated.** Every broker answered FindCoordinator with itself (as node id
   1) and kept membership and committed offsets locally, so a group's offsets

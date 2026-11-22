@@ -11,15 +11,15 @@ use kube::{Api, Client};
 
 use crate::constants::ports;
 use crate::crds::cluster::{sasl_setting_of, ChronikCluster, SaslSetting, INTER_BROKER_SECRET_ENV};
-use crate::crds::common::{EnvVar, SecretKeyRef};
+use crate::crds::common::{EnvVar, KafkaTlsSpec, SecretKeyRef};
 use crate::crds::standalone::ChronikStandalone;
 use crate::crds::topic::ClusterRef;
 use crate::error::OperatorError;
-use crate::kafka_admin::{Credentials, KafkaAccess};
+use crate::kafka_admin::{Credentials, KafkaAccess, KafkaTls};
 
 /// The broker-to-broker user, as the broker names it.
 const BROKER_USER: &str = chronik_scram::INTER_BROKER_USER;
-/// `CHRONIK_TLS_CERT` puts the Kafka port behind TLS.
+/// `CHRONIK_TLS_CERT` puts the Kafka port behind TLS (set by `spec.tls`, or by hand).
 const KAFKA_TLS_ENV: &str = "CHRONIK_TLS_CERT";
 
 /// Resolve a `clusterRef` (ChronikCluster or ChronikStandalone) to its Kafka
@@ -37,7 +37,7 @@ pub async fn resolve_kafka_access(
             let cluster = api.get(name).await.map_err(|e| {
                 OperatorError::NotFound(format!("ChronikCluster '{name}' not found: {e}"))
             })?;
-            refuse_tls(&cluster.spec.env)?;
+            let tls = kafka_tls(client, namespace, cluster.spec.tls.as_ref(), &cluster.spec.env).await?;
             let bootstrap = (1..=cluster.spec.replicas.max(1) as u64)
                 .map(|id| {
                     format!(
@@ -57,14 +57,14 @@ pub async fn resolve_kafka_access(
                     },
                 }),
             };
-            Ok(KafkaAccess { bootstrap, credentials: secret.map(broker_login) })
+            Ok(KafkaAccess { bootstrap, credentials: secret.map(broker_login), tls })
         }
         "ChronikStandalone" => {
             let api: Api<ChronikStandalone> = Api::namespaced(client.clone(), namespace);
             let standalone = api.get(name).await.map_err(|e| {
                 OperatorError::NotFound(format!("ChronikStandalone '{name}' not found: {e}"))
             })?;
-            refuse_tls(&standalone.spec.env)?;
+            let tls = kafka_tls(client, namespace, standalone.spec.tls.as_ref(), &standalone.spec.env).await?;
             let bootstrap = vec![format!("{name}.{namespace}.svc.cluster.local:{}", ports::KAFKA)];
             // A standalone has no operator-managed broker secret: the login
             // exists only if the user set CHRONIK_INTER_BROKER_SECRET.
@@ -75,7 +75,7 @@ pub async fn resolve_kafka_access(
                     None => return Err(no_secret(kind, name, setting)),
                 },
             };
-            Ok(KafkaAccess { bootstrap, credentials: secret.map(broker_login) })
+            Ok(KafkaAccess { bootstrap, credentials: secret.map(broker_login), tls })
         }
         other => Err(OperatorError::Config(format!(
             "Unsupported clusterRef kind: '{other}'. Expected 'ChronikCluster' or 'ChronikStandalone'"
@@ -90,11 +90,42 @@ fn broker_login(secret: String) -> Credentials {
     }
 }
 
+/// How the operator speaks TLS to the Kafka port: with `spec.tls`, the CA and
+/// certificate from its Secret. TLS configured only through env cannot be
+/// verified (the operator does not know the CA), so it is refused.
+async fn kafka_tls(
+    client: &Client,
+    namespace: &str,
+    tls: Option<&KafkaTlsSpec>,
+    env: &[EnvVar],
+) -> Result<Option<KafkaTls>, OperatorError> {
+    let Some(tls) = tls else {
+        refuse_tls(env)?;
+        return Ok(None);
+    };
+    let key = |key: &str| SecretKeyRef {
+        name: tls.secret_name.clone(),
+        key: key.into(),
+    };
+    Ok(Some(KafkaTls {
+        ca_pem: read_secret(client, namespace, &key("ca.crt"))
+            .await?
+            .into_bytes(),
+        cert_pem: read_secret(client, namespace, &key("tls.crt"))
+            .await?
+            .into_bytes(),
+        key_pem: read_secret(client, namespace, &key("tls.key"))
+            .await?
+            .into_bytes(),
+    }))
+}
+
 fn refuse_tls(env: &[EnvVar]) -> Result<(), OperatorError> {
     if env.iter().any(|e| e.name == KAFKA_TLS_ENV) {
         return Err(OperatorError::Config(format!(
-            "the Kafka port uses TLS ({KAFKA_TLS_ENV} is set); the operator cannot verify the \
-             broker certificate yet, so it does not manage topics or users on this cluster"
+            "the Kafka port uses TLS through env ({KAFKA_TLS_ENV}), so the operator cannot \
+             verify the brokers; configure spec.tls (a Secret with tls.crt, tls.key and ca.crt) \
+             instead and the operator manages topics and users over TLS"
         )));
     }
     Ok(())

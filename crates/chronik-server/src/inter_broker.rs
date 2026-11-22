@@ -47,10 +47,85 @@ pub fn secret() -> Option<&'static str> {
         .as_deref()
 }
 
+/// TLS for replica fetches, set once at cluster startup by [`configure_tls`].
+static TLS: OnceLock<Option<tokio_rustls::TlsConnector>> = OnceLock::new();
+
+/// Make replica fetches speak TLS when this node's Kafka port does: every
+/// broker of a cluster serves the same listener, so a follower must dial its
+/// leaders the way clients dial it. Before, followers always dialled in
+/// plaintext; against a TLS port every fetch failed, every ISR shrank to its
+/// leader, and `acks=all` writes timed out while clients saw a running cluster.
+///
+/// Refuses (the node does not start) when the port uses TLS but other brokers
+/// cannot be verified: no `CHRONIK_TLS_CA_CERT`, or unreadable files.
+pub fn configure_tls(listener: Option<&crate::tls::TlsConfig>) -> Result<(), String> {
+    let connector = match listener {
+        None => None,
+        Some(config) => Some(crate::tls::create_tls_connector(config).map_err(|e| {
+            format!(
+                "the Kafka port uses TLS (CHRONIK_TLS_CERT), so followers fetch from their leaders \
+                 over TLS, but that client cannot be built: {e:#}"
+            )
+        })?),
+    };
+    let _ = TLS.set(connector);
+
+    // Query fan-out reaches peers' Unified API, which serves HTTPS when this
+    // node's does (CHRONIK_API_TLS_*, or the Kafka listener's certificate).
+    let api = match crate::tls::api_tls_config() {
+        None => None,
+        Some(config) => Some(crate::tls::client_config(&config).map_err(|e| {
+            format!(
+                "the Unified API serves HTTPS, so queries fan out to peers over HTTPS, but that \
+                 client cannot be built: {e:#}"
+            )
+        })?),
+    };
+    let _ = API_TLS.set(api);
+    Ok(())
+}
+
+/// TLS for query fan-out to peers' Unified API, set by [`configure_tls`].
+static API_TLS: OnceLock<Option<rustls::ClientConfig>> = OnceLock::new();
+
+/// The client config for HTTPS to peers' Unified API, if it serves HTTPS.
+pub fn api_tls() -> Option<rustls::ClientConfig> {
+    API_TLS.get().and_then(Option::clone)
+}
+
+/// The TLS client for replica fetches, if this node's Kafka port uses TLS.
+pub fn tls() -> Option<&'static tokio_rustls::TlsConnector> {
+    TLS.get().and_then(Option::as_ref)
+}
+
+/// The identity of a connection that presented a verified client certificate.
+/// A peer whose certificate names the same principal as this broker's own
+/// (`CHRONIK_TLS_CERT`) is a broker: the handshake proved it holds a key the CA
+/// certified under that name, which is how brokers sharing one certificate (the
+/// operator's `spec.tls`) recognise each other. It authenticates as the broker
+/// principal, so it may replicate. Before, an mTLS cluster without SASL
+/// refused every replica fetch (CLUSTER_AUTHORIZATION_FAILED) and replicated
+/// nothing. The name, not the exact certificate, is compared, so brokers keep
+/// replicating while they restart one by one onto a renewed certificate.
+pub fn certificate_identity(certificate_principal: Option<String>) -> Option<String> {
+    static OWN: OnceLock<Option<String>> = OnceLock::new();
+    let own = OWN.get_or_init(|| {
+        crate::tls::TlsConfig::from_env().and_then(|c| crate::tls::certificate_file_principal(&c.cert_path))
+    });
+    identity_for(own.as_deref(), certificate_principal)
+}
+
+fn identity_for(own: Option<&str>, certificate_principal: Option<String>) -> Option<String> {
+    match certificate_principal {
+        Some(p) if own == Some(p.as_str()) => Some(principal()),
+        other => other,
+    }
+}
+
 /// The broker user the server accepts, or `None` when no secret is set.
 ///
 /// SCRAM-SHA-512 only. PLAIN would send the secret in the clear on every
-/// reconnect, and there is no TLS between brokers yet.
+/// reconnect when brokers do not use TLS.
 pub fn server_user() -> Option<SaslUser> {
     let secret = secret()?;
     match ScramCredential::derive(
@@ -105,6 +180,17 @@ pub fn check_cluster_startup(mode: SaslMode, secret: Option<&str>) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer presenting a certificate under this broker's name is a broker;
+    /// any other certificate keeps its own principal.
+    #[test]
+    fn a_certificate_under_the_broker_name_is_the_broker() {
+        let own = Some("User:chronik-broker");
+        assert_eq!(identity_for(own, Some("User:chronik-broker".into())), Some(principal()));
+        assert_eq!(identity_for(own, Some("User:alice".into())).as_deref(), Some("User:alice"));
+        assert_eq!(identity_for(own, None), None);
+        assert_eq!(identity_for(None, Some("User:alice".into())).as_deref(), Some("User:alice"));
+    }
 
     #[test]
     fn required_sasl_without_a_secret_refuses_to_start() {
