@@ -80,7 +80,7 @@ pub fn top_docs(
         return Ok(Vec::new());
     }
     let Some(fields) = RankFields::detect(searcher.schema()) else {
-        return searcher.search(query, &TopDocs::with_limit(limit));
+        return searcher.search(query, &TopDocs::with_limit(limit).order_by_score());
     };
     type Getter = Box<dyn Fn(DocId) -> i64 + Send + Sync>;
     let i64_col = |ff: &tantivy::fastfield::FastFieldReaders, name: &str| -> Getter {
