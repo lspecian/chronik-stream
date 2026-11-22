@@ -50,6 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`lru` 0.12 → 0.18 in the memory client** (RUSTSEC-2026-0253: possible
+  use-after-free when a panic interrupts `LruCache::pop`; RUSTSEC-2026-0002:
+  `IterMut` invalidates an internal pointer). Tantivy 0.24 still pins 0.12
+  for its search caches; it moves with the next tantivy upgrade, which changes
+  the index format. `rustls-pemfile` (unmaintained) replaced by the PEM parser
+  in `rustls-pki-types`. **rdkafka 0.36 → 0.40** (librdkafka 2.16.0) for the
+  memory client, bench and perf tools. `cargo audit`: one vulnerability left,
+  `rsa` via OpenDAL's Azure request signer (reqsign-azure-storage 3.3.1, the
+  latest, still pins rsa 0.9; the Marvin timing attack needs an attacker
+  measuring this process's RSA private-key operations, which only Azure
+  client-certificate authentication performs).
 - **Container images install the base OS security updates.** The server and
   operator images installed their few packages on top of `ubuntu:24.04` without
   upgrading it, and the release build reused that layer from its cache, so

@@ -15,8 +15,6 @@
 //! chronik-server start
 //! ```
 
-use std::fs::File;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
@@ -24,6 +22,7 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -96,35 +95,23 @@ impl TlsConfig {
 
 /// Load certificates from a PEM file
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path)
+    let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to open certificate file: {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("Failed to parse certificates from: {}", path.display()))?;
-
+        .map_err(|e| anyhow::anyhow!("Failed to parse certificates from {}: {e}", path.display()))?;
     if certs.is_empty() {
         anyhow::bail!("No certificates found in: {}", path.display());
     }
-
     Ok(certs)
 }
 
-/// Load private key from a PEM file
+/// Load the private key (PKCS#8, PKCS#1 or SEC1) from a PEM file
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(path)
+    let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to open private key file: {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-
-    // Try to read PKCS#8 key first, then RSA key, then EC key
-    let keys = rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("Failed to parse private key from: {}", path.display()))?;
-
-    match keys {
-        Some(key) => Ok(key),
-        None => anyhow::bail!("No private key found in: {}", path.display()),
-    }
+    PrivateKeyDer::from_pem_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("No private key read from {}: {e}", path.display()))
 }
 
 /// Install the process-wide rustls crypto provider.
