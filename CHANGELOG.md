@@ -15,6 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DESCRIBE_CLIENT_QUOTAS". AlterClientQuotas stays unadvertised, so setting a
   quota is refused by the client instead of accepted and never enforced.
 
+- **Disaster recovery from the object store works** (it never did: since 1.3.65
+  the uploader read paths the server no longer writes and the restore had no
+  caller). With S3, GCS or Azure, each node uploads, when they change, an image
+  of the cluster catalog (`dr/catalog/node-<id>.img`: topics, assignments,
+  configs, ACLs, SCRAM users, with its Raft index) and of its node-local
+  metadata (`dr/local/node-<id>.img`: consumer offsets and groups, segment and
+  Parquet records, watermarks, transactions) — snapshots, not the metadata
+  WAL. A blank data directory is restored before the catalog starts:
+  automatically for a single node; for a whole lost cluster with
+  `CHRONIK_DR_RESTORE=true` on every node, which all found the cluster on the
+  same catalog image (installed as the first Raft snapshot at its index). One
+  lost node of a running cluster rejoins from its peers as before. A node never
+  overwrites the images of another catalog incarnation, so a blank node started
+  against the bucket of a lost cluster leaves the backup alone. After a restore,
+  Parquet records whose local files were lost are dropped so columnar catch-up
+  rewrites them from the archive. `CHRONIK_DR_UPLOAD_INTERVAL_SECS` (default
+  60). Verified by `tests/cluster/e2e/dr_restore.sh` (single node: topics,
+  config, offsets, every record, `/_sql`) and `dr_cluster_restore.sh` (three
+  nodes, every disk lost: same image everywhere, SCRAM logins, records, offsets,
+  acks=all writes, full ISR), each with a control run that does not restore.
+  `docs/DISASTER_RECOVERY.md` rewritten.
+
 ### Security
 
 - **Container images install the base OS security updates.** The server and
@@ -58,30 +80,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (above). Raft messages travel as protobuf bytes, the same encoding under
   either prost, so nodes on either version form one cluster during a roll.
   Route paths use axum 0.8 syntax (`/{topic}`); the URLs are unchanged.
-
-### Added
-
-- **Disaster recovery from the object store works** (it never did: since 1.3.65
-  the uploader read paths the server no longer writes and the restore had no
-  caller). With S3, GCS or Azure, each node uploads, when they change, an image
-  of the cluster catalog (`dr/catalog/node-<id>.img`: topics, assignments,
-  configs, ACLs, SCRAM users, with its Raft index) and of its node-local
-  metadata (`dr/local/node-<id>.img`: consumer offsets and groups, segment and
-  Parquet records, watermarks, transactions) — snapshots, not the metadata
-  WAL. A blank data directory is restored before the catalog starts:
-  automatically for a single node; for a whole lost cluster with
-  `CHRONIK_DR_RESTORE=true` on every node, which all found the cluster on the
-  same catalog image (installed as the first Raft snapshot at its index). One
-  lost node of a running cluster rejoins from its peers as before. A node never
-  overwrites the images of another catalog incarnation, so a blank node started
-  against the bucket of a lost cluster leaves the backup alone. After a restore,
-  Parquet records whose local files were lost are dropped so columnar catch-up
-  rewrites them from the archive. `CHRONIK_DR_UPLOAD_INTERVAL_SECS` (default
-  60). Verified by `tests/cluster/e2e/dr_restore.sh` (single node: topics,
-  config, offsets, every record, `/_sql`) and `dr_cluster_restore.sh` (three
-  nodes, every disk lost: same image everywhere, SCRAM logins, records, offsets,
-  acks=all writes, full ISR), each with a control run that does not restore.
-  `docs/DISASTER_RECOVERY.md` rewritten.
 
 ### Known issues
 
