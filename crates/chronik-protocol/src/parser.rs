@@ -860,9 +860,8 @@ pub fn supported_api_versions() -> HashMap<ApiKey, VersionRange> {
     // this API's response schema. See the note above supported_api_versions.
     // versions.insert(ApiKey::ListPartitionReassignments, VersionRange { min: 0, max: 0 });
     versions.insert(ApiKey::OffsetDelete, VersionRange { min: 0, max: 0 });
-    // NOT advertised: only the catch-all answers it, and that body does not match
-    // this API's response schema. See the note above supported_api_versions.
-    // versions.insert(ApiKey::DescribeClientQuotas, VersionRange { min: 0, max: 0 });
+    // Answered with "no quotas" (the broker has none); see handle_describe_client_quotas.
+    versions.insert(ApiKey::DescribeClientQuotas, VersionRange { min: 0, max: 1 });
     // NOT advertised: only the catch-all answers it, and that body does not match
     // this API's response schema. See the note above supported_api_versions.
     // versions.insert(ApiKey::AlterClientQuotas, VersionRange { min: 0, max: 0 });

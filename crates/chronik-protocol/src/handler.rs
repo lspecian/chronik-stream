@@ -1730,6 +1730,7 @@ impl ProtocolHandler {
             // Other APIs
             ApiKey::ListOffsets => self.handle_list_offsets(header, &mut buf).await,
             ApiKey::DescribeCluster => self.handle_describe_cluster(header, &mut buf).await,
+            ApiKey::DescribeClientQuotas => self.handle_describe_client_quotas(header, &mut buf).await,
             
             // SASL authentication (partial support for compatibility)
             ApiKey::SaslHandshake => self.handle_sasl_handshake(header, &mut buf).await,
@@ -1769,7 +1770,6 @@ impl ProtocolHandler {
             ApiKey::ElectLeaders |
             ApiKey::AlterPartitionReassignments |
             ApiKey::ListPartitionReassignments |
-            ApiKey::DescribeClientQuotas |
             ApiKey::AlterClientQuotas |
             ApiKey::DescribeUserScramCredentials |
             ApiKey::AlterUserScramCredentials |
@@ -4888,6 +4888,59 @@ impl ProtocolHandler {
             header.api_version, CLUSTER_ID, self.broker_id, brokers.len(), body_bytes.len());
 
         Ok(Self::make_response(&header, ApiKey::DescribeCluster, body_bytes))
+    }
+
+    /// DescribeClientQuotas (API 48), v0-v1: no quotas.
+    ///
+    /// The broker has no client quotas: nothing to configure, nothing enforced.
+    /// Answering "no entries" is the truth, and what `kafka-configs.sh
+    /// --describe --entity-type users` needs: it asks for quotas before it lists
+    /// SCRAM credentials, and failed outright while the API was unadvertised.
+    /// AlterClientQuotas stays unadvertised, so setting a quota is refused by
+    /// the client rather than accepted and ignored.
+    async fn handle_describe_client_quotas(&self, header: RequestHeader, body: &mut Bytes) -> Result<Response> {
+        use crate::parser::{Decoder, Encoder};
+        use bytes::BytesMut;
+
+        if header.api_version > 1 {
+            return Err(Error::Protocol(format!("DescribeClientQuotas v{} not implemented", header.api_version)));
+        }
+        // Request: components [entity_type, match_type, match], strict. Read to
+        // reject a malformed request; with no quotas, every filter matches nothing.
+        let flexible = header.api_version >= 1;
+        let mut d = Decoder::new(body);
+        let count = if flexible {
+            (d.read_unsigned_varint()? as i64) - 1
+        } else {
+            d.read_i32()? as i64
+        };
+        for _ in 0..count.max(0) {
+            if flexible {
+                d.read_compact_string()?;
+                d.read_i8()?;
+                d.read_compact_string()?;
+                d.read_unsigned_varint()?; // component tagged fields
+            } else {
+                d.read_string()?;
+                d.read_i8()?;
+                d.read_string()?;
+            }
+        }
+        let _strict = d.read_i8()?;
+
+        let mut out = BytesMut::new();
+        let mut e = Encoder::new(&mut out);
+        e.write_i32(0); // throttle_time_ms
+        e.write_i16(0); // error_code
+        if flexible {
+            e.write_compact_string(None); // error_message
+            e.write_unsigned_varint(1); // entries: empty compact array
+            e.write_unsigned_varint(0); // tagged fields
+        } else {
+            e.write_string(None); // error_message
+            e.write_i32(0); // entries: empty array
+        }
+        Ok(Self::make_response(&header, ApiKey::DescribeClientQuotas, out.freeze()))
     }
 
     /// Handle JoinGroup request

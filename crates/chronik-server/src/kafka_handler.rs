@@ -642,7 +642,7 @@ impl KafkaProtocolHandler {
         let results = match &request.users {
             // Named users: report each, including RESOURCE_NOT_FOUND for one
             // that does not exist, which is what kafka-configs.sh expects.
-            Some(users) => users
+            Some(users) if !users.is_empty() => users
                 .iter()
                 .map(|u| match by_user.get(&u.name) {
                     Some(infos) => DescribeUserScramCredentialsResult {
@@ -653,14 +653,16 @@ impl KafkaProtocolHandler {
                     },
                     None => DescribeUserScramCredentialsResult {
                         user: u.name.clone(),
-                        error_code: 89, // RESOURCE_NOT_FOUND
+                        error_code: 91, // RESOURCE_NOT_FOUND (89 is THROTTLING_QUOTA_EXCEEDED)
                         error_message: Some("User not found".to_string()),
                         credential_infos: Vec::new(),
                     },
                 })
                 .collect(),
-            // All users.
-            None => by_user
+            // All users: a null list or, as Kafka also reads it, an empty one
+            // (`kafka-configs.sh --describe --entity-type users` sends that, and
+            // listed nobody while only null meant "all").
+            _ => by_user
                 .into_iter()
                 .map(|(user, credential_infos)| DescribeUserScramCredentialsResult {
                     user,
