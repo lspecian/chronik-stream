@@ -91,9 +91,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   group's offsets depend on which broker its clients reach, and members of one
   group that bootstrap through different brokers each get every partition.
   Single-node deployments are unaffected.
-- `kafka-configs.sh --describe --entity-type users` fails: it calls
-  DescribeClientQuotas, which the broker does not implement. Users and their
-  SCRAM credentials work (`--alter`, logins); only this listing fails.
 
 ### Fixed
 
