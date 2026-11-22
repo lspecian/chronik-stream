@@ -185,9 +185,9 @@ Chronik implements a 3-tier storage system for infinite retention:
 
 **Write**: Producer → WAL (fsync) → Segments (background) → Tantivy (indexer, every 30s)
 **Read**: Try WAL → Try Segments (cached) → Try Tantivy (S3 download) → Metadata fallback
-**Metadata DR**: NOT working — the uploader reads paths no longer written (uploads nothing) and the restore is never called; see the status note in docs/DISASTER_RECOVERY.md
+**Metadata DR**: each node uploads its catalog image (`dr/catalog/node-<id>.img`) and node-local metadata image (`dr/local/node-<id>.img`) when they change (`CHRONIK_DR_UPLOAD_INTERVAL_SECS`, default 60); remote object stores only
 
-**Disaster Recovery**: message data is archived to S3/GCS/Azure and read back from it (`tests/cluster/e2e/s3_roundtrip.sh`). Recovering a node from an empty data directory does NOT work yet (no catalog restore). See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md).
+**Disaster Recovery**: a blank single node restores from the bucket automatically; a whole lost cluster restores with `CHRONIK_DR_RESTORE=true` on every node (one lost cluster node rejoins via remove-node/add-node/`CHRONIK_CLUSTER_JOIN` instead). Tests: `tests/cluster/e2e/dr_restore.sh`, `dr_cluster_restore.sh`. See [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md).
 
 **vs. Kafka Tiered Storage**: Chronik Tier 3 provides full-text search on archived data (Tantivy indexes), not just offset-based retrieval. Query old messages by content without scanning.
 
@@ -1014,6 +1014,8 @@ Key environment variables:
 - `CHRONIK_BACKGROUND_THREADS` - Threads for background CPU work such as rebuilding HNSW vector indexes at boot (default: half the cores the process may use, at least 1). Those threads, and the WAL indexer's, run at nice 10 so request handling is scheduled first. Lower it if produce latency suffers right after a restart; raise it to finish rebuilds faster on an idle node.
 - `CHRONIK_CLUSTER_JOIN` - `true` on a node added with `cluster add-node`: it starts with an empty catalog and is brought up to date by the leader instead of founding a cluster from its config. Leave unset on founding nodes.
 - `CHRONIK_CATALOG_SNAPSHOT_EVERY` - Catalog Raft snapshot interval in applied entries (default 10000).
+- `CHRONIK_DR_RESTORE` - Restore a blank data directory from the object store: `auto` (default; single node only), `true` (also cluster nodes, for a whole lost cluster; fails if there is no image), `false`.
+- `CHRONIK_DR_UPLOAD_INTERVAL_SECS` - How often changed disaster-recovery images are uploaded (default 60). Remote object stores only.
 - `CHRONIK_FAULT_FILE` - Test-only: fault injection on catalog Raft traffic (see Cluster Catalog on Raft). Never set in production.
 - `CHRONIK_ADMIN_API_KEY` - API key for admin API authentication (Priority 2, **REQUIRED for production**)
 - `CHRONIK_ADMIN_TLS_CERT` / `CHRONIK_ADMIN_TLS_KEY` - **NOT IMPLEMENTED.** Setting either logs a warning ("axum-server crate not available") and the admin API still serves plain **HTTP**. The whole Unified API (6092) is plaintext; there is no HTTPS anywhere yet. Tracked as Phase 4 in [docs/ROADMAP_SECURITY.md](docs/ROADMAP_SECURITY.md).

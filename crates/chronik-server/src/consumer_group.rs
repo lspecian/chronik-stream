@@ -2265,8 +2265,32 @@ impl GroupManager {
 
             response_topics
         } else {
-            // Return empty response if no topics specified
-            vec![]
+            // No topic list means every committed offset of the group: what
+            // `kafka-consumer-groups --describe`, Kafka UI and lag monitors ask
+            // for. Answering nothing made every group look offset-less to them
+            // while consumers resumed correctly.
+            let mut by_topic: std::collections::BTreeMap<String, Vec<OffsetFetchResponsePartition>> =
+                std::collections::BTreeMap::new();
+            match self.metadata_store.list_consumer_offsets(&request.group_id).await {
+                Ok(offsets) => {
+                    for o in offsets {
+                        by_topic.entry(o.topic.clone()).or_default().push(OffsetFetchResponsePartition {
+                            partition_index: o.partition as i32,
+                            committed_offset: o.offset,
+                            metadata: o.metadata,
+                            error_code: 0,
+                        });
+                    }
+                }
+                Err(e) => warn!("Listing committed offsets of group {} failed: {}", request.group_id, e),
+            }
+            by_topic
+                .into_iter()
+                .map(|(name, mut partitions)| {
+                    partitions.sort_by_key(|p| p.partition_index);
+                    OffsetFetchResponseTopic { name, partitions }
+                })
+                .collect()
         };
 
         Ok(chronik_protocol::types::OffsetFetchResponse {

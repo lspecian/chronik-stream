@@ -88,7 +88,6 @@ pub struct IntegratedKafkaServerBuilder {
 
 
     // Metadata DR (Stage 5)
-    metadata_uploader: Option<Arc<chronik_common::metadata::MetadataUploader>>,
 
     // Follower-pull replication (Stage 16, RP-2.4). Held so the fetcher lives
     // as long as the server rather than being dropped at the end of build().
@@ -133,7 +132,6 @@ impl IntegratedKafkaServerBuilder {
             hot_text_index: None,
             hot_vector_index: None,
             hot_vector_batcher_slot: None,
-            metadata_uploader: None,
             replica_fetcher: None,
             partition_failover: None,
             isr_publisher: None,
@@ -181,12 +179,22 @@ impl IntegratedKafkaServerBuilder {
             .context("data_dir not initialized - call init_directories() first")?;
         if self.cluster_catalog.is_none() {
             let node_id = self.config.node_id as u64;
-            let config = crate::cluster_catalog::ClusterCatalogConfig::new(
+            let mut config = crate::cluster_catalog::ClusterCatalogConfig::new(
                 node_id,
                 data_dir.join("catalog-raft"),
                 vec![(node_id, "127.0.0.1:0".to_string())],
                 vec![node_id],
             );
+            // A blank single node restores its metadata from the object store
+            // (disaster recovery), before the catalog starts.
+            config.bootstrap = crate::metadata_dr::restore_if_blank(
+                data_dir,
+                node_id,
+                None,
+                self.config.object_store_config.as_ref(),
+            )
+            .await
+            .context("restoring metadata from the object store")?;
             let catalog = crate::cluster_catalog::ClusterCatalog::start(
                 config,
                 crate::cluster::catalog_setup::catalog_runtime().handle().clone(),
@@ -268,6 +276,12 @@ impl IntegratedKafkaServerBuilder {
         wal_metadata_store.set_event_bus(event_bus_publish_fn);
 
         info!("✅ WalMetadataStore created with event bus wiring");
+
+        // A node restored from the object store starts from that state; the
+        // metadata WAL (empty at restore) replays on top of it.
+        crate::metadata_dr::load_local_base_state(self.data_dir.as_ref().context("data_dir not initialized")?, &wal_metadata_store)
+            .await
+            .context("loading restored node-local metadata")?;
 
         // Recover metadata state from WAL before wrapping in Arc
         info!("Recovering metadata state from WAL...");
@@ -566,6 +580,16 @@ impl IntegratedKafkaServerBuilder {
         self.storage_config = Some(storage_config);
         self.storage_service = Some(storage_service);
         self.segment_reader = Some(segment_reader);
+
+        // First boot after a disaster-recovery restore: drop restored records of
+        // files that did not survive, before anything reads them.
+        if let (Some(data_dir), Some(metadata), Some(store)) =
+            (self.data_dir.as_ref(), self.metadata_store.as_ref(), self.object_store.as_ref())
+        {
+            crate::metadata_dr::reconcile_after_restore(data_dir, metadata.as_ref(), store.as_ref())
+                .await
+                .context("reconciling restored metadata")?;
+        }
 
         info!("✅ Storage layer initialized (ObjectStore + StorageService + SegmentReader)");
         Ok(())
@@ -1658,65 +1682,31 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
-    /// Stage 14: Initialize MetadataUploader for disaster recovery
-    /// Complexity: < 15 (configuration and conditional startup)
+    /// Stage 14: Start disaster-recovery uploads (remote object stores only):
+    /// this node's catalog and local metadata images, whenever they change.
     async fn init_metadata_uploader(&mut self) -> Result<()> {
-        info!("Stage 14: Initializing Metadata Uploader (if enabled)");
-
-        let object_store = self.object_store.as_ref()
-            .context("object_store not initialized")?;
+        info!("Stage 14: Disaster-recovery metadata uploads");
         let storage_config = self.storage_config.as_ref()
             .context("storage_config not initialized")?;
-
-        // Only enable for remote object stores (S3/GCS/Azure)
-        let is_remote_object_store = matches!(
-            storage_config.object_store_config.backend,
-            chronik_storage::object_store::StorageBackend::S3 { .. } |
-            chronik_storage::object_store::StorageBackend::Gcs { .. } |
-            chronik_storage::object_store::StorageBackend::Azure { .. }
+        if !self.config.enable_metadata_dr {
+            info!("Disaster-recovery uploads disabled by configuration");
+            return Ok(());
+        }
+        if !crate::metadata_dr::is_remote(&storage_config.object_store_config) {
+            info!("Disaster-recovery uploads off: the object store is local, on the same disk as the data");
+            return Ok(());
+        }
+        let object_store = self.object_store.clone().context("object_store not initialized")?;
+        let catalog = self.cluster_catalog.clone().context("cluster catalog not initialized")?;
+        let local = self.wal_metadata_store.clone().context("metadata store not initialized")?;
+        let interval = std::time::Duration::from_secs(self.config.metadata_upload_interval_secs.max(1));
+        let data_dir = self.data_dir.as_ref().context("data_dir not initialized")?;
+        let incarnation = crate::metadata_dr::incarnation(data_dir).context("disaster-recovery incarnation")?;
+        crate::metadata_dr::spawn_uploader(object_store, catalog, local, self.config.node_id as u64, incarnation, interval);
+        info!(
+            "Disaster-recovery uploads every {}s to dr/catalog/ and dr/local/ in the object store",
+            interval.as_secs()
         );
-
-        let metadata_uploader = if self.config.enable_metadata_dr && is_remote_object_store {
-            info!("Initializing Metadata Uploader for disaster recovery (metadata WAL → Object Store)");
-
-            let uploader_config = chronik_common::metadata::MetadataUploaderConfig {
-                upload_interval_secs: self.config.metadata_upload_interval_secs,
-                wal_base_path: "metadata-wal".to_string(),
-                snapshot_base_path: "metadata-snapshots".to_string(),
-                delete_after_upload: false, // Keep local WAL for redundancy
-                delete_old_snapshots: true,
-                keep_local_snapshot_count: 2,
-                enabled: true,
-            };
-
-            let uploader = Arc::new(crate::metadata_dr::create_metadata_uploader(
-                object_store.clone(),
-                &self.config.data_dir,
-                uploader_config,
-            ));
-
-            // Start the background upload task
-            uploader.start().await
-                .map_err(|e| anyhow::anyhow!("Failed to start metadata uploader: {}", e))?;
-
-            info!("Metadata Uploader started successfully (interval: {}s)", self.config.metadata_upload_interval_secs);
-            info!("  Metadata WAL and snapshots will be uploaded to object store for disaster recovery");
-
-            Some(uploader)
-        } else {
-            if !is_remote_object_store {
-                info!("Metadata Uploader disabled (local filesystem backend - no DR benefit)");
-                info!("  Local metadata already persists to disk and survives restarts");
-                info!("  For true DR, configure S3/GCS/Azure object store");
-            } else {
-                info!("Metadata Uploader disabled by configuration");
-            }
-            None
-        };
-
-        self.metadata_uploader = metadata_uploader;
-
-        info!("✅ Metadata Uploader initialization complete");
         Ok(())
     }
 
@@ -2130,7 +2120,6 @@ impl IntegratedKafkaServerBuilder {
         let kafka_handler = self.kafka_handler.unwrap();
         let metadata_store = self.metadata_store.unwrap();
         let wal_indexer = self.wal_indexer.unwrap();
-        let metadata_uploader = self.metadata_uploader;
         let isr_tracker = self.isr_tracker;
         let hot_text_index = self.hot_text_index;
         let hot_vector_index = self.hot_vector_index;
@@ -2141,7 +2130,6 @@ impl IntegratedKafkaServerBuilder {
             kafka_handler,
             metadata_store,
             wal_indexer,
-            metadata_uploader,
             isr_tracker,
             hot_text_index,
             hot_vector_index,
@@ -2410,10 +2398,8 @@ mod tests {
         builder.init_directories().await.unwrap();
         builder.init_metadata_wal().await.unwrap();
         builder.init_storage().await.unwrap();
+        // A local backend starts no uploads (the "bucket" is on the same disk).
         builder.init_metadata_uploader().await.unwrap();
-
-        // For local backend, metadata_uploader should be None
-        assert!(builder.metadata_uploader.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

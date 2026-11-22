@@ -407,6 +407,10 @@ impl MetadataStore for CatalogMetadataStore {
         self.local.get_consumer_offset(group_id, topic, partition).await
     }
 
+    async fn list_consumer_offsets(&self, group_id: &str) -> Result<Vec<ConsumerOffset>> {
+        self.local.list_consumer_offsets(group_id).await
+    }
+
     async fn commit_transactional_offsets(
         &self,
         transactional_id: String,

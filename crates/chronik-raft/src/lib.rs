@@ -21,7 +21,7 @@ pub mod transport;
 
 pub use config::RaftConfig;
 pub use error::{RaftError, Result};
-pub use driver::{Applied, DriverConfig, Outbox, ProposeError, RaftDriver, RaftHandle, RaftStatus, StateMachine};
+pub use driver::{Applied, BootstrapSnapshot, DriverConfig, Outbox, ProposeError, RaftDriver, RaftHandle, RaftStatus, StateMachine};
 pub use log_store::{LogStoreOptions, RaftLogStore};
 pub use storage::{RaftEntry, RaftLogStorage, MemoryLogStorage, RAFT_TOPIC, RAFT_PARTITION};
 pub use transport::{Transport, GrpcTransport, InMemoryTransport, InMemoryRouter};

@@ -1621,6 +1621,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap 5.5.3",
+ "flate2",
  "parking_lot 0.12.5",
  "prometheus",
  "serde",
