@@ -2370,6 +2370,28 @@ impl GroupCommitWal {
             })
     }
 
+    /// Seal a partition's active segment (when it holds data) and start a new
+    /// one. Returns the id of the segment now active, or `None` when nothing
+    /// was written to the partition since boot (every segment on disk is then
+    /// from an earlier run, and the next write starts a new one after them).
+    /// The caller stops appends to the partition meanwhile if it relies on
+    /// "every segment below the returned id holds only earlier records".
+    pub async fn seal_partition(&self, topic: &str, partition: i32) -> Result<Option<u64>> {
+        let Some(queue) = self.partition_queues.get(&(topic.to_string(), partition)).map(|q| q.clone()) else {
+            return Ok(None);
+        };
+        Self::force_seal_segment(
+            &queue,
+            &self.sealed_segments,
+            &self.base_dir,
+            true,
+            #[cfg(all(target_os = "linux", feature = "async-io"))]
+            &self.io_uring_handle,
+        )
+        .await?;
+        Ok(Some(queue.segment_id.load(Ordering::Relaxed)))
+    }
+
     /// Get the base directory for WAL files
     pub fn base_dir(&self) -> &Path {
         &self.base_dir

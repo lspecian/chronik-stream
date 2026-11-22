@@ -666,10 +666,29 @@ pub struct AssignmentContext {
 }
 
 /// Consumer group manager with metadata store integration
+/// Who coordinates consumer groups and transactional ids.
+///
+/// Before the catalog holds group offsets every broker coordinates the groups
+/// whose clients reach it (offsets on that broker). After, one broker — the
+/// catalog leader — coordinates every group, and offsets are replicated.
+pub trait Coordination: Send + Sync {
+    /// `None` while coordination is per broker; otherwise whether this broker
+    /// is the coordinator.
+    fn is_local(&self) -> Option<bool>;
+    /// The coordinator's (node id, host, port), when one is known.
+    fn coordinator(&self) -> Option<(i32, String, i32)>;
+}
+
+/// Kafka's NOT_COORDINATOR: the client looks the coordinator up again.
+pub const NOT_COORDINATOR: i16 = 16;
+/// Kafka's COORDINATOR_NOT_AVAILABLE.
+pub const COORDINATOR_NOT_AVAILABLE: i16 = 15;
+
 pub struct GroupManager {
     groups: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
     metadata_store: Arc<dyn MetadataStore>,
     assignor: Arc<Mutex<Box<dyn PartitionAssignor>>>,
+    coordination: Arc<std::sync::OnceLock<Arc<dyn Coordination>>>,
 }
 
 impl GroupManager {
@@ -679,7 +698,33 @@ impl GroupManager {
             groups: Arc::new(RwLock::new(HashMap::new())),
             metadata_store,
             assignor: Arc::new(Mutex::new(Box::new(CooperativeStickyAssignor::new()))),
+            coordination: Default::default(),
         }
+    }
+
+    /// Who coordinates groups (set once, when the cluster catalog is up).
+    pub fn set_coordination(&self, coordination: Arc<dyn Coordination>) {
+        let _ = self.coordination.set(coordination);
+    }
+
+    /// `None` while every broker coordinates its own clients' groups.
+    pub fn coordination_is_local(&self) -> Option<bool> {
+        self.coordination.get().and_then(|c| c.is_local())
+    }
+
+    /// True when another broker coordinates groups. Groups this broker held
+    /// while it coordinated are dropped: their members rejoin the coordinator,
+    /// and their offsets are in the catalog.
+    pub async fn not_coordinator(&self) -> bool {
+        if self.coordination_is_local() == Some(false) {
+            let mut groups = self.groups.write().await;
+            if !groups.is_empty() {
+                info!("No longer the group coordinator: dropping {} group(s); members rejoin the coordinator", groups.len());
+                groups.clear();
+            }
+            return true;
+        }
+        false
     }
     
     /// Set the partition assignment strategy
@@ -763,6 +808,12 @@ impl GroupManager {
             Err(e) => {
                 warn!(error = %e, "ListGroups: could not read persisted consumer groups");
             }
+        }
+
+        // Groups known only by their committed offsets.
+        match self.metadata_store.list_offset_groups().await {
+            Ok(ids) => group_ids.extend(ids),
+            Err(e) => warn!(error = %e, "ListGroups: could not list groups with committed offsets"),
         }
 
         group_ids.sort();
@@ -856,7 +907,13 @@ impl GroupManager {
         }
         // Not in memory — check durable metadata (offsets-only / restarted groups).
         match self.metadata_store.get_consumer_group(group_id).await {
-            Ok(Some(_)) => Some(false), // persisted groups have no live members
+            Ok(Some(_)) => return Some(false), // persisted groups have no live members
+            _ => {}
+        }
+        // A group known only by its committed offsets (after a coordinator
+        // change, or one that never kept members on this broker).
+        match self.metadata_store.list_consumer_offsets(group_id).await {
+            Ok(offsets) if !offsets.is_empty() => Some(false),
             _ => None,
         }
     }
@@ -1892,6 +1949,18 @@ impl GroupManager {
         header_client_id: Option<String>,
         api_version: i16,
     ) -> Result<chronik_protocol::join_group_types::JoinGroupResponse> {
+        if self.not_coordinator().await {
+            return Ok(chronik_protocol::join_group_types::JoinGroupResponse {
+                throttle_time_ms: 0,
+                error_code: NOT_COORDINATOR,
+                generation_id: -1,
+                protocol_type: None,
+                protocol_name: None,
+                leader: String::new(),
+                member_id: request.member_id.clone(),
+                members: Vec::new(),
+            });
+        }
         use std::time::Duration;
 
         // Use client_id from request header (most reliable source for dynamic membership)
@@ -1984,6 +2053,15 @@ impl GroupManager {
     }
     
     pub async fn handle_sync_group(&self, request: chronik_protocol::sync_group_types::SyncGroupRequest) -> Result<chronik_protocol::sync_group_types::SyncGroupResponse> {
+        if self.not_coordinator().await {
+            return Ok(chronik_protocol::sync_group_types::SyncGroupResponse {
+                throttle_time_ms: 0,
+                error_code: NOT_COORDINATOR,
+                protocol_type: None,
+                protocol_name: None,
+                assignment: bytes::Bytes::new(),
+            });
+        }
         // Clone values we'll need for logging later
         let group_id_for_log = request.group_id.clone();
         let member_id_for_log = request.member_id.clone();
@@ -2035,6 +2113,9 @@ impl GroupManager {
     }
     
     pub async fn handle_heartbeat(&self, request: chronik_protocol::heartbeat_types::HeartbeatRequest) -> Result<chronik_protocol::heartbeat_types::HeartbeatResponse> {
+        if self.not_coordinator().await {
+            return Ok(chronik_protocol::heartbeat_types::HeartbeatResponse { throttle_time_ms: 0, error_code: NOT_COORDINATOR });
+        }
         // Call the real heartbeat implementation to update member's last_heartbeat timestamp
         let heartbeat_response = self.heartbeat(
             request.group_id,
@@ -2051,6 +2132,13 @@ impl GroupManager {
     
     pub async fn handle_leave_group(&self, request: chronik_protocol::leave_group_types::LeaveGroupRequest) -> Result<chronik_protocol::leave_group_types::LeaveGroupResponse> {
         use chronik_protocol::leave_group_types::MemberResponse;
+        if self.not_coordinator().await {
+            return Ok(chronik_protocol::leave_group_types::LeaveGroupResponse {
+                throttle_time_ms: 0,
+                error_code: NOT_COORDINATOR,
+                members: Vec::new(),
+            });
+        }
 
         // Actually remove them. This used to build the response below and
         // return, never calling `leave_group` — which was implemented, correct,
@@ -2106,6 +2194,24 @@ impl GroupManager {
     
     pub async fn handle_offset_commit(&self, request: chronik_protocol::types::OffsetCommitRequest) -> Result<chronik_protocol::types::OffsetCommitResponse> {
         use chronik_protocol::types::{OffsetCommitResponseTopic, OffsetCommitResponsePartition};
+        if self.not_coordinator().await {
+            return Ok(chronik_protocol::types::OffsetCommitResponse {
+                header: chronik_protocol::parser::ResponseHeader { correlation_id: 0 },
+                throttle_time_ms: 0,
+                topics: request
+                    .topics
+                    .iter()
+                    .map(|t| OffsetCommitResponseTopic {
+                        name: t.name.clone(),
+                        partitions: t
+                            .partitions
+                            .iter()
+                            .map(|p| OffsetCommitResponsePartition { partition_index: p.partition_index, error_code: NOT_COORDINATOR })
+                            .collect(),
+                    })
+                    .collect(),
+            });
+        }
 
         info!("OffsetCommit for group: {}", request.group_id);
 
@@ -2178,6 +2284,15 @@ impl GroupManager {
     
     pub async fn handle_offset_fetch(&self, request: chronik_protocol::types::OffsetFetchRequest) -> Result<chronik_protocol::types::OffsetFetchResponse> {
         use chronik_protocol::types::{OffsetFetchResponseTopic, OffsetFetchResponsePartition};
+        if self.not_coordinator().await {
+            return Ok(chronik_protocol::types::OffsetFetchResponse {
+                header: chronik_protocol::parser::ResponseHeader { correlation_id: 0 },
+                throttle_time_ms: 0,
+                topics: Vec::new(),
+                group_id: Some(request.group_id.clone()),
+                error_code: NOT_COORDINATOR,
+            });
+        }
 
         info!("OffsetFetch for group: {}", request.group_id);
 
@@ -2300,27 +2415,50 @@ impl GroupManager {
             throttle_time_ms: 0,
             topics,
             group_id: Some(request.group_id.clone()),  // v8+ requires group_id
+            error_code: 0,
         })
     }
     
-    pub fn handle_find_coordinator(&self, request: chronik_protocol::find_coordinator_types::FindCoordinatorRequest, host: &str, port: i32) -> Result<chronik_protocol::find_coordinator_types::FindCoordinatorResponse> {
-        // Create coordinator entry for v4+
+    /// The coordinator for a group or a transactional id: the catalog leader once
+    /// the catalog holds group offsets, this broker before that.
+    pub fn handle_find_coordinator(
+        &self,
+        request: chronik_protocol::find_coordinator_types::FindCoordinatorRequest,
+        node_id: i32,
+        host: &str,
+        port: i32,
+    ) -> Result<chronik_protocol::find_coordinator_types::FindCoordinatorResponse> {
+        let (error_code, error_message, node_id, host, port) = match self.coordination.get() {
+            // Another broker coordinates: name it (this broker answers itself
+            // when it is the coordinator, or while coordination is per broker).
+            Some(c) if c.is_local() == Some(false) => match c.coordinator() {
+                Some((id, h, p)) => (0, None, id, h, p),
+                None => (
+                    COORDINATOR_NOT_AVAILABLE,
+                    Some("no catalog leader yet".to_string()),
+                    -1,
+                    String::new(),
+                    -1,
+                ),
+            },
+            _ => (0, None, node_id, host.to_string(), port),
+        };
         let coordinator = chronik_protocol::find_coordinator_types::Coordinator {
             key: request.key,
-            node_id: 1,
-            host: host.to_string(),
+            node_id,
+            host: host.clone(),
             port,
-            error_code: 0,
-            error_message: None,
+            error_code,
+            error_message: error_message.clone(),
         };
 
         Ok(chronik_protocol::find_coordinator_types::FindCoordinatorResponse {
             throttle_time_ms: 0,
             // v0-v3 fields
-            error_code: 0,
-            error_message: None,
-            node_id: 1,
-            host: host.to_string(),
+            error_code,
+            error_message,
+            node_id,
+            host,
             port,
             // v4+ fields
             coordinators: vec![coordinator],
@@ -2746,6 +2884,88 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use chronik_common::metadata::InMemoryMetadataStore;
+
+    /// Coordination fixed for a test: `local` is what `is_local` answers.
+    struct FixedCoordination {
+        local: Option<bool>,
+    }
+
+    impl Coordination for FixedCoordination {
+        fn is_local(&self) -> Option<bool> {
+            self.local
+        }
+        fn coordinator(&self) -> Option<(i32, String, i32)> {
+            self.local.map(|_| (2, "broker-2".to_string(), 9093))
+        }
+    }
+
+    fn manager_with(local: Option<bool>) -> Arc<GroupManager> {
+        let manager = Arc::new(GroupManager::new(Arc::new(InMemoryMetadataStore::new())));
+        manager.set_coordination(Arc::new(FixedCoordination { local }));
+        manager
+    }
+
+    fn find(key: &str) -> chronik_protocol::find_coordinator_types::FindCoordinatorRequest {
+        chronik_protocol::find_coordinator_types::FindCoordinatorRequest { key: key.into(), key_type: 0 }
+    }
+
+    /// Another broker coordinates: FindCoordinator names it, and the group APIs
+    /// answer NOT_COORDINATOR so the client goes there.
+    #[tokio::test]
+    async fn a_broker_that_does_not_coordinate_sends_clients_to_the_one_that_does() {
+        let m = manager_with(Some(false));
+        let r = m.handle_find_coordinator(find("g"), 1, "broker-1", 9092).unwrap();
+        assert_eq!((r.error_code, r.node_id, r.host.as_str(), r.port), (0, 2, "broker-2", 9093));
+        assert_eq!(r.coordinators[0].node_id, 2);
+
+        let hb = m
+            .handle_heartbeat(chronik_protocol::heartbeat_types::HeartbeatRequest {
+                group_id: "g".into(),
+                generation_id: 1,
+                member_id: "m".into(),
+                group_instance_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hb.error_code, NOT_COORDINATOR);
+
+        let commit = m
+            .handle_offset_commit(chronik_protocol::types::OffsetCommitRequest {
+                group_id: "g".into(),
+                generation_id: -1,
+                member_id: String::new(),
+                topics: vec![chronik_protocol::types::OffsetCommitTopic {
+                    name: "t".into(),
+                    partitions: vec![chronik_protocol::types::OffsetCommitPartition {
+                        partition_index: 0,
+                        committed_offset: 5,
+                        committed_metadata: None,
+                    }],
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(commit.topics[0].partitions[0].error_code, NOT_COORDINATOR);
+
+        let fetch = m
+            .handle_offset_fetch(chronik_protocol::types::OffsetFetchRequest { group_id: "g".into(), topics: None })
+            .await
+            .unwrap();
+        assert_eq!(fetch.error_code, NOT_COORDINATOR);
+    }
+
+    /// Coordination per broker (feature off): this broker answers for itself,
+    /// under its own node id (it once said 1 on every broker).
+    #[tokio::test]
+    async fn before_the_feature_each_broker_coordinates_under_its_own_id() {
+        let m = manager_with(None);
+        let r = m.handle_find_coordinator(find("g"), 3, "broker-3", 9094).unwrap();
+        assert_eq!((r.error_code, r.node_id, r.host.as_str(), r.port), (0, 3, "broker-3", 9094));
+        let local = manager_with(Some(true));
+        let r = local.handle_find_coordinator(find("g"), 2, "broker-2", 9093).unwrap();
+        assert_eq!((r.node_id, r.port), (2, 9093));
+        assert!(!local.not_coordinator().await);
+    }
 
     #[tokio::test]
     async fn test_consumer_group_lifecycle() {

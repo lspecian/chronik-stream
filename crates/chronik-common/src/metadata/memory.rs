@@ -290,6 +290,14 @@ impl MetadataStore for InMemoryMetadataStore {
         let offsets = self.consumer_offsets.read().await;
         Ok(offsets.iter().filter(|((g, _, _), _)| g == group_id).map(|(_, o)| o.clone()).collect())
     }
+
+    async fn list_offset_groups(&self) -> Result<Vec<String>> {
+        let offsets = self.consumer_offsets.read().await;
+        let mut groups: Vec<String> = offsets.keys().map(|(g, _, _)| g.clone()).collect();
+        groups.sort();
+        groups.dedup();
+        Ok(groups)
+    }
     
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()> {
         let mut offsets = self.partition_offsets.write().await;

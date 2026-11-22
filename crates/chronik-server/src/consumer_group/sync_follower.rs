@@ -71,6 +71,7 @@ impl FollowerSync {
                             groups: groups_clone.clone(),
                             metadata_store: metadata_store_clone.clone(),
                             assignor: assignor_clone.clone(),
+                            coordination: Default::default(),
                         };
 
                         match manager.compute_assignments(group).await {

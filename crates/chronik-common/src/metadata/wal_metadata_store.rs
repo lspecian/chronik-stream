@@ -94,6 +94,11 @@ pub struct WalMetadataStore {
 
     /// See [`TopicDeletedFn`].
     topic_deleted_hooks: std::sync::RwLock<Vec<TopicDeletedFn>>,
+
+    /// Writes hold it shared from the WAL append until the event is applied;
+    /// [`Self::checkpoint`] holds it exclusively, so its image covers exactly
+    /// the events appended before its cut.
+    write_gate: tokio::sync::RwLock<()>,
 }
 
 /// In-memory metadata state (built from events)
@@ -698,6 +703,7 @@ impl WalMetadataStore {
             wal_append,
             event_bus_publish: None, // Set later via set_event_bus()
             topic_deleted_hooks: std::sync::RwLock::new(Vec::new()),
+            write_gate: tokio::sync::RwLock::new(()),
         }
     }
 
@@ -748,12 +754,15 @@ impl WalMetadataStore {
         let bytes = event.to_bytes()
             .map_err(|e| MetadataError::StorageError(format!("Failed to serialize event: {}", e)))?;
 
-        // 2. Write to WAL via injected callback (durable, 1-2ms)
-        let _offset = (self.wal_append)(bytes).await
-            .map_err(|e| MetadataError::StorageError(format!("WAL write failed: {}", e)))?;
-
-        // 3. Apply to local state machine (in-memory)
-        self.state.apply_event(&event).await?;
+        // 2. Write to WAL via injected callback (durable, 1-2ms), and
+        // 3. apply to the local state machine (in-memory), both inside the
+        // write gate (see [`Self::checkpoint`]).
+        {
+            let _gate = self.write_gate.read().await;
+            let _offset = (self.wal_append)(bytes).await
+                .map_err(|e| MetadataError::StorageError(format!("WAL write failed: {}", e)))?;
+            self.state.apply_event(&event).await?;
+        }
         self.after_live_apply(&event);
 
         // 4. v2.2.9 Phase 7 FIX: Publish event to event bus for replication
@@ -1277,6 +1286,14 @@ impl MetadataStore for WalMetadataStore {
         Ok(offsets.iter().filter(|((g, _, _), _)| g == group_id).map(|(_, o)| o.clone()).collect())
     }
 
+    async fn list_offset_groups(&self) -> Result<Vec<String>> {
+        let offsets = self.state.consumer_offsets.read().await;
+        let mut groups: Vec<String> = offsets.keys().map(|(g, _, _)| g.clone()).collect();
+        groups.sort();
+        groups.dedup();
+        Ok(groups)
+    }
+
     async fn update_partition_offset(&self, topic: &str, partition: u32, high_watermark: i64, log_start_offset: i64) -> Result<()> {
         // v2.2.13 CRITICAL FIX: Deduplicate high watermark events to prevent event storm
         // Before publishing event, check if watermark has actually changed
@@ -1545,12 +1562,54 @@ struct LocalStateImage {
 
 const LOCAL_STATE_IMAGE_VERSION: u32 = 1;
 
+/// Gzip-compressed JSON, off the async threads (a large node's image takes a
+/// while to encode).
+async fn encode_image(image: LocalStateImage) -> Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let json = serde_json::to_vec(&image)
+            .map_err(|e| MetadataError::SerializationError(format!("local state image: {e}")))?;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&json)
+            .and_then(|_| gz.finish())
+            .map_err(|e| MetadataError::SerializationError(format!("compressing local state image: {e}")))
+    })
+    .await
+    .map_err(|e| MetadataError::StorageError(format!("encoding local state image: {e}")))?
+}
+
 impl WalMetadataStore {
+    /// Every committed offset on this node (merging them into the catalog).
+    pub async fn all_consumer_offsets(&self) -> Vec<ConsumerOffset> {
+        self.state.consumer_offsets.read().await.values().cloned().collect()
+    }
+
     /// The whole node-local state, gzip-compressed JSON.
     pub async fn export_state(&self) -> Result<Vec<u8>> {
-        use std::io::Write;
+        let image = self.capture_image().await;
+        encode_image(image).await
+    }
+
+    /// An image of the state that covers exactly the events appended before
+    /// `cut` runs: writes wait while it runs and while the state is copied.
+    /// For compacting the metadata WAL: `cut` seals the WAL and reports where,
+    /// and the WAL before that point is then redundant with the image.
+    pub async fn checkpoint<T, F, Fut>(&self, cut: F) -> Result<(T, Vec<u8>)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let (at, image) = {
+            let _gate = self.write_gate.write().await;
+            let at = cut().await?;
+            (at, self.capture_image().await)
+        };
+        Ok((at, encode_image(image).await?))
+    }
+
+    async fn capture_image(&self) -> LocalStateImage {
         let s = &self.state;
-        let image = LocalStateImage {
+        LocalStateImage {
             version: LOCAL_STATE_IMAGE_VERSION,
             topics: s.topics.read().await.values().cloned().collect(),
             brokers: s.brokers.read().await.values().cloned().collect(),
@@ -1568,13 +1627,7 @@ impl WalMetadataStore {
             next_producer_id: s.next_producer_id.load(Ordering::SeqCst),
             acls: s.acls.read().await.clone(),
             scram_credentials: s.scram_credentials.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        };
-        let json = serde_json::to_vec(&image)
-            .map_err(|e| MetadataError::SerializationError(format!("local state image: {e}")))?;
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gz.write_all(&json)
-            .and_then(|_| gz.finish())
-            .map_err(|e| MetadataError::SerializationError(format!("compressing local state image: {e}")))
+        }
     }
 
     /// Replace the node-local state with an image from [`Self::export_state`].

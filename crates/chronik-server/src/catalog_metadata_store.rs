@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chronik_common::metadata::catalog::{
-    AssignmentChange, CatalogChange, CatalogCommand, CatalogError, CatalogResult, ConfigChange, IsrUpdate,
+    AssignmentChange, CatalogChange, CatalogCommand, CatalogError, CatalogResult, ConfigChange, GroupOffset,
+    IsrUpdate, OffsetCommitEntry, FEATURE_GROUP_OFFSETS, FEATURE_GROUP_OFFSETS_MIRROR,
 };
 use chronik_common::metadata::{
     AclBindingRecord, BrokerMetadata, BrokerStatus, ConsumerGroupMetadata, ConsumerOffset, MetadataError,
@@ -32,10 +33,51 @@ pub struct CatalogMetadataStore {
     local: Arc<WalMetadataStore>,
     /// Bumped whenever ACLs or SCRAM credentials change, for the security caches.
     security_generation: watch::Sender<u64>,
+    /// Commits hold it shared from choosing where to write until written; the
+    /// offset merge holds it exclusively, so no commit decided "local only"
+    /// before the merge lands after the merge has read the local offsets.
+    offsets_gate: tokio::sync::RwLock<()>,
+}
+
+/// Where committed offsets are written and read during the move to the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetMode {
+    /// Some voter does not understand catalog offsets: each node, as before.
+    Local,
+    /// [`FEATURE_GROUP_OFFSETS_MIRROR`]: every voter understands them, not all
+    /// have merged their local offsets yet: read locally, write locally and
+    /// to the catalog.
+    Mirrored,
+    /// [`FEATURE_GROUP_OFFSETS`] is on: the catalog only.
+    Catalog,
 }
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Declared by a node once its pre-catalog offsets are merged into the catalog.
+const OFFSETS_MERGED: &str = "group-offsets-merged";
+
+fn offset_entry(o: ConsumerOffset) -> OffsetCommitEntry {
+    OffsetCommitEntry {
+        topic: o.topic,
+        partition: o.partition,
+        offset: o.offset,
+        metadata: o.metadata,
+        commit_timestamp_ms: o.commit_timestamp.timestamp_millis(),
+    }
+}
+
+fn consumer_offset(group_id: &str, topic: &str, partition: u32, o: &GroupOffset) -> ConsumerOffset {
+    ConsumerOffset {
+        group_id: group_id.to_string(),
+        topic: topic.to_string(),
+        partition,
+        offset: o.offset,
+        metadata: o.metadata.clone(),
+        commit_timestamp: chrono::DateTime::from_timestamp_millis(o.commit_timestamp_ms).unwrap_or_default(),
+    }
 }
 
 fn to_metadata_error(e: CatalogError, subject: &str) -> MetadataError {
@@ -49,9 +91,171 @@ fn to_metadata_error(e: CatalogError, subject: &str) -> MetadataError {
 }
 
 impl CatalogMetadataStore {
+    /// Committed offsets live in the catalog once every node supports it
+    /// ([`FEATURE_GROUP_OFFSETS`]); before that, on each node as they were.
+    pub fn offsets_in_catalog(&self) -> bool {
+        self.offset_mode() == OffsetMode::Catalog
+    }
+
+    fn offset_mode(&self) -> OffsetMode {
+        let st = self.catalog.read();
+        if st.has_feature(FEATURE_GROUP_OFFSETS) {
+            OffsetMode::Catalog
+        } else if st.has_feature(FEATURE_GROUP_OFFSETS_MIRROR) {
+            OffsetMode::Mirrored
+        } else {
+            OffsetMode::Local
+        }
+    }
+
+    /// Bring this node to [`FEATURE_GROUP_OFFSETS`] without a moment where a
+    /// committed offset is missing:
+    ///   1. declare the capability once caught up;
+    ///   2. once every voter has declared it (so none would skip an offset
+    ///      command) the leader enables [`FEATURE_GROUP_OFFSETS_MIRROR`]:
+    ///      commits go to the catalog as well as locally, and this
+    ///      node merges its pre-catalog offsets into the catalog (the newer
+    ///      commit wins) and records that it did, in the catalog, so a restart
+    ///      never merges again (and never resurrects an offset deleted since);
+    ///   3. the leader enables the feature once every voter has merged; from
+    ///      then on offsets are read from the catalog, which by now holds every
+    ///      node's offsets and every commit made since step 2.
+    /// Until step 2, offsets stay on each node as before, so a cluster
+    /// mid-upgrade never sends a command an older node would skip.
+    pub fn spawn_group_offsets_rollout(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let store = self.clone();
+        tokio::spawn(async move {
+            let node = store.catalog.node_id();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if !store.catalog.is_caught_up() {
+                    continue;
+                }
+                let (declared, migrated, mirrored, enabled, all_declared, all_merged) = {
+                    let st = store.catalog.read();
+                    let voters = store.catalog.voters();
+                    (
+                        st.declared(node, FEATURE_GROUP_OFFSETS),
+                        st.declared(node, OFFSETS_MERGED),
+                        st.has_feature(FEATURE_GROUP_OFFSETS_MIRROR),
+                        st.has_feature(FEATURE_GROUP_OFFSETS),
+                        st.all_declare(&voters, FEATURE_GROUP_OFFSETS),
+                        st.all_declare(&voters, OFFSETS_MERGED),
+                    )
+                };
+                if enabled && migrated {
+                    return;
+                }
+                if !declared {
+                    let caps = if migrated {
+                        vec![FEATURE_GROUP_OFFSETS.to_string(), OFFSETS_MERGED.to_string()]
+                    } else {
+                        vec![FEATURE_GROUP_OFFSETS.to_string()]
+                    };
+                    if let Err(e) = store.catalog.execute(CatalogCommand::DeclareCapabilities { node_id: node, capabilities: caps }).await {
+                        tracing::debug!("declaring capabilities: {e:?}");
+                    }
+                    continue;
+                }
+                if !mirrored && !enabled {
+                    if store.catalog.am_i_leader() && all_declared {
+                        store.enable(FEATURE_GROUP_OFFSETS_MIRROR, "Every node supports catalog consumer-group offsets: \
+                            commits now also go to the catalog while nodes merge their own").await;
+                    }
+                    continue;
+                }
+                if !migrated {
+                    match store.merge_local_offsets().await {
+                        Ok(count) => {
+                            let caps = vec![FEATURE_GROUP_OFFSETS.to_string(), OFFSETS_MERGED.to_string()];
+                            match store.catalog.execute(CatalogCommand::DeclareCapabilities { node_id: node, capabilities: caps }).await {
+                                Ok(_) => tracing::info!("Merged {count} committed offset(s) of this node into the catalog"),
+                                Err(e) => tracing::warn!("recording the offset merge: {e:?}"),
+                            }
+                        }
+                        Err(e) => tracing::warn!("merging this node's offsets into the catalog (retrying): {e}"),
+                    }
+                    continue;
+                }
+                if !enabled && store.catalog.am_i_leader() && all_merged {
+                    store.enable(FEATURE_GROUP_OFFSETS, "Every node merged its offsets: catalog consumer-group offsets \
+                        enabled (groups are now coordinated by the catalog leader)").await;
+                }
+            }
+        })
+    }
+
+    async fn enable(&self, feature: &str, announce: &str) {
+        match self.catalog.execute(CatalogCommand::EnableFeature { feature: feature.to_string() }).await {
+            Ok(_) => tracing::info!("{announce}"),
+            Err(e) => tracing::debug!("enabling {feature}: {e:?}"),
+        }
+    }
+
+    /// Propose this node's local offsets, per group, keeping newer catalog ones.
+    async fn merge_local_offsets(&self) -> Result<usize> {
+        // Exclusive: every commit that chose "local only" has landed, and every
+        // later one also writes to the catalog.
+        let _gate = self.offsets_gate.write().await;
+        let mut by_group: BTreeMap<String, Vec<OffsetCommitEntry>> = BTreeMap::new();
+        for o in self.local.all_consumer_offsets().await {
+            by_group.entry(o.group_id.clone()).or_default().push(offset_entry(o));
+        }
+        let mut count = 0;
+        for (group_id, entries) in by_group {
+            for chunk in entries.chunks(500) {
+                count += chunk.len();
+                self.run(
+                    CatalogCommand::CommitOffsets {
+                        group_id: group_id.clone(),
+                        offsets: chunk.to_vec(),
+                        only_if_newer: true,
+                    },
+                    &format!("merging offsets of group {group_id}"),
+                )
+                .await?;
+            }
+        }
+        Ok(count)
+    }
+
+    /// One catalog entry per group (an OffsetCommit names one group).
+    async fn commit_offsets_to_catalog(&self, offsets: Vec<ConsumerOffset>) -> Result<Vec<Result<()>>> {
+        let mut results: Vec<Result<()>> = (0..offsets.len()).map(|_| Ok(())).collect();
+        let mut by_group: BTreeMap<String, Vec<(usize, OffsetCommitEntry)>> = BTreeMap::new();
+        for (i, o) in offsets.into_iter().enumerate() {
+            by_group.entry(o.group_id.clone()).or_default().push((i, offset_entry(o)));
+        }
+        for (group_id, items) in by_group {
+            let (positions, entries): (Vec<usize>, Vec<OffsetCommitEntry>) = items.into_iter().unzip();
+            let subject = format!("offsets of group {group_id}");
+            match self
+                .catalog
+                .execute(CatalogCommand::CommitOffsets { group_id, offsets: entries, only_if_newer: false })
+                .await?
+            {
+                CatalogResult::Items(outcomes) => {
+                    for (pos, outcome) in positions.into_iter().zip(outcomes) {
+                        results[pos] = outcome.map_err(|e| to_metadata_error(e, &subject));
+                    }
+                }
+                CatalogResult::Err(e) => {
+                    let err = to_metadata_error(e, &subject);
+                    for pos in positions {
+                        results[pos] = Err(MetadataError::StorageError(err.to_string()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(results)
+    }
+
     pub fn new(catalog: Arc<ClusterCatalog>, local: Arc<WalMetadataStore>) -> Self {
         let (security_generation, _) = watch::channel(0);
-        Self { catalog, local, security_generation }
+        Self { catalog, local, security_generation, offsets_gate: tokio::sync::RwLock::new(()) }
     }
 
     pub fn catalog(&self) -> &Arc<ClusterCatalog> {
@@ -400,15 +604,64 @@ impl MetadataStore for CatalogMetadataStore {
     }
 
     async fn commit_offset(&self, offset: ConsumerOffset) -> Result<()> {
-        self.local.commit_offset(offset).await
+        self.commit_offsets(vec![offset])
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or(Ok(()))
+    }
+
+    async fn commit_offsets(&self, offsets: Vec<ConsumerOffset>) -> Result<Vec<Result<()>>> {
+        let _gate = self.offsets_gate.read().await;
+        let mode = self.offset_mode();
+        if mode == OffsetMode::Catalog {
+            return self.commit_offsets_to_catalog(offsets).await;
+        }
+        let mut results = Vec::with_capacity(offsets.len());
+        for offset in &offsets {
+            results.push(self.local.commit_offset(offset.clone()).await);
+        }
+        if mode == OffsetMode::Mirrored {
+            // A commit the catalog refuses would be gone once offsets are read
+            // from it, so the client hears of it now.
+            for (result, mirrored) in results.iter_mut().zip(self.commit_offsets_to_catalog(offsets).await?) {
+                if result.is_ok() {
+                    *result = mirrored;
+                }
+            }
+        }
+        Ok(results)
     }
 
     async fn get_consumer_offset(&self, group_id: &str, topic: &str, partition: u32) -> Result<Option<ConsumerOffset>> {
-        self.local.get_consumer_offset(group_id, topic, partition).await
+        if !self.offsets_in_catalog() {
+            return self.local.get_consumer_offset(group_id, topic, partition).await;
+        }
+        Ok(self
+            .catalog
+            .read()
+            .group_offset(group_id, topic, partition)
+            .map(|o| consumer_offset(group_id, topic, partition, o)))
     }
 
     async fn list_consumer_offsets(&self, group_id: &str) -> Result<Vec<ConsumerOffset>> {
-        self.local.list_consumer_offsets(group_id).await
+        if !self.offsets_in_catalog() {
+            return self.local.list_consumer_offsets(group_id).await;
+        }
+        Ok(self
+            .catalog
+            .read()
+            .group_offsets(group_id)
+            .into_iter()
+            .map(|(topic, partition, o)| consumer_offset(group_id, &topic, partition, &o))
+            .collect())
+    }
+
+    async fn list_offset_groups(&self) -> Result<Vec<String>> {
+        if !self.offsets_in_catalog() {
+            return self.local.list_offset_groups().await;
+        }
+        Ok(self.catalog.read().offset_groups().into_iter().collect())
     }
 
     async fn commit_transactional_offsets(
@@ -419,10 +672,27 @@ impl MetadataStore for CatalogMetadataStore {
         group_id: String,
         offsets: Vec<(String, u32, i64, Option<String>)>,
     ) -> Result<()> {
-        self.local
-            .commit_transactional_offsets(transactional_id, producer_id, producer_epoch, group_id, offsets)
-            .await
+        // Committed as plain commits, as the local store does, so they follow
+        // the offsets wherever they currently live.
+        let _ = (transactional_id, producer_id, producer_epoch);
+        let now = chrono::Utc::now();
+        let batch = offsets
+            .into_iter()
+            .map(|(topic, partition, offset, metadata)| ConsumerOffset {
+                group_id: group_id.clone(),
+                topic,
+                partition,
+                offset,
+                metadata,
+                commit_timestamp: now,
+            })
+            .collect();
+        for outcome in self.commit_offsets(batch).await? {
+            outcome?;
+        }
+        Ok(())
     }
+
 
     async fn begin_transaction(&self, transactional_id: String, producer_id: i64, producer_epoch: i16, timeout_ms: i32) -> Result<()> {
         self.local.begin_transaction(transactional_id, producer_id, producer_epoch, timeout_ms).await
@@ -498,10 +768,33 @@ impl MetadataStore for CatalogMetadataStore {
     }
 
     async fn delete_consumer_group(&self, group_id: &str) -> Result<()> {
+        let _gate = self.offsets_gate.read().await;
+        if self.offset_mode() != OffsetMode::Local {
+            self.run(
+                CatalogCommand::DeleteOffsets { group_id: group_id.to_string(), partitions: None },
+                &format!("offsets of group {group_id}"),
+            )
+            .await?;
+        }
         self.local.delete_consumer_group(group_id).await
     }
 
     async fn delete_consumer_offsets(&self, group_id: &str, topic_partitions: &[(String, u32)]) -> Result<()> {
+        let _gate = self.offsets_gate.read().await;
+        let mode = self.offset_mode();
+        if mode != OffsetMode::Local {
+            self.run(
+                CatalogCommand::DeleteOffsets {
+                    group_id: group_id.to_string(),
+                    partitions: Some(topic_partitions.to_vec()),
+                },
+                &format!("offsets of group {group_id}"),
+            )
+            .await?;
+        }
+        if mode == OffsetMode::Catalog {
+            return Ok(());
+        }
         self.local.delete_consumer_offsets(group_id, topic_partitions).await
     }
 
@@ -585,6 +878,134 @@ mod tests {
             assert!(n.store.catalog().wait_caught_up(Duration::from_secs(10)).await, "node never caught up");
         }
         nodes
+    }
+
+    fn local_offset(group: &str, topic: &str, partition: u32, offset: i64, ts_ms: i64) -> ConsumerOffset {
+        ConsumerOffset {
+            group_id: group.into(),
+            topic: topic.into(),
+            partition,
+            offset,
+            metadata: None,
+            commit_timestamp: chrono::DateTime::from_timestamp_millis(ts_ms).unwrap(),
+        }
+    }
+
+    /// Catalog offsets turn on only when every voter supports them and has
+    /// merged its pre-catalog offsets (the newer commit wins); from then on a
+    /// commit through any node is read the same through every node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn group_offsets_move_into_the_catalog_once_every_node_supports_it() {
+        let nodes = cluster(3).await;
+        let s1 = &nodes[0].store;
+        for id in 1..=3 {
+            s1.register_broker(broker(id)).await.unwrap();
+        }
+        s1.create_topic("t", topic_config(2, 3)).await.unwrap();
+        // Offsets committed per broker before the upgrade, disagreeing on t-0.
+        nodes[0].store.local.commit_offset(local_offset("g", "t", 0, 10, 1_000)).await.unwrap();
+        nodes[1].store.local.commit_offset(local_offset("g", "t", 0, 20, 2_000)).await.unwrap();
+        nodes[2].store.local.commit_offset(local_offset("g", "t", 1, 5, 1_500)).await.unwrap();
+        assert!(!s1.offsets_in_catalog());
+        assert_eq!(s1.get_consumer_offset("g", "t", 0).await.unwrap().map(|o| o.offset), Some(10), "before: local");
+
+        // Two of three nodes upgraded: the feature must stay off.
+        nodes[0].store.spawn_group_offsets_rollout();
+        nodes[1].store.spawn_group_offsets_rollout();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!s1.offsets_in_catalog(), "enabled before every voter declared it");
+
+        nodes[2].store.spawn_group_offsets_rollout();
+        let merged = |n: &Node| {
+            let st = n.store.catalog().read();
+            (1..=3).all(|id| st.declared(id, OFFSETS_MERGED))
+        };
+        // Never enabled while some node still holds offsets only locally.
+        for _ in 0..2000 {
+            for n in &nodes {
+                if n.store.offsets_in_catalog() {
+                    assert!(merged(n), "enabled before every voter merged its offsets");
+                }
+            }
+            if nodes.iter().all(|n| n.store.offsets_in_catalog()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            nodes.iter().all(merged),
+            "nodes did not all merge their offsets: {:?}",
+            nodes
+                .iter()
+                .map(|n| { let st = n.store.catalog().read(); ((1..=3).map(|id| (st.declared(id, FEATURE_GROUP_OFFSETS), st.declared(id, OFFSETS_MERGED))).collect::<Vec<_>>(), n.store.offset_mode()) })
+                .collect::<Vec<_>>()
+        );
+        for n in &nodes {
+            assert!(n.store.offsets_in_catalog());
+            assert_eq!(n.store.get_consumer_offset("g", "t", 0).await.unwrap().map(|o| o.offset), Some(20), "newer commit wins");
+            assert_eq!(n.store.get_consumer_offset("g", "t", 1).await.unwrap().map(|o| o.offset), Some(5));
+        }
+
+        // A commit through node 3 reads the same through node 1.
+        let results = nodes[2].store.commit_offsets(vec![local_offset("g", "t", 0, 30, 9_000)]).await.unwrap();
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        let mut seen = None;
+        for _ in 0..50 {
+            seen = s1.get_consumer_offset("g", "t", 0).await.unwrap().map(|o| o.offset);
+            if seen == Some(30) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(seen, Some(30));
+        assert_eq!(s1.list_offset_groups().await.unwrap(), vec!["g".to_string()]);
+        let unknown = nodes[2].store.commit_offsets(vec![local_offset("g", "nope", 0, 1, 9_000)]).await.unwrap();
+        assert!(unknown[0].is_err(), "a commit to an unknown topic was accepted");
+    }
+
+    /// A commit made while nodes are still merging (mirrored) is in the
+    /// committing node's own store and in the catalog, so it is not lost when
+    /// reads move to the catalog.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_while_nodes_merge_survives_the_switch_to_the_catalog() {
+        let nodes = cluster(3).await;
+        let s1 = &nodes[0].store;
+        for id in 1..=3 {
+            s1.register_broker(broker(id)).await.unwrap();
+        }
+        s1.create_topic("t", topic_config(1, 3)).await.unwrap();
+        for id in 1..=3u64 {
+            s1.catalog()
+                .execute(CatalogCommand::DeclareCapabilities { node_id: id, capabilities: vec![FEATURE_GROUP_OFFSETS.into()] })
+                .await
+                .unwrap();
+        }
+        s1.catalog().execute(CatalogCommand::EnableFeature { feature: FEATURE_GROUP_OFFSETS_MIRROR.into() }).await.unwrap();
+        for _ in 0..50 {
+            if nodes[1].store.offset_mode() == OffsetMode::Mirrored {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(nodes[1].store.offset_mode(), OffsetMode::Mirrored);
+
+        let r = nodes[1].store.commit_offsets(vec![local_offset("g", "t", 0, 42, 5_000)]).await.unwrap();
+        assert!(r.iter().all(|r| r.is_ok()), "{r:?}");
+        assert_eq!(nodes[1].store.get_consumer_offset("g", "t", 0).await.unwrap().map(|o| o.offset), Some(42), "read locally");
+        assert!(s1.get_consumer_offset("g", "t", 0).await.unwrap().is_none(), "node 1 still reads its own store");
+        let r = nodes[1].store.commit_offsets(vec![local_offset("g", "nope", 0, 1, 5_000)]).await.unwrap();
+        assert!(r[0].is_err(), "a commit the catalog refuses was reported as done");
+
+        s1.catalog().execute(CatalogCommand::EnableFeature { feature: FEATURE_GROUP_OFFSETS.into() }).await.unwrap();
+        let mut seen = None;
+        for _ in 0..50 {
+            seen = s1.get_consumer_offset("g", "t", 0).await.unwrap().map(|o| o.offset);
+            if seen.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(seen, Some(42), "the mirrored commit is in the catalog");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -698,5 +1119,36 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "catalogs did not converge: {:?}", views.iter().map(|v| v.len()).collect::<Vec<_>>());
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+/// Group and transaction coordination from the catalog: off until
+/// [`FEATURE_GROUP_OFFSETS`] is enabled; then the catalog leader coordinates.
+pub struct CatalogCoordination {
+    catalog: Arc<ClusterCatalog>,
+}
+
+impl CatalogCoordination {
+    pub fn new(catalog: Arc<ClusterCatalog>) -> Self {
+        Self { catalog }
+    }
+}
+
+impl crate::consumer_group::Coordination for CatalogCoordination {
+    fn is_local(&self) -> Option<bool> {
+        if !self.catalog.read().has_feature(FEATURE_GROUP_OFFSETS) {
+            return None;
+        }
+        Some(self.catalog.am_i_leader())
+    }
+
+    fn coordinator(&self) -> Option<(i32, String, i32)> {
+        if !self.catalog.read().has_feature(FEATURE_GROUP_OFFSETS) {
+            return None;
+        }
+        let leader = self.catalog.leader_id()?;
+        let state = self.catalog.read();
+        let broker = state.broker(leader as i32)?;
+        Some((broker.broker_id, broker.host.clone(), broker.port))
     }
 }

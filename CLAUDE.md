@@ -394,9 +394,9 @@ After successful persistence, old WAL segments are truncated.
 
 ### Consumer Group Coordination
 - `GroupManager` tracks groups and members
-- `FindCoordinator` returns this node as coordinator
+- In a cluster the catalog Raft leader coordinates every group: `FindCoordinator` names it, other brokers answer group/offset/transactional-coordinator requests with `NOT_COORDINATOR` (16), and group state moves with catalog leadership (`CatalogCoordination` in `catalog_metadata_store.rs`). Single node: itself.
+- Committed offsets are catalog state (`CatalogCommand::CommitOffsets`). Rollout during an upgrade: every voter declares `group-offsets` → leader enables `group-offsets-mirror` (commits written locally and to the catalog; each node merges its local offsets, newer wins, and declares `group-offsets-merged`) → leader enables `group-offsets` (reads from the catalog, leader coordinates). Tests: `tests/cluster/e2e/group_coordination.sh`, `group_upgrade.sh`.
 - `JoinGroup` / `SyncGroup` / `Heartbeat` / `LeaveGroup` fully implemented
-- Offset commit/fetch stored in metadata store
 
 ## Common Development Tasks
 
@@ -1014,6 +1014,7 @@ Key environment variables:
 - `CHRONIK_BACKGROUND_THREADS` - Threads for background CPU work such as rebuilding HNSW vector indexes at boot (default: half the cores the process may use, at least 1). Those threads, and the WAL indexer's, run at nice 10 so request handling is scheduled first. Lower it if produce latency suffers right after a restart; raise it to finish rebuilds faster on an idle node.
 - `CHRONIK_CLUSTER_JOIN` - `true` on a node added with `cluster add-node`: it starts with an empty catalog and is brought up to date by the leader instead of founding a cluster from its config. Leave unset on founding nodes.
 - `CHRONIK_CATALOG_SNAPSHOT_EVERY` - Catalog Raft snapshot interval in applied entries (default 10000).
+- `CHRONIK_METADATA_WAL_COMPACT_BYTES` - Compact the node-local metadata WAL once its segments reach this size (default `256MB`; `KB`/`MB`/`GB` or bytes). Checked every minute from 30 s after boot: writes pause while the state is copied, a checkpoint (`metadata_wal/checkpoint.img`, with the WAL offset it covers) is written and renamed into place, then the segments it covers are deleted. Boot loads the checkpoint and replays only later records.
 - `CHRONIK_DR_RESTORE` - Restore a blank data directory from the object store: `auto` (default; single node only), `true` (also cluster nodes, for a whole lost cluster; fails if there is no image), `false`.
 - `CHRONIK_DR_UPLOAD_INTERVAL_SECS` - How often changed disaster-recovery images are uploaded (default 60). Remote object stores only.
 - `CHRONIK_FAULT_FILE` - Test-only: fault injection on catalog Raft traffic (see Cluster Catalog on Raft). Never set in production.

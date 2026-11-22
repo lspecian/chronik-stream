@@ -81,17 +81,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either prost, so nodes on either version form one cluster during a roll.
   Route paths use axum 0.8 syntax (`/{topic}`); the URLs are unchanged.
 
-### Known issues
-
-- **Consumer groups in a cluster are not coordinated across brokers.** Every
-  broker answers FindCoordinator with itself (as node id 1), and group
-  membership and committed offsets live on the broker that handled them. A
-  group's offsets depend on which broker its clients reach, and members of one
-  group that bootstrap through different brokers each get every partition.
-  Single-node deployments are unaffected.
-
 ### Fixed
 
+- **Consumer groups in a cluster are coordinated by one broker, with offsets
+  replicated.** Every broker answered FindCoordinator with itself (as node id
+  1) and kept membership and committed offsets locally, so a group's offsets
+  depended on the broker its clients reached, and members of one group that
+  bootstrapped through different brokers each consumed every partition. Now the
+  catalog Raft leader coordinates every group: other brokers name it in
+  FindCoordinator and answer group, offset and transactional-coordinator
+  requests with `NOT_COORDINATOR`, so clients move to it, and it fails over with
+  the catalog leader. Committed offsets are catalog state, the same through
+  every broker and kept across a coordinator failover; deleting a topic removes
+  its offsets. The move happens during a rolling upgrade without losing an
+  offset: once every node runs this version, commits are written both locally
+  and to the catalog while each node merges the offsets it held (the newer
+  commit wins), and only after every node has merged are offsets read from the
+  catalog and groups coordinated by the leader. A cluster with an older node
+  keeps the old behaviour. Single-node deployments are unaffected. Verified by
+  `tests/cluster/e2e/group_coordination.sh` (two members through different
+  brokers split six partitions 3/3, 6,000 records read once, the same offsets
+  through every broker, coordinator killed: another coordinates and a member
+  resumes with only the new records) and `group_upgrade.sh` (2.18.3 → this
+  build: offsets committed before the upgrade are read through every broker
+  after it).
+- **Wrong Kafka error codes** in the shared table: `NOT_COORDINATOR` was 15
+  (`COORDINATOR_NOT_AVAILABLE`), `ILLEGAL_GENERATION`, `INVALID_GROUP_ID`,
+  `INCONSISTENT_GROUP_PROTOCOL`, the producer sequence and epoch errors,
+  `INVALID_TXN_STATE`, `BROKER_ID_NOT_REGISTERED` and `FENCED_MEMBER_EPOCH`
+  were off too, so clients took the wrong recovery action.
+- **The node-local metadata WAL is compacted.** It was never truncated: every
+  SegmentCreated, watermark and offset event since a node's first boot stayed
+  on disk and was replayed at every boot (16 GB on a long-running node, while
+  the state it builds is a small fraction of that). Once the WAL reaches
+  `CHRONIK_METADATA_WAL_COMPACT_BYTES` (default 256MB, checked every minute)
+  the node writes a checkpoint of that state with the WAL offset it covers
+  (`metadata_wal/checkpoint.img`, written to a temporary file, synced and
+  renamed) and deletes the segments before it; boot loads the checkpoint and
+  replays only later records. Writes pause while the state is copied, not while
+  it is encoded or written. A node that boots on a long WAL compacts it 30 s
+  later.
 - **Listing every SCRAM user** (`kafka-configs.sh --describe --entity-type
   users`) returned nobody: DescribeUserScramCredentials took only a null user
   list as "all users", and the Java tool sends an empty one (Kafka reads both as
