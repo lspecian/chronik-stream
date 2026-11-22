@@ -8,15 +8,14 @@ use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{finalizer, Event as Finalizer};
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::constants::{self, FINALIZER};
-use crate::crds::cluster::ChronikCluster;
 use crate::crds::common::Condition;
-use crate::crds::standalone::ChronikStandalone;
 use crate::crds::topic::{ChronikTopic, ChronikTopicStatus};
 use crate::error::OperatorError;
-use crate::kafka_client::{self, CreateTopicRequest, KafkaAdminClient};
+use crate::kafka_access::resolve_kafka_access;
+use crate::kafka_admin::KafkaAdmin;
 
 /// Shared context for the topic reconciler.
 pub struct Context {
@@ -37,7 +36,7 @@ pub async fn run(client: Client) {
             match res {
                 Ok((_obj, _action)) => {}
                 Err(e) => {
-                    error!("Topic reconciliation error: {:?}", e);
+                    super::log_controller_error("Topic", &e);
                 }
             }
         })
@@ -70,16 +69,17 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
 
     info!(cr = %cr_name, topic = %topic_name, "Reconciling ChronikTopic");
 
-    // Resolve clusterRef to get admin URL and API key
-    let (admin_url, api_key) = resolve_cluster_ref(&client, &namespace, &spec.cluster_ref).await?;
-
-    let admin_client = KafkaAdminClient::new(api_key);
-
-    // Check if topic exists
-    let existing = admin_client.describe_topic(&admin_url, topic_name).await;
+    // Connect to the cluster's Kafka port, then check whether the topic exists.
+    let existing = match resolve_kafka_access(&client, &namespace, &spec.cluster_ref).await {
+        Ok(access) => match KafkaAdmin::connect(&access).await {
+            Ok(mut admin) => admin.describe_topic(topic_name).await.map(|d| (admin, d)),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
 
     match existing {
-        Ok(Some(desc)) => {
+        Ok((mut admin, Some(desc))) => {
             // Topic exists — check for updates
             let mut updated = false;
 
@@ -91,8 +91,8 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
                     desired = spec.partitions,
                     "Increasing partitions"
                 );
-                admin_client
-                    .increase_partitions(&admin_url, topic_name, spec.partitions)
+                admin
+                    .increase_partitions(topic_name, spec.partitions)
                     .await?;
                 updated = true;
             } else if spec.partitions < desc.partitions {
@@ -113,8 +113,8 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
 
                 if config_changed {
                     info!(topic = %topic_name, "Updating topic config");
-                    admin_client
-                        .update_topic_config(&admin_url, topic_name, &desired_config)
+                    admin
+                        .update_topic_config(topic_name, &desired_config)
                         .await?;
                     updated = true;
                 }
@@ -145,33 +145,42 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
             )
             .await?;
         }
-        Ok(None) => {
+        Ok((mut admin, None)) => {
             // Topic doesn't exist — create it
             info!(topic = %topic_name, partitions = spec.partitions, rf = spec.replication_factor, "Creating topic");
 
             let config = build_topic_config(spec);
-            let request = CreateTopicRequest {
-                name: topic_name.to_string(),
-                partitions: spec.partitions,
-                replication_factor: spec.replication_factor,
-                config,
-            };
-
-            let resp = admin_client.create_topic(&admin_url, &request).await?;
-
-            let phase = if resp.success { "Ready" } else { "Error" };
-            let condition = if resp.success {
-                make_condition(
-                    "Ready",
-                    "True",
-                    "TopicCreated",
-                    &format!(
-                        "Topic '{topic_name}' created with {} partitions",
-                        spec.partitions
-                    ),
+            let created = admin
+                .create_topic(
+                    topic_name,
+                    spec.partitions,
+                    spec.replication_factor,
+                    &config,
                 )
-            } else {
-                make_condition("Ready", "False", "CreateFailed", &resp.message)
+                .await;
+
+            let (phase, topic_id, condition) = match created {
+                Ok(topic_id) => (
+                    "Ready",
+                    topic_id,
+                    make_condition(
+                        "Ready",
+                        "True",
+                        "TopicCreated",
+                        &format!(
+                            "Topic '{topic_name}' created with {} partitions",
+                            spec.partitions
+                        ),
+                    ),
+                ),
+                Err(e) => {
+                    warn!(topic = %topic_name, "Create failed: {e}");
+                    (
+                        "Error",
+                        None,
+                        make_condition("Ready", "False", "CreateFailed", &e.to_string()),
+                    )
+                }
             };
 
             update_status(
@@ -181,15 +190,15 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
                 phase,
                 Some(spec.partitions),
                 Some(spec.replication_factor),
-                resp.topic_id,
+                topic_id,
                 vec![condition],
                 topic.metadata.generation,
             )
             .await?;
         }
         Err(e) => {
-            // Failed to reach admin API
-            warn!(topic = %topic_name, "Failed to describe topic: {e}");
+            // Cluster not resolvable, Kafka port unreachable, or login refused
+            warn!(topic = %topic_name, "Cannot reach the cluster: {e}");
             update_status(
                 &client,
                 &cr_name,
@@ -201,8 +210,8 @@ async fn apply(client: Client, topic: &ChronikTopic) -> Result<Action, OperatorE
                 vec![make_condition(
                     "Ready",
                     "False",
-                    "AdminApiUnreachable",
-                    &format!("Cannot reach admin API: {e}"),
+                    "KafkaUnreachable",
+                    &format!("Cannot reach the cluster over Kafka: {e}"),
                 )],
                 topic.metadata.generation,
             )
@@ -236,20 +245,17 @@ async fn cleanup(client: Client, topic: &ChronikTopic) -> Result<Action, Operato
 
     info!(topic = %topic_name, "Deleting topic");
 
-    let resolve_result = resolve_cluster_ref(&client, &namespace, &spec.cluster_ref).await;
-
-    match resolve_result {
-        Ok((admin_url, api_key)) => {
-            let admin_client = KafkaAdminClient::new(api_key);
-            match admin_client.delete_topic(&admin_url, topic_name).await {
-                Ok(_) => info!(topic = %topic_name, "Topic deleted"),
-                Err(e) => warn!(topic = %topic_name, "Failed to delete topic: {e}"),
-            }
-        }
-        Err(e) => {
-            warn!(topic = %topic_name, "Cannot resolve cluster for cleanup: {e}");
-            // Don't block finalizer removal if cluster is gone
-        }
+    // A cluster that is gone or unreachable must not block finalizer removal.
+    let deleted = match resolve_kafka_access(&client, &namespace, &spec.cluster_ref).await {
+        Ok(access) => match KafkaAdmin::connect(&access).await {
+            Ok(mut admin) => admin.delete_topic(topic_name).await,
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    match deleted {
+        Ok(()) => info!(topic = %topic_name, "Topic deleted"),
+        Err(e) => warn!(topic = %topic_name, "Could not delete topic: {e}"),
     }
 
     Ok(Action::await_change())
@@ -289,58 +295,6 @@ fn build_topic_config(spec: &crate::crds::topic::ChronikTopicSpec) -> BTreeMap<S
     }
 
     config
-}
-
-/// Resolve a ClusterRef to an admin API URL and optional API key.
-///
-/// Public so that other controllers (user_controller) can reuse this logic.
-pub async fn resolve_cluster_ref(
-    client: &Client,
-    namespace: &str,
-    cluster_ref: &crate::crds::topic::ClusterRef,
-) -> Result<(String, Option<String>), OperatorError> {
-    let kind = cluster_ref.kind.as_deref().unwrap_or("ChronikCluster");
-
-    match kind {
-        "ChronikCluster" => {
-            let api: Api<ChronikCluster> =
-                Api::namespaced(client.clone(), namespace);
-            let cluster = api.get(&cluster_ref.name).await.map_err(|e| {
-                OperatorError::NotFound(format!(
-                    "ChronikCluster '{}' not found: {e}",
-                    cluster_ref.name
-                ))
-            })?;
-
-            let admin_url =
-                kafka_client::cluster_admin_url(&cluster_ref.name, namespace);
-
-            // Get API key from the cluster spec's admin_api_key_secret
-            // The actual key resolution from the Secret would be done here.
-            // For now, we pass None — the admin API key is injected via env var on the pods.
-            let _ = cluster.spec.admin_api_key_secret;
-
-            Ok((admin_url, None))
-        }
-        "ChronikStandalone" => {
-            let api: Api<ChronikStandalone> =
-                Api::namespaced(client.clone(), namespace);
-            let _standalone = api.get(&cluster_ref.name).await.map_err(|e| {
-                OperatorError::NotFound(format!(
-                    "ChronikStandalone '{}' not found: {e}",
-                    cluster_ref.name
-                ))
-            })?;
-
-            let admin_url =
-                kafka_client::standalone_admin_url(&cluster_ref.name, namespace);
-
-            Ok((admin_url, None))
-        }
-        other => Err(OperatorError::Config(format!(
-            "Unsupported clusterRef kind: '{other}'. Expected 'ChronikCluster' or 'ChronikStandalone'"
-        ))),
-    }
 }
 
 /// Update the ChronikTopic status subresource.

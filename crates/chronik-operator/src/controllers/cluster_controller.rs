@@ -11,7 +11,7 @@ use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{finalizer, Event as Finalizer};
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config_generator::{self, NodeConfigParams, PeerEntry};
 use crate::constants::{self, labels, values, FINALIZER};
@@ -52,7 +52,7 @@ pub async fn run(client: Client) {
             match res {
                 Ok((_obj, _action)) => {}
                 Err(e) => {
-                    error!("Cluster reconciliation error: {:?}", e);
+                    super::log_controller_error("Cluster", &e);
                 }
             }
         })

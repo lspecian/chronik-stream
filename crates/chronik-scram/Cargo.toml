@@ -1,0 +1,18 @@
+[package]
+name = "chronik-scram"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SASL mechanisms and SCRAM (RFC 5802/7677) for Chronik: broker exchange, client, credential derivation"
+
+# Kept free of the protocol and metadata crates so a client (the operator)
+# can log in and derive credentials without depending on the broker's code.
+[dependencies]
+base64 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+pbkdf2 = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }

@@ -21,6 +21,12 @@ use bytes::{Bytes, BytesMut, BufMut, Buf};
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument};
 
+/// What the ACL admin APIs answer with authorization off. Kafka answers
+/// `SECURITY_DISABLED` too; reporting success would claim a rule exists that
+/// the broker discarded.
+const ACLS_DISABLED_MESSAGE: &str =
+    "ACLs are disabled on this broker (CHRONIK_ACL_ENABLED is not true); nothing was changed";
+
 /// Kafka protocol handler with ingest-specific extensions
 pub struct KafkaProtocolHandler {
     /// Core protocol handler from chronik-protocol
@@ -734,10 +740,18 @@ impl KafkaProtocolHandler {
                 .metadata_store
                 .delete_scram_credential(&deletion.name, deletion.mechanism)
                 .await;
+            // A credential that does not exist is RESOURCE_NOT_FOUND (91), as in
+            // Kafka: clients deleting every mechanism of a user rely on it to tell
+            // "already gone" from a failure.
+            let error_code = match &outcome {
+                Ok(()) => 0,
+                Err(chronik_common::metadata::MetadataError::NotFound(_)) => 91,
+                Err(_) => 42, // INVALID_REQUEST
+            };
             results.push(AlterUserScramCredentialsResult {
                 user: deletion.name.clone(),
-                error_code: if outcome.is_ok() { 0 } else { 42 },
-                error_message: outcome.err().map(|e| format!("{:?}", e)),
+                error_code,
+                error_message: outcome.err().map(|e| e.to_string()),
             });
         }
 
@@ -858,6 +872,25 @@ impl KafkaProtocolHandler {
         let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
         let request = parse_create_acls_request(&mut decoder, header.api_version)?;
 
+        if !self.authorizer.is_enabled() {
+            let results = request
+                .creations
+                .iter()
+                .map(|_| AclCreationResult {
+                    error_code: chronik_protocol::error_codes::SECURITY_DISABLED,
+                    error_message: Some(ACLS_DISABLED_MESSAGE.to_string()),
+                })
+                .collect();
+            return self.acl_response(
+                &header,
+                encode_create_acls_response(&CreateAclsResponse {
+                    throttle_time_ms: 0,
+                    results,
+                }),
+                ApiKey::CreateAcls,
+            );
+        }
+
         // Altering ACLs is itself a privileged cluster operation.
         if !self
             .authorizer
@@ -936,6 +969,29 @@ impl KafkaProtocolHandler {
 
         let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
         let request = parse_delete_acls_request(&mut decoder, header.api_version)?;
+
+        if !self.authorizer.is_enabled() {
+            let filter_results = request
+                .filters
+                .iter()
+                .map(|_| FilterResult {
+                    error_code: chronik_protocol::error_codes::SECURITY_DISABLED,
+                    error_message: Some(ACLS_DISABLED_MESSAGE.to_string()),
+                    matching_acls: Vec::new(),
+                })
+                .collect();
+            return self.acl_response(
+                &header,
+                encode_delete_acls_response(
+                    &DeleteAclsResponse {
+                        throttle_time_ms: 0,
+                        filter_results,
+                    },
+                    header.api_version,
+                ),
+                ApiKey::DeleteAcls,
+            );
+        }
 
         if !self
             .authorizer
@@ -1045,6 +1101,22 @@ impl KafkaProtocolHandler {
         let host = decoder.read_string()?;
         let operation = decoder.read_i8()?;
         let _permission_type = decoder.read_i8()?;
+
+        if !self.authorizer.is_enabled() {
+            return self.acl_response(
+                &header,
+                encode_describe_acls_response(
+                    &DescribeAclsResponse {
+                        throttle_time_ms: 0,
+                        error_code: chronik_protocol::error_codes::SECURITY_DISABLED,
+                        error_message: Some(ACLS_DISABLED_MESSAGE.to_string()),
+                        resources: Vec::new(),
+                    },
+                    header.api_version,
+                ),
+                ApiKey::DescribeAcls,
+            );
+        }
 
         if !self
             .authorizer

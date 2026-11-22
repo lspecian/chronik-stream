@@ -62,6 +62,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ChronikTopic and ChronikUser never reconciled.** The operator called
+  HTTP endpoints for topics and users (`/admin/topics`, `/admin/users`) that the
+  broker never had; every resource stayed `Pending` with "Cannot reach admin
+  API". Its tests passed against a mock of those endpoints. The operator now
+  manages them over the Kafka admin protocol the broker implements: topics
+  (create, describe, configs, partitions, delete), SCRAM credentials, and ACLs
+  reconciled to exactly the listed set. On SASL clusters it logs in as
+  `__chronik_broker` with the Pods' secret. `sasl-plain` users and TLS Kafka
+  ports are reported as unsupported in the status. Verified against a broker
+  with and without SASL+ACLs (`tests/cluster/e2e/operator_kafka_admin.sh`).
+  End to end on minikube (3-node cluster, SASL and ACLs enforced): ChronikTopic
+  and ChronikUser go Ready; the generated password produces and consumes on the
+  allowed topic, is refused on another, and stops working when the user is
+  deleted; partition and ACL changes reach the broker; deleting a ChronikTopic
+  deletes the topic. A reconcile queued for an already-deleted resource is no
+  longer logged as an ERROR.
+- **The ACL admin APIs reported success with ACLs disabled.** CreateAcls
+  answered OK and discarded the binding, so DescribeAcls then returned nothing.
+  With `CHRONIK_ACL_ENABLED` off they now answer `SECURITY_DISABLED`, as Kafka
+  does.
+- **Deleting a SCRAM credential that does not exist** answered
+  `INVALID_REQUEST`; it is now `RESOURCE_NOT_FOUND`, as in Kafka, so clients that
+  delete every mechanism of a user can tell "already gone" from a failure.
 - **GCS and Azure object stores** (found porting them to OpenDAL 0.59):
   - `GCS_PREFIX` and `AZURE_PREFIX` were read and never applied; objects went to
     the bucket root. They are now applied, under the GCS project as before.
