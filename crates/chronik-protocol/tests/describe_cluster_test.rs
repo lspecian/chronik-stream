@@ -134,7 +134,6 @@ fn unimplemented_apis_are_not_advertised() {
         ApiKey::AlterPartitionReassignments,
         ApiKey::ElectLeaders,
         ApiKey::AlterReplicaLogDirs,
-        ApiKey::DescribeClientQuotas,
         ApiKey::AlterClientQuotas,
         // DescribeUserScramCredentials / AlterUserScramCredentials were on this
         // list and have been REMOVED because they are now genuinely

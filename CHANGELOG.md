@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **DescribeClientQuotas** (API 48, v0-v1), answered with no quotas: the broker
+  has none. `kafka-configs.sh --describe --entity-type users` calls it before
+  listing SCRAM credentials and failed with "The node does not support
+  DESCRIBE_CLIENT_QUOTAS". AlterClientQuotas stays unadvertised, so setting a
+  quota is refused by the client instead of accepted and never enforced.
+
 ### Security
 
 - **Container images install the base OS security updates.** The server and
@@ -62,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Listing every SCRAM user** (`kafka-configs.sh --describe --entity-type
+  users`) returned nobody: DescribeUserScramCredentials took only a null user
+  list as "all users", and the Java tool sends an empty one (Kafka reads both as
+  all). A user that does not exist was reported as `THROTTLING_QUOTA_EXCEEDED`
+  (code 89); it is `RESOURCE_NOT_FOUND` (91).
 - **ChronikTopic and ChronikUser never reconciled.** The operator called
   HTTP endpoints for topics and users (`/admin/topics`, `/admin/users`) that the
   broker never had; every resource stayed `Pending` with "Cannot reach admin
