@@ -25,9 +25,43 @@ use super::traits::{
     TopicMetadata,
 };
 
-/// Encoding version of commands and snapshots. Bumped on any incompatible
-/// change; there is no upgrade path (clusters are recreated).
+/// Encoding version of commands. New commands are appended to
+/// [`CatalogCommand`], which keeps the existing ones decodable by older nodes
+/// (an older node reads a new command as malformed and changes nothing), so
+/// this does not move when commands are added.
 pub const CATALOG_FORMAT_VERSION: u8 = 1;
+
+/// Encoding version of snapshots. 2 added capabilities, features and
+/// consumer-group offsets; 1 is still read.
+pub const CATALOG_SNAPSHOT_VERSION: u8 = 2;
+
+/// Consumer-group offsets live in the catalog (replicated), and groups are
+/// coordinated by the catalog leader. Enabled once every voter has merged its
+/// pre-catalog offsets under [`FEATURE_GROUP_OFFSETS_MIRROR`].
+pub const FEATURE_GROUP_OFFSETS: &str = "group-offsets";
+
+/// Every voter declared [`FEATURE_GROUP_OFFSETS`]: offset commands are accepted
+/// (commits are written to the catalog as well as on each node, and nodes merge
+/// their own offsets in) but offsets are still read on each node.
+pub const FEATURE_GROUP_OFFSETS_MIRROR: &str = "group-offsets-mirror";
+
+/// A committed consumer-group offset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupOffset {
+    pub offset: i64,
+    pub metadata: Option<String>,
+    pub commit_timestamp_ms: i64,
+}
+
+/// One offset in a [`CatalogCommand::CommitOffsets`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OffsetCommitEntry {
+    pub topic: String,
+    pub partition: u32,
+    pub offset: i64,
+    pub metadata: Option<String>,
+    pub commit_timestamp_ms: i64,
+}
 
 /// A config change for an existing topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +151,17 @@ pub enum CatalogCommand {
     /// that is, each partition takes the assignment with the higher leader
     /// epoch, so several nodes' views merge and no epoch ever goes back.
     ImportTopics { topics: Vec<ImportedTopic> },
+    /// The features a node's binary supports (sent by each node once caught
+    /// up). A feature is enabled only when every voter declares it.
+    DeclareCapabilities { node_id: u64, capabilities: Vec<String> },
+    EnableFeature { feature: String },
+    /// Committed offsets of one group (one OffsetCommit). With
+    /// `only_if_newer`, an entry replaces an existing one only if its commit
+    /// time is later (merging nodes' pre-catalog offsets), and offsets for
+    /// unknown topics are skipped instead of refused.
+    CommitOffsets { group_id: String, offsets: Vec<OffsetCommitEntry>, only_if_newer: bool },
+    /// Remove a group's offsets: these partitions, or all of them.
+    DeleteOffsets { group_id: String, partitions: Option<Vec<(String, u32)>> },
 }
 
 impl CatalogCommand {
@@ -207,6 +252,7 @@ pub enum CatalogChange {
     NodeAddressChanged(u64),
     AclsChanged,
     ScramChanged,
+    FeaturesChanged,
     /// The whole catalog was replaced (a snapshot was installed): re-read everything.
     Reset,
 }
@@ -225,6 +271,40 @@ pub struct CatalogState {
     placement_cursor: u64,
     /// Index of the last applied command.
     applied_index: u64,
+    /// Snapshot 2: what each node's binary supports, the features enabled,
+    /// and committed consumer-group offsets keyed (group, topic, partition).
+    capabilities: BTreeMap<u64, BTreeSet<String>>,
+    features: BTreeSet<String>,
+    offsets: BTreeMap<(String, String, u32), GroupOffset>,
+}
+
+/// Snapshot format 1 (before capabilities, features and offsets).
+#[derive(Deserialize)]
+struct CatalogStateV1 {
+    topics: BTreeMap<String, TopicMetadata>,
+    assignments: BTreeMap<(String, u32), PartitionAssignment>,
+    brokers: BTreeMap<i32, BrokerMetadata>,
+    acls: BTreeSet<AclKey>,
+    scram: BTreeMap<(String, i8), ScramCredentialRecord>,
+    node_addresses: BTreeMap<u64, String>,
+    placement_cursor: u64,
+    applied_index: u64,
+}
+
+impl From<CatalogStateV1> for CatalogState {
+    fn from(v: CatalogStateV1) -> Self {
+        CatalogState {
+            topics: v.topics,
+            assignments: v.assignments,
+            brokers: v.brokers,
+            acls: v.acls,
+            scram: v.scram,
+            node_addresses: v.node_addresses,
+            placement_cursor: v.placement_cursor,
+            applied_index: v.applied_index,
+            ..Default::default()
+        }
+    }
 }
 
 /// `AclBindingRecord` ordered, for a deterministic set.
@@ -279,6 +359,40 @@ impl CatalogState {
         self.applied_index
     }
 
+    pub fn has_feature(&self, feature: &str) -> bool {
+        self.features.contains(feature)
+    }
+
+    /// Whether these nodes have all declared `capability`.
+    pub fn all_declare(&self, nodes: &[u64], capability: &str) -> bool {
+        !nodes.is_empty()
+            && nodes
+                .iter()
+                .all(|n| self.capabilities.get(n).map(|c| c.contains(capability)).unwrap_or(false))
+    }
+
+    pub fn declared(&self, node: u64, capability: &str) -> bool {
+        self.capabilities.get(&node).map(|c| c.contains(capability)).unwrap_or(false)
+    }
+
+    pub fn group_offset(&self, group: &str, topic: &str, partition: u32) -> Option<&GroupOffset> {
+        self.offsets.get(&(group.to_string(), topic.to_string(), partition))
+    }
+
+    /// Every committed offset of a group: (topic, partition, offset).
+    pub fn group_offsets(&self, group: &str) -> Vec<(String, u32, GroupOffset)> {
+        self.offsets
+            .range((group.to_string(), String::new(), 0)..)
+            .take_while(|((g, _, _), _)| g == group)
+            .map(|((_, t, p), o)| (t.clone(), *p, o.clone()))
+            .collect()
+    }
+
+    /// Groups holding committed offsets.
+    pub fn offset_groups(&self) -> BTreeSet<String> {
+        self.offsets.keys().map(|(g, _, _)| g.clone()).collect()
+    }
+
     pub fn topic(&self, name: &str) -> Option<&TopicMetadata> {
         self.topics.get(name)
     }
@@ -326,14 +440,17 @@ impl CatalogState {
     // ---- snapshots -----------------------------------------------------------
 
     pub fn to_snapshot(&self) -> Vec<u8> {
-        let mut out = vec![CATALOG_FORMAT_VERSION];
+        let mut out = vec![CATALOG_SNAPSHOT_VERSION];
         out.extend(bincode::serialize(self).expect("catalog state serializes"));
         out
     }
 
     pub fn from_snapshot(bytes: &[u8]) -> Result<Self, String> {
         match bytes.split_first() {
-            Some((&CATALOG_FORMAT_VERSION, rest)) => bincode::deserialize(rest).map_err(|e| e.to_string()),
+            Some((&CATALOG_SNAPSHOT_VERSION, rest)) => bincode::deserialize(rest).map_err(|e| e.to_string()),
+            Some((&1, rest)) => bincode::deserialize::<CatalogStateV1>(rest)
+                .map(CatalogState::from)
+                .map_err(|e| e.to_string()),
             Some((v, _)) => Err(format!("catalog snapshot format {} is not supported", v)),
             None => Err("empty catalog snapshot".into()),
         }
@@ -430,6 +547,42 @@ impl CatalogState {
             CatalogCommand::ImportTopics { topics } => {
                 CatalogResult::Items(topics.into_iter().map(|t| self.import_topic(index, term, t, &mut changes)).collect())
             }
+            CatalogCommand::DeclareCapabilities { node_id, capabilities } => {
+                let declared: BTreeSet<String> = capabilities.into_iter().collect();
+                if self.capabilities.get(&node_id) != Some(&declared) {
+                    self.capabilities.insert(node_id, declared);
+                    changes.push(CatalogChange::FeaturesChanged);
+                }
+                CatalogResult::Ok
+            }
+            CatalogCommand::EnableFeature { feature } => {
+                if self.features.insert(feature) {
+                    changes.push(CatalogChange::FeaturesChanged);
+                }
+                CatalogResult::Ok
+            }
+            CatalogCommand::CommitOffsets { group_id, offsets, only_if_newer } => {
+                if !self.features.contains(FEATURE_GROUP_OFFSETS) && !self.features.contains(FEATURE_GROUP_OFFSETS_MIRROR) {
+                    CatalogResult::Err(CatalogError::InvalidConfig(format!(
+                        "neither {FEATURE_GROUP_OFFSETS_MIRROR} nor {FEATURE_GROUP_OFFSETS} is enabled"
+                    )))
+                } else {
+                    CatalogResult::Items(
+                        offsets.into_iter().map(|e| self.commit_offset(&group_id, e, only_if_newer)).collect(),
+                    )
+                }
+            }
+            CatalogCommand::DeleteOffsets { group_id, partitions } => {
+                match partitions {
+                    None => self.offsets.retain(|(g, _, _), _| g != &group_id),
+                    Some(list) => {
+                        for (topic, partition) in list {
+                            self.offsets.remove(&(group_id.clone(), topic, partition));
+                        }
+                    }
+                }
+                CatalogResult::Ok
+            }
             CatalogCommand::RemoveNodeAddress { node_id } => {
                 if self.node_addresses.remove(&node_id).is_some() {
                     changes.push(CatalogChange::NodeAddressChanged(node_id));
@@ -503,8 +656,36 @@ impl CatalogState {
         for p in 0..topic.config.partition_count {
             self.assignments.remove(&(name.to_string(), p));
         }
+        // A deleted topic's committed offsets go with it: a later topic of the
+        // same name must not resume from them.
+        self.offsets.retain(|(_, t, _), _| t != name);
         changes.push(CatalogChange::TopicDeleted(name.to_string()));
         CatalogResult::Ok
+    }
+
+    fn commit_offset(&mut self, group_id: &str, e: OffsetCommitEntry, only_if_newer: bool) -> Result<(), CatalogError> {
+        let known = self
+            .topics
+            .get(&e.topic)
+            .map(|t| e.partition < t.config.partition_count)
+            .unwrap_or(false);
+        if !known {
+            // A merge of pre-catalog offsets skips topics deleted since.
+            return if only_if_newer { Ok(()) } else { Err(CatalogError::UnknownPartition) };
+        }
+        let key = (group_id.to_string(), e.topic, e.partition);
+        if only_if_newer {
+            if let Some(existing) = self.offsets.get(&key) {
+                if existing.commit_timestamp_ms >= e.commit_timestamp_ms {
+                    return Ok(());
+                }
+            }
+        }
+        self.offsets.insert(
+            key,
+            GroupOffset { offset: e.offset, metadata: e.metadata, commit_timestamp_ms: e.commit_timestamp_ms },
+        );
+        Ok(())
     }
 
     fn alter_config(
@@ -878,6 +1059,90 @@ mod tests {
     fn run(s: &mut CatalogState, index: &mut u64, cmd: CatalogCommand) -> CatalogResult {
         *index += 1;
         s.apply_entry(*index, 2, &cmd.encode()).0
+    }
+
+    fn offset(topic: &str, partition: u32, offset: i64, ts: i64) -> OffsetCommitEntry {
+        OffsetCommitEntry { topic: topic.into(), partition, offset, metadata: None, commit_timestamp_ms: ts }
+    }
+
+    fn commit(group: &str, offsets: Vec<OffsetCommitEntry>, only_if_newer: bool) -> CatalogCommand {
+        CatalogCommand::CommitOffsets { group_id: group.into(), offsets, only_if_newer }
+    }
+
+    /// Offsets are refused until a feature is enabled, then replicated state:
+    /// unknown partitions refused, a merge keeps the newer commit, deleting the
+    /// topic or the group removes them.
+    #[test]
+    fn group_offsets_follow_the_feature_and_the_topics() {
+        let (mut s, mut i) = with_brokers(3);
+        run(&mut s, &mut i, create("t", 2, 3));
+        let r = run(&mut s, &mut i, commit("g", vec![offset("t", 0, 5, 100)], false));
+        assert!(matches!(r, CatalogResult::Err(CatalogError::InvalidConfig(_))), "before the feature: {r:?}");
+        assert_eq!(s.group_offset("g", "t", 0), None);
+
+        run(&mut s, &mut i, CatalogCommand::DeclareCapabilities { node_id: 1, capabilities: vec![FEATURE_GROUP_OFFSETS.into()] });
+        assert!(!s.all_declare(&[1, 2], FEATURE_GROUP_OFFSETS));
+        run(&mut s, &mut i, CatalogCommand::DeclareCapabilities { node_id: 2, capabilities: vec![FEATURE_GROUP_OFFSETS.into()] });
+        assert!(s.all_declare(&[1, 2], FEATURE_GROUP_OFFSETS));
+        run(&mut s, &mut i, CatalogCommand::EnableFeature { feature: FEATURE_GROUP_OFFSETS_MIRROR.into() });
+        let r = run(&mut s, &mut i, commit("g", vec![offset("t", 0, 4, 90)], false));
+        assert_eq!(r, CatalogResult::Items(vec![Ok(())]), "mirrored commits are accepted");
+        run(&mut s, &mut i, CatalogCommand::EnableFeature { feature: FEATURE_GROUP_OFFSETS.into() });
+        assert!(s.has_feature(FEATURE_GROUP_OFFSETS));
+
+        let r = run(&mut s, &mut i, commit("g", vec![offset("t", 0, 5, 100), offset("t", 9, 1, 100), offset("nope", 0, 1, 100)], false));
+        assert_eq!(r, CatalogResult::Items(vec![Ok(()), Err(CatalogError::UnknownPartition), Err(CatalogError::UnknownPartition)]));
+        assert_eq!(s.group_offset("g", "t", 0).map(|o| o.offset), Some(5));
+
+        // A merge (pre-catalog offsets) keeps the newer commit and skips unknown topics.
+        let r = run(&mut s, &mut i, commit("g", vec![offset("t", 0, 3, 50), offset("t", 1, 7, 50), offset("nope", 0, 1, 50)], true));
+        assert_eq!(r, CatalogResult::Items(vec![Ok(()), Ok(()), Ok(())]));
+        assert_eq!(s.group_offset("g", "t", 0).map(|o| o.offset), Some(5), "older merge entry replaced a newer commit");
+        assert_eq!(s.group_offset("g", "t", 1).map(|o| o.offset), Some(7));
+        run(&mut s, &mut i, commit("other", vec![offset("t", 0, 1, 10)], false));
+        assert_eq!(s.group_offsets("g").len(), 2);
+        assert_eq!(s.offset_groups(), BTreeSet::from(["g".to_string(), "other".to_string()]));
+
+        run(&mut s, &mut i, CatalogCommand::DeleteOffsets { group_id: "g".into(), partitions: Some(vec![("t".into(), 1)]) });
+        assert_eq!(s.group_offsets("g").len(), 1);
+        run(&mut s, &mut i, CatalogCommand::DeleteOffsets { group_id: "g".into(), partitions: None });
+        assert!(s.group_offsets("g").is_empty());
+
+        run(&mut s, &mut i, CatalogCommand::DeleteTopic { name: "t".into() });
+        assert!(s.group_offsets("other").is_empty(), "a deleted topic's offsets survived");
+    }
+
+    /// A node upgraded from snapshot format 1 reads its old snapshot.
+    #[test]
+    fn a_format_1_snapshot_still_loads() {
+        #[derive(Serialize)]
+        struct V1<'a> {
+            topics: &'a BTreeMap<String, TopicMetadata>,
+            assignments: &'a BTreeMap<(String, u32), PartitionAssignment>,
+            brokers: &'a BTreeMap<i32, BrokerMetadata>,
+            acls: &'a BTreeSet<AclKey>,
+            scram: &'a BTreeMap<(String, i8), ScramCredentialRecord>,
+            node_addresses: &'a BTreeMap<u64, String>,
+            placement_cursor: u64,
+            applied_index: u64,
+        }
+        let (mut s, mut i) = with_brokers(3);
+        run(&mut s, &mut i, create("t", 3, 3));
+        let mut bytes = vec![1u8];
+        bytes.extend(bincode::serialize(&V1 {
+            topics: &s.topics,
+            assignments: &s.assignments,
+            brokers: &s.brokers,
+            acls: &s.acls,
+            scram: &s.scram,
+            node_addresses: &s.node_addresses,
+            placement_cursor: s.placement_cursor,
+            applied_index: s.applied_index,
+        }).unwrap());
+        let back = CatalogState::from_snapshot(&bytes).expect("format 1 decodes");
+        assert_eq!(back, s);
+        assert_eq!(CatalogState::from_snapshot(&s.to_snapshot()).unwrap(), s);
+        assert_eq!(s.to_snapshot()[0], CATALOG_SNAPSHOT_VERSION);
     }
 
     fn replicas_of(s: &CatalogState, topic: &str) -> Vec<Vec<u64>> {

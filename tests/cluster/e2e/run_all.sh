@@ -4,7 +4,8 @@
 # Usage: run_all.sh <binary> <label>
 # Needs: KAFKA_HOME (a Kafka distribution), LEGACY_BIN (a v2.17.0 binary, for
 # search_after_archive), SETUP_BIN (a v2.16.7 binary, for
-# straddle's setup), kcat and a JDK, and the legacy_index_tool example built
+# straddle's setup), PREV_BIN (the previous release, v2.18.3, for
+# group_upgrade), kcat and a JDK, and the legacy_index_tool example built
 # (cargo build --release -p chronik-search --example legacy_index_tool).
 # Logs go to tests/cluster/data/e2e/<label>/.
 # Each check starts and stops the local 3-node cluster (tests/cluster/), so
@@ -18,6 +19,7 @@ E2E="$REPO/tests/cluster/e2e"
 export KAFKA_BIN="${KAFKA_HOME:?set KAFKA_HOME to a Kafka distribution}/bin" CHRONIK_BIN=$BIN
 : "${SETUP_BIN:?set SETUP_BIN to a v2.16.7 chronik-server (straddle setup)}"
 : "${LEGACY_BIN:?set LEGACY_BIN to a v2.17.0 chronik-server (search_after_archive upgrade case)}"
+: "${PREV_BIN:?set PREV_BIN to a v2.18.3 chronik-server (group_upgrade)}"
 export LEGACY_BIN
 OUT="$REPO/tests/cluster/data/e2e/$LABEL"; mkdir -p "$OUT"
 cd "$REPO"
@@ -63,6 +65,9 @@ run query_fanout "$E2E/query_fanout.sh" "$BIN" "$LABEL"
 run s3_roundtrip "$E2E/s3_roundtrip.sh" "$BIN" "$LABEL"
 run dr_restore "$E2E/dr_restore.sh" "$BIN" "$LABEL"
 run dr_cluster_restore "$E2E/dr_cluster_restore.sh" "$BIN" "$LABEL"
+run group_coordination "$E2E/group_coordination.sh" "$BIN" "$LABEL"
+run group_upgrade "$E2E/group_upgrade.sh" "$PREV_BIN" "$BIN" "$LABEL"
+run metadata_compaction "$E2E/metadata_compaction.sh" "$BIN" "$LABEL"
 run unified_api_routes "$E2E/unified_api_routes.sh" "$BIN" "$LABEL"
 run operator_kafka_admin "$E2E/operator_kafka_admin.sh" "$BIN" "$LABEL"
 run regression_replication ./tests/cluster/regression_replication.sh

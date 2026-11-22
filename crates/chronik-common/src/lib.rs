@@ -1,5 +1,6 @@
 //! Common types and utilities shared across Chronik Stream components.
 
+pub mod env;
 pub mod error;
 pub mod metrics;
 pub mod types;

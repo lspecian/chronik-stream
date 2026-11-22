@@ -46,13 +46,13 @@ pub const INVALID_TOPIC: i16 = 17;
 pub const UNKNOWN_MEMBER_ID: i16 = 25;
 
 /// The generation id provided in the request is stale
-pub const ILLEGAL_GENERATION: i16 = 27;
+pub const ILLEGAL_GENERATION: i16 = 22;
 
 /// The rebalance timeout is invalid
 pub const REBALANCE_IN_PROGRESS: i16 = 27;
 
 /// The group is rebalancing
-pub const GROUP_COORDINATOR_NOT_AVAILABLE: i16 = 16;
+pub const GROUP_COORDINATOR_NOT_AVAILABLE: i16 = 15;
 
 /// The committing offset data size is not valid
 pub const OFFSET_METADATA_TOO_LARGE: i16 = 12;
@@ -94,16 +94,19 @@ pub const INVALID_REPLICA_ASSIGNMENT: i16 = 39;
 pub const INVALID_CONFIG: i16 = 40;
 
 /// This is not the correct coordinator
-pub const NOT_COORDINATOR: i16 = 41;
+pub const NOT_COORDINATOR: i16 = 16;
 
 /// The request attempted to perform an operation on an invalid group
-pub const INVALID_GROUP_ID: i16 = 42;
+pub const INVALID_GROUP_ID: i16 = 24;
 
 /// The group member's supported protocols are incompatible with those of existing members
-pub const INCONSISTENT_GROUP_PROTOCOL: i16 = 43;
+pub const INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
 
-/// The configured groupId is invalid
-pub const INVALID_GROUP_ID_EXCEPTION: i16 = 44;
+/// The request violates a broker policy
+pub const POLICY_VIOLATION: i16 = 44;
+
+/// This is not the controller
+pub const NOT_CONTROLLER: i16 = 41;
 
 /// The coordinator is loading
 pub const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
@@ -127,25 +130,25 @@ pub const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 pub const SECURITY_DISABLED: i16 = 54;
 
 /// The broker epoch has changed
-pub const BROKER_ID_NOT_REGISTERED: i16 = 68;
+pub const BROKER_ID_NOT_REGISTERED: i16 = 102;
 
 /// The leader epoch is older than the broker epoch
 pub const STALE_BROKER_EPOCH: i16 = 77;
 
 /// The member epoch is fenced
-pub const FENCED_MEMBER_EPOCH: i16 = 78;
+pub const FENCED_MEMBER_EPOCH: i16 = 110;
 
 /// Duplicate sequence number
-pub const DUPLICATE_SEQUENCE_NUMBER: i16 = 88;
+pub const DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
 
 /// Producer epoch is invalid
-pub const INVALID_PRODUCER_EPOCH: i16 = 89;
+pub const INVALID_PRODUCER_EPOCH: i16 = 47;
 
 /// Out of order sequence number
-pub const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 90;
+pub const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
 
 /// Invalid transaction state
-pub const INVALID_TXN_STATE: i16 = 91;
+pub const INVALID_TXN_STATE: i16 = 48;
 
 /// DescribeCluster asked for an endpoint type this node does not serve (KIP-919)
 pub const UNSUPPORTED_ENDPOINT_TYPE: i16 = 119;

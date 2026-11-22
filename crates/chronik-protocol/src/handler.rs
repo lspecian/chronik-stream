@@ -106,6 +106,10 @@ pub struct ProtocolHandler {
     /// CreateTopics, AlterConfigs and IncrementalAlterConfigs; an `Err` is
     /// answered with INVALID_CONFIG and its message, and nothing is changed.
     topic_config_check: Option<TopicConfigCheck>,
+    /// True while another broker coordinates transactional ids (the cluster
+    /// catalog leader); transaction requests are then refused with
+    /// NOT_COORDINATOR so the client finds the coordinator.
+    coordinator_elsewhere: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// See [`ProtocolHandler::set_topic_config_check`].
@@ -204,6 +208,7 @@ impl ProtocolHandler {
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
             topic_defaults: TopicDefaults::default(),
             topic_config_check: None,
+            coordinator_elsewhere: None,
         }
     }
 
@@ -220,6 +225,7 @@ impl ProtocolHandler {
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
             topic_defaults: TopicDefaults::default(),
             topic_config_check: None,
+            coordinator_elsewhere: None,
         }
     }
 
@@ -239,6 +245,7 @@ impl ProtocolHandler {
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
             topic_defaults: TopicDefaults::default(),
             topic_config_check: None,
+            coordinator_elsewhere: None,
         }
     }
 
@@ -260,6 +267,7 @@ impl ProtocolHandler {
             sasl_authenticator: Arc::new(Mutex::new(crate::sasl::SaslAuthenticator::new())),
             topic_defaults: TopicDefaults::default(),
             topic_config_check: None,
+            coordinator_elsewhere: None,
         }
     }
 
@@ -273,6 +281,17 @@ impl ProtocolHandler {
     pub fn with_topic_config_check(mut self, check: TopicConfigCheck) -> Self {
         self.topic_config_check = Some(check);
         self
+    }
+
+    /// See [`Self::coordinator_elsewhere`]: refuse transaction requests while
+    /// this returns true.
+    pub fn with_coordinator_check(mut self, elsewhere: std::sync::Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.coordinator_elsewhere = Some(elsewhere);
+        self
+    }
+
+    fn coordinator_is_elsewhere(&self) -> bool {
+        self.coordinator_elsewhere.as_ref().map(|f| f()).unwrap_or(false)
     }
 
     /// Run the topic config check, if one is set.
@@ -1305,7 +1324,7 @@ impl ProtocolHandler {
             }
 
             // Error code at group level (v8+)
-            encoder.write_i16(0); // error_code
+            encoder.write_i16(response.error_code);
 
             // Tagged fields at group level
             if flexible {
@@ -1372,7 +1391,7 @@ impl ProtocolHandler {
 
             // Error code at response level (v2-7)
             if version >= 2 {
-                encoder.write_i16(0); // error_code at response level
+                encoder.write_i16(response.error_code); // error_code at response level
             }
 
             // Tagged fields at response level
@@ -3936,6 +3955,12 @@ impl ProtocolHandler {
         // Decode request
         let mut decoder = Decoder::new(body);
         let request = InitProducerIdRequest::decode(&mut decoder, header.api_version)?;
+        if request.transactional_id.is_some() && self.coordinator_is_elsewhere() {
+            let response = InitProducerIdResponse { throttle_time_ms: 0, error_code: crate::error_codes::NOT_COORDINATOR, producer_id: -1, producer_epoch: -1 };
+            let mut body_buf = BytesMut::new();
+            response.encode(&mut Encoder::new(&mut body_buf), header.api_version)?;
+            return Ok(Self::make_response(&header, ApiKey::InitProducerId, body_buf.freeze()));
+        }
 
         tracing::info!(
             "InitProducerId for transaction: {:?}, timeout: {}ms",
@@ -4052,6 +4077,24 @@ impl ProtocolHandler {
         // Decode request
         let mut decoder = Decoder::new(body);
         let request = TxnOffsetCommitRequest::decode(&mut decoder, header.api_version)?;
+        if self.coordinator_is_elsewhere() {
+            let topics = request
+                .topics
+                .iter()
+                .map(|t| TxnOffsetCommitTopicResponse {
+                    name: t.name.clone(),
+                    partitions: t
+                        .partitions
+                        .iter()
+                        .map(|p| TxnOffsetCommitPartitionResponse { partition_index: p.partition_index, error_code: crate::error_codes::NOT_COORDINATOR })
+                        .collect(),
+                })
+                .collect();
+            let response = TxnOffsetCommitResponse { throttle_time_ms: 0, topics };
+            let mut body_buf = BytesMut::new();
+            response.encode(&mut Encoder::new(&mut body_buf), header.api_version)?;
+            return Ok(Self::make_response(&header, ApiKey::TxnOffsetCommit, body_buf.freeze()));
+        }
 
         tracing::info!(
             "TxnOffsetCommit for transaction: {}, group: {}, producer_id: {}, epoch: {}, topics: {}",
@@ -4156,6 +4199,12 @@ impl ProtocolHandler {
         // Decode request
         let mut decoder = Decoder::new(body);
         let request = AddOffsetsToTxnRequest::decode(&mut decoder, header.api_version)?;
+        if self.coordinator_is_elsewhere() {
+            let response = AddOffsetsToTxnResponse { throttle_time_ms: 0, error_code: crate::error_codes::NOT_COORDINATOR };
+            let mut body_buf = BytesMut::new();
+            response.encode(&mut Encoder::new(&mut body_buf), header.api_version)?;
+            return Ok(Self::make_response(&header, ApiKey::AddOffsetsToTxn, body_buf.freeze()));
+        }
 
         tracing::info!(
             "AddOffsetsToTxn for transaction: {}, producer_id: {}, epoch: {}, group: {}",
@@ -4199,6 +4248,24 @@ impl ProtocolHandler {
         // Decode request
         let mut decoder = Decoder::new(body);
         let request = AddPartitionsToTxnRequest::decode(&mut decoder, header.api_version)?;
+        if self.coordinator_is_elsewhere() {
+            let results = request
+                .topics
+                .iter()
+                .map(|t| AddPartitionsToTxnTopicResult {
+                    name: t.name.clone(),
+                    results: t
+                        .partitions
+                        .iter()
+                        .map(|p| AddPartitionsToTxnPartitionResult { partition: p.partition, error_code: crate::error_codes::NOT_COORDINATOR })
+                        .collect(),
+                })
+                .collect();
+            let response = AddPartitionsToTxnResponse { throttle_time_ms: 0, results };
+            let mut body_buf = BytesMut::new();
+            response.encode(&mut Encoder::new(&mut body_buf), header.api_version)?;
+            return Ok(Self::make_response(&header, ApiKey::AddPartitionsToTxn, body_buf.freeze()));
+        }
 
         tracing::info!(
             "AddPartitionsToTxn for transaction: {}, producer_id: {}, epoch: {}, topics: {}",

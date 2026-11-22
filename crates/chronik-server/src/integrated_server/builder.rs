@@ -277,15 +277,30 @@ impl IntegratedKafkaServerBuilder {
 
         info!("✅ WalMetadataStore created with event bus wiring");
 
-        // A node restored from the object store starts from that state; the
-        // metadata WAL (empty at restore) replays on top of it.
-        crate::metadata_dr::load_local_base_state(self.data_dir.as_ref().context("data_dir not initialized")?, &wal_metadata_store)
-            .await
-            .context("loading restored node-local metadata")?;
+        // Start from the last checkpoint of the metadata WAL (it includes a
+        // restored base state); without one, from the state a restore from the
+        // object store wrote (its metadata WAL starts empty). The WAL then
+        // replays what came after.
+        let covered = match metadata_wal.load_checkpoint().context("reading the metadata checkpoint")? {
+            Some((covered, image)) => {
+                wal_metadata_store
+                    .import_state(&image)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("loading the metadata checkpoint: {e}"))?;
+                info!("Loaded the metadata checkpoint (covers WAL offsets up to {covered})");
+                Some(covered)
+            }
+            None => {
+                crate::metadata_dr::load_local_base_state(self.data_dir.as_ref().context("data_dir not initialized")?, &wal_metadata_store)
+                    .await
+                    .context("loading restored node-local metadata")?;
+                None
+            }
+        };
 
         // Recover metadata state from WAL before wrapping in Arc
         info!("Recovering metadata state from WAL...");
-        let recovered_events = metadata_wal.recover().await
+        let recovered_events = metadata_wal.recover(covered).await
             .context("Failed to recover metadata WAL")?;
 
         if !recovered_events.is_empty() {
@@ -299,6 +314,7 @@ impl IntegratedKafkaServerBuilder {
 
         // Wrap in Arc now that recovery is complete
         let wal_metadata_store = Arc::new(wal_metadata_store);
+        metadata_wal.spawn_compaction(wal_metadata_store.clone());
 
         self.wal_metadata_store = Some(wal_metadata_store.clone());
         let catalog = self.cluster_catalog.clone().context("cluster catalog not initialized")?;
@@ -306,6 +322,7 @@ impl IntegratedKafkaServerBuilder {
             catalog,
             wal_metadata_store,
         ));
+        catalog_store.spawn_group_offsets_rollout();
         self.catalog_store = Some(catalog_store.clone());
         self.metadata_store = Some(catalog_store);
         Ok(())
@@ -475,6 +492,7 @@ impl IntegratedKafkaServerBuilder {
                         CatalogChange::Reset => state.topics().filter_map(|t| topic_event(&t.name)).collect(),
                         CatalogChange::AclsChanged
                         | CatalogChange::ScramChanged
+                        | CatalogChange::FeaturesChanged
                         | CatalogChange::NodeAddressChanged(_) => Vec::new(),
                     }
                 };
@@ -1557,6 +1575,13 @@ impl IntegratedKafkaServerBuilder {
             self.config.replication_factor,
         ).await?);
 
+        // Groups and transactional ids are coordinated by the catalog leader once
+        // every node supports catalog offsets.
+        if let Some(catalog) = self.cluster_catalog.as_ref() {
+            kafka_handler.set_group_coordination(Arc::new(
+                crate::catalog_metadata_store::CatalogCoordination::new(catalog.clone()),
+            ));
+        }
         self.kafka_handler = Some(kafka_handler);
 
         info!("✅ KafkaProtocolHandler initialized");

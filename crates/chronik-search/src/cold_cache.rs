@@ -80,7 +80,7 @@ impl ColdSegmentCache {
             .or_insert_with(|| {
                 Arc::new(Self::new(
                     root,
-                    env_bytes("CHRONIK_SEARCH_CACHE_BYTES").unwrap_or(DEFAULT_BUDGET_BYTES),
+                    chronik_common::env::bytes("CHRONIK_SEARCH_CACHE_BYTES").unwrap_or(DEFAULT_BUDGET_BYTES),
                     env_usize("CHRONIK_SEARCH_CACHE_OPEN_SEGMENTS").unwrap_or(DEFAULT_MAX_OPEN),
                 ))
             })
@@ -243,7 +243,7 @@ impl ColdSegmentCache {
     fn remember_filter(&self, object_key: &str, filter: Option<Arc<TermFilter>>) {
         static BUDGET: OnceLock<usize> = OnceLock::new();
         let budget = *BUDGET.get_or_init(|| {
-            env_bytes("CHRONIK_SEARCH_TERM_FILTER_BYTES").unwrap_or(256 * 1024 * 1024) as usize
+            chronik_common::env::bytes("CHRONIK_SEARCH_TERM_FILTER_BYTES").unwrap_or(256 * 1024 * 1024) as usize
         });
         let mut f = self.filters.lock().unwrap();
         f.clock += 1;
@@ -466,44 +466,12 @@ fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0)
 }
 
-/// `CHRONIK_SEARCH_CACHE_BYTES`: raw bytes, or a number with KB, MB or GB.
-fn env_bytes(name: &str) -> Option<u64> {
-    let raw = std::env::var(name).ok()?;
-    let parsed = parse_bytes(&raw);
-    if parsed.is_none() {
-        warn!("{name}={raw:?} is not a size (e.g. 4GB, 512MB, 1073741824); using the default");
-    }
-    parsed
-}
-
-fn parse_bytes(raw: &str) -> Option<u64> {
-    let v = raw.trim().to_ascii_uppercase();
-    let (num, mult) = if let Some(n) = v.strip_suffix("GB") {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = v.strip_suffix("MB") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = v.strip_suffix("KB") {
-        (n, 1024)
-    } else {
-        (v.as_str(), 1)
-    };
-    num.trim().parse::<u64>().ok().map(|n| n * mult)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chronik_storage::canonical_record::{CanonicalRecord, CanonicalRecordEntry, CompressionType, TimestampType};
     use chronik_storage::object_store::{ObjectStoreConfig, ObjectStoreFactory, StorageBackend};
     use chronik_storage::tantivy_segment::TantivySegmentWriter;
-
-    #[test]
-    fn sizes_parse() {
-        assert_eq!(parse_bytes("4GB"), Some(4 << 30));
-        assert_eq!(parse_bytes(" 512mb "), Some(512 << 20));
-        assert_eq!(parse_bytes("1024"), Some(1024));
-        assert_eq!(parse_bytes("lots"), None);
-    }
 
     #[test]
     fn directory_names_are_short_and_distinct() {

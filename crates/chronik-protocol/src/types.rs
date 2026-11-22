@@ -375,6 +375,8 @@ pub struct OffsetFetchResponse {
     pub throttle_time_ms: i32,
     pub topics: Vec<OffsetFetchResponseTopic>,
     pub group_id: Option<String>,  // v8+ requires group_id for Groups array
+    /// Top-level error (v2-v7) and group-level error (v8+), e.g. NOT_COORDINATOR.
+    pub error_code: i16,
 }
 
 /// Offset fetch response topic

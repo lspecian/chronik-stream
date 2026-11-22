@@ -110,7 +110,13 @@ impl KafkaProtocolHandler {
             // the indexer's log.
             .with_topic_config_check(std::sync::Arc::new(|config| {
                 chronik_columnar::projection::validate_config(config)
-            })),
+            }))
+            // Transaction requests are refused while another broker (the catalog
+            // leader) coordinates transactional ids.
+            .with_coordinator_check({
+                let groups = group_manager.clone();
+                std::sync::Arc::new(move || groups.coordination_is_local() == Some(false))
+            }),
             produce_handler,
             wal_handler,
             segment_reader,
@@ -124,6 +130,11 @@ impl KafkaProtocolHandler {
             default_num_partitions,
             authorizer: Authorizer::new(acl_store),
         })
+    }
+
+    /// Who coordinates consumer groups and transactional ids (cluster catalog).
+    pub fn set_group_coordination(&self, coordination: Arc<dyn crate::consumer_group::Coordination>) {
+        self.group_manager.set_coordination(coordination);
     }
 
     /// Get reference to the produce handler for shutdown
@@ -1338,6 +1349,7 @@ impl KafkaProtocolHandler {
             throttle_time_ms: 0,
             topics,
             group_id: Some(request.group_id.clone()),
+            error_code: 0,
         };
 
         let mut body_buf = BytesMut::new();
@@ -1521,7 +1533,10 @@ impl KafkaProtocolHandler {
             request.transactional_id, request.producer_id, request.producer_epoch, request.committed
         );
 
-        let error_code = match self.metadata_store.get_transaction(&request.transactional_id).await {
+        // Another broker (the catalog leader) coordinates transactional ids.
+        let error_code = if self.group_manager.coordination_is_local() == Some(false) {
+            error_codes::NOT_COORDINATOR
+        } else { match self.metadata_store.get_transaction(&request.transactional_id).await {
             Ok(Some(txn)) => {
                 if txn.is_fenced(request.producer_id, request.producer_epoch) {
                     tracing::warn!("EndTxn fenced: request pid/epoch {}/{} vs bound {}/{}",
@@ -1589,7 +1604,7 @@ impl KafkaProtocolHandler {
             // the client isn't stuck (matches Kafka's lenient handling of an empty txn).
             Ok(None) => error_codes::NONE,
             Err(e) => { tracing::warn!("EndTxn get_transaction failed: {}", e); error_codes::COORDINATOR_NOT_AVAILABLE }
-        };
+        } };
 
         let response = EndTxnResponse { throttle_time_ms: 0, error_code };
         let mut body_buf = BytesMut::new();
@@ -1938,7 +1953,7 @@ impl KafkaProtocolHandler {
         let request = self.protocol_handler.parse_find_coordinator_request(&header, &mut buf)?;
         tracing::info!("FindCoordinator parsed: key='{}', key_type={}", request.key, request.key_type);
 
-        let response = self.group_manager.handle_find_coordinator(request, &self.host, self.port)?;
+        let response = self.group_manager.handle_find_coordinator(request, self.node_id, &self.host, self.port)?;
         tracing::info!("FindCoordinator response: node_id={}, host={}:{}, coordinators.len()={}",
             response.node_id, response.host, response.port, response.coordinators.len());
 
@@ -2106,7 +2121,13 @@ impl KafkaProtocolHandler {
         use chronik_protocol::list_groups_types::{ListGroupsResponse, ListGroupsResponseGroup, error_codes};
         use bytes::BytesMut;
 
-        let group_ids = self.group_manager.list_groups().await.unwrap_or_default();
+        // A broker lists the groups it coordinates; admin clients ask every
+        // broker and merge. Another broker coordinating means none here.
+        let group_ids = if self.group_manager.not_coordinator().await {
+            Vec::new()
+        } else {
+            self.group_manager.list_groups().await.unwrap_or_default()
+        };
         let groups = group_ids.into_iter().map(|group_id| ListGroupsResponseGroup {
             group_id,
             protocol_type: "consumer".to_string(),
@@ -2165,8 +2186,21 @@ impl KafkaProtocolHandler {
             request.group_ids
         );
 
+        let not_coordinator = self.group_manager.not_coordinator().await;
         let mut groups = Vec::with_capacity(request.group_ids.len());
         for group_id in request.group_ids {
+            if not_coordinator {
+                groups.push(DescribedGroup {
+                    error_code: crate::consumer_group::NOT_COORDINATOR,
+                    group_id,
+                    group_state: String::new(),
+                    protocol_type: String::new(),
+                    protocol_data: String::new(),
+                    members: Vec::new(),
+                    authorized_operations: NO_AUTHORIZED_OPERATIONS,
+                });
+                continue;
+            }
             if !self
                 .authorizer
                 .authorize_group(ctx, &group_id, AclOperation::Describe)
@@ -2260,8 +2294,13 @@ impl KafkaProtocolHandler {
         };
         tracing::info!("DeleteGroups v{} request: {:?}", header.api_version, request.groups_names);
 
+        let not_coordinator = self.group_manager.not_coordinator().await;
         let mut results = Vec::with_capacity(request.groups_names.len());
         for group_id in &request.groups_names {
+            if not_coordinator {
+                results.push(DeletableGroupResult { group_id: group_id.clone(), error_code: crate::consumer_group::NOT_COORDINATOR });
+                continue;
+            }
             let error_code = match self.group_manager.group_status(group_id).await {
                 None => ec::GROUP_ID_NOT_FOUND,
                 Some(true) => ec::GROUP_NOT_EMPTY,
@@ -2320,6 +2359,11 @@ impl KafkaProtocolHandler {
         let group_error = match status {
             None => ec::GROUP_ID_NOT_FOUND,
             Some(_) => ec::NONE,
+        };
+        let group_error = if self.group_manager.not_coordinator().await {
+            crate::consumer_group::NOT_COORDINATOR
+        } else {
+            group_error
         };
         let has_members = matches!(status, Some(true));
 
