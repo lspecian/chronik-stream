@@ -34,7 +34,6 @@ chronik-scram = { path = "../chronik-scram" }
 bytes = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 sha2 = { workspace = true }
 
 # Error handling

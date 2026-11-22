@@ -1722,7 +1722,7 @@ dependencies = [
  "dashmap 5.5.3",
  "futures",
  "hex",
- "lru 0.12.5",
+ "lru 0.18.5",
  "parking_lot 0.12.5",
  "rdkafka",
  "regex",
@@ -1798,7 +1798,6 @@ dependencies = [
  "rand 0.8.8",
  "reqwest 0.12.28",
  "rustls",
- "rustls-pemfile",
  "schemars",
  "serde",
  "serde_json",
@@ -2021,7 +2020,6 @@ dependencies = [
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -7652,15 +7650,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework 3.5.1",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]

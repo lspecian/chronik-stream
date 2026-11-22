@@ -106,19 +106,19 @@ impl KafkaTls {
             OperatorError::Config(format!("TLS {what}: {e}"))
         };
         let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_pemfile::certs(&mut self.ca_pem.as_slice()) {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        for cert in CertificateDer::pem_slice_iter(&self.ca_pem) {
             let cert = cert.map_err(|e| bad("ca.crt", &e))?;
             roots.add(cert).map_err(|e| bad("ca.crt", &e))?;
         }
         if roots.is_empty() {
             return Err(bad("ca.crt", &"no certificate"));
         }
-        let certs = rustls_pemfile::certs(&mut self.cert_pem.as_slice())
+        let certs = CertificateDer::pem_slice_iter(&self.cert_pem)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| bad("tls.crt", &e))?;
-        let key = rustls_pemfile::private_key(&mut self.key_pem.as_slice())
-            .map_err(|e| bad("tls.key", &e))?
-            .ok_or_else(|| bad("tls.key", &"no private key"))?;
+        let key = PrivateKeyDer::from_pem_slice(&self.key_pem).map_err(|e| bad("tls.key", &e))?;
         // An explicit provider: the process may link more than one.
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),

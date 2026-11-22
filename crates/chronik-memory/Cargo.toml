@@ -42,7 +42,7 @@ thiserror = { workspace = true }
 # Idempotency
 sha2 = "0.10"
 hex = "0.4"
-lru = "0.12"
+lru = "0.18"
 parking_lot = { workspace = true }
 
 # MemoryRegistry: per-namespace Memory cache (AM-1.7)
