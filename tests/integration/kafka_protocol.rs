@@ -177,7 +177,7 @@ async fn test_kafka_produce_consume() -> Result<()> {
     
     // Wait for all deliveries
     for (i, future) in delivery_futures.into_iter().enumerate() {
-        let (partition, offset) = future
+        let rdkafka::producer::future_producer::Delivery { partition, offset, .. } = future
             .await
             .expect("Delivery error");
         
