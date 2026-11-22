@@ -76,7 +76,8 @@ impl QueryExecutor {
         options: &QueryOptions,
     ) -> Result<Vec<SearchHit>> {
         let collector = TopDocs::with_limit(options.limit)
-            .and_offset(options.offset);
+            .and_offset(options.offset)
+            .order_by_score();
         
         let top_docs = searcher.search(query, &collector)
             .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;

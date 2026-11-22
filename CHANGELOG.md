@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Tantivy 0.24 → 0.27** (full-text search). Clears the last `lru` advisories
+  (RUSTSEC-2026-0253, possible use-after-free; RUSTSEC-2026-0002) and brings
+  upstream fixes: an out-of-bounds write in terms aggregation on a corrupt
+  index, dates outside the nanosecond range wrapping to a wrong date, a `vint`
+  buffer overflow during indexing. The on-disk index format is unchanged
+  (format 7, doc store V2), so archived indexes need no migration and a
+  rollback reads what this version wrote; `tests/cluster/e2e/tantivy_cross_version.sh`
+  checks both directions (same hits, same order). `cargo audit`: one
+  vulnerability left, `rsa` (upstream).
+
 ### Fixed
 
 - **Operator 0.4.0 panicked at startup** ("Could not automatically determine the

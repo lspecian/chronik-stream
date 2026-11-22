@@ -264,7 +264,7 @@ impl TantivySegmentWriter {
         // Copy every document to the disk index by walking the segments
         // directly.
         //
-        // This used to run `AllQuery` through `TopDocs::with_limit(1_000_000)`,
+        // This used to run `AllQuery` through `TopDocs::with_limit(1_000_000).order_by_score()`,
         // which silently wrote only the first million documents: a WAL segment
         // holding more than that produced a cold index missing the rest, with no
         // error and a record_count in the metadata that disagreed with what the
@@ -778,7 +778,7 @@ impl TantivySegmentReader {
 
         // Collect every document in the range, not the top 10,000 of them.
         //
-        // `TopDocs::with_limit(10_000)` silently capped this: a segment holding
+        // `TopDocs::with_limit(10_000).order_by_score()` silently capped this: a segment holding
         // more than 10,000 records in the requested range returned 10,000 and
         // reported no truncation, so a caller reading a range back got a short
         // answer indistinguishable from a complete one. These documents carry no

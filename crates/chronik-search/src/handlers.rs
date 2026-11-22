@@ -1202,7 +1202,7 @@ async fn search_in_index(
     };
 
     // Execute search
-    let top_docs = searcher.search(&*query, &TopDocs::with_limit(request.from.saturating_add(request.size)))
+    let top_docs = searcher.search(&*query, &TopDocs::with_limit(request.from.saturating_add(request.size)).order_by_score())
         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
     
     // Collect results
@@ -1892,7 +1892,7 @@ pub async fn get_document(
     let term = Term::from_field_text(id_field, &id);
     let query = TermQuery::new(term, Default::default());
     
-    let top_docs = searcher.search(&query, &TopDocs::with_limit(1))
+    let top_docs = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())
         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))
         .map_err(|e| search_error(e))?;
     
@@ -2447,7 +2447,7 @@ mod json_field_tests {
         let searcher = index.reader().unwrap().searcher();
         let offset = schema.get_field("offset").unwrap();
         let mut out: Vec<i64> = searcher
-            .search(&*query, &TopDocs::with_limit(100))
+            .search(&*query, &TopDocs::with_limit(100).order_by_score())
             .unwrap()
             .into_iter()
             .map(|(_, addr)| {

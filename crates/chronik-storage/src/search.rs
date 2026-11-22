@@ -180,7 +180,7 @@ impl SearchIndex {
             .map_err(|e| Error::Search(e.to_string()))?;
         
         // Execute search
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())
             .map_err(|e| Error::Search(e.to_string()))?;
         let total_hits = searcher.search(&query, &tantivy::collector::Count)
             .map_err(|e| Error::Search(e.to_string()))?;

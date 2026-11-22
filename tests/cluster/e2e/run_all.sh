@@ -4,8 +4,8 @@
 # Usage: run_all.sh <binary> <label>
 # Needs: KAFKA_HOME (a Kafka distribution), LEGACY_BIN (a v2.17.0 binary, for
 # search_after_archive), SETUP_BIN (a v2.16.7 binary, for
-# straddle's setup), PREV_BIN (the previous release, v2.18.3, for
-# group_upgrade), kcat and a JDK, and the legacy_index_tool example built
+# straddle's setup), PREV_BIN (the previous release, for group_upgrade and
+# tantivy_cross_version), kcat and a JDK, and the legacy_index_tool example built
 # (cargo build --release -p chronik-search --example legacy_index_tool).
 # Logs go to tests/cluster/data/e2e/<label>/.
 # Each check starts and stops the local 3-node cluster (tests/cluster/), so
@@ -19,7 +19,7 @@ E2E="$REPO/tests/cluster/e2e"
 export KAFKA_BIN="${KAFKA_HOME:?set KAFKA_HOME to a Kafka distribution}/bin" CHRONIK_BIN=$BIN
 : "${SETUP_BIN:?set SETUP_BIN to a v2.16.7 chronik-server (straddle setup)}"
 : "${LEGACY_BIN:?set LEGACY_BIN to a v2.17.0 chronik-server (search_after_archive upgrade case)}"
-: "${PREV_BIN:?set PREV_BIN to a v2.18.3 chronik-server (group_upgrade)}"
+: "${PREV_BIN:?set PREV_BIN to the chronik-server of the previous release (group_upgrade, tantivy_cross_version)}"
 export LEGACY_BIN
 OUT="$REPO/tests/cluster/data/e2e/$LABEL"; mkdir -p "$OUT"
 cd "$REPO"
@@ -54,6 +54,8 @@ run legacy_index_retirement "$E2E/legacy_index_retirement.sh" "$BIN" "$LABEL"
 run archive_merge "$E2E/archive_merge.sh" "$BIN" "$LABEL"
 run archive_merge_crash "$E2E/archive_merge_crash.sh" "$BIN" "$LABEL"
 run archive_upgrade "$E2E/archive_upgrade.sh" "$BIN" "$LABEL"
+run tantivy_cross_version_up "$E2E/tantivy_cross_version.sh" "$PREV_BIN" "$BIN" "$LABEL-up"
+run tantivy_cross_version_down "$E2E/tantivy_cross_version.sh" "$BIN" "$PREV_BIN" "$LABEL-down"
 run acks0_no_response "$E2E/acks0_no_response.sh" "$BIN" "$LABEL"
 run hot_buffer_limit "$E2E/hot_buffer_limit.sh" "$BIN" "$LABEL"
 run projected_columns "$E2E/projected_columns.sh" "$BIN" "$LABEL"

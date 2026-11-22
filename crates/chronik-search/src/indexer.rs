@@ -202,7 +202,7 @@ impl TantivyIndexer {
             .map_err(|e| Error::InvalidInput(format!("Invalid query: {}", e)))?;
         
         // Execute search
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())
             .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
         
         // Collect results

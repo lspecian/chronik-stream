@@ -499,7 +499,7 @@ fn search_index_for_candidates(
     let parsed_query = query_parser.parse_query(query_text)
         .map_err(|e| BackendError::ExecutionFailed(format!("Query parse failed: {}", e)))?;
 
-    let top_docs = searcher.search(&*parsed_query, &TopDocs::with_limit(k))
+    let top_docs = searcher.search(&*parsed_query, &TopDocs::with_limit(k).order_by_score())
         .map_err(|e| BackendError::ExecutionFailed(format!("Search failed: {}", e)))?;
 
     let mut candidates = Vec::new();
@@ -644,7 +644,7 @@ fn search_wal_topic_for_candidates(
             Err(_) => continue,
         };
 
-        let top_docs = match searcher.search(&*parsed_query, &TopDocs::with_limit(k)) {
+        let top_docs = match searcher.search(&*parsed_query, &TopDocs::with_limit(k).order_by_score()) {
             Ok(docs) => docs,
             Err(_) => continue,
         };
