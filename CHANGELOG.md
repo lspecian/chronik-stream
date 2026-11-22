@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Operator 0.4.0 panicked at startup** ("Could not automatically determine the
+  process-level CryptoProvider"). The Kafka TLS client added `rustls` with its
+  default `aws-lc-rs` provider beside kube's `ring`, and nothing chose between
+  them, so building the Kubernetes client aborted the process; a rolling update
+  kept the previous operator running. Operator 0.4.1 installs the provider before
+  anything else. A new test starts the real `chronik-operator start` binary
+  (no unit test ran it).
+
 ## [2.19.0] - 2026-11-22
 
 ### Added
