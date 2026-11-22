@@ -52,7 +52,7 @@ run() { # <name> <test env...> -- <broker env...>
   kill $pid; wait $pid 2>/dev/null; pid=
 }
 
-PKI=$D-pki
+PKI=$REPO/$D-pki # absolute: cargo test runs in the crate directory
 rm -rf "$PKI"; mkdir -p "$PKI"
 (
   cd "$PKI"
