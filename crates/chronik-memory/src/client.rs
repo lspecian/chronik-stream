@@ -350,7 +350,7 @@ impl Memory {
             .payload(payload.as_slice());
 
         match self.inner.producer.send(record, DEFAULT_PRODUCE_TIMEOUT).await {
-            Ok((partition, offset)) => Ok(IngestAck {
+            Ok(rdkafka::producer::future_producer::Delivery { partition, offset, .. }) => Ok(IngestAck {
                 topic,
                 partition,
                 offset,
@@ -417,7 +417,7 @@ impl Memory {
             .payload(payload.as_slice());
 
         match self.inner.producer.send(record, DEFAULT_PRODUCE_TIMEOUT).await {
-            Ok((partition, offset)) => Ok(IngestAck {
+            Ok(rdkafka::producer::future_producer::Delivery { partition, offset, .. }) => Ok(IngestAck {
                 topic,
                 partition,
                 offset,
@@ -477,7 +477,7 @@ impl Memory {
             let record = FutureRecord::to(raw_topic.as_str())
                 .key(key.as_str())
                 .payload(payload.as_slice());
-            let (partition, offset) = self
+            let rdkafka::producer::future_producer::Delivery { partition, offset, .. } = self
                 .inner
                 .producer
                 .send(record, DEFAULT_PRODUCE_TIMEOUT)

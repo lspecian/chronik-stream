@@ -85,7 +85,7 @@ async fn produce(
     }
 
     match state.producer.send(record, Duration::from_secs(5)).await {
-        Ok((partition, offset)) => {
+        Ok(rdkafka::producer::future_producer::Delivery { partition, offset, .. }) => {
             state.produced.fetch_add(1, Ordering::Relaxed);
             Ok(Json(ProduceResponse { partition, offset }))
         }
