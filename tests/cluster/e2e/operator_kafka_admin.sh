@@ -8,6 +8,9 @@
 #   1. no SASL;
 #   2. SASL required and ACLs enforced, the client logging in as the broker
 #      user, as the operator does on a SASL cluster.
+#   3. the same over TLS with client certificates required (`spec.tls` with
+#      requireClientCert), the client verifying the broker against the CA and
+#      presenting the broker certificate.
 #
 # Usage: operator_kafka_admin.sh <binary> <label>
 set -u
@@ -34,7 +37,11 @@ run() { # <name> <test env...> -- <broker env...>
   rm -rf "$D"; mkdir -p "$D"
   env CHRONIK_ADVERTISED_ADDR=localhost "${broker_env[@]}" "$BIN" start --data-dir "$D" > "$LOG-$name.log" 2>&1 &
   pid=$!
-  for _ in $(seq 60); do curl -fsS -m 2 localhost:6092/health >/dev/null 2>&1 && break; sleep 1; done
+  for _ in $(seq 60); do
+    curl -fsS -m 2 localhost:6092/health >/dev/null 2>&1 && break
+    curl -fsS -m 2 --cacert "$PKI/ca.crt" --cert "$PKI/tls.crt" --key "$PKI/tls.key" https://localhost:6092/health >/dev/null 2>&1 && break
+    sleep 1
+  done
   sleep 3
   echo "-- $name"
   if env CHRONIK_ADMIN_TEST_BOOTSTRAP=localhost:9092 "${test_env[@]}" \
@@ -45,10 +52,25 @@ run() { # <name> <test env...> -- <broker env...>
   kill $pid; wait $pid 2>/dev/null; pid=
 }
 
+PKI=$D-pki
+rm -rf "$PKI"; mkdir -p "$PKI"
+(
+  cd "$PKI"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 2 -subj "/CN=opadmin-ca" 2>/dev/null
+  openssl req -newkey rsa:2048 -nodes -keyout tls.key -out tls.csr -subj "/CN=localhost" 2>/dev/null
+  printf 'subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth,clientAuth\n' > ext.cnf
+  openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out tls.crt -days 2 -extfile ext.cnf 2>/dev/null
+) || { echo "FAIL: could not create certificates"; exit 1; }
+
 echo "=== $LABEL ($BIN)"
 run plain -- CHRONIK_SASL_ENABLED=false
 run sasl-acl CHRONIK_ADMIN_TEST_SECRET="$SECRET" CHRONIK_ADMIN_TEST_ACLS=1 -- \
   CHRONIK_SASL_ENABLED=true CHRONIK_INTER_BROKER_SECRET="$SECRET" \
   CHRONIK_ACL_ENABLED=true CHRONIK_ACL_ALLOW_IF_NO_ACL=false
+run tls-sasl-acl CHRONIK_ADMIN_TEST_SECRET="$SECRET" CHRONIK_ADMIN_TEST_ACLS=1 CHRONIK_ADMIN_TEST_TLS_DIR="$PKI" -- \
+  CHRONIK_SASL_ENABLED=true CHRONIK_INTER_BROKER_SECRET="$SECRET" \
+  CHRONIK_ACL_ENABLED=true CHRONIK_ACL_ALLOW_IF_NO_ACL=false \
+  CHRONIK_TLS_CERT="$PKI/tls.crt" CHRONIK_TLS_KEY="$PKI/tls.key" CHRONIK_TLS_CA_CERT="$PKI/ca.crt" \
+  CHRONIK_TLS_REQUIRE_CLIENT_CERT=true
 
 if [ $fail = 0 ]; then echo "RESULT $LABEL: PASS"; else echo "RESULT $LABEL: FAIL"; exit 1; fi

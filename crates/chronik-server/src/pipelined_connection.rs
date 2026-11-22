@@ -23,7 +23,7 @@
 ///     │← response ───────────────┴───────────────────┘
 /// ```
 
-use tokio::net::TcpStream;
+use crate::replication::replica_fetcher::connection::LeaderStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
@@ -70,17 +70,17 @@ impl PipelinedConnection {
     pub async fn connect(remote_addr: String, request_queue_size: usize) -> Result<Self> {
         debug!("Establishing pipelined connection to {}", remote_addr);
 
-        // Connect to remote leader
-        let stream = TcpStream::connect(&remote_addr).await.map_err(|e| {
-            Error::Internal(format!("Failed to connect to {}: {}", remote_addr, e))
-        })?;
-
-        // Set TCP_NODELAY for low latency
-        stream.set_nodelay(true).map_err(|e| {
-            Error::Internal(format!("Failed to set TCP_NODELAY: {}", e))
-        })?;
-
-        let (read_half, write_half) = stream.into_split();
+        // Connect to the leader as brokers do: TLS when the Kafka port uses it,
+        // SASL as the broker user when a secret is set. A plain socket was cut
+        // off by a TLS or SASL-required leader, and every forwarded write fell
+        // back to NOT_LEADER.
+        let stream = crate::replication::replica_fetcher::connection::dial(
+            &remote_addr,
+            crate::inter_broker::tls(),
+            crate::inter_broker::secret(),
+        )
+        .await?;
+        let (read_half, write_half) = tokio::io::split(stream);
 
         // Create request queue channel
         let (request_tx, request_rx) = mpsc::channel(request_queue_size);
@@ -196,7 +196,7 @@ impl PipelinedConnection {
 
 /// Send task: reads requests from queue and writes to TCP stream
 async fn send_task(
-    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    mut write_half: tokio::io::WriteHalf<LeaderStream>,
     mut request_rx: mpsc::Receiver<PendingRequest>,
     pending_responses: Arc<Mutex<HashMap<i32, oneshot::Sender<Result<Bytes>>>>>,
 ) -> Result<()> {
@@ -230,7 +230,7 @@ async fn send_task(
 
 /// Receive task: reads responses from TCP stream and matches to pending requests
 async fn receive_task(
-    mut read_half: tokio::net::tcp::OwnedReadHalf,
+    mut read_half: tokio::io::ReadHalf<LeaderStream>,
     pending_responses: Arc<Mutex<HashMap<i32, oneshot::Sender<Result<Bytes>>>>>,
 ) -> Result<()> {
     loop {

@@ -182,6 +182,10 @@ pub struct ChronikClusterSpec {
     /// so it injects only a secret set here, and generates none.
     #[serde(default)]
     pub inter_broker_secret: Option<SecretKeyRef>,
+
+    /// TLS on the Kafka port (and the Unified API). Unset: plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<super::common::KafkaTlsSpec>,
 }
 
 /// Env var that turns on SASL in the broker.

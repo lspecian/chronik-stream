@@ -981,8 +981,7 @@ async fn spawn_api_server(
     addr: std::net::SocketAddr,
     app: Router,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let tls_config = crate::tls::TlsConfig::from_env_with_prefix("CHRONIK_API_TLS")
-        .or_else(crate::tls::TlsConfig::from_env);
+    let tls_config = crate::tls::api_tls_config();
 
     match tls_config {
         Some(tls) => {

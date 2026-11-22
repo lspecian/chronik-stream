@@ -244,6 +244,44 @@ user `__chronik_broker`. The operator handles this with no manual step:
 Turning SASL on changes `env`, so it rolls the cluster's brokers like any other
 `env` edit.
 
+### TLS Clusters
+
+`spec.tls` puts the Kafka port behind TLS. The Unified API (6092) serves HTTPS
+with the same certificate, brokers fetch from each other and fan queries out to
+each other over TLS, and the operator manages topics and users over TLS.
+
+```yaml
+spec:
+  tls:
+    secretName: chronik-kafka-tls   # tls.crt, tls.key, ca.crt
+    requireClientCert: false         # true: clients must present a certificate signed by ca.crt
+```
+
+The Secret has the layout cert-manager writes. One certificate serves every
+broker, so it must name all of them (and any name clients use to reach them;
+list new brokers before scaling up), and `ca.crt` must be the CA that signed it:
+brokers and the operator verify each other against it. With cert-manager:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: chronik-kafka-tls
+spec:
+  secretName: chronik-kafka-tls
+  issuerRef: {name: my-ca-issuer, kind: Issuer}
+  dnsNames:                          # every broker: <cluster>-<id>.<namespace>.svc.cluster.local
+    - prod-cluster-1.default.svc.cluster.local
+    - prod-cluster-2.default.svc.cluster.local
+    - prod-cluster-3.default.svc.cluster.local
+  usages: [server auth, client auth]
+```
+
+With `requireClientCert: true` brokers and the operator present this
+certificate to each other, so it must allow client authentication (as above).
+Turning TLS on or off, or changing the Secret name, restarts the brokers;
+clusters without `spec.tls` are not touched by an operator upgrade.
+
 ### How Config Generation Works
 
 The operator automatically generates a TOML config for each node with:
@@ -381,9 +419,10 @@ in as the broker-to-broker user `__chronik_broker` with the same secret the
 broker Pods receive (the generated `<cluster>-inter-broker` Secret,
 `spec.interBrokerSecret`, or `CHRONIK_INTER_BROKER_SECRET` in `env`). A
 ChronikStandalone with SASL needs `CHRONIK_INTER_BROKER_SECRET` set in its
-`env`. Clusters whose Kafka port uses TLS (`CHRONIK_TLS_CERT`) are not managed
-yet: the operator cannot verify the broker certificate, and the resource's
-status says so.
+`env`. With `spec.tls` the operator connects over TLS, verifying the brokers
+against the Secret's `ca.crt` and presenting its `tls.crt`. A cluster that sets
+`CHRONIK_TLS_CERT` through `env` instead is not managed (the operator does not
+know the CA), and the resource's status says so.
 
 ### ACL Rule Structure
 

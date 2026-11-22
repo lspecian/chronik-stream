@@ -6,6 +6,7 @@
 //!
 //!   CHRONIK_ADMIN_TEST_BOOTSTRAP=localhost:9092 \
 //!   [CHRONIK_ADMIN_TEST_SECRET=<CHRONIK_INTER_BROKER_SECRET>] \
+//!   [CHRONIK_ADMIN_TEST_TLS_DIR=<dir with ca.crt, tls.crt, tls.key>] \
 //!     cargo test -p chronik-operator --test kafka_admin_test -- --ignored
 //!
 //! CHRONIK_ADMIN_TEST_ACLS=1 when the broker enforces ACLs; otherwise the test
@@ -16,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use chronik_operator::kafka_admin::{AclEntry, Credentials, KafkaAccess, KafkaAdmin};
+use chronik_operator::kafka_admin::{AclEntry, Credentials, KafkaAccess, KafkaAdmin, KafkaTls};
 use chronik_scram::SaslMechanism;
 
 fn access(credentials: Option<Credentials>) -> Option<KafkaAccess> {
@@ -25,6 +26,18 @@ fn access(credentials: Option<Credentials>) -> Option<KafkaAccess> {
     Some(KafkaAccess {
         bootstrap: vec!["127.0.0.1:1".into(), bootstrap],
         credentials,
+        tls: tls(),
+    })
+}
+
+/// With CHRONIK_ADMIN_TEST_TLS_DIR (ca.crt, tls.crt, tls.key), over TLS.
+fn tls() -> Option<KafkaTls> {
+    let dir = std::path::PathBuf::from(std::env::var("CHRONIK_ADMIN_TEST_TLS_DIR").ok()?);
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    Some(KafkaTls {
+        ca_pem: read("ca.crt"),
+        cert_pem: read("tls.crt"),
+        key_pem: read("tls.key"),
     })
 }
 

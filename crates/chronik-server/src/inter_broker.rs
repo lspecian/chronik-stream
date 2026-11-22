@@ -47,10 +47,61 @@ pub fn secret() -> Option<&'static str> {
         .as_deref()
 }
 
+/// TLS for replica fetches, set once at cluster startup by [`configure_tls`].
+static TLS: OnceLock<Option<tokio_rustls::TlsConnector>> = OnceLock::new();
+
+/// Make replica fetches speak TLS when this node's Kafka port does: every
+/// broker of a cluster serves the same listener, so a follower must dial its
+/// leaders the way clients dial it. Before, followers always dialled in
+/// plaintext; against a TLS port every fetch failed, every ISR shrank to its
+/// leader, and `acks=all` writes timed out while clients saw a running cluster.
+///
+/// Refuses (the node does not start) when the port uses TLS but other brokers
+/// cannot be verified: no `CHRONIK_TLS_CA_CERT`, or unreadable files.
+pub fn configure_tls(listener: Option<&crate::tls::TlsConfig>) -> Result<(), String> {
+    let connector = match listener {
+        None => None,
+        Some(config) => Some(crate::tls::create_tls_connector(config).map_err(|e| {
+            format!(
+                "the Kafka port uses TLS (CHRONIK_TLS_CERT), so followers fetch from their leaders \
+                 over TLS, but that client cannot be built: {e:#}"
+            )
+        })?),
+    };
+    let _ = TLS.set(connector);
+
+    // Query fan-out reaches peers' Unified API, which serves HTTPS when this
+    // node's does (CHRONIK_API_TLS_*, or the Kafka listener's certificate).
+    let api = match crate::tls::api_tls_config() {
+        None => None,
+        Some(config) => Some(crate::tls::client_config(&config).map_err(|e| {
+            format!(
+                "the Unified API serves HTTPS, so queries fan out to peers over HTTPS, but that \
+                 client cannot be built: {e:#}"
+            )
+        })?),
+    };
+    let _ = API_TLS.set(api);
+    Ok(())
+}
+
+/// TLS for query fan-out to peers' Unified API, set by [`configure_tls`].
+static API_TLS: OnceLock<Option<rustls::ClientConfig>> = OnceLock::new();
+
+/// The client config for HTTPS to peers' Unified API, if it serves HTTPS.
+pub fn api_tls() -> Option<rustls::ClientConfig> {
+    API_TLS.get().and_then(Option::clone)
+}
+
+/// The TLS client for replica fetches, if this node's Kafka port uses TLS.
+pub fn tls() -> Option<&'static tokio_rustls::TlsConnector> {
+    TLS.get().and_then(Option::as_ref)
+}
+
 /// The broker user the server accepts, or `None` when no secret is set.
 ///
 /// SCRAM-SHA-512 only. PLAIN would send the secret in the clear on every
-/// reconnect, and there is no TLS between brokers yet.
+/// reconnect when brokers do not use TLS.
 pub fn server_user() -> Option<SaslUser> {
     let secret = secret()?;
     match ScramCredential::derive(

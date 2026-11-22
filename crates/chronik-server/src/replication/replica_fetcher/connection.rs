@@ -55,14 +55,22 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const SASL_HANDSHAKE_API_KEY: i16 = 17;
 const SASL_AUTHENTICATE_API_KEY: i16 = 36;
 
+/// The byte stream to a leader: plain TCP, or TLS over it when the Kafka port
+/// uses TLS.
+pub(crate) trait LeaderIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> LeaderIo for T {}
+pub(crate) type LeaderStream = Box<dyn LeaderIo>;
+
 /// A lazily-connected, self-healing link to one leader's Kafka port.
 pub struct LeaderConnection {
     addr: String,
-    stream: Option<TcpStream>,
+    stream: Option<LeaderStream>,
     next_correlation_id: i32,
     /// Inter-broker secret. When set, every new socket authenticates as
     /// `__chronik_broker` before its first request.
     secret: Option<String>,
+    /// TLS client, when leaders' Kafka ports use TLS.
+    tls: Option<tokio_rustls::TlsConnector>,
 }
 
 impl LeaderConnection {
@@ -72,6 +80,7 @@ impl LeaderConnection {
             stream: None,
             next_correlation_id: 1,
             secret: None,
+            tls: None,
         }
     }
 
@@ -80,7 +89,14 @@ impl LeaderConnection {
     pub fn for_replication(addr: impl Into<String>) -> Self {
         let mut conn = Self::new(addr);
         conn.secret = crate::inter_broker::secret().map(str::to_string);
+        conn.tls = crate::inter_broker::tls().cloned();
         conn
+    }
+
+    /// Speak TLS to the leader with this client.
+    pub fn with_tls(mut self, tls: tokio_rustls::TlsConnector) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
     /// Authenticate every new socket with this secret.
@@ -243,111 +259,10 @@ impl LeaderConnection {
         if self.stream.is_some() {
             return Ok(());
         }
-
-        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&self.addr))
-            .await
-            .map_err(|_| {
-                Error::Network(format!(
-                    "Connect to leader {} timed out after {:?}",
-                    self.addr, CONNECT_TIMEOUT
-                ))
-            })?
-            .map_err(|e| Error::Network(format!("Connect to leader {} failed: {e}", self.addr)))?;
-
-        // Replication is latency-sensitive and its requests are small; Nagle
-        // would add up to a round trip per fetch for no benefit.
-        if let Err(e) = stream.set_nodelay(true) {
-            warn!("Could not disable Nagle on the link to {}: {}", self.addr, e);
-        }
-
-        let mut stream = stream;
-        if let Some(secret) = self.secret.clone() {
-            // A leader with SASL required closes the socket on the first
-            // non-SASL request, which surfaced only as "early eof" on every
-            // fetch. Authenticate first, and say so when it fails.
-            timeout(AUTH_TIMEOUT, self.authenticate(&mut stream, &secret))
-                .await
-                .map_err(|_| {
-                    Error::Network(format!(
-                        "Authentication to leader {} timed out after {:?}",
-                        self.addr, AUTH_TIMEOUT
-                    ))
-                })??;
-            debug!("Replica fetcher authenticated to leader {}", self.addr);
-        }
-
+        let stream = dial(&self.addr, self.tls.as_ref(), self.secret.as_deref()).await?;
         debug!("Replica fetcher connected to leader {}", self.addr);
         self.stream = Some(stream);
         Ok(())
-    }
-
-    /// SASL SCRAM-SHA-512 as `__chronik_broker`: SaslHandshake v1, then two
-    /// SaslAuthenticate v1 rounds. The server's final signature is verified, so
-    /// a peer that does not hold the secret cannot pose as the leader.
-    async fn authenticate(&mut self, stream: &mut TcpStream, secret: &str) -> Result<()> {
-        use chronik_protocol::sasl::{SaslMechanism, INTER_BROKER_USER};
-        use chronik_protocol::scram::ScramClient;
-
-        let auth_err = |what: String| Error::Network(format!("Authentication to leader failed: {what}"));
-
-        // SaslHandshake v1: mechanism string.
-        let correlation_id = self.take_correlation_id();
-        let mut body = BytesMut::new();
-        put_request_header(&mut body, SASL_HANDSHAKE_API_KEY, 1, correlation_id);
-        put_string(&mut body, SaslMechanism::ScramSha512.as_str());
-        let mut response = sasl_round_trip(stream, &self.addr, &body, correlation_id).await?;
-        let error_code = get_i16(&mut response)?;
-        if error_code != 0 {
-            return Err(auth_err(format!(
-                "leader {} refused SCRAM-SHA-512 (error {error_code})",
-                self.addr
-            )));
-        }
-
-        let mut client = ScramClient::new(SaslMechanism::ScramSha512, INTER_BROKER_USER, secret);
-
-        let server_first = self
-            .sasl_authenticate(stream, &client.client_first())
-            .await?;
-        let client_final = client
-            .client_final(&server_first)
-            .map_err(|e| auth_err(e.to_string()))?;
-        let server_final = self.sasl_authenticate(stream, &client_final).await?;
-        client
-            .verify_server_final(&server_final)
-            .map_err(|e| auth_err(format!("{} ({})", e, self.addr)))?;
-        Ok(())
-    }
-
-    /// One SaslAuthenticate v1 round; returns the server's auth bytes.
-    async fn sasl_authenticate(&mut self, stream: &mut TcpStream, auth: &[u8]) -> Result<Vec<u8>> {
-        let correlation_id = self.take_correlation_id();
-        let mut body = BytesMut::new();
-        put_request_header(&mut body, SASL_AUTHENTICATE_API_KEY, 1, correlation_id);
-        body.put_i32(auth.len() as i32);
-        body.put_slice(auth);
-
-        let mut response = sasl_round_trip(stream, &self.addr, &body, correlation_id).await?;
-        let error_code = get_i16(&mut response)?;
-        let message = get_nullable_string(&mut response)?;
-        if error_code != 0 {
-            return Err(Error::Network(format!(
-                "Authentication to leader {} failed as {} (error {}): {}. \
-                 Check that CHRONIK_INTER_BROKER_SECRET is identical on every broker.",
-                self.addr,
-                chronik_protocol::sasl::INTER_BROKER_USER,
-                error_code,
-                message.unwrap_or_default()
-            )));
-        }
-        let len = get_i32(&mut response)?;
-        if len < 0 || response.len() < len as usize {
-            return Err(Error::Protocol(format!(
-                "SaslAuthenticate response from {} has a bad auth_bytes length {len}",
-                self.addr
-            )));
-        }
-        Ok(response.split_to(len as usize).to_vec())
     }
 
     fn take_correlation_id(&mut self) -> i32 {
@@ -357,8 +272,114 @@ impl LeaderConnection {
     }
 }
 
+/// Open a broker-to-broker connection to another broker's Kafka port the way
+/// a client must: TLS when its port uses TLS, then SASL as `__chronik_broker`
+/// when a secret is set. Used by the replica fetcher and by produce
+/// forwarding, so both reach a TLS or SASL leader.
+pub(crate) async fn dial(
+    addr: &str,
+    tls: Option<&tokio_rustls::TlsConnector>,
+    secret: Option<&str>,
+) -> Result<LeaderStream> {
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| Error::Network(format!("Connect to leader {addr} timed out after {CONNECT_TIMEOUT:?}")))?
+        .map_err(|e| Error::Network(format!("Connect to leader {addr} failed: {e}")))?;
+
+    // Requests between brokers are latency-sensitive and small; Nagle would
+    // add up to a round trip per request for no benefit.
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("Could not disable Nagle on the link to {}: {}", addr, e);
+    }
+
+    let mut stream: LeaderStream = match tls {
+        None => Box::new(stream),
+        Some(tls) => {
+            // The leader's certificate must name the host it is dialled by.
+            let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            let name = rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| Error::Network(format!("Leader address {addr} has no valid TLS server name: {e}")))?;
+            let tls_stream = timeout(CONNECT_TIMEOUT, tls.connect(name, stream))
+                .await
+                .map_err(|_| Error::Network(format!("TLS handshake with leader {addr} timed out after {CONNECT_TIMEOUT:?}")))?
+                .map_err(|e| Error::Network(format!("TLS handshake with leader {addr} failed: {e}")))?;
+            Box::new(tls_stream)
+        }
+    };
+    if let Some(secret) = secret {
+        // A leader with SASL required closes the socket on the first non-SASL
+        // request, which surfaced only as "early eof" on every fetch.
+        // Authenticate first, and say so when it fails.
+        timeout(AUTH_TIMEOUT, authenticate(&mut stream, addr, secret))
+            .await
+            .map_err(|_| Error::Network(format!("Authentication to leader {addr} timed out after {AUTH_TIMEOUT:?}")))??;
+        debug!("Authenticated to leader {} as {}", addr, chronik_protocol::sasl::INTER_BROKER_USER);
+    }
+    Ok(stream)
+}
+
+/// SASL SCRAM-SHA-512 as `__chronik_broker`: SaslHandshake v1, then two
+/// SaslAuthenticate v1 rounds. The server's final signature is verified, so a
+/// peer that does not hold the secret cannot pose as the leader. Correlation
+/// ids 1–3; the requests are answered before the connection is used.
+async fn authenticate(stream: &mut LeaderStream, addr: &str, secret: &str) -> Result<()> {
+    use chronik_protocol::sasl::{SaslMechanism, INTER_BROKER_USER};
+    use chronik_protocol::scram::ScramClient;
+
+    let auth_err = |what: String| Error::Network(format!("Authentication to leader failed: {what}"));
+
+    // SaslHandshake v1: mechanism string.
+    let mut body = BytesMut::new();
+    put_request_header(&mut body, SASL_HANDSHAKE_API_KEY, 1, 1);
+    put_string(&mut body, SaslMechanism::ScramSha512.as_str());
+    let mut response = sasl_round_trip(stream, addr, &body, 1).await?;
+    let error_code = get_i16(&mut response)?;
+    if error_code != 0 {
+        return Err(auth_err(format!("leader {addr} refused SCRAM-SHA-512 (error {error_code})")));
+    }
+
+    let mut client = ScramClient::new(SaslMechanism::ScramSha512, INTER_BROKER_USER, secret);
+    let server_first = sasl_authenticate(stream, addr, &client.client_first(), 2).await?;
+    let client_final = client.client_final(&server_first).map_err(|e| auth_err(e.to_string()))?;
+    let server_final = sasl_authenticate(stream, addr, &client_final, 3).await?;
+    client
+        .verify_server_final(&server_final)
+        .map_err(|e| auth_err(format!("{e} ({addr})")))?;
+    Ok(())
+}
+
+/// One SaslAuthenticate v1 round; returns the server's auth bytes.
+async fn sasl_authenticate(stream: &mut LeaderStream, addr: &str, auth: &[u8], correlation_id: i32) -> Result<Vec<u8>> {
+    let mut body = BytesMut::new();
+    put_request_header(&mut body, SASL_AUTHENTICATE_API_KEY, 1, correlation_id);
+    body.put_i32(auth.len() as i32);
+    body.put_slice(auth);
+
+    let mut response = sasl_round_trip(stream, addr, &body, correlation_id).await?;
+    let error_code = get_i16(&mut response)?;
+    let message = get_nullable_string(&mut response)?;
+    if error_code != 0 {
+        return Err(Error::Network(format!(
+            "Authentication to leader {} failed as {} (error {}): {}. \
+             Check that CHRONIK_INTER_BROKER_SECRET is identical on every broker.",
+            addr,
+            chronik_protocol::sasl::INTER_BROKER_USER,
+            error_code,
+            message.unwrap_or_default()
+        )));
+    }
+    let len = get_i32(&mut response)?;
+    if len < 0 || response.len() < len as usize {
+        return Err(Error::Protocol(format!(
+            "SaslAuthenticate response from {addr} has a bad auth_bytes length {len}"
+        )));
+    }
+    Ok(response.split_to(len as usize).to_vec())
+}
+
 /// Read one length-prefixed Kafka frame.
-async fn read_frame(stream: &mut TcpStream, addr: &str) -> Result<Bytes> {
+async fn read_frame(stream: &mut LeaderStream, addr: &str) -> Result<Bytes> {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -428,7 +449,7 @@ fn get_nullable_string(buf: &mut Bytes) -> Result<Option<String>> {
 /// Send one SASL request and return the response body after the correlation
 /// id (response header v0, no tagged fields at v1).
 async fn sasl_round_trip(
-    stream: &mut TcpStream,
+    stream: &mut LeaderStream,
     addr: &str,
     body: &[u8],
     correlation_id: i32,
@@ -870,5 +891,40 @@ mod tests {
             .await
             .expect_err("an absurd frame length must be refused");
         assert!(err.to_string().contains("cap"), "got: {err}");
+    }
+
+    /// A follower reaches a leader whose Kafka port uses TLS (it dialled in
+    /// plaintext, and a TLS cluster replicated nothing): the request and the
+    /// leader's reply cross the TLS session (the reply here is refused for
+    /// its length, which needs it to have been read).
+    #[tokio::test]
+    async fn a_follower_fetches_from_a_tls_leader() {
+        let pki = crate::tls::test_pki::Pki::new();
+        let acceptor = crate::tls::create_tls_acceptor(&pki.listener(true)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let Ok(mut socket) = acceptor.accept(tcp).await else { continue };
+                let mut len_buf = [0u8; 4];
+                socket.read_exact(&mut len_buf).await.unwrap();
+                let mut payload = vec![0u8; i32::from_be_bytes(len_buf) as usize];
+                socket.read_exact(&mut payload).await.unwrap();
+                socket.write_all(&i32::MAX.to_be_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+
+        let mut plain = LeaderConnection::new(format!("localhost:{port}"));
+        let err = plain.fetch(spec(10)).await.expect_err("plaintext against a TLS port");
+        // What production logged: the TLS alert read as a frame length.
+        assert!(!err.to_string().contains(&i32::MAX.to_string()), "a plaintext fetch read the reply: {err}");
+
+        let connector = crate::tls::create_tls_connector(&pki.listener(true)).unwrap();
+        let mut conn = LeaderConnection::new(format!("localhost:{port}")).with_tls(connector);
+        let err = conn.fetch(spec(10)).await.expect_err("the reply is refused for its length");
+        assert!(err.to_string().contains(&i32::MAX.to_string()), "the fetch did not cross TLS: {err}");
     }
 }

@@ -159,6 +159,45 @@ fn ensure_crypto_provider() {
     });
 }
 
+/// Every certificate in a PEM file, as trust anchors.
+fn load_root_store(path: &Path) -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in load_certs(path)? {
+        root_store.add(cert).context("Failed to add CA certificate to root store")?;
+    }
+    Ok(root_store)
+}
+
+/// A TLS client for connecting to other brokers' Kafka ports (replica
+/// fetches): it trusts the CA in `ca_cert_path`, which must have signed every
+/// broker's certificate, and presents this broker's own certificate, which a
+/// leader that requires client certificates verifies against the same CA.
+pub fn create_tls_connector(config: &TlsConfig) -> Result<tokio_rustls::TlsConnector> {
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(client_config(config)?)))
+}
+
+/// The rustls client behind [`create_tls_connector`], also used for HTTPS to
+/// other brokers' Unified API (query fan-out).
+pub fn client_config(config: &TlsConfig) -> Result<rustls::ClientConfig> {
+    ensure_crypto_provider();
+    let ca_path = config.ca_cert_path.as_deref().context(
+        "no CA certificate to verify other brokers with: set CHRONIK_TLS_CA_CERT to the CA that signed every broker's certificate",
+    )?;
+    let roots = load_root_store(Path::new(ca_path))?;
+    let certs = load_certs(Path::new(&config.cert_path))?;
+    let key = load_private_key(Path::new(&config.key_path))?;
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .context("Failed to build the inter-broker TLS client config")
+}
+
+/// TLS for the Unified API: `CHRONIK_API_TLS_*`, falling back to the Kafka
+/// listener's `CHRONIK_TLS_*`.
+pub fn api_tls_config() -> Option<TlsConfig> {
+    TlsConfig::from_env_with_prefix("CHRONIK_API_TLS").or_else(TlsConfig::from_env)
+}
+
 /// Create a TLS acceptor from configuration
 pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     ensure_crypto_provider();
@@ -166,6 +205,11 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     info!("Loading TLS certificate from: {}", config.cert_path);
     info!("Loading TLS private key from: {}", config.key_path);
 
+    if config.require_client_cert && config.ca_cert_path.is_none() {
+        anyhow::bail!(
+            "client certificates are required (REQUIRE_CLIENT_CERT) but no CA is set (CA_CERT) to verify them against"
+        );
+    }
     let certs = load_certs(Path::new(&config.cert_path))?;
     let key = load_private_key(Path::new(&config.key_path))?;
 
@@ -173,21 +217,16 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
 
     // Build server config
     let server_config = if let Some(ref ca_path) = config.ca_cert_path {
-        // mTLS: require client certificates
+        // A client certificate is verified against this CA when offered, and
+        // required only with CHRONIK_TLS_REQUIRE_CLIENT_CERT. It used to be
+        // required whenever a CA was set, whatever that flag said.
         info!("Loading CA certificate for client auth from: {}", ca_path);
-        let ca_certs = load_certs(Path::new(ca_path))?;
-
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in ca_certs {
-            root_store.add(cert)
-                .context("Failed to add CA certificate to root store")?;
-        }
-
-        let client_cert_verifier = rustls::server::WebPkiClientVerifier::builder(
-            Arc::new(root_store)
-        )
-        .build()
-        .context("Failed to build client certificate verifier")?;
+        let root_store = load_root_store(Path::new(ca_path))?;
+        let builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+        let builder = if config.require_client_cert { builder } else { builder.allow_unauthenticated() };
+        let client_cert_verifier = builder
+            .build()
+            .context("Failed to build client certificate verifier")?;
 
         ServerConfig::builder()
             .with_client_cert_verifier(client_cert_verifier)
@@ -202,8 +241,10 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     };
 
     info!("TLS configuration loaded successfully");
-    if config.require_client_cert {
-        info!("mTLS enabled: client certificates required");
+    match (config.require_client_cert, config.ca_cert_path.is_some()) {
+        (true, true) => info!("mTLS enabled: client certificates required"),
+        (false, true) => info!("Client certificates are verified when offered (not required)"),
+        _ => {}
     }
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
@@ -618,5 +659,128 @@ mod principal_tests {
         // Plain arm returns None before touching any TLS state.
         // (Exercised end-to-end by the SASL suite, where every plaintext
         // connection authorizes as ANONYMOUS.)
+    }
+}
+
+/// A throwaway CA and a `localhost` certificate it signed, for TLS tests.
+#[cfg(test)]
+pub(crate) mod test_pki {
+    use super::TlsConfig;
+
+    pub struct Pki {
+        pub dir: tempfile::TempDir,
+        pub ca: String,
+        pub cert: String,
+        pub key: String,
+    }
+
+    impl Pki {
+        pub fn new() -> Self {
+            use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+            let dir = tempfile::tempdir().unwrap();
+            let ca_key = KeyPair::generate().unwrap();
+            let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            ca_params.distinguished_name.push(DnType::CommonName, "chronik test ca");
+            let ca = ca_params.self_signed(&ca_key).unwrap();
+            let key = KeyPair::generate().unwrap();
+            let cert = CertificateParams::new(vec!["localhost".to_string()])
+                .unwrap()
+                .signed_by(&key, &ca, &ca_key)
+                .unwrap();
+            let write = |name: &str, pem: String| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, pem).unwrap();
+                path.to_string_lossy().into_owned()
+            };
+            let ca = write("ca.crt", ca.pem());
+            let cert = write("tls.crt", cert.pem());
+            let key = write("tls.key", key.serialize_pem());
+            Self { dir, ca, cert, key }
+        }
+
+        /// The listener config a broker with this PKI runs.
+        pub fn listener(&self, require_client_cert: bool) -> TlsConfig {
+            TlsConfig {
+                cert_path: self.cert.clone(),
+                key_path: self.key.clone(),
+                ca_cert_path: Some(self.ca.clone()),
+                require_client_cert,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::test_pki::Pki;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve one TLS connection that echoes 4 bytes; returns the address.
+    async fn echo_server(acceptor: TlsAcceptor) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            if let Ok(mut tls) = acceptor.accept(tcp).await {
+                let mut buf = [0u8; 4];
+                if tls.read_exact(&mut buf).await.is_ok() {
+                    let _ = tls.write_all(&buf).await;
+                    let _ = tls.flush().await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A client that trusts the CA and presents no certificate.
+    fn anonymous_client(pki: &Pki) -> tokio_rustls::TlsConnector {
+        ensure_crypto_provider();
+        let roots = load_root_store(Path::new(&pki.ca)).unwrap();
+        let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    async fn echo(connector: &tokio_rustls::TlsConnector, addr: std::net::SocketAddr) -> std::io::Result<[u8; 4]> {
+        let tcp = TcpStream::connect(addr).await?;
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(name, tcp).await?;
+        tls.write_all(b"ping").await?;
+        tls.flush().await?;
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    /// With a CA but without CHRONIK_TLS_REQUIRE_CLIENT_CERT, a client with no
+    /// certificate is served (it was refused: the flag was ignored).
+    #[tokio::test]
+    async fn a_client_certificate_is_optional_unless_required() {
+        let pki = Pki::new();
+        let addr = echo_server(create_tls_acceptor(&pki.listener(false)).unwrap()).await;
+        assert_eq!(&echo(&anonymous_client(&pki), addr).await.unwrap(), b"ping");
+
+        let addr = echo_server(create_tls_acceptor(&pki.listener(true)).unwrap()).await;
+        assert!(echo(&anonymous_client(&pki), addr).await.is_err(), "served a client without a certificate");
+    }
+
+    /// The broker-to-broker client verifies the leader against the CA and
+    /// presents its own certificate, so it reaches a leader that requires one.
+    #[tokio::test]
+    async fn the_inter_broker_client_reaches_a_leader_that_requires_certificates() {
+        let pki = Pki::new();
+        let addr = echo_server(create_tls_acceptor(&pki.listener(true)).unwrap()).await;
+        let connector = create_tls_connector(&pki.listener(true)).unwrap();
+        assert_eq!(&echo(&connector, addr).await.unwrap(), b"ping");
+    }
+
+    #[test]
+    fn requiring_client_certificates_without_a_ca_is_refused() {
+        let pki = Pki::new();
+        let mut config = pki.listener(true);
+        config.ca_cert_path = None;
+        assert!(create_tls_acceptor(&config).is_err());
+        assert!(create_tls_connector(&config).is_err(), "a broker client that verifies nothing");
     }
 }

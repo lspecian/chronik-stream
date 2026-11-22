@@ -94,6 +94,10 @@ pub struct ChronikStandaloneSpec {
     #[serde(default)]
     pub service_annotations: Option<std::collections::BTreeMap<String, String>>,
 
+    /// TLS on the Kafka port (and the Unified API). Unset: plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<super::common::KafkaTlsSpec>,
+
     /// Extra environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,

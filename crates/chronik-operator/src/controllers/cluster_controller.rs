@@ -668,6 +668,11 @@ fn cluster_spec_hash_at(spec: &ChronikClusterSpec, pod_shape_generation: u32) ->
     // Bumping this is the deliberate way to say "the Pod I build has changed in
     // a way existing Pods must pick up", and it costs a rolling restart of every
     // managed cluster. Do not bump it for cosmetics.
+    // Only when set, so clusters without TLS keep their hash (and Pods).
+    if let Some(ref tls) = spec.tls {
+        tls.hash(&mut hasher);
+    }
+
     pod_shape_generation.hash(&mut hasher);
 
     format!("{:016x}", hasher.finish())
@@ -1069,6 +1074,27 @@ mod tests {
             "d0307e0bbda03cd2",
             "the hash of a default spec changed — every broker Pod under this \
              operator would be recreated on upgrade"
+        );
+    }
+
+    /// Turning TLS on recreates the Pods (they need the Secret and settings);
+    /// leaving it unset keeps the hash pinned above.
+    #[test]
+    fn kafka_tls_moves_the_hash() {
+        let plain: ChronikClusterSpec = serde_json::from_str("{}").unwrap();
+        let tls: ChronikClusterSpec =
+            serde_json::from_str(r#"{"tls":{"secretName":"kafka-certs"}}"#).unwrap();
+        let mtls: ChronikClusterSpec = serde_json::from_str(
+            r#"{"tls":{"secretName":"kafka-certs","requireClientCert":true}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            compute_cluster_spec_hash(&plain),
+            compute_cluster_spec_hash(&tls)
+        );
+        assert_ne!(
+            compute_cluster_spec_hash(&tls),
+            compute_cluster_spec_hash(&mtls)
         );
     }
 
