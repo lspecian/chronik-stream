@@ -40,6 +40,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // One process-wide rustls provider, chosen before anything builds a TLS
+    // client. The tree links both `ring` (kube's client) and `aws-lc-rs`
+    // (rustls's default, through the Kafka TLS client), and rustls refuses to
+    // guess between them: 0.4.0 panicked at startup building the kube client.
+    // Err means one is already installed, which is fine.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
 
     match cli.command {
