@@ -2826,6 +2826,7 @@ impl KafkaProtocolHandler {
                 let (_epoch, end_offset) = crate::replication::leader_epoch::answer_epoch_query(
                     from_history,
                     ask.leader_epoch,
+                    epochs.latest_epoch(&topic.name, ask.partition),
                     leading_at,
                     log_end_offset,
                 );

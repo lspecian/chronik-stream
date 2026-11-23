@@ -115,19 +115,22 @@ impl LeaderEpochCache {
 
     /// Answer `OffsetForLeaderEpoch`: where did `requested` end?
     ///
-    /// Returns `(epoch, end_offset)`, following Kafka's semantics exactly:
+    /// Returns `(epoch, end_offset)`, following Kafka's semantics
+    /// (`LeaderEpochFileCache.endOffsetFor`):
     ///
     /// - the **current** epoch ends at the log end offset — it has not ended yet,
     ///   so everything written so far belongs to it;
     /// - an **earlier** epoch ends where the next epoch began;
-    /// - an epoch **newer than anything here**, or **older than anything still
-    ///   retained**, is answered `(UNDEFINED, UNDEFINED)`. The asker holds
-    ///   history this replica cannot speak to, and must fall back rather than
-    ///   act on a number that means something else.
+    /// - an epoch **older than anything here** ends where the oldest known epoch
+    ///   began: epochs only grow, so every record from there on belongs to a
+    ///   newer epoch than the one asked about. (This answered UNDEFINED, which
+    ///   left a follower that held only an older epoch unable to reconcile.)
+    /// - an epoch **newer than anything here** is answered
+    ///   `(UNDEFINED, UNDEFINED)`: the asker holds history this replica cannot
+    ///   speak to, and must fall back rather than act on a guess.
     ///
-    /// Getting that last case wrong is how epoch truncation causes the data loss
-    /// it exists to prevent: returning 0, or the log end offset, for an unknown
-    /// epoch tells a follower to discard a correct log or keep a divergent one.
+    /// Returning 0 for an unknown epoch would tell a follower to discard a correct
+    /// log; every offset returned here is one this replica's history vouches for.
     pub fn end_offset_for_epoch(&self, requested: i32, log_end_offset: i64) -> (i32, i64) {
         if requested < 0 || self.entries.is_empty() {
             return (UNDEFINED_EPOCH, UNDEFINED_OFFSET);
@@ -143,7 +146,9 @@ impl LeaderEpochCache {
 
         match (previous, subsequent) {
             (Some(p), Some(s)) => (p.epoch, s.start_offset),
-            // requested is beyond the newest, or below the oldest we still hold
+            // Older than the oldest entry: it ended where that entry began.
+            (None, Some(s)) => (requested, s.start_offset),
+            // Newer than the newest: nothing here can answer.
             _ => (UNDEFINED_EPOCH, UNDEFINED_OFFSET),
         }
     }
@@ -366,31 +371,46 @@ fn parse_checkpoint(text: &str) -> Vec<EpochEntry> {
 
 /// A leader's answer to "where did epoch `requested` end?", from its epoch
 /// history (`from_history`, what [`LeaderEpochStore::end_offset_for_epoch`]
-/// returned) and the epoch at which the catalog says this node currently
-/// leads the partition (`leading_at`, `None` when it does not lead it).
+/// returned, and `history_latest`, the newest epoch it records) and the epoch at
+/// which the catalog says this node leads the partition (`leading_at`, `None`
+/// when it does not lead it).
 ///
-/// History alone left a gap: a leader whose history for a partition was lost
-/// (checkpoints from before followers recorded epochs, then a leadership move)
-/// answered "unknown" for every epoch, for good on an idle partition, so its
-/// followers could never truncate a divergent tail there. Measured on a live
-/// cluster: every one of 9,308 answers was "unknown", all for the current
-/// epoch. The current epoch has not ended, so it ends at the log end — and that
-/// holds without history, because epochs move only when leadership does: every
-/// record stamped with the epoch this node leads at was written by this node,
-/// so a follower holding it holds a prefix of this log.
+/// History records the epochs of *writes*. Kafka also records an epoch when
+/// leadership begins (`maybeAssignEpochStartOffset`: the new epoch starts at
+/// the log end). Without that, a leader of an idle partition — leadership moved
+/// on (every rolling restart moves it away and back) but nothing was written —
+/// could not place the epoch its followers last wrote in: on a live cluster
+/// 6,360 of 6,360 answers were "unknown", so followers could never truncate a
+/// divergent tail there. This applies the same rule at query time: if this node
+/// leads at `E` and its history holds no write in `E`, then `E` began at the
+/// current log end (every write in `E` would be recorded), so any epoch up to
+/// `E` that history cannot place ended there. Computing it here instead of at
+/// election avoids reading the log end while partition state may still be
+/// loading; and with no usable log end it does not answer.
+///
+/// If history was lost after writes in `E`, the log end overestimates where `E`
+/// began: a follower then truncates less, never more — no worse than "unknown".
 pub fn answer_epoch_query(
     from_history: (i32, i64),
     requested: i32,
+    history_latest: Option<i32>,
     leading_at: Option<i32>,
     log_end_offset: i64,
 ) -> (i32, i64) {
     if from_history.1 >= 0 {
         return from_history;
     }
-    match leading_at {
-        Some(current) if current >= 0 && current == requested => (requested, log_end_offset),
-        _ => from_history,
+    let Some(current) = leading_at else {
+        return from_history;
+    };
+    let no_write_in_current = history_latest.is_none_or(|latest| latest < current);
+    if requested < 0 || current < 0 || log_end_offset <= 0 || requested > current {
+        return from_history;
     }
+    if requested == current || no_write_in_current {
+        return (requested, log_end_offset);
+    }
+    from_history
 }
 
 #[cfg(test)]
@@ -402,22 +422,35 @@ mod answer_tests {
     /// No history, asked about the epoch this node leads at: it ends at the log end.
     #[test]
     fn the_current_epoch_ends_at_the_log_end_without_history() {
-        assert_eq!(answer_epoch_query(UNKNOWN, 0, Some(0), 20_784), (0, 20_784));
+        assert_eq!(answer_epoch_query(UNKNOWN, 0, None, Some(0), 20_784), (0, 20_784));
     }
 
-    /// Never invent an answer for an epoch this node is not leading.
+    /// The live case: followers last wrote in epoch 0, leadership has since
+    /// moved to epoch 5 with no write in it, and this leader lost its history.
+    /// Epoch 0 ended where 5 began: the log end.
     #[test]
-    fn other_epochs_stay_unknown_without_history() {
-        assert_eq!(answer_epoch_query(UNKNOWN, 0, Some(1), 500), UNKNOWN, "an older epoch");
-        assert_eq!(answer_epoch_query(UNKNOWN, 2, Some(1), 500), UNKNOWN, "a newer epoch");
-        assert_eq!(answer_epoch_query(UNKNOWN, 0, None, 500), UNKNOWN, "not the leader");
-        assert_eq!(answer_epoch_query(UNKNOWN, -1, Some(-1), 500), UNKNOWN, "no epoch");
+    fn an_older_epoch_ends_at_the_log_end_when_nothing_was_written_since() {
+        assert_eq!(answer_epoch_query(UNKNOWN, 0, None, Some(5), 20_784), (0, 20_784));
+        // History knows epoch 0 but nothing after it; asked about epoch 3.
+        assert_eq!(answer_epoch_query(UNKNOWN, 3, Some(0), Some(5), 900), (3, 900));
+    }
+
+    /// Never answer for an epoch newer than the one led, for a node that does
+    /// not lead, without a log end, or for an older epoch history should have
+    /// placed (writes in the current epoch exist, so its start is not the log end).
+    #[test]
+    fn otherwise_it_stays_unknown() {
+        assert_eq!(answer_epoch_query(UNKNOWN, 7, None, Some(5), 500), UNKNOWN, "newer than led");
+        assert_eq!(answer_epoch_query(UNKNOWN, 0, None, None, 500), UNKNOWN, "not the leader");
+        assert_eq!(answer_epoch_query(UNKNOWN, 0, None, Some(5), 0), UNKNOWN, "no log end");
+        assert_eq!(answer_epoch_query(UNKNOWN, -1, None, Some(5), 500), UNKNOWN, "no epoch");
+        assert_eq!(answer_epoch_query(UNKNOWN, 3, Some(5), Some(5), 500), UNKNOWN, "current epoch has writes");
     }
 
     /// History, when it can answer, is the answer.
     #[test]
     fn history_answers_first() {
-        assert_eq!(answer_epoch_query((1, 100), 1, Some(2), 500), (1, 100));
+        assert_eq!(answer_epoch_query((1, 100), 1, Some(2), Some(2), 500), (1, 100));
     }
 }
 
@@ -575,13 +608,15 @@ mod tests {
         assert_eq!(c.end_offset_for_epoch(9, 500), (UNDEFINED_EPOCH, UNDEFINED_OFFSET));
     }
 
-    /// Likewise for an epoch that retention has aged out entirely.
+    /// An epoch older than anything retained ended where the oldest surviving
+    /// epoch began (Kafka's rule): from there on every record is newer.
     #[test]
-    fn an_epoch_older_than_retained_history_is_undefined() {
+    fn an_epoch_older_than_retained_history_ends_where_the_oldest_began() {
         let mut c = cache(&[(1, 0), (5, 100), (6, 200)]);
         c.truncate_from_start(150);
 
-        assert_eq!(c.end_offset_for_epoch(1, 400), (UNDEFINED_EPOCH, UNDEFINED_OFFSET));
+        assert_eq!(c.end_offset_for_epoch(1, 400), (1, 150));
+        assert_eq!(c.end_offset_for_epoch(0, 400), (0, 150));
     }
 
     #[test]

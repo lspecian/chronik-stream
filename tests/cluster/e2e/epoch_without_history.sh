@@ -11,8 +11,10 @@
 #
 #   1. Three nodes; a topic of 6 partitions, RF3, written and archived so the
 #      WAL is reclaimed (history can then only come from the checkpoints).
-#   2. The leader of those partitions loses its checkpoints for the topic and
-#      restarts.
+#   2. The leader goes down (leadership moves on: a new epoch, nothing written
+#      in it), loses its checkpoints for the topic, restarts and leads again
+#      (another epoch) — the state of idle partitions after a rolling restart.
+#      Followers last wrote in epoch 0; the leader now leads at a later one.
 #   3. Followers re-run the handshake (a topic create re-plans them): the
 #      leader answers every epoch query (none "unknown"), followers log no
 #      "Not truncating", and every record is still readable from every node.
@@ -32,7 +34,7 @@ expect() {
 distinct_via() { kcat -C -b "localhost:$1" -t $T -o beginning -e -q -f '%k\n' 2>/dev/null | sort -u | wc -l; }
 
 echo "=== $LABEL ($CHRONIK_BIN)"
-EXTRA_ENV="CHRONIK_WAL_ROTATION_SIZE=64KB" cluster_start || { echo "FAIL: cluster did not start"; exit 1; }
+EXTRA_ENV="CHRONIK_WAL_ROTATION_SIZE=64KB CHRONIK_LEADER_REBALANCE_INTERVAL_SECS=10" cluster_start || { echo "FAIL: cluster did not start"; exit 1; }
 trap cluster_stop EXIT
 # All six partitions led by node 1, so one node's history is what is lost.
 "$K"/kafka-topics.sh --bootstrap-server "$BOOTS" --create --topic $T \
@@ -53,15 +55,19 @@ done
 expect "node 1 archived the topic and reclaimed its WAL" "$reclaimed" "1"
 expect "node 1 holds epoch history for the topic" "$(ls "$DIR/data/node1/leader-epochs/$T" 2>/dev/null | wc -l)" "6"
 
-echo "-- node 1 loses its epoch history for the topic and restarts"
+leaders() { "$K"/kafka-topics.sh --bootstrap-server "$BOOTS" --describe --topic $T 2>/dev/null | grep -o 'Leader: [0-9]*' | sort | uniq -c | sed 's/^ *//' | tr -s ' ' | tr '\n' ','; }
+echo "-- node 1 goes down: leadership moves on (a new epoch, nothing written in it)"
 before=$(wc -l < "$DIR/logs/node1.log")
 node_kill 1
+moved=0
+for _ in $(seq 60); do leaders | grep -q 'Leader: 1' || { moved=1; break; }; sleep 2; done
+expect "leadership moved off node 1" "$moved" "1"
+echo "-- node 1 loses its epoch history for the topic, restarts, and leads again (another epoch)"
 rm -rf "$DIR/data/node1/leader-epochs/$T"
 node_start 1 || { echo "  FAIL node 1 did not restart"; fail=1; }
-for _ in $(seq 60); do
-  "$K"/kafka-topics.sh --bootstrap-server "$BOOTS" --describe --topic $T 2>/dev/null | grep -q 'Leader: 1' && break
-  sleep 2
-done
+back=0
+for _ in $(seq 90); do [ "$(leaders)" = "6 Leader: 1," ] && { back=1; break; }; sleep 2; done
+expect "node 1 leads all six partitions again" "$back" "1"
 sleep 10
 # A topic create re-plans every follower: each re-runs the handshake with node 1.
 "$K"/kafka-topics.sh --bootstrap-server "$BOOTS" --create --topic ${T}_poke --partitions 1 --replication-factor 3 >/dev/null 2>&1
