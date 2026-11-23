@@ -1249,15 +1249,22 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Version => {
-            println!("Chronik Server v{}", env!("CARGO_PKG_VERSION"));
-            println!("Build features:");
+            #[allow(unused_mut)]
+            let mut out = format!("Chronik Server v{}\nBuild features:\n", env!("CARGO_PKG_VERSION"));
             #[cfg(feature = "search")]
-            println!("  - Search: enabled");
+            out.push_str("  - Search: enabled\n");
             #[cfg(feature = "backup")]
-            println!("  - Backup: enabled");
+            out.push_str("  - Backup: enabled\n");
             #[cfg(feature = "dynamic-config")]
-            println!("  - Dynamic Config: enabled");
-            Ok(())
+            out.push_str("  - Dynamic Config: enabled\n");
+            // `println!` panics when the reader has gone (`version | head -1`),
+            // and the release build aborts on panic: a core dump for a pipe
+            // that closed early. A reader that stopped reading is not an error.
+            use std::io::Write;
+            match std::io::stdout().lock().write_all(out.as_bytes()) {
+                Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
+                _ => Ok(()),
+            }
         }
 
         Commands::Start { config, bind, advertise, node_id, disable_hot_text, kafka_port } => {

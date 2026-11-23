@@ -1371,6 +1371,21 @@ impl ProduceHandler {
         self.leader_epochs.clone()
     }
 
+    /// The epoch at which the catalog says this node leads `topic`-`partition`,
+    /// or `None` when it does not lead it (or the catalog does not say).
+    pub async fn leading_epoch(&self, topic: &str, partition: i32) -> Option<i32> {
+        let leader = self.metadata_store.get_partition_leader(topic, partition as u32).await.ok()??;
+        if leader != self.config.node_id {
+            return None;
+        }
+        self.metadata_store
+            .get_partition_leader_epoch(topic, partition as u32)
+            .await
+            .ok()
+            .flatten()
+            .filter(|e| *e >= 0)
+    }
+
     /// Stamp the current leader epoch onto a batch and record it in this node's
     /// leadership history.
     ///

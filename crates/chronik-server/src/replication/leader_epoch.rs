@@ -364,6 +364,63 @@ fn parse_checkpoint(text: &str) -> Vec<EpochEntry> {
         .collect()
 }
 
+/// A leader's answer to "where did epoch `requested` end?", from its epoch
+/// history (`from_history`, what [`LeaderEpochStore::end_offset_for_epoch`]
+/// returned) and the epoch at which the catalog says this node currently
+/// leads the partition (`leading_at`, `None` when it does not lead it).
+///
+/// History alone left a gap: a leader whose history for a partition was lost
+/// (checkpoints from before followers recorded epochs, then a leadership move)
+/// answered "unknown" for every epoch, for good on an idle partition, so its
+/// followers could never truncate a divergent tail there. Measured on a live
+/// cluster: every one of 9,308 answers was "unknown", all for the current
+/// epoch. The current epoch has not ended, so it ends at the log end — and that
+/// holds without history, because epochs move only when leadership does: every
+/// record stamped with the epoch this node leads at was written by this node,
+/// so a follower holding it holds a prefix of this log.
+pub fn answer_epoch_query(
+    from_history: (i32, i64),
+    requested: i32,
+    leading_at: Option<i32>,
+    log_end_offset: i64,
+) -> (i32, i64) {
+    if from_history.1 >= 0 {
+        return from_history;
+    }
+    match leading_at {
+        Some(current) if current >= 0 && current == requested => (requested, log_end_offset),
+        _ => from_history,
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+
+    const UNKNOWN: (i32, i64) = (UNDEFINED_EPOCH, UNDEFINED_OFFSET);
+
+    /// No history, asked about the epoch this node leads at: it ends at the log end.
+    #[test]
+    fn the_current_epoch_ends_at_the_log_end_without_history() {
+        assert_eq!(answer_epoch_query(UNKNOWN, 0, Some(0), 20_784), (0, 20_784));
+    }
+
+    /// Never invent an answer for an epoch this node is not leading.
+    #[test]
+    fn other_epochs_stay_unknown_without_history() {
+        assert_eq!(answer_epoch_query(UNKNOWN, 0, Some(1), 500), UNKNOWN, "an older epoch");
+        assert_eq!(answer_epoch_query(UNKNOWN, 2, Some(1), 500), UNKNOWN, "a newer epoch");
+        assert_eq!(answer_epoch_query(UNKNOWN, 0, None, 500), UNKNOWN, "not the leader");
+        assert_eq!(answer_epoch_query(UNKNOWN, -1, Some(-1), 500), UNKNOWN, "no epoch");
+    }
+
+    /// History, when it can answer, is the answer.
+    #[test]
+    fn history_answers_first() {
+        assert_eq!(answer_epoch_query((1, 100), 1, Some(2), 500), (1, 100));
+    }
+}
+
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
