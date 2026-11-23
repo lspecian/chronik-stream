@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Followers still could not truncate on idle partitions after 2.19.1.** The
+  2.19.1 fix answered only for the epoch a leader currently leads; on a live
+  cluster the leaders still answered 6,360 of 6,360 epoch queries "unknown".
+  Every rolling restart moves leadership away and back, so an idle partition's
+  current epoch moves on while its followers last wrote in an older one. The
+  leader now follows Kafka's two rules: an epoch it leads with no write yet
+  began at the log end (Kafka records that at election), and an epoch older
+  than anything in its history ended where the oldest known epoch began
+  (`endOffsetFor`; this answered "unknown"). Both only ever let a follower keep
+  more, not cut good records. `epoch_without_history.sh` now moves leadership
+  away and back after the last write, the case the 2.19.1 test missed.
+
 ## [2.19.1] - 2026-11-23
 
 ### Security
