@@ -978,36 +978,61 @@ impl ReplicaFetcher {
 
         let response = connection.offset_for_leader_epoch(&request).await?;
 
+        // One line per handshake, not per partition: a leader that cannot place
+        // an epoch usually cannot for many partitions at once, and every
+        // assignment change re-runs the handshake (thousands of identical lines
+        // per topic create on a large node).
+        let mut abstained: Vec<String> = Vec::new();
         for topic in response.topics {
             for answer in topic.partitions {
-                self.apply_epoch_answer(&topic.name, answer).await;
+                let partition = answer.partition;
+                if self.apply_epoch_answer(&topic.name, answer).await {
+                    abstained.push(format!("{}-{}", topic.name, partition));
+                }
             }
+        }
+        if !abstained.is_empty() {
+            warn!(
+                "Not truncating {} of {} partition(s): the leader could not place their epoch \
+                 (e.g. {}). Replication resolves these through the fetch offset instead.",
+                abstained.len(),
+                asked,
+                abstained.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            );
         }
 
         Ok(())
     }
 
-    /// Act on one partition's "your epoch ended here".
+    /// Act on one partition's "your epoch ended here". Returns whether it
+    /// abstained (the leader could not answer), for the caller's summary.
     async fn apply_epoch_answer(
         &self,
         topic: &str,
         answer: chronik_protocol::offset_for_leader_epoch_types::OffsetForLeaderPartitionResponse,
-    ) {
+    ) -> bool {
         let partition = answer.partition;
         let local_end = self.position_of(topic, partition).await;
 
         match plan_reconciliation(answer.error_code, answer.end_offset, local_end) {
-            ReconcileAction::Resume => debug!(
-                "{}-{}: log is a prefix of the leader's (ours ends at {}, the epoch ran to {}) — nothing to truncate",
-                topic, partition, local_end, answer.end_offset
-            ),
-            ReconcileAction::Abstain { reason } => warn!(
-                "{}-{}: not truncating — {}. Replication will resolve this through the fetch \
-                 offset instead if it can.",
-                topic, partition, reason
-            ),
+            ReconcileAction::Resume => {
+                debug!(
+                    "{}-{}: log is a prefix of the leader's (ours ends at {}, the epoch ran to {}) — nothing to truncate",
+                    topic, partition, local_end, answer.end_offset
+                );
+                false
+            }
+            ReconcileAction::Abstain { reason } => {
+                debug!(
+                    "{}-{}: not truncating — {}. Replication will resolve this through the fetch \
+                     offset instead if it can.",
+                    topic, partition, reason
+                );
+                true
+            }
             ReconcileAction::Truncate { to } => {
-                self.truncate_partition(topic, partition, to, local_end).await
+                self.truncate_partition(topic, partition, to, local_end).await;
+                false
             }
         }
     }

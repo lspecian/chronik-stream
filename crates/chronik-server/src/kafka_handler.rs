@@ -2794,6 +2794,9 @@ impl KafkaProtocolHandler {
 
         let epochs = self.produce_handler.leader_epochs();
         let mut topics = Vec::with_capacity(request.topics.len());
+        // Followers ask after every assignment change, for every partition they
+        // follow: one summary per request, the per-partition answers at debug.
+        let (mut answered, mut unknown) = (0usize, 0usize);
 
         for topic in &request.topics {
             let mut partitions = Vec::with_capacity(topic.partitions.len());
@@ -2808,20 +2811,33 @@ impl KafkaProtocolHandler {
                     .await
                     .unwrap_or(0);
 
-                let (_epoch, end_offset) = epochs.end_offset_for_epoch(
+                let from_history = epochs.end_offset_for_epoch(
                     &topic.name,
                     ask.partition,
                     ask.leader_epoch,
                     log_end_offset,
                 );
+                // History can lack the epoch this node leads at (see answer_epoch_query).
+                let leading_at = if from_history.1 < 0 {
+                    self.produce_handler.leading_epoch(&topic.name, ask.partition).await
+                } else {
+                    None
+                };
+                let (_epoch, end_offset) = crate::replication::leader_epoch::answer_epoch_query(
+                    from_history,
+                    ask.leader_epoch,
+                    leading_at,
+                    log_end_offset,
+                );
 
-                // Info, not debug: a follower only asks this when leadership
-                // changed or its log disagreed, so it is rare and it is the
-                // record of a truncation decision being made.
-                tracing::info!(
+                tracing::debug!(
                     "OffsetForLeaderEpoch {}-{}: epoch {} ends at {} (log end {})",
                     topic.name, ask.partition, ask.leader_epoch, end_offset, log_end_offset
                 );
+                answered += 1;
+                if end_offset < 0 {
+                    unknown += 1;
+                }
 
                 partitions.push(OffsetForLeaderPartitionResponse {
                     error_code: 0,
@@ -2835,6 +2851,10 @@ impl KafkaProtocolHandler {
             });
         }
 
+        tracing::info!(
+            "OffsetForLeaderEpoch: answered {} partition(s), {} with an unknown epoch",
+            answered, unknown
+        );
         let mut body_buf = BytesMut::new();
         encode_response(&mut body_buf, &OffsetForLeaderEpochResponse { topics });
 

@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Followers could not truncate on partitions whose leader had lost its epoch
+  history.** A leader answered OffsetForLeaderEpoch from its local history
+  only; where that history was gone (missing checkpoints, the WAL it is rebuilt
+  from already reclaimed) every answer was "unknown", for good on an idle
+  partition, so a divergent follower tail there could never be cut. Measured on
+  a live cluster: 9,308 of 9,308 answers were "unknown", all for the current
+  epoch. The leader now answers for the epoch at which the catalog says it
+  leads (it ends at the log end), which needs no history: epochs move only
+  with leadership, so every record stamped with it was written by this leader.
+  The handshake also logged one warning per partition, on both sides, every
+  time an assignment changed (about 1,100 lines per topic create on a large
+  node); it now logs one summary line per handshake. New
+  `tests/cluster/e2e/epoch_without_history.sh`.
+- **`chronik-server version | head -1` dumped core**: `println!` panicked on the
+  closed pipe and the release build aborts on panic. A reader that stops early
+  is no longer an error.
 - **Operator 0.4.0 panicked at startup** ("Could not automatically determine the
   process-level CryptoProvider"). The Kafka TLS client added `rustls` with its
   default `aws-lc-rs` provider beside kube's `ring`, and nothing chose between
