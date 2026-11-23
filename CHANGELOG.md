@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.19.2] - 2026-11-23
+
 ### Fixed
 
 - **Followers still could not truncate on idle partitions after 2.19.1.** The
