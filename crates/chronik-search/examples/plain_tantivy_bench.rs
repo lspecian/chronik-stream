@@ -1,4 +1,4 @@
-//! Plain Tantivy on the OpenSearch comparison corpus (tests/os_adaptor/bench):
+//! Plain Tantivy on the search benchmark corpus (bulk-*.ndjson log documents):
 //! a typed timeseries schema, multi-threaded indexing, the same queries.
 //! Answers "is a Tantivy index slower than OpenSearch?" apart from how
 //! Chronik uses it. In-process: no HTTP or JSON request parsing.

@@ -1,6 +1,9 @@
 # Search profiles and the archive tier
 
-Status: proposal (2026-11-24). Branch context: `feat/opensearch-adaptor-v2`.
+Status: proposal (2026-11-24). Independent of the OpenSearch adaptor: this is
+about Chronik's own indexing and `/_search`. The adaptor (local branch
+`feat/opensearch-adaptor-v2`, not merged) is where the gap was measured and
+would benefit, but nothing here depends on it.
 
 ## 1. Why
 
@@ -8,7 +11,8 @@ Benchmarking the OpenSearch adaptor against OpenSearch 2.19.1 (single node,
 same machine, 1M synthetic log documents, `tests/os_adaptor/bench/`) and then
 plain Tantivy on the same corpus
 (`crates/chronik-search/examples/plain_tantivy_bench.rs`) showed that the gap
-is in how Chronik builds and queries its indexes, not in Tantivy:
+is in how Chronik builds and queries its indexes, not in Tantivy. The same
+causes apply to every searchable topic produced over Kafka:
 
 | 1M documents | Plain Tantivy (in-process) | OpenSearch (HTTP) | Chronik (HTTP) |
 |---|---|---|---|
@@ -34,13 +38,14 @@ Causes, from the code:
    merged: 6 archives at 1M documents per partition, ~600 at 100M. Every
    all-time search visits each one.
 3. **One hot writer on the minimum heap.** The hot index uses Tantivy's
-   minimum writer heap (15 MB) and the adaptor writes to partition 0 only:
-   ~44K docs/s, so a 1M burst takes ~23 s to become searchable.
+   minimum writer heap (15 MB), one writer per partition (the benchmark wrote
+   to one partition): ~44K docs/s, so a 1M burst takes ~23 s to become searchable.
 4. **Newest-first on every query.** Ranking is score, then timestamp; with no
    index sort, `match_all` scans hundreds of thousands of documents to find the
    newest ten.
-5. **An uncompressed second copy.** The adaptor produces uncompressed batches;
-   the raw tier (`segments/segments`) holds them as is.
+5. **An uncompressed second copy.** The raw tier (`segments/segments`) keeps
+   batches as produced; producers that send uncompressed batches (the adaptor
+   in the benchmark, many Kafka clients by default) are stored uncompressed.
 
 And one correctness issue found while reading:
 
@@ -54,7 +59,7 @@ And one correctness issue found while reading:
 
 Goals: typed and timeseries indexing as a per-topic choice; query cost roughly
 flat as data grows; sub-second freshness under bursts; no unsearchable window;
-smaller disk footprint. Benefits every topic's `/_search`, not only the adaptor.
+smaller disk footprint. For every searchable topic, adaptor or not.
 
 Non-goals: OpenSearch Dashboards; dynamic per-field mapping of unknown fields
 (Tantivy schemas are fixed per index; unknown fields stay in the catch-all).
@@ -94,9 +99,9 @@ per-topic configs (`searchable`, `columnar.*`, `vector.*`); search gets the same
   archives (§4.2).
 
 One declaration feeds both engines: a field declared once is a typed SQL column
-(`/_sql`, projected columns #73) and a typed search field. The adaptor maps an
-OpenSearch mapping / index template onto these configs, so OpenSearch clients
-and Chronik-native users get the same index.
+(`/_sql`, projected columns #73) and a typed search field. If the adaptor ships, it maps an
+OpenSearch mapping / index template onto these configs; nothing else here
+needs it.
 
 Changing a profile or fields: new archives use the new schema; existing ones
 keep theirs (search already handles mixed layouts per archive). A reindex
@@ -115,8 +120,8 @@ operation (§6) rewrites history when wanted.
   (`archive_merge_crash.sh`).
 - Merge only archives of one schema (as today) and, for `timeseries`, of one
   time bucket.
-- Compress produced batches in the adaptor (zstd) and keep the raw tier
-  compressed.
+- Compress raw-tier segments that arrive uncompressed (zstd) when they are
+  written to tier 2.
 - Decide `segment_compaction.rs`: an older retention/cleanup module not wired
   into the server. Adopt its retention ideas into the merge pass or delete it.
 
@@ -146,8 +151,8 @@ decide after measuring A and B.
   dropping unarchived offsets. Invariant: every offset below the partition's
   high watermark is searchable in exactly one of {hot, archive}.
 - **Writer capacity.** Writer threads and heap per profile (`timeseries`: e.g.
-  4 threads, 256 MB); adaptor `_bulk` routes by document id across partitions
-  so partitions index in parallel.
+  4 threads, 256 MB). (Adaptor-only, if it ships: route `_bulk` by document id
+  across partitions so they index in parallel.)
 - **Commit cadence.** Keep the 100 ms visibility flip; measure commit cost at
   the larger heap.
 
@@ -195,7 +200,7 @@ decide after measuring A and B.
 | Phase | Scope | Estimate | Exit |
 |---|---|---|---|
 | A | tiered merging, compression, coverage-bounded eviction, coverage checker | 3–5 days | archives logarithmic; no unsearchable window under sustained ingest; disk ≤ OpenSearch |
-| B | profiles + typed/timeseries archives, `_source`, exact totals, range pruning, hot writer capacity, partitioned `_bulk` | 1–2 weeks | adaptor ranges/aggregations correct; query and freshness targets |
+| B | profiles + typed/timeseries archives, `_source`, exact totals, range pruning, hot writer capacity | 1–2 weeks | ranges/aggregations over typed topics correct; query and freshness targets |
 | — | per-archive result cache, archive verification, reindex | 1 week | dashboards' repeated aggregations near-free; repair path |
 | C | live merged index per partition | 2–4 weeks | only if A + B miss targets |
 
@@ -212,3 +217,13 @@ decide after measuring A and B.
 - Rolling upgrade: old binaries must keep reading new archives during a
   rollback window; typed archives are a new layout, so gate profile use on all
   nodes supporting it (as group offsets did).
+
+## 10. Measurement on main
+
+The comparison harness (`tests/os_adaptor/bench/`) lives on the adaptor branch.
+For this work, a harness on main: the same deterministic corpus produced over
+Kafka to a searchable topic, Chronik's native `/_search` for queries (k6),
+marker-document freshness, disk and RSS, at 1M and 10M records, single node and
+the local 3-node cluster. `crates/chronik-search/examples/plain_tantivy_bench.rs`
+stays the reference ceiling (it reads the corpus as NDJSON; the generator moves
+to main with the harness).
