@@ -225,6 +225,73 @@ pub struct IndexingStats {
     pub duration_ms: u64,
 }
 
+/// Partitions whose unarchived backlog is pressing (their hot index is
+/// filling, or produce to them is being held back), and the signal that wakes
+/// the indexer for them. See [`request_indexing`].
+struct IndexingPressure {
+    partitions: std::sync::Mutex<HashSet<(String, i32)>>,
+    wake: tokio::sync::Notify,
+}
+
+static PRESSURE: std::sync::LazyLock<IndexingPressure> = std::sync::LazyLock::new(|| IndexingPressure {
+    partitions: std::sync::Mutex::new(HashSet::new()),
+    wake: tokio::sync::Notify::new(),
+});
+
+/// Ask for `topic`/`partition` to be archived now rather than at the next
+/// scheduled run: the indexer wakes (instead of finishing its idle interval)
+/// and first seals the partition's active segment, so what it holds becomes
+/// archivable without waiting for a size rotation or the idle seal. Cheap and
+/// idempotent; requests made during a run are served by the next one.
+///
+/// Used when a burst outruns archiving: the hot index keeps unarchived records
+/// only up to its hard cap, so the sooner the archive starts the fewer it has
+/// to drop.
+pub fn request_indexing(topic: &str, partition: i32) {
+    let inserted = PRESSURE
+        .partitions
+        .lock()
+        .map(|mut p| p.insert((topic.to_string(), partition)))
+        .unwrap_or(false);
+    if inserted {
+        PRESSURE.wake.notify_one();
+    }
+}
+
+fn take_indexing_requests() -> Vec<(String, i32)> {
+    PRESSURE.partitions.lock().map(|mut p| p.drain().collect()).unwrap_or_default()
+}
+
+/// A Tantivy archive built into a local tar, not yet uploaded or registered.
+/// The temporary directory holding it goes with it.
+struct LocalArchive {
+    _dir: tempfile::TempDir,
+    archive_path: PathBuf,
+    base_offset: i64,
+    last_offset: i64,
+    min_offset: i64,
+    max_offset: i64,
+    min_timestamp: i64,
+    max_timestamp: i64,
+    record_count: usize,
+}
+
+/// The CPU-bound part of indexing one sealed segment, done ahead of its turn:
+/// the segment read and decoded, its raw-tier bytes encoded and (searchable
+/// topics) its Tantivy archive built. Everything that publishes (uploads,
+/// catalogue entries, cold-flush notifications, Parquet, WAL deletion) still
+/// happens segment by segment in offset order, under the partition's archive
+/// lock; the work is used only if no truncation ran since it was read.
+struct PreparedSegment {
+    /// The partition's truncation epoch when the segment was read.
+    truncation_epoch: u64,
+    tp_records: HashMap<TopicPartition, Vec<CanonicalRecord>>,
+    records_indexed: usize,
+    raw: HashMap<TopicPartition, Vec<u8>>,
+    archives: HashMap<TopicPartition, LocalArchive>,
+}
+
+
 /// Topic-partition identifier
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TopicPartition {
@@ -729,7 +796,7 @@ impl WalIndexer {
         batches: Vec<CanonicalRecord>,
     ) -> Result<(u64, i64)> {
         let tp = TopicPartition::new(topic.to_string(), partition);
-        Self::create_tantivy_index(&self.config, &self.object_store, &self.segment_index, &tp, batches).await
+        Self::create_tantivy_index(&self.config, &self.object_store, &self.segment_index, &tp, batches, None).await
     }
 
     /// Object store holding this node's cold Tantivy/Parquet segments. Exposed
@@ -855,7 +922,13 @@ impl WalIndexer {
 
             loop {
                 if !first_run {
-                    tokio::time::sleep(idle_between_runs).await;
+                    // A partition under pressure (request_indexing) cuts the
+                    // idle short: records it has not archived are about to
+                    // become unsearchable, which outweighs the headroom.
+                    tokio::select! {
+                        _ = tokio::time::sleep(idle_between_runs) => {}
+                        _ = PRESSURE.wake.notified() => {}
+                    }
                 }
                 first_run = false;
 
@@ -976,6 +1049,13 @@ impl WalIndexer {
             let sealed_count = wal_manager.seal_stale_segments(config.stale_segment_seal_secs).await;
             if sealed_count > 0 {
                 debug!("Sealed {} stale segments before indexing", sealed_count);
+            }
+        }
+        // Partitions under pressure: seal what they hold now (see request_indexing).
+        for (topic, partition) in take_indexing_requests() {
+            match wal_manager.group_commit_wal().seal_partition(&topic, partition).await {
+                Ok(_) => debug!(topic = %topic, partition, "Sealed a partition under indexing pressure"),
+                Err(e) => warn!(topic = %topic, partition, "Could not seal a partition under indexing pressure: {}", e),
             }
         }
 
@@ -1161,8 +1241,30 @@ impl WalIndexer {
             }
         }
 
-        // Process each segment
+        // Process each segment, in order. With build concurrency above 1 the
+        // next segments are prepared (read, encoded, archive built) on their
+        // own tasks while earlier ones are published, so a partition with a
+        // backlog archives several segments' worth of CPU at once instead of
+        // one segment at a time.
+        let window = Self::archive_build_concurrency(config);
+        let mut ahead: std::collections::VecDeque<tokio::task::JoinHandle<Option<PreparedSegment>>> =
+            std::collections::VecDeque::new();
+        let mut next_to_prepare = 0;
         for (n, segment_id) in segments_to_index.iter().enumerate() {
+            if window > 1 {
+                while next_to_prepare < segments_to_index.len() && next_to_prepare < n + window {
+                    ahead.push_back(tokio::spawn(Self::prepare_segment(
+                        wal_manager.clone(),
+                        metadata_store.clone(),
+                        segments_to_index[next_to_prepare].clone(),
+                    )));
+                    next_to_prepare += 1;
+                }
+            }
+            let prepared = match ahead.pop_front() {
+                Some(handle) => handle.await.ok().flatten(),
+                None => None,
+            };
             if n > 0 && config.segment_pause_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(config.segment_pause_ms)).await;
             }
@@ -1181,6 +1283,7 @@ impl WalIndexer {
                 replication_progress,
                 cold_flush_listener,
                 hot_vector_index,
+                prepared,
             ).await {
                 Ok(_) => {
                     debug!(segment = %segment_id, "Successfully indexed segment");
@@ -1268,6 +1371,22 @@ impl WalIndexer {
 
     /// `(topic, partition)` of a WAL segment id `topic:partition:id`. Kafka topic
     /// names cannot contain `:`, so splitting from the right is exact.
+    /// How many sealed segments are prepared at once
+    /// (`CHRONIK_ARCHIVE_BUILD_CONCURRENCY`). Default: a quarter of the cores
+    /// the process may use, at most `max_concurrent_tasks` and at least 1;
+    /// each build is a Tantivy writer of up to 3 threads and 50 MB, plus the
+    /// segment's records in memory.
+    fn archive_build_concurrency(config: &WalIndexerConfig) -> usize {
+        if let Some(n) = std::env::var("CHRONIK_ARCHIVE_BUILD_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            return n.max(1);
+        }
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        (cores / 4).clamp(1, config.max_concurrent_tasks.max(1))
+    }
+
     fn segment_partition(segment_id: &str) -> Option<(String, i32)> {
         let mut parts = segment_id.rsplitn(3, ':');
         let _id = parts.next()?;
@@ -1368,8 +1487,94 @@ impl WalIndexer {
         info!("Replication progress wired to WalIndexer — WAL retention now waits for followers");
     }
 
+    /// Group a segment's records by topic-partition; also returns how many
+    /// records it holds. V1 records carry no topic-partition and are skipped
+    /// (handled by the legacy path).
+    fn decode_segment(records: Vec<WalRecord>) -> Result<(HashMap<TopicPartition, Vec<CanonicalRecord>>, usize)> {
+        let mut tp_records: HashMap<TopicPartition, Vec<CanonicalRecord>> = HashMap::new();
+        let mut count = 0;
+        for record in records {
+            match record {
+                WalRecord::V1 { .. } => {
+                    debug!("Skipping V1 record (legacy format)");
+                }
+                WalRecord::V2 { topic, partition, canonical_data, .. } => {
+                    let canonical_record: CanonicalRecord = bincode::deserialize(&canonical_data)
+                        .map_err(|e| Error::Internal(format!("Failed to deserialize CanonicalRecord: {}", e)))?;
+                    count += canonical_record.records.len();
+                    tp_records.entry(TopicPartition::new(topic, partition)).or_default().push(canonical_record);
+                }
+            }
+        }
+        Ok((tp_records, count))
+    }
+
+    /// The CPU-bound part of indexing `segment_id`, run ahead of its turn (see
+    /// [`PreparedSegment`]). `None` when there is nothing worth preparing or
+    /// anything fails: `index_segment` then does the work itself and reports
+    /// what went wrong.
+    async fn prepare_segment(
+        wal_manager: Arc<WalManager>,
+        metadata_store: Arc<dyn MetadataStore>,
+        segment_id: String,
+    ) -> Option<PreparedSegment> {
+        let (topic, partition) = Self::segment_partition(&segment_id)?;
+        // Sampled under the archive lock: a truncation holds it from before it
+        // bumps the epoch until it is done, so the segment read below is not
+        // one a truncation is halfway through.
+        let truncation_epoch = {
+            let lock = wal_manager.archive_lock(&topic, partition);
+            let _guard = lock.lock().await;
+            wal_manager.truncation_epoch(&topic, partition)
+        };
+        let started = std::time::Instant::now();
+        let records = wal_manager.read_segment(&segment_id).await.ok()?;
+        let read = started.elapsed();
+        if records.is_empty() {
+            return None;
+        }
+        let (tp_records, records_indexed) = Self::decode_segment(records).ok()?;
+        let decoded = started.elapsed();
+        let mut searchable = HashSet::new();
+        for tp in tp_records.keys() {
+            let config = metadata_store.get_topic(&tp.topic).await.ok().flatten().map(|t| t.config).unwrap_or_default();
+            if config.is_searchable() {
+                searchable.insert(tp.clone());
+            }
+        }
+        // Encoding and indexing run on blocking threads (they inherit the
+        // indexer's lowered priority), so several segments build at once.
+        tokio::task::spawn_blocking(move || {
+            let mut raw = HashMap::new();
+            let mut archives = HashMap::new();
+            for (tp, records) in &tp_records {
+                if let Ok(bytes) = crate::archive::encode_raw_segment(records) {
+                    raw.insert(tp.clone(), bytes);
+                }
+                if searchable.contains(tp) && !records.is_empty() {
+                    match Self::build_archive_local(tp, records.clone()) {
+                        Ok(local) => {
+                            archives.insert(tp.clone(), local);
+                        }
+                        Err(e) => debug!(topic = %tp.topic, partition = tp.partition, "archive not prepared: {}", e),
+                    }
+                }
+            }
+            debug!(
+                segment = %segment_id,
+                read_ms = read.as_millis() as u64,
+                decode_ms = (decoded - read).as_millis() as u64,
+                build_ms = (started.elapsed() - decoded).as_millis() as u64,
+                "Prepared segment"
+            );
+            PreparedSegment { truncation_epoch, tp_records, records_indexed, raw, archives }
+        })
+        .await
+        .ok()
+    }
+
     /// Index a single sealed WAL segment
-    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer, replication_progress, cold_flush_listener, hot_vector_index))]
+    #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer, replication_progress, cold_flush_listener, hot_vector_index, prepared))]
     async fn index_segment(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -1384,6 +1589,7 @@ impl WalIndexer {
         replication_progress: &Arc<RwLock<Option<Arc<dyn ReplicationProgress>>>>,
         cold_flush_listener: &Arc<RwLock<Vec<Arc<dyn ColdFlushListener>>>>,
         hot_vector_index: &Arc<RwLock<Option<Arc<chronik_columnar::hot_vector_index::HotVectorIndex>>>>,
+        prepared: Option<PreparedSegment>,
     ) -> Result<()> {
         info!(segment = %segment_id, "Indexing WAL segment");
 
@@ -1418,41 +1624,38 @@ impl WalIndexer {
             None => None,
         };
 
-        // Read all records from the segment (v1.3.47+: direct call)
-        let records = wal_manager.read_segment(segment_id).await
-            .map_err(|e| Error::Internal(format!("Failed to read segment {}: {}", segment_id, e)))?;
-
-        if records.is_empty() {
-            info!(segment = %segment_id, "Segment is empty, skipping");
-            stats.segments_processed += 1;
-            return Ok(());
-        }
-
-        // Group records by topic-partition
-        let mut tp_records: HashMap<TopicPartition, Vec<CanonicalRecord>> = HashMap::new();
-
-        for record in records {
-            match record {
-                WalRecord::V1 { .. } => {
-                    // V1 records don't have topic-partition info in the record itself
-                    // We need to get this from the segment metadata
-                    // For now, skip V1 records (they're handled by legacy path)
-                    debug!("Skipping V1 record (legacy format)");
-                    continue;
-                }
-                WalRecord::V2 { topic, partition, canonical_data, .. } => {
-                    // Deserialize CanonicalRecord from bincode
-                    let canonical_record: CanonicalRecord = bincode::deserialize(&canonical_data)
-                        .map_err(|e| Error::Internal(format!("Failed to deserialize CanonicalRecord: {}", e)))?;
-
-                    let record_count = canonical_record.records.len();
-                    let tp = TopicPartition::new(topic.clone(), partition);
-                    tp_records.entry(tp).or_insert_with(Vec::new).push(canonical_record);
-
-                    stats.records_indexed += record_count;
-                }
+        // Work prepared ahead counts only if no truncation ran since the
+        // segment was read: a truncation bumps the epoch before it changes
+        // anything, and takes the lock held here, so an unchanged epoch means
+        // the records read then are the records the log holds now.
+        let prepared = prepared.filter(|p| {
+            let current = Self::segment_partition(segment_id)
+                .map(|(topic, partition)| wal_manager.truncation_epoch(&topic, partition));
+            let valid = current == Some(p.truncation_epoch);
+            if !valid {
+                info!(segment = %segment_id, "Partition truncated since the segment was prepared — indexing it again");
             }
-        }
+            valid
+        });
+        let (tp_records, mut raw_prepared, mut archives_prepared) = match prepared {
+            Some(p) => {
+                stats.records_indexed += p.records_indexed;
+                (p.tp_records, p.raw, p.archives)
+            }
+            None => {
+                // Read all records from the segment (v1.3.47+: direct call)
+                let records = wal_manager.read_segment(segment_id).await
+                    .map_err(|e| Error::Internal(format!("Failed to read segment {}: {}", segment_id, e)))?;
+                if records.is_empty() {
+                    info!(segment = %segment_id, "Segment is empty, skipping");
+                    stats.segments_processed += 1;
+                    return Ok(());
+                }
+                let (tp_records, records_indexed) = Self::decode_segment(records)?;
+                stats.records_indexed += records_indexed;
+                (tp_records, HashMap::new(), HashMap::new())
+            }
+        };
 
         // Collect vector embedding work for concurrent processing after the main loop
         let mut vector_work_items: Vec<(TopicPartition, Vec<CanonicalRecord>)> = Vec::new();
@@ -1492,16 +1695,15 @@ impl WalIndexer {
             // and write different files, and both are CPU-bound (indexing;
             // zstd), so on the indexer's two workers they overlap instead of
             // adding up.
+            // When the archive was built ahead (prepare_segment) only its upload
+            // and registration are left.
+            let prebuilt = archives_prepared.remove(&tp);
             let tantivy = is_searchable.then(|| {
-                let (config, object_store, segment_index, tp, records) = (
-                    config.clone(),
-                    object_store.clone(),
-                    segment_index.clone(),
-                    tp.clone(),
-                    canonical_records.clone(),
-                );
+                let (config, object_store, segment_index, tp) =
+                    (config.clone(), object_store.clone(), segment_index.clone(), tp.clone());
+                let records = if prebuilt.is_some() { Vec::new() } else { canonical_records.clone() };
                 tokio::spawn(async move {
-                    Self::create_tantivy_index(&config, &object_store, &segment_index, &tp, records).await
+                    Self::create_tantivy_index(&config, &object_store, &segment_index, &tp, records, prebuilt).await
                 })
             });
 
@@ -1513,6 +1715,7 @@ impl WalIndexer {
                 &tp,
                 &canonical_records,
                 is_leader,
+                raw_prepared.remove(&tp),
             ).await {
                 Ok(segment_bytes) => {
                     info!(
@@ -1802,13 +2005,14 @@ impl WalIndexer {
     ///
     /// This stores the actual CanonicalRecords (bincode-serialized) so consumers can
     /// fetch messages from S3 when they're no longer in local WAL/segments.
-    #[instrument(skip(object_store, metadata_store, canonical_records, is_leader))]
+    #[instrument(skip(object_store, metadata_store, canonical_records, is_leader, encoded))]
     async fn upload_raw_segment(
         object_store: &Arc<dyn ObjectStore>,
         metadata_store: &Arc<dyn MetadataStore>,
         tp: &TopicPartition,
         canonical_records: &[CanonicalRecord],
         is_leader: &Arc<AtomicBool>,
+        encoded: Option<Vec<u8>>,
     ) -> Result<u64> {
         if canonical_records.is_empty() {
             return Ok(0);
@@ -1826,8 +2030,11 @@ impl WalIndexer {
 
         // The batches exactly as the WAL holds them (original wire bytes
         // included, so fetch serves them with their producer CRCs), compressed.
-        let serialized_data = crate::archive::encode_raw_segment(canonical_records)
-            .map_err(|e| Error::Internal(format!("Failed to encode raw segment: {}", e)))?;
+        let serialized_data = match encoded {
+            Some(bytes) => bytes,
+            None => crate::archive::encode_raw_segment(canonical_records)
+                .map_err(|e| Error::Internal(format!("Failed to encode raw segment: {}", e)))?,
+        };
 
         let data_size = serialized_data.len() as u64;
 
@@ -1896,18 +2103,20 @@ impl WalIndexer {
     }
 
     /// Create Tantivy index from CanonicalRecords
-    #[instrument(skip(config, object_store, segment_index, canonical_records))]
+    #[instrument(skip(config, object_store, segment_index, canonical_records, prebuilt))]
     async fn create_tantivy_index(
         config: &WalIndexerConfig,
         object_store: &Arc<dyn ObjectStore>,
         segment_index: &Arc<SegmentIndex>,
         tp: &TopicPartition,
         canonical_records: Vec<CanonicalRecord>,
+        prebuilt: Option<LocalArchive>,
     ) -> Result<(u64, i64)> {
-        if canonical_records.is_empty() {
-            return Ok((0, -1));
-        }
-        let segment_metadata = Self::build_archive(config, object_store, tp, canonical_records, None).await?;
+        let segment_metadata = match prebuilt {
+            Some(local) => Self::upload_archive(config, object_store, tp, local, None).await?,
+            None if canonical_records.is_empty() => return Ok((0, -1)),
+            None => Self::build_archive(config, object_store, tp, canonical_records, None).await?,
+        };
         let (segment_id, bytes_written, max_offset) =
             (segment_metadata.segment_id.clone(), segment_metadata.size_bytes, segment_metadata.max_offset);
         segment_index.add_segment(segment_metadata).await
@@ -1934,6 +2143,18 @@ impl WalIndexer {
         canonical_records: Vec<CanonicalRecord>,
         key_suffix: Option<&str>,
     ) -> Result<SegmentIndexMetadata> {
+        let local = {
+            let tp = tp.clone();
+            tokio::task::spawn_blocking(move || Self::build_archive_local(&tp, canonical_records))
+                .await
+                .map_err(|e| Error::Internal(format!("Tantivy archive build task failed: {}", e)))??
+        };
+        Self::upload_archive(config, object_store, tp, local, key_suffix).await
+    }
+
+    /// The CPU half of [`Self::build_archive`]: index the records into a tar
+    /// (and its term filter) in a temporary directory. Blocking.
+    fn build_archive_local(tp: &TopicPartition, canonical_records: Vec<CanonicalRecord>) -> Result<LocalArchive> {
         if canonical_records.is_empty() {
             return Err(Error::Internal("no records to archive".into()));
         }
@@ -1944,30 +2165,24 @@ impl WalIndexer {
         let mut max_offset = i64::MIN;
         let mut min_timestamp = i64::MAX;
         let mut max_timestamp = i64::MIN;
-        let mut total_record_count = 0;
+        let mut record_count = 0;
 
         for record in &canonical_records {
             min_offset = min_offset.min(record.min_offset());
             max_offset = max_offset.max(record.last_offset());
             min_timestamp = min_timestamp.min(record.min_timestamp());
             max_timestamp = max_timestamp.max(record.max_timestamp);
-            total_record_count += record.records.len();
+            record_count += record.records.len();
         }
 
-        // Create TantivySegmentWriter
         let mut writer = TantivySegmentWriter::new(tp.topic.clone(), tp.partition, base_offset)?;
-
-        // Write all batches (CPU-intensive: 285K records)
         for canonical_record in canonical_records {
             writer.write_batch(&canonical_record)?;
         }
 
-        // Create output directory for the archive
-        let temp_dir = tempfile::tempdir()
+        let dir = tempfile::tempdir()
             .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
-
-        // Commit and serialize to a tar (CPU + I/O intensive)
-        let (archive_path, metadata) = writer.commit_and_serialize(temp_dir.path())?;
+        let (archive_path, metadata) = writer.commit_and_serialize(dir.path())?;
 
         info!(
             topic = %tp.topic,
@@ -1979,24 +2194,43 @@ impl WalIndexer {
             metadata.record_count
         );
 
-        // Read the archive (blocking I/O)
-        let archive_data = tokio::fs::read(&archive_path).await
+        Ok(LocalArchive {
+            _dir: dir,
+            archive_path,
+            base_offset: metadata.base_offset,
+            last_offset: metadata.last_offset,
+            min_offset,
+            max_offset,
+            min_timestamp,
+            max_timestamp,
+            record_count,
+        })
+    }
+
+    /// The I/O half of [`Self::build_archive`]: upload a built archive and its
+    /// term filter; returns the catalogue entry (not registered).
+    async fn upload_archive(
+        config: &WalIndexerConfig,
+        object_store: &Arc<dyn ObjectStore>,
+        tp: &TopicPartition,
+        local: LocalArchive,
+        key_suffix: Option<&str>,
+    ) -> Result<SegmentIndexMetadata> {
+        let archive_data = tokio::fs::read(&local.archive_path).await
             .map_err(|e| Error::Internal(format!("Failed to read the archive: {}", e)))?;
         let bytes_written = archive_data.len() as u64;
 
-        // Upload to object store
         let object_key = format!(
             "{}/{}/partition-{}/segment-{}-{}{}.tar",
             config.index_base_path,
             tp.topic,
             tp.partition,
-            metadata.base_offset,
-            metadata.last_offset,
+            local.base_offset,
+            local.last_offset,
             key_suffix.map(|s| format!("-{s}")).unwrap_or_default()
         );
 
-        let data_bytes = bytes::Bytes::from(archive_data);
-        object_store.put(&object_key, data_bytes).await
+        object_store.put(&object_key, bytes::Bytes::from(archive_data)).await
             .map_err(|e| Error::Internal(format!("Failed to upload index: {}", e)))?;
 
         info!(
@@ -2011,7 +2245,7 @@ impl WalIndexer {
         // without opening it when a required word is absent. Best effort — a
         // missing filter only means the archive is always opened (and the
         // search builds one the first time it does).
-        let filter_path = crate::term_filter::term_filter_key(&archive_path.to_string_lossy());
+        let filter_path = crate::term_filter::term_filter_key(&local.archive_path.to_string_lossy());
         if let Ok(filter) = tokio::fs::read(&filter_path).await {
             let key = crate::term_filter::term_filter_key(&object_key);
             if let Err(e) = object_store.put(&key, bytes::Bytes::from(filter)).await {
@@ -2019,24 +2253,20 @@ impl WalIndexer {
             }
         }
 
-        // Register segment in index
-        let segment_id = format!("{}-{}-{}-{}", tp.topic, tp.partition, min_offset, max_offset);
-        let segment_metadata = SegmentIndexMetadata {
-            segment_id: segment_id.clone(),
+        Ok(SegmentIndexMetadata {
+            segment_id: format!("{}-{}-{}-{}", tp.topic, tp.partition, local.min_offset, local.max_offset),
             topic: tp.topic.clone(),
             partition: tp.partition,
-            min_offset,
-            max_offset,
-            record_count: total_record_count,
-            min_timestamp,
-            max_timestamp,
-            object_store_path: object_key.clone(),
+            min_offset: local.min_offset,
+            max_offset: local.max_offset,
+            record_count: local.record_count,
+            min_timestamp: local.min_timestamp,
+            max_timestamp: local.max_timestamp,
+            object_store_path: object_key,
             size_bytes: bytes_written,
             created_at: chrono::Utc::now().timestamp(),
             compression: "snappy".to_string(),
-        };
-
-        Ok(segment_metadata)
+        })
     }
 
     /// v2.2.21: Create Parquet file from CanonicalRecords for columnar storage
@@ -4050,4 +4280,175 @@ fn parquet_flush_lock(tp: &TopicPartition) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::LazyLock<dashmap::DashMap<(String, i32), Arc<tokio::sync::Mutex<()>>>> =
         std::sync::LazyLock::new(dashmap::DashMap::new);
     LOCKS.entry((tp.topic.clone(), tp.partition)).or_default().clone()
+}
+
+#[cfg(test)]
+mod prepare_tests {
+    use super::*;
+    use crate::object_store::{LocalBackend, ObjectStoreConfig, StorageBackend};
+    use chronik_common::metadata::{InMemoryMetadataStore, TopicConfig};
+
+    const TOPIC: &str = "prep";
+
+    /// One batch of `n` records from `base`, as produce writes it to the WAL.
+    fn batch(base: i64, n: i64) -> CanonicalRecord {
+        CanonicalRecord {
+            base_offset: base,
+            partition_leader_epoch: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            is_transactional: false,
+            is_control: false,
+            compression: crate::canonical_record::CompressionType::None,
+            timestamp_type: TimestampType::CreateTime,
+            base_timestamp: 1_700_000_000_000 + base,
+            max_timestamp: 1_700_000_000_000 + base + n - 1,
+            records: (base..base + n)
+                .map(|o| CanonicalRecordEntry {
+                    offset: o,
+                    timestamp: 1_700_000_000_000 + o,
+                    key: None,
+                    value: Some(format!("{{\"n\":{o}}}").into_bytes()),
+                    headers: vec![],
+                    attributes: 0,
+                })
+                .collect(),
+            compressed_records_wire_bytes: None,
+            original_v1_wire_format: None,
+            original_v2_wire_format: None,
+        }
+    }
+
+    async fn indexer(dir: &std::path::Path) -> WalIndexer {
+        let mut wal_config = chronik_wal::config::WalConfig::default();
+        wal_config.data_dir = dir.join("wal");
+        let wal = Arc::new(WalManager::new(wal_config).await.unwrap());
+        for b in 0..10 {
+            let data = bincode::serialize(&batch(b * 10, 10)).unwrap();
+            wal.append_canonical(TOPIC.to_string(), 0, data, b * 10, b * 10 + 9, 10).await.unwrap();
+        }
+        assert_eq!(wal.seal_stale_segments(0).await, 1);
+
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(
+            LocalBackend::new(ObjectStoreConfig {
+                backend: StorageBackend::Local { path: store_dir.to_string_lossy().to_string() },
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let metadata: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+        let mut config = HashMap::new();
+        config.insert("searchable".to_string(), "true".to_string());
+        metadata
+            .create_topic(
+                TOPIC,
+                TopicConfig {
+                    partition_count: 1,
+                    replication_factor: 1,
+                    retention_ms: None,
+                    segment_bytes: 1 << 30,
+                    config,
+                },
+            )
+            .await
+            .unwrap();
+        let config = WalIndexerConfig {
+            segment_index_path: None,
+            vector_base_path: dir.join("vectors").to_string_lossy().to_string(),
+            columnar_base_path: dir.join("columnar").to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        WalIndexer::new(config, wal, object_store, metadata, None)
+    }
+
+    async fn finish(w: &WalIndexer, segment: &str, prepared: Option<PreparedSegment>) {
+        let mut stats = IndexingStats::default();
+        WalIndexer::index_segment(
+            &w.config,
+            &w.wal_manager,
+            &w.object_store,
+            &w.segment_index,
+            &w.metadata_store,
+            &w.vector_index_manager,
+            segment,
+            &mut stats,
+            &w.is_leader,
+            &w.hot_buffer,
+            &w.replication_progress,
+            &w.cold_flush_listener,
+            &w.hot_vector_index,
+            prepared,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.errors, 0);
+    }
+
+    async fn archived(w: &WalIndexer) -> Vec<(i64, i64, usize)> {
+        let mut v: Vec<_> = w
+            .segment_index
+            .get_segments_for_partition(TOPIC, 0)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|s| (s.min_offset, s.max_offset, s.record_count))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn sealed(w: &WalIndexer) -> String {
+        let segments = w.wal_manager.get_sealed_segments_with_size();
+        assert_eq!(segments.len(), 1);
+        segments[0].0.clone()
+    }
+
+    /// Prepared work is what gets published when nothing changed.
+    #[tokio::test]
+    async fn a_prepared_segment_is_published_as_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = indexer(dir.path()).await;
+        let segment = sealed(&w);
+        let prepared = WalIndexer::prepare_segment(w.wal_manager.clone(), w.metadata_store.clone(), segment.clone())
+            .await
+            .expect("a sealed segment of a searchable topic is prepared");
+        assert_eq!(prepared.records_indexed, 100);
+        assert_eq!(prepared.archives.len(), 1, "the archive is built ahead");
+        assert_eq!(prepared.raw.len(), 1, "the raw segment is encoded ahead");
+
+        finish(&w, &segment, Some(prepared)).await;
+        assert_eq!(archived(&w).await, vec![(0, 99, 100)]);
+    }
+
+    /// A truncation between preparing a segment and publishing it must not
+    /// publish what the truncation discarded: the prepared archive covers
+    /// offsets the log no longer holds.
+    #[tokio::test]
+    async fn a_truncation_after_prepare_discards_the_prepared_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = indexer(dir.path()).await;
+        let segment = sealed(&w);
+        let prepared = WalIndexer::prepare_segment(w.wal_manager.clone(), w.metadata_store.clone(), segment.clone())
+            .await
+            .unwrap();
+        assert_eq!(prepared.archives.len(), 1);
+
+        // What a follower does when it learns its log diverged.
+        {
+            let lock = w.wal_manager.archive_lock(TOPIC, 0);
+            let _guard = lock.lock().await;
+            w.wal_manager.truncate_to(TOPIC, 0, 50).await.unwrap();
+        }
+
+        finish(&w, &segment, Some(prepared)).await;
+        let got = archived(&w).await;
+        assert!(
+            got.iter().all(|&(_, max, _)| max < 50),
+            "offsets the truncation removed were archived from stale prepared work: {got:?}"
+        );
+    }
 }

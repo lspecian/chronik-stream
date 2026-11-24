@@ -885,6 +885,11 @@ impl WalManager {
         self.group_commit_wal.cleanup_topic(topic).await;
     }
 
+    /// See [`GroupCommitWal::truncation_epoch`].
+    pub fn truncation_epoch(&self, topic: &str, partition: i32) -> u64 {
+        self.group_commit_wal.truncation_epoch(topic, partition)
+    }
+
     /// Read all records from a specific sealed segment (v1.3.62+: Now reads from sealed file)
     pub async fn read_segment(&self, segment_id: &str) -> Result<Vec<WalRecord>> {
         // Parse segment_id format: "topic:partition:segment_id"

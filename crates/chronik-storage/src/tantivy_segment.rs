@@ -186,6 +186,9 @@ impl TantivySegmentWriter {
     ) -> Result<Self> {
         let (_, schema_fields) = SchemaFields::build_schema();
         text_analysis::register_analyzer(&index);
+        // 50 MB: three indexing threads. Fewer, larger Tantivy segments per
+        // archive (more threads with a bigger budget, or merging) measured
+        // slower to query at 10M records, and no faster to build in parallel.
         let writer = index.writer(50_000_000)
             .map_err(|e| Error::Internal(format!("Failed to create Tantivy writer: {}", e)))?;
         let live = LIVE_SEGMENT_WRITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
