@@ -13,6 +13,12 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use chronik_monitoring::{init_monitoring, TracingConfig};
 
+// mimalloc instead of the system allocator: search requests allocate many
+// short-lived buffers (column reads, aggregation buckets, JSON), and glibc
+// malloc/free took 7-15% of the CPU of a query load.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod integrated_server;
 mod error_handler;
 mod kafka_handler;

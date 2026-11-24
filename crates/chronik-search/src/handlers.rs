@@ -143,6 +143,9 @@ async fn search_hot_topic(
     let dsl = request.query.as_ref().unwrap_or(&match_all);
     // The whole window: page `from` of the merge may come from here.
     let k = request.from.saturating_add(request.size);
+    if request.size == 0 {
+        return Vec::new(); // no page to fill (counts and aggregations run separately)
+    }
 
     if let Some(query_text) = extract_simple_query_text(dsl) {
         return match hot_idx.search_topic(topic, &query_text, k).await {
@@ -870,13 +873,22 @@ async fn count_and_aggregate(
         let window = required_time_window(request.query.as_ref());
         let store = wal_indexer.object_store();
         let shared = Arc::new((request.clone(), aggs.cloned()));
+        let results = crate::result_cache::ResultCache::shared();
+        let request_key = crate::result_cache::ResultCache::request_key(
+            request.query.as_ref(),
+            request.aggs.as_ref().or(request.aggregations.as_ref()),
+        );
         let mut parts = stream::iter(segments.into_iter().filter(|s| counts(s.partition) && segment_in_window(s, window)).map(|seg| {
-            let (cache, store, shared) = (cache.clone(), store.clone(), shared.clone());
+            let (cache, store, shared, request_key) = (cache.clone(), store.clone(), shared.clone(), request_key.clone());
             async move {
+                // An archive never changes: its share of this request may be known already.
+                if let Some(cached) = request_key.as_ref().and_then(|k| results.get(&seg, k)) {
+                    return Ok((*cached).clone());
+                }
                 let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
                     Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
                 })?;
-                tokio::task::spawn_blocking(move || {
+                let part = tokio::task::spawn_blocking(move || {
                     let (request, aggs) = (&shared.0, shared.1.as_ref());
                     let index = reader.index();
                     let schema = index.schema();
@@ -888,7 +900,11 @@ async fn count_and_aggregate(
                     collect(&reader.searcher(), &*query, aggs)
                 })
                 .await
-                .map_err(|e| Error::Internal(format!("count task failed: {}", e)))?
+                .map_err(|e| Error::Internal(format!("count task failed: {}", e)))?;
+                if let (Ok(part), Some(k)) = (&part, &request_key) {
+                    results.put(&seg, k, Arc::new(part.clone()));
+                }
+                part
             }
         }))
         .buffered(cold_search_concurrency());
