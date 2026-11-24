@@ -708,6 +708,20 @@ impl WalIndexer {
     /// archives the WAL. For records the indexer missed (re-archived from the
     /// log); the batches must hold only offsets no archive covers yet.
     /// Returns (bytes written, highest offset archived).
+    /// Build `batches` into one archive and upload it, unregistered (see
+    /// `build_archive`): for a reindex, which swaps it in for the archive it
+    /// rebuilds.
+    pub async fn build_unregistered_archive(
+        &self,
+        topic: &str,
+        partition: i32,
+        batches: Vec<CanonicalRecord>,
+        key_suffix: &str,
+    ) -> Result<SegmentIndexMetadata> {
+        let tp = TopicPartition::new(topic.to_string(), partition);
+        Self::build_archive(&self.config, &self.object_store, &tp, batches, Some(key_suffix)).await
+    }
+
     pub async fn archive_batches(
         &self,
         topic: &str,
@@ -1885,6 +1899,36 @@ impl WalIndexer {
         if canonical_records.is_empty() {
             return Ok((0, -1));
         }
+        let segment_metadata = Self::build_archive(config, object_store, tp, canonical_records, None).await?;
+        let (segment_id, bytes_written, max_offset) =
+            (segment_metadata.segment_id.clone(), segment_metadata.size_bytes, segment_metadata.max_offset);
+        segment_index.add_segment(segment_metadata).await
+            .map_err(|e| Error::Internal(format!("Failed to register segment in index: {}", e)))?;
+
+        info!(
+            topic = %tp.topic,
+            partition = tp.partition,
+            segment_id = %segment_id,
+            "Registered segment in index"
+        );
+
+        Ok((bytes_written, max_offset))
+    }
+
+    /// Build `canonical_records` into one Tantivy archive and upload it with
+    /// its term filter, without registering it: the catalogue entry to add (or
+    /// to swap in for others, as a reindex does). `key_suffix` makes the file
+    /// name distinct from an archive of the same range it will replace.
+    async fn build_archive(
+        config: &WalIndexerConfig,
+        object_store: &Arc<dyn ObjectStore>,
+        tp: &TopicPartition,
+        canonical_records: Vec<CanonicalRecord>,
+        key_suffix: Option<&str>,
+    ) -> Result<SegmentIndexMetadata> {
+        if canonical_records.is_empty() {
+            return Err(Error::Internal("no records to archive".into()));
+        }
 
         // Get base offset and calculate ranges from all records
         let base_offset = canonical_records[0].base_offset;
@@ -1934,12 +1978,13 @@ impl WalIndexer {
 
         // Upload to object store
         let object_key = format!(
-            "{}/{}/partition-{}/segment-{}-{}.tar",
+            "{}/{}/partition-{}/segment-{}-{}{}.tar",
             config.index_base_path,
             tp.topic,
             tp.partition,
             metadata.base_offset,
-            metadata.last_offset
+            metadata.last_offset,
+            key_suffix.map(|s| format!("-{s}")).unwrap_or_default()
         );
 
         let data_bytes = bytes::Bytes::from(archive_data);
@@ -1983,17 +2028,7 @@ impl WalIndexer {
             compression: "snappy".to_string(),
         };
 
-        segment_index.add_segment(segment_metadata).await
-            .map_err(|e| Error::Internal(format!("Failed to register segment in index: {}", e)))?;
-
-        info!(
-            topic = %tp.topic,
-            partition = tp.partition,
-            segment_id = %segment_id,
-            "Registered segment in index"
-        );
-
-        Ok((bytes_written, max_offset))
+        Ok(segment_metadata)
     }
 
     /// v2.2.21: Create Parquet file from CanonicalRecords for columnar storage

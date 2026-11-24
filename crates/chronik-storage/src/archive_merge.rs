@@ -220,7 +220,9 @@ pub async fn sweep_orphans(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentInde
 fn file_range(file: &str) -> Option<(i64, i64)> {
     let stem = file.strip_prefix("segment-")?;
     let stem = stem.strip_suffix(".tar.gz").or_else(|| stem.strip_suffix(".tar"))?;
-    let (lo, hi) = stem.split_once('-')?;
+    let (lo, rest) = stem.split_once('-')?;
+    // A reindexed archive carries a suffix: `segment-<lo>-<hi>-r<id>.tar`.
+    let hi = rest.split('-').next()?;
     let (lo, hi) = (lo.parse().ok()?, hi.parse().ok()?);
     (lo <= hi).then_some((lo, hi))
 }
@@ -561,7 +563,7 @@ fn merged_key(source_key: &str, min: i64, max: i64) -> String {
 /// Open a source archive for merging: a local plain tar in place; anything
 /// else downloaded — a plain tar read from memory, a `.tar.gz` unpacked into
 /// `scratch` (kept until the merge is written).
-async fn open_source(store: &Arc<dyn ObjectStore>, key: &str, scratch: &std::path::Path) -> Result<TantivySegmentReader> {
+pub(crate) async fn open_source(store: &Arc<dyn ObjectStore>, key: &str, scratch: &std::path::Path) -> Result<TantivySegmentReader> {
     if let Some(path) = store.local_path(key).filter(|p| p.is_file()) {
         if let Some(reader) = TantivySegmentReader::open_tar_file(&path)? {
             return Ok(reader);
@@ -993,6 +995,7 @@ mod tests {
         assert!(store.get("idx/t/partition-0/notes.txt").await.is_ok(), "anything else stays");
         // Absolute keys, as thunderbird's catalogue holds them, sweep the same.
         assert_eq!(file_range("segment-1003901-1041137.tar.gz"), Some((1003901, 1041137)));
+        assert_eq!(file_range("segment-5-9-r1795507862393.tar"), Some((5, 9)));
     }
 
     /// Thunderbird's catalogue keys are absolute ("/data/tantivy_indexes/…")

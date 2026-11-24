@@ -976,6 +976,8 @@ Elasticsearch query DSL over a searchable topic's records (hot index + archives)
 - `range` on JSON numbers and strings; `term`/`match` as before.
 - Aggregations on `/{topic}/_search`: terms, histogram, `date_histogram` (fixed intervals; run as a millisecond histogram, keys in ms with `key_as_string`), range, stats, avg/sum/min/max, cardinality, percentiles; `x.keyword` means `x`. Partials merge across archives, hot partitions and nodes (`topic_aggs.rs`).
 - Exact `hits.total` for `size: 0`, aggregations or `track_total_hits: true`; otherwise the total is what the page collection saw (`gte`). Each record is counted once: hot only above its partition's archived watermark, and each node only the partitions it leads.
+- `match_all` ranks newest-first without reading every record: segments and archives are visited by the best rank they can hold (newest second, lowest partition, highest offset) and skipped once they cannot place a hit.
+- `POST /admin/reindex` (admin key) rebuilds this node's archived search indexes from its raw tier in the background, one archive at a time: body `{"topic": "t"}` (all topics when absent), `"force": true` to rebuild archives that are already current (a repair). `GET /admin/reindex` reports progress (archives, rebuilt, current, incomplete, raced, failed). An archive whose records the raw tier does not all hold is left alone (`incomplete`). The rebuilt archive is swapped into the catalogue atomically; the old file goes after `CHRONIK_ARCHIVE_MERGE_GRACE_SECS`. Archives written before JSON columns existed need it for ranges and aggregations. Per node: on a cluster, call each node.
 
 ### Background Processing
 

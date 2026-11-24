@@ -1463,6 +1463,7 @@ async fn run_cluster_mode(
         None, // Uses CHRONIK_ADMIN_API_KEY env var
         server.isr_tracker(),
         schema_registry.clone(),
+        Some(server.get_wal_indexer()),
     );
     info!("✓ Admin API + Schema Registry integrated into Unified API");
 
@@ -1903,6 +1904,7 @@ async fn run_single_node_mode(
             None, // Uses CHRONIK_ADMIN_API_KEY env var
             None, // no ISR tracker in single-node
             schema_registry_single,
+            Some(server.get_wal_indexer()),
         );
 
         let _unified_handle = unified_api::start_unified_api_with_state(
