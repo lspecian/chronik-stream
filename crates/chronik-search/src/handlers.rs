@@ -693,10 +693,12 @@ async fn search_cold_segments(
     }
     // Newest first, and a fixed order among equals, so the same request
     // searches the same segments in the same order.
+    // Best possible rank first (see `RankBound`): the early stop below needs
+    // every unsearched segment to rank no higher than the next one.
     segments.sort_by(|a, b| {
-        b.max_timestamp.cmp(&a.max_timestamp).then_with(|| a.object_store_path.cmp(&b.object_store_path))
+        RankBound::of_segment(b).cmp(&RankBound::of_segment(a)).then_with(|| a.object_store_path.cmp(&b.object_store_path))
     });
-    let newest: Vec<i64> = segments.iter().map(|s| s.max_timestamp).collect();
+    let newest: Vec<RankBound> = segments.iter().map(RankBound::of_segment).collect();
     let unranked = is_unranked(request);
     let store = wal_indexer.object_store();
     // The terms a hit must contain, to skip archives whose term filter proves
@@ -942,20 +944,68 @@ async fn count_and_aggregate(
 /// strictly older than the `window`-th hit, nothing unsearched can rank above
 /// any hit kept. (Equal timestamps go on searching: the tie-break could still
 /// favour the unsearched record.)
-fn can_stop_unranked(hits: &[Hit], window: usize, next_newest: Option<&i64>) -> bool {
+fn can_stop_unranked(hits: &[Hit], window: usize, next: Option<&RankBound>) -> bool {
     if hits.len() < window || window == 0 {
         return false;
     }
-    let Some(&next_newest) = next_newest else {
+    let Some(next) = next else {
         return true; // nothing left to search
     };
-    let mut stamps: Vec<i64> = hits
-        .iter()
-        .map(|h| crate::ranking::rank_second(h).unwrap_or(i64::MIN))
-        .collect();
-    // The window-th newest, in the seconds the order compares (rank_second).
-    let (_, kth, _) = stamps.select_nth_unstable_by(window - 1, |a, b| b.cmp(a));
-    next_newest.div_euclid(1000) < *kth
+    let mut keys: Vec<RankBound> = hits.iter().map(RankBound::of_hit).collect();
+    // The window-th best kept, by the order the merge uses.
+    let (_, kth, _) = keys.select_nth_unstable_by(window - 1, |a, b| b.cmp(a));
+    next < kth
+}
+
+/// Where an unranked hit (every score equal) sorts, as `ranking::hit_order`
+/// compares: newest second, then topic, lowest partition, highest offset.
+/// Greater ranks higher. For a segment, the best any of its records can
+/// reach (newest second, highest offset): when records share seconds (every
+/// burst does) the second alone could not tell segments apart, so a search
+/// for the newest page read every archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RankBound {
+    second: i64,
+    topic: String,
+    partition: i64,
+    offset: i64,
+}
+
+impl RankBound {
+    fn of_hit(h: &Hit) -> Self {
+        let num = |k: &str| h._source.get(k).and_then(|v| v.as_i64());
+        Self {
+            second: crate::ranking::rank_second(h).unwrap_or(i64::MIN),
+            topic: h._index.clone(),
+            partition: num("partition").unwrap_or(i64::MAX),
+            offset: num("offset").unwrap_or(i64::MIN),
+        }
+    }
+
+    fn of_segment(s: &chronik_storage::segment_index::SegmentMetadata) -> Self {
+        Self {
+            second: s.max_timestamp.div_euclid(1000),
+            topic: s.topic.clone(),
+            partition: s.partition as i64,
+            offset: s.max_offset,
+        }
+    }
+}
+
+impl PartialOrd for RankBound {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankBound {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.second
+            .cmp(&other.second)
+            .then_with(|| other.topic.cmp(&self.topic))
+            .then_with(|| other.partition.cmp(&self.partition))
+            .then_with(|| self.offset.cmp(&other.offset))
+    }
 }
 
 /// What a cold search found.
@@ -2970,14 +3020,21 @@ mod unranked_stop_tests {
     #[test]
     fn stops_only_when_nothing_unsearched_can_rank_higher() {
         let hits: Vec<Hit> = [100, 90, 80, 70].into_iter().map(at).collect();
+        // The best a segment of partition 0 can hold: its newest second and
+        // highest offset.
+        let seg = |max_ms: i64, max_offset: i64| RankBound { second: max_ms.div_euclid(1000), topic: "t".into(), partition: 0, offset: max_offset };
         // Not a full window yet.
-        assert!(!can_stop_unranked(&hits[..2], 3, Some(&10_000)));
-        // The 3rd newest is 80; the next segment's newest is older: done.
-        assert!(can_stop_unranked(&hits, 3, Some(&79_999)));
-        // A tie at 80 could still win the tie-break: keep going.
-        assert!(!can_stop_unranked(&hits, 3, Some(&80_000)));
+        assert!(!can_stop_unranked(&hits[..2], 3, Some(&seg(10_000, 10))));
+        // The 3rd best is (80 s, offset 80); the next segment's newest is older: done.
+        assert!(can_stop_unranked(&hits, 3, Some(&seg(79_999, 1_000))));
+        // Same second: the offset breaks the tie. Lower offsets cannot win...
+        assert!(can_stop_unranked(&hits, 3, Some(&seg(80_000, 79))));
+        // ...higher ones can: keep going.
+        assert!(!can_stop_unranked(&hits, 3, Some(&seg(80_999, 81))));
+        // A lower partition wins a tie in the second.
+        assert!(!can_stop_unranked(&hits, 3, Some(&RankBound { partition: -1, ..seg(80_000, 0) })));
         // A newer record could be in the next segment.
-        assert!(!can_stop_unranked(&hits, 3, Some(&95_000)));
+        assert!(!can_stop_unranked(&hits, 3, Some(&seg(95_000, 0))));
         // Nothing left.
         assert!(can_stop_unranked(&hits, 3, None));
     }
