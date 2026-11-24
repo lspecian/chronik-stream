@@ -59,6 +59,7 @@ run tantivy_cross_version_down "$E2E/tantivy_cross_version.sh" "$BIN" "$PREV_BIN
 run epoch_without_history "$E2E/epoch_without_history.sh" "$BIN" "$LABEL"
 run acks0_no_response "$E2E/acks0_no_response.sh" "$BIN" "$LABEL"
 run hot_buffer_limit "$E2E/hot_buffer_limit.sh" "$BIN" "$LABEL"
+run search_coverage "$E2E/search_coverage.sh" "$BIN" "$LABEL"
 run projected_columns "$E2E/projected_columns.sh" "$BIN" "$LABEL"
 run columnar_catchup "$E2E/columnar_catchup.sh" "$BIN" "$LABEL"
 run vector_catchup "$E2E/vector_catchup.sh" "$BIN" "$LABEL"
