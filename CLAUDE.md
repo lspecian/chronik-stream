@@ -1051,7 +1051,8 @@ Key environment variables:
 - `CHRONIK_COLUMNAR_KEEP_LOCAL` - Keep local copy when uploading to object storage (default: `true`)
 - `CHRONIK_HOT_TEXT_ENABLED` - Enable in-memory Tantivy hot text index for NRT search (default: `true`). Merged with cold Tantivy hits on `/_search`, query-cache bypassed while active.
 - `CHRONIK_HOT_TEXT_COMMIT_INTERVAL_MS` - In-memory buffer visibility flip interval (default: `100`). Purely a RAM-only Tantivy `commit` — no disk I/O.
-- `CHRONIK_HOT_TEXT_MAX_DOCS` - Soft cap on documents per (topic, partition) in hot index (default: `100000`). Also the trailing-offset window read from WAL at startup warm-up.
+- `CHRONIK_HOT_TEXT_MAX_DOCS` - Documents per (topic, partition) the hot index keeps once an archive covers the older ones (default: `100000`). Records no archive covers yet are never trimmed below this: they stay (up to `CHRONIK_HOT_TEXT_HARD_MAX_DOCS`) until archived, so every acknowledged record is searchable. Boot warm-up reloads this many plus everything after the last archive.
+- `CHRONIK_HOT_TEXT_HARD_MAX_DOCS` - Memory bound per (topic, partition) in the hot index (default: 10x `CHRONIK_HOT_TEXT_MAX_DOCS`). Past it the oldest records go even unarchived: counted in `chronik_hot_text_docs_total{op="evicted_unarchived"}`, logged, unsearchable until indexed.
 - `CHRONIK_HOT_TEXT_WRITER_HEAP_BYTES` - Tantivy writer heap budget per partition in bytes (default: `15_000_000`, Tantivy minimum). In-memory only.
 - `CHRONIK_SEARCH_TIMEOUT_MS` - Time limit for a `/_search` or `/{topic}/_search` when the request sets no `timeout` (default: `10000`). At the limit the node answers with the hits found so far and `timed_out: true`; the merged answer is `timed_out` when any node's was. Keep it under the 30 s a node waits for its peers.
 - `CHRONIK_SEARCH_CONCURRENCY` - Archived segments searched at once per request (default: cores the process may use, at most 8).

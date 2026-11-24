@@ -185,6 +185,11 @@ pub struct SegmentIndex {
 
     /// Whether auto-save is enabled
     auto_save: bool,
+
+    /// True once the persisted catalogue has been read (or there is none to
+    /// read). Until then the index answers as if no archive existed, which
+    /// readers that act on "not archived" must not mistake for the truth.
+    loaded: tokio::sync::watch::Sender<bool>,
 }
 
 impl SegmentIndex {
@@ -196,6 +201,7 @@ impl SegmentIndex {
             persistence_path: None,
             parquet_persistence_path: None,
             auto_save: false,
+            loaded: tokio::sync::watch::Sender::new(true),
         }
     }
 
@@ -214,6 +220,7 @@ impl SegmentIndex {
             persistence_path: Some(path),
             parquet_persistence_path: Some(parquet_path),
             auto_save,
+            loaded: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -229,6 +236,7 @@ impl SegmentIndex {
             persistence_path: Some(tantivy_path),
             parquet_persistence_path: Some(parquet_path),
             auto_save,
+            loaded: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -947,8 +955,23 @@ impl SegmentIndex {
         Ok(())
     }
 
-    /// Load the Tantivy index from disk
+    /// Load the Tantivy index from disk. Marks the index loaded whether or not
+    /// the read succeeds (a failed read starts empty, as before).
     pub async fn load(&self) -> Result<()> {
+        let result = self.load_from_disk().await;
+        self.loaded.send_replace(true);
+        result
+    }
+
+    /// Wait until the persisted catalogue has been read, at most `timeout`.
+    /// Returns whether it was.
+    pub async fn wait_loaded(&self, timeout: std::time::Duration) -> bool {
+        let mut rx = self.loaded.subscribe();
+        let loaded = matches!(tokio::time::timeout(timeout, rx.wait_for(|v| *v)).await, Ok(Ok(_)));
+        loaded
+    }
+
+    async fn load_from_disk(&self) -> Result<()> {
         if let Some(ref path) = self.persistence_path {
             if !path.exists() {
                 info!("Segment index file does not exist, starting with empty index");
