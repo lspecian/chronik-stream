@@ -191,7 +191,7 @@ mod tests {
             original_v1_wire_format: None,
             original_v2_wire_format: None,
         };
-        let mut w = TantivySegmentWriter::new("t".into(), 0, 0).unwrap();
+        let mut w = TantivySegmentWriter::new_in_ram("t".into(), 0, 0).unwrap();
         w.write_batch(&batch).unwrap();
         let index = w.commit().unwrap().0;
         let filter = TermFilter::build(&index).unwrap();

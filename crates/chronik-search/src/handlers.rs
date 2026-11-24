@@ -2914,7 +2914,7 @@ mod archived_hit_tests {
             original_v1_wire_format: None,
             original_v2_wire_format: None,
         };
-        let mut writer = TantivySegmentWriter::new("orders".to_string(), 2, 100).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("orders".to_string(), 2, 100).unwrap();
         writer.write_batch(&canonical).unwrap();
         writer.commit().unwrap().0
     }
@@ -3135,7 +3135,7 @@ mod legacy_index_tests {
                     original_v1_wire_format: None,
                     original_v2_wire_format: None,
                 };
-                let mut w = TantivySegmentWriter::new("orders".to_string(), p, 0).unwrap();
+                let mut w = TantivySegmentWriter::new_in_ram("orders".to_string(), p, 0).unwrap();
                 w.write_batch(&batch).unwrap();
                 w.commit().unwrap().0
             })

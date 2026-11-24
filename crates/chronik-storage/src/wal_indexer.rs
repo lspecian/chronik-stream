@@ -1470,6 +1470,41 @@ impl WalIndexer {
 
         // Process each topic-partition: upload raw segments + create Tantivy indexes
         for (tp, canonical_records) in tp_records {
+            // Which tiers this topic gets.
+            // v2.2.16: Only index searchable topics for Tantivy
+            // v2.2.21: Only create Parquet files for columnar-enabled topics
+            // v2.2.22: Only generate embeddings for vector-enabled topics
+            let (is_searchable, is_columnar, is_vector) = {
+                // Look up topic config from metadata store. If topic not yet in metadata
+                // (e.g., follower node hasn't received TopicCreated event yet), fall back
+                // to a default TopicConfig which respects env var defaults like
+                // CHRONIK_DEFAULT_VECTOR_ENABLED, CHRONIK_DEFAULT_COLUMNAR, etc.
+                let config = metadata_store.get_topic(&tp.topic).await
+                    .ok()
+                    .flatten()
+                    .map(|t| t.config)
+                    .unwrap_or_default();
+                (config.is_searchable(), config.is_columnar_enabled(), config.is_vector_enabled())
+            };
+
+            // The Tantivy archive (searchable topics) is built on its own task
+            // while this one writes the raw segment: they read the same records
+            // and write different files, and both are CPU-bound (indexing;
+            // zstd), so on the indexer's two workers they overlap instead of
+            // adding up.
+            let tantivy = is_searchable.then(|| {
+                let (config, object_store, segment_index, tp, records) = (
+                    config.clone(),
+                    object_store.clone(),
+                    segment_index.clone(),
+                    tp.clone(),
+                    canonical_records.clone(),
+                );
+                tokio::spawn(async move {
+                    Self::create_tantivy_index(&config, &object_store, &segment_index, &tp, records).await
+                })
+            });
+
             // STEP 1: Upload raw segment data to S3 (Tier 2: warm storage)
             // This preserves the actual message data for consumption
             match Self::upload_raw_segment(
@@ -1497,58 +1532,31 @@ impl WalIndexer {
                         "Failed to upload raw segment - CRITICAL DATA LOSS RISK!"
                     );
                     stats.errors += 1;
-                    // Continue to Tantivy indexing even if raw upload fails
+                    // Tantivy indexing continues even if raw upload fails
                     // (at least we'll have searchable index)
                 }
             }
 
-            // STEP 2: Check topic configuration for searchable, columnar, and vector
-            // v2.2.16: Only index searchable topics for Tantivy
-            // v2.2.21: Only create Parquet files for columnar-enabled topics
-            // v2.2.22: Only generate embeddings for vector-enabled topics
-            let (is_searchable, is_columnar, is_vector) = {
-                // Look up topic config from metadata store. If topic not yet in metadata
-                // (e.g., follower node hasn't received TopicCreated event yet), fall back
-                // to a default TopicConfig which respects env var defaults like
-                // CHRONIK_DEFAULT_VECTOR_ENABLED, CHRONIK_DEFAULT_COLUMNAR, etc.
-                let config = metadata_store.get_topic(&tp.topic).await
-                    .ok()
-                    .flatten()
-                    .map(|t| t.config)
-                    .unwrap_or_default();
-                (config.is_searchable(), config.is_columnar_enabled(), config.is_vector_enabled())
-            };
-
-            // Clone records for each processing step that needs them
-            // The last step in order (vector > columnar > searchable) can use the original
-            let records_for_tantivy = if is_searchable {
-                Some(canonical_records.clone())
-            } else {
-                None
-            };
+            // Clone records for each remaining step that needs them; the last
+            // one (vector) takes the original.
             let records_for_columnar = if is_columnar {
                 Some(canonical_records.clone())
             } else {
                 None
             };
-            // Vector gets the original to avoid extra clone
             let records_for_vector = if is_vector {
                 Some(canonical_records)
             } else {
-                // We still need to drop canonical_records
                 drop(canonical_records);
                 None
             };
 
-            // STEP 2a: Create Tantivy index (searchable topics only)
-            if let Some(records) = records_for_tantivy {
-                match Self::create_tantivy_index(
-                    config,
-                    object_store,
-                    segment_index,
-                    &tp,
-                    records,
-                ).await {
+            // STEP 2a: the Tantivy index (searchable topics only)
+            if let Some(tantivy) = tantivy {
+                let result = tantivy
+                    .await
+                    .unwrap_or_else(|e| Err(Error::Internal(format!("Tantivy archive task failed: {}", e))));
+                match result {
                     Ok((bytes_written, max_offset)) => {
                         info!(
                             topic = %tp.topic,

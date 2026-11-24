@@ -11,12 +11,6 @@ use tantivy::{
 };
 use serde::{Serialize, Deserialize};
 
-/// Document-store blocks kept decompressed while copying an index.
-///
-/// The copy reads documents in store order, so a handful of blocks is enough to
-/// stop consecutive documents re-decompressing the block they share. Zero would
-/// make the copy decompress once per document.
-const STORE_BLOCK_CACHE: usize = 16;
 use std::path::{Path, PathBuf};
 use std::fs::{self, File};
 use std::io::{Write, Read};
@@ -142,19 +136,55 @@ impl Drop for WriterCountGuard {
     }
 }
 
-/// Writer for creating Tantivy segments
+/// Writer for creating Tantivy segments.
+///
+/// `new` builds the archive's index on disk, in a temporary directory, and is
+/// finished with `commit_and_serialize`, which packs that directory. Each
+/// record is indexed once. (Up to v2.19.2 the index was built in RAM and then
+/// every document was read back from its store and indexed a second time into
+/// a disk index, which more than doubled the cost of archiving: a 10M-record
+/// burst into one partition stayed partly unsearchable for minutes.)
+///
+/// `new_in_ram` keeps the index in memory and is finished with `commit`, which
+/// hands back the `Index` for inspection.
 pub struct TantivySegmentWriter {
     index: Index,
     writer: IndexWriter,
     schema_fields: SchemaFields,
     metadata: SegmentMetadata,
+    /// The directory holding `index/` when built on disk (`new`).
+    dir: Option<tempfile::TempDir>,
     _count_guard: WriterCountGuard,
 }
 
 impl TantivySegmentWriter {
+    /// A writer whose index is built on disk; finish with `commit_and_serialize`.
     pub fn new(topic: String, partition: i32, base_offset: i64) -> Result<Self> {
-        let (schema, schema_fields) = SchemaFields::build_schema();
-        let index = Index::create_in_ram(schema);
+        let dir = tempfile::tempdir()
+            .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
+        let index_dir = dir.path().join("index");
+        fs::create_dir_all(&index_dir)
+            .map_err(|e| Error::Internal(format!("Failed to create index dir: {}", e)))?;
+        let (schema, _) = SchemaFields::build_schema();
+        let index = Index::create_in_dir(&index_dir, schema)
+            .map_err(|e| Error::Internal(format!("Failed to create disk index: {}", e)))?;
+        Self::with_index(index, Some(dir), topic, partition, base_offset)
+    }
+
+    /// A writer whose index stays in memory; finish with `commit`.
+    pub fn new_in_ram(topic: String, partition: i32, base_offset: i64) -> Result<Self> {
+        let (schema, _) = SchemaFields::build_schema();
+        Self::with_index(Index::create_in_ram(schema), None, topic, partition, base_offset)
+    }
+
+    fn with_index(
+        index: Index,
+        dir: Option<tempfile::TempDir>,
+        topic: String,
+        partition: i32,
+        base_offset: i64,
+    ) -> Result<Self> {
+        let (_, schema_fields) = SchemaFields::build_schema();
         text_analysis::register_analyzer(&index);
         let writer = index.writer(50_000_000)
             .map_err(|e| Error::Internal(format!("Failed to create Tantivy writer: {}", e)))?;
@@ -173,11 +203,11 @@ impl TantivySegmentWriter {
             compression: CompressionType::None,
         };
 
-        Ok(Self { index, writer, schema_fields, metadata, _count_guard: WriterCountGuard })
+        Ok(Self { index, writer, schema_fields, metadata, dir, _count_guard: WriterCountGuard })
     }
 
     pub fn write_batch(&mut self, canonical: &CanonicalRecord) -> Result<()> {
-        for record in &canonical.records {
+        for (record_index, record) in canonical.records.iter().enumerate() {
             let mut doc = TantivyDocument::new();
 
             doc.add_i64(self.schema_fields.offset, record.offset);
@@ -208,7 +238,6 @@ impl TantivySegmentWriter {
             doc.add_i64(self.schema_fields.producer_epoch, canonical.producer_epoch as i64);
             doc.add_i64(self.schema_fields.base_sequence, canonical.base_sequence as i64);
 
-            let record_index = canonical.records.iter().position(|r| r.offset == record.offset).unwrap_or(0);
             let sequence = canonical.base_sequence + record_index as i32;
             doc.add_i64(self.schema_fields.sequence, sequence as i64);
 
@@ -223,95 +252,37 @@ impl TantivySegmentWriter {
             self.metadata.last_offset = record.offset;
             self.metadata.record_count += 1;
             self.metadata.min_timestamp = self.metadata.min_timestamp.min(record.timestamp);
-            self.metadata.max_timestamp = self.metadata.max_timestamp.min(record.timestamp);
+            self.metadata.max_timestamp = self.metadata.max_timestamp.max(record.timestamp);
         }
 
         Ok(())
     }
 
+    /// Commit an in-memory writer (`new_in_ram`) and hand back its index.
     pub fn commit(mut self) -> Result<(Index, SegmentMetadata)> {
+        if self.dir.is_some() {
+            // The temporary directory goes with the writer, so the index
+            // returned would point at deleted files.
+            return Err(Error::Internal(
+                "commit needs an in-memory writer (TantivySegmentWriter::new_in_ram); \
+                 finish an on-disk writer with commit_and_serialize"
+                    .into(),
+            ));
+        }
         self.writer.commit()
             .map_err(|e| Error::Internal(format!("Failed to commit: {}", e)))?;
         Ok((self.index, self.metadata))
     }
 
-    /// Commit and write the index to a directory, then serialize to tar.gz
+    /// Commit the on-disk index and pack it, with its metadata, into
+    /// `<output_dir>/segment_<topic>_<partition>_<base>_<last>.tar`.
     pub fn commit_and_serialize(mut self, output_dir: &Path) -> Result<(PathBuf, SegmentMetadata)> {
-        // Create temp directory for index files
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
+        let temp_dir = self.dir.take().ok_or_else(|| {
+            Error::Internal("commit_and_serialize needs a writer built on disk (TantivySegmentWriter::new)".into())
+        })?;
         let index_dir = temp_dir.path().join("index");
-        fs::create_dir_all(&index_dir)
-            .map_err(|e| Error::Internal(format!("Failed to create index dir: {}", e)))?;
 
-        // Create disk-based index
-        let (schema, _fields) = SchemaFields::build_schema();
-        let disk_index = Index::create_in_dir(&index_dir, schema.clone())
-            .map_err(|e| Error::Internal(format!("Failed to create disk index: {}", e)))?;
-        text_analysis::register_analyzer(&disk_index);
-
-        let mut disk_writer: IndexWriter<TantivyDocument> = disk_index.writer(50_000_000)
-            .map_err(|e| Error::Internal(format!("Failed to create disk writer: {}", e)))?;
-
-        // Read all documents from in-memory index and write to disk
         self.writer.commit()
-            .map_err(|e| Error::Internal(format!("Failed to commit in-memory index: {}", e)))?;
-
-        let reader = self.index.reader()
-            .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?;
-        let searcher = reader.searcher();
-
-        // Copy every document to the disk index by walking the segments
-        // directly.
-        //
-        // This used to run `AllQuery` through `TopDocs::with_limit(1_000_000).order_by_score()`,
-        // which silently wrote only the first million documents: a WAL segment
-        // holding more than that produced a cold index missing the rest, with no
-        // error and a record_count in the metadata that disagreed with what the
-        // index could answer. A scoring collector is also the wrong instrument
-        // for "every document" — it heap-sorts by a score none of these
-        // documents have. Walking `segment_readers()` is exact, unbounded, and
-        // cheaper.
-        let offset_field = self.schema_fields.offset;
-        let mut copied: usize = 0;
-        for segment_reader in searcher.segment_readers() {
-            let store = segment_reader
-                .get_store_reader(STORE_BLOCK_CACHE)
-                .map_err(|e| Error::Internal(format!("Failed to open document store: {}", e)))?;
-            // Passing the alive bitset skips deleted documents. Nothing deletes
-            // from these indexes today, but a copy that ignored it would
-            // resurrect anything that ever did.
-            for doc in store.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
-                let mut doc = doc
-                    .map_err(|e| Error::Internal(format!("Failed to retrieve doc: {}", e)))?;
-                // The document store holds only STORED fields; the JSON field
-                // is not stored, so the copy would ship an archive in which
-                // field queries match nothing. Rebuild it from the raw value.
-                let raw_value = doc
-                    .get_first(self.schema_fields.value)
-                    .and_then(|v| v.as_bytes())
-                    .map(|b| b.to_vec());
-                if let Some(raw_value) = raw_value {
-                    add_json_document(&mut doc, self.schema_fields.json, &raw_value);
-                }
-                disk_writer.add_document(doc)
-                    .map_err(|e| Error::Internal(format!("Failed to add doc to disk index: {}", e)))?;
-                copied += 1;
-            }
-        }
-
-        // The metadata we are about to ship says how many records this segment
-        // holds. If the index does not hold that many, the segment would serve
-        // confident partial answers forever.
-        if copied != self.metadata.record_count {
-            return Err(Error::Internal(format!(
-                "Tantivy index for {}:{} holds {} documents but the segment metadata says {} — \
-                 refusing to publish an index that cannot answer for its own offset range",
-                self.metadata.topic, self.metadata.partition, copied, self.metadata.record_count
-            )));
-        }
-
-        disk_writer.commit()
             .map_err(|e| Error::Internal(format!("Failed to commit disk index: {}", e)))?;
 
         // Join Tantivy's background merge threads before anything reads the
@@ -332,8 +303,23 @@ impl TantivySegmentWriter {
         // Consuming the writer joins those threads and drops the write lock, so
         // from here the directory is stable. This is the fix; the retry inside
         // `write_archive` is belt-and-braces, not the cure.
-        disk_writer.wait_merging_threads()
+        self.writer.wait_merging_threads()
             .map_err(|e| Error::Internal(format!("Failed to join Tantivy merge threads: {}", e)))?;
+
+        // The metadata we are about to ship says how many records this segment
+        // holds. If the index does not hold that many, the segment would serve
+        // confident partial answers forever.
+        let indexed = archived_reader(&self.index)
+            .map_err(|e| Error::Internal(format!("Failed to create reader: {}", e)))?
+            .searcher()
+            .num_docs() as usize;
+        if indexed != self.metadata.record_count {
+            return Err(Error::Internal(format!(
+                "Tantivy index for {}:{} holds {} documents but the segment metadata says {} — \
+                 refusing to publish an index that cannot answer for its own offset range",
+                self.metadata.topic, self.metadata.partition, indexed, self.metadata.record_count
+            )));
+        }
 
         // Write metadata.json
         let metadata_path = temp_dir.path().join("metadata.json");
@@ -355,7 +341,7 @@ impl TantivySegmentWriter {
         // The archive's term filter, beside it (`<archive>.terms`), so a search
         // can skip this archive without opening it. Optional: an archive
         // without one is simply always opened.
-        match crate::term_filter::TermFilter::build(&disk_index) {
+        match crate::term_filter::TermFilter::build(&self.index) {
             Ok(filter) => {
                 let path = PathBuf::from(crate::term_filter::term_filter_key(&output_path.to_string_lossy()));
                 if let Err(e) = fs::write(&path, filter.to_bytes()) {
@@ -954,7 +940,7 @@ mod tests {
 
     #[test]
     fn test_write_and_commit() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
         let canonical = create_test_canonical_record(0, 50);
 
         writer.write_batch(&canonical).unwrap();
@@ -989,12 +975,12 @@ mod tests {
         assert_eq!(writer.metadata.last_offset, 1009);
         assert_eq!(writer.metadata.record_count, 10);
         assert_eq!(writer.metadata.min_timestamp, 1700000000000);
-        assert!(writer.metadata.max_timestamp <= 1700000009000);
+        assert_eq!(writer.metadata.max_timestamp, 1700000009000, "the newest record's time, not i64::MIN");
     }
 
     #[test]
     fn test_null_key_value_handling() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
 
         let mut canonical = create_test_canonical_record(0, 1);
         canonical.records[0].key = None;
@@ -1013,7 +999,7 @@ mod tests {
 
     #[test]
     fn test_empty_headers() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
 
         let mut canonical = create_test_canonical_record(0, 1);
         canonical.records[0].headers = vec![];
@@ -1028,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_large_batch_1000_records() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
         let canonical = create_test_canonical_record(0, 1000);
 
         writer.write_batch(&canonical).unwrap();
@@ -1044,7 +1030,7 @@ mod tests {
 
     #[test]
     fn test_transactional_batch() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
 
         let mut canonical = create_test_canonical_record(0, 10);
         canonical.is_transactional = true;
@@ -1065,7 +1051,7 @@ mod tests {
             CompressionType::Lz4,
             CompressionType::Zstd,
         ] {
-            let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+            let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
 
             let mut canonical = create_test_canonical_record(0, 5);
             canonical.compression = compression.clone();
@@ -1079,7 +1065,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_write_and_query() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
         let canonical = create_test_canonical_record(0, 100);
 
         writer.write_batch(&canonical).unwrap();
@@ -1109,7 +1095,7 @@ mod tests {
 
     #[test]
     fn test_query_by_offset_range_boundaries() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
         let canonical = create_test_canonical_record(100, 50);
 
         writer.write_batch(&canonical).unwrap();
@@ -1143,7 +1129,7 @@ mod tests {
 
     #[test]
     fn test_query_preserves_headers() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
         let canonical = create_test_canonical_record(0, 5);
 
         writer.write_batch(&canonical).unwrap();
@@ -1170,7 +1156,7 @@ mod tests {
 
     #[test]
     fn test_query_null_key_value() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
 
         let mut canonical = create_test_canonical_record(0, 5);
         canonical.records[2].key = None;
@@ -1202,7 +1188,7 @@ mod tests {
 
     #[test]
     fn test_large_query_1000_records() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
         let canonical = create_test_canonical_record(0, 1000);
 
         writer.write_batch(&canonical).unwrap();
@@ -1235,7 +1221,7 @@ mod tests {
 
     #[test]
     fn test_multiple_batches_query() {
-        let mut writer = TantivySegmentWriter::new("test-topic".to_string(), 0, 0).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
 
         let batch1 = create_test_canonical_record(0, 100);
         let batch2 = create_test_canonical_record(100, 100);
