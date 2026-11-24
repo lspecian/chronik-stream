@@ -137,7 +137,16 @@ async fn handle_reindex(
 /// Progress of this node's reindex.
 async fn handle_reindex_status(State(state): State<AdminApiState>) -> Response {
     match state.reindex {
-        Some(reindex) => Json(reindex.progress.lock().unwrap().clone()).into_response(),
+        Some(reindex) => {
+            // Progress, plus the archives found damaged and awaiting (or
+            // unable to get) a rebuild from the raw tier.
+            let mut body = serde_json::to_value(reindex.progress.lock().unwrap().clone()).unwrap_or_default();
+            body["damaged"] = chronik_storage::archive_health::damaged_archives()
+                .into_iter()
+                .map(|(archive, reason)| serde_json::json!({"archive": archive, "reason": reason}))
+                .collect();
+            Json(body).into_response()
+        }
         None => (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"error": "this server has no archive to reindex"}))).into_response(),
     }
 }

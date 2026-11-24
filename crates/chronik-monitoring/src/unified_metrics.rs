@@ -169,6 +169,10 @@ pub struct UnifiedMetrics {
     pub hot_text_trims: AtomicU64,             // Capacity trims
     pub hot_text_purges: AtomicU64,            // Merges that reclaimed deleted docs
     pub hot_text_docs_evicted_unarchived: AtomicU64, // Evicted at the hard cap before an archive covered them
+    pub search_unsearchable_offsets: AtomicU64,  // Acknowledged offsets neither hot nor archived (last coverage check)
+    pub search_unsearchable_partitions: AtomicU64, // Partitions with any (last coverage check)
+    pub archives_damaged: AtomicU64,           // Archives failing their checksums, awaiting or unable to get a rebuild
+    pub archives_repaired: AtomicU64,          // Damaged archives rebuilt from the raw tier
     pub hot_text_searches: AtomicU64,          // Search calls
     pub hot_text_search_latency_us_sum: AtomicU64,
     pub hot_text_search_count: AtomicU64,
@@ -345,6 +349,10 @@ impl UnifiedMetrics {
             hot_text_trims: AtomicU64::new(0),
             hot_text_purges: AtomicU64::new(0),
             hot_text_docs_evicted_unarchived: AtomicU64::new(0),
+            search_unsearchable_offsets: AtomicU64::new(0),
+            search_unsearchable_partitions: AtomicU64::new(0),
+            archives_damaged: AtomicU64::new(0),
+            archives_repaired: AtomicU64::new(0),
             hot_text_searches: AtomicU64::new(0),
             hot_text_search_latency_us_sum: AtomicU64::new(0),
             hot_text_search_count: AtomicU64::new(0),
@@ -849,6 +857,19 @@ impl UnifiedMetrics {
         output.push_str(&format!("chronik_hot_text_docs_total{{op=\"evicted_unarchived\"}} {}\n",
             self.hot_text_docs_evicted_unarchived.load(Ordering::Relaxed)));
 
+        output.push_str("# HELP chronik_search_unsearchable_offsets Acknowledged offsets of led searchable partitions that neither the hot index nor an archive covers (coverage check; should be 0)\n");
+        output.push_str("# TYPE chronik_search_unsearchable_offsets gauge\n");
+        output.push_str(&format!("chronik_search_unsearchable_offsets {}\n", self.search_unsearchable_offsets.load(Ordering::Relaxed)));
+        output.push_str("# HELP chronik_search_unsearchable_partitions Partitions with unsearchable offsets (coverage check)\n");
+        output.push_str("# TYPE chronik_search_unsearchable_partitions gauge\n");
+        output.push_str(&format!("chronik_search_unsearchable_partitions {}\n", self.search_unsearchable_partitions.load(Ordering::Relaxed)));
+        output.push_str("# HELP chronik_archives_damaged Archives failing their checksums, awaiting or unable to get a rebuild\n");
+        output.push_str("# TYPE chronik_archives_damaged gauge\n");
+        output.push_str(&format!("chronik_archives_damaged {}\n", self.archives_damaged.load(Ordering::Relaxed)));
+        output.push_str("# HELP chronik_archives_repaired_total Damaged archives rebuilt from the raw tier\n");
+        output.push_str("# TYPE chronik_archives_repaired_total counter\n");
+        output.push_str(&format!("chronik_archives_repaired_total {}\n", self.archives_repaired.load(Ordering::Relaxed)));
+
         output.push_str("# HELP chronik_hot_text_events_total Hot text index lifecycle events\n");
         output.push_str("# TYPE chronik_hot_text_events_total counter\n");
         output.push_str(&format!("chronik_hot_text_events_total{{event=\"commit\"}} {}\n",
@@ -1309,6 +1330,18 @@ impl MetricsRecorder {
     /// cap is too low for the ingest rate or the indexer is far behind.
     pub fn record_hot_text_evicted_unarchived(docs: u64) {
         global_metrics().hot_text_docs_evicted_unarchived.fetch_add(docs, Ordering::Relaxed);
+    }
+    /// The last coverage check: unsearchable offsets and the partitions holding them.
+    pub fn set_search_unsearchable(offsets: u64, partitions: u64) {
+        let m = global_metrics();
+        m.search_unsearchable_offsets.store(offsets, Ordering::Relaxed);
+        m.search_unsearchable_partitions.store(partitions, Ordering::Relaxed);
+    }
+    pub fn set_archives_damaged(n: u64) {
+        global_metrics().archives_damaged.store(n, Ordering::Relaxed);
+    }
+    pub fn record_archive_repaired() {
+        global_metrics().archives_repaired.fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_hot_text_search(duration: std::time::Duration) {
         let us = duration.as_micros() as u64;

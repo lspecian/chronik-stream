@@ -1747,12 +1747,22 @@ impl IntegratedKafkaServerBuilder {
         // and archive cleanup below a DeleteRecords' log start.
         if let Some(produce) = self.produce_handler_base.clone() {
             let hot = crate::retention::HotIndexes { text: self.hot_text_index.clone(), vector: self.hot_vector_index.clone() };
-            crate::retention::spawn(metadata_store.clone(), wal_indexer.clone(), produce, hot);
+            crate::retention::spawn(metadata_store.clone(), wal_indexer.clone(), produce.clone(), hot);
+            // Every acknowledged record searchable: a gauge and a warning per gap.
+            crate::search_coverage::spawn(crate::search_coverage::Coverage {
+                metadata_store: metadata_store.clone(),
+                wal_indexer: wal_indexer.clone(),
+                produce,
+                hot: self.hot_text_index.clone(),
+                node_id: self.config.node_id as i32,
+            });
         }
 
         // Merge runs of small archives into larger ones, in the background
         // (CHRONIK_ARCHIVE_MERGE=false turns it off).
         chronik_storage::archive_merge::spawn(wal_indexer.object_store(), wal_indexer.segment_index().clone());
+        // Rebuild archives found damaged (checksums), and scrub the local ones.
+        chronik_storage::archive_health::spawn(wal_indexer.clone());
 
         self.wal_indexer = Some(wal_indexer);
 

@@ -79,6 +79,7 @@ mod authorizer;  // Security Phase 3: maps Kafka requests onto ACL checks
 mod txn_authorization;  // ACL checks for the transactional APIs
 mod vector_catchup;  // embeds archived records a vector index is missing
 mod columnar_catchup;  // writes archived records Parquet is missing
+mod search_coverage;  // every acknowledged record searchable (metric)
 mod retention;  // retention.ms / retention.bytes over the archive
 mod schema_registry;  // Phase 5: Confluent-compatible Schema Registry
 

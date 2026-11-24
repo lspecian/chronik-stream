@@ -28,6 +28,7 @@ pub mod term_filter;
 pub mod tar_directory;
 pub mod archive_merge;
 pub mod reindex;
+pub mod archive_health;
 // v2.2.7 Phase 5: Deleted metadata_wal_adapter.rs (old WAL adapter, replaced by Raft)
 
 pub use canonical_record::{

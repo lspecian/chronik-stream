@@ -1046,6 +1046,13 @@ impl HotTextIndex {
         guard.doc_count
     }
 
+    /// The lowest and highest offsets the partition's hot index holds.
+    pub async fn offset_range(&self, topic: &str, partition: i32) -> Option<(i64, i64)> {
+        let part = self.partitions.get(&(topic.to_string(), partition))?.clone();
+        let guard = part.read().await;
+        guard.min_offset.zip(guard.max_offset)
+    }
+
     pub fn partition_keys(&self) -> Vec<(String, i32)> {
         self.partitions.iter().map(|e| e.key().clone()).collect()
     }

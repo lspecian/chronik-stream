@@ -572,6 +572,24 @@ impl TantivySegmentReader {
         &self.index
     }
 
+    /// Check every index file of the archive against the checksum Tantivy
+    /// wrote in its footer. A mismatch means the archive is damaged (disk,
+    /// object store or transfer): searching it could return wrong hits or
+    /// fail partway, so callers treat it as unreadable and rebuild it from
+    /// the raw tier.
+    pub fn verify(&self) -> Result<()> {
+        let damaged = self
+            .index
+            .validate_checksum()
+            .map_err(|e| Error::Internal(format!("checking the archive: {e}")))?;
+        if damaged.is_empty() {
+            return Ok(());
+        }
+        let mut files: Vec<String> = damaged.iter().map(|p| p.display().to_string()).collect();
+        files.sort();
+        Err(Error::Storage(format!("archive files fail their checksum: {}", files.join(", "))))
+    }
+
     /// A searcher over the segment, from the reader opened with it.
     pub fn searcher(&self) -> tantivy::Searcher {
         self.reader.searcher()
@@ -835,6 +853,38 @@ impl TantivySegmentReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A byte flipped inside an index file of an archive is caught by
+    /// `verify`; the intact archive passes.
+    #[test]
+    fn verify_catches_a_damaged_archive() {
+        let mut w = TantivySegmentWriter::new("t".into(), 0, 0).unwrap();
+        w.write_batch(&create_test_canonical_record(0, 50)).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (path, _) = w.commit_and_serialize(out.path()).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let open = |d: &[u8]| TantivySegmentReader::open_tar(crate::tar_directory::owned(bytes::Bytes::copy_from_slice(d))).unwrap();
+        open(&data).verify().unwrap();
+
+        // The data of the largest index file other than meta.json.
+        let mut archive = tar::Archive::new(std::io::Cursor::new(data.clone()));
+        let (pos, len) = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| {
+                let p = e.path().unwrap().display().to_string();
+                p.starts_with("index/") && !p.ends_with(".json") && !p.ends_with(".lock")
+            })
+            .map(|e| (e.raw_file_position() as usize, e.size() as usize))
+            .max_by_key(|(_, len)| *len)
+            .unwrap();
+        assert!(len > 16);
+        let mut damaged = data;
+        damaged[pos + len / 2] ^= 0xff;
+        let err = open(&damaged).verify().unwrap_err().to_string();
+        assert!(err.contains("checksum"), "{err}");
+    }
 
     pub(super) fn create_test_canonical_record(base_offset: i64, num_records: usize) -> CanonicalRecord {
         let mut records = Vec::new();

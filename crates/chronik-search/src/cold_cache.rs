@@ -133,6 +133,9 @@ impl ColdSegmentCache {
         store: Arc<dyn ObjectStore>,
         object_key: &str,
     ) -> Result<Arc<TantivySegmentReader>> {
+        if chronik_storage::archive_health::is_damaged(object_key) {
+            return Err(Error::Internal(format!("{object_key} is damaged (awaiting rebuild)")));
+        }
         let load = {
             let mut s = self.state.lock().unwrap();
             if let Some(reader) = s.touch(object_key) {
@@ -168,6 +171,17 @@ impl ColdSegmentCache {
         let known = self.state.lock().unwrap().entries.contains_key(&key);
         let local = store.local_path(&key);
         let (opened, dir) = open_archive(store.clone(), &key, &self.root, local).await;
+        // Checked against its checksums the first time it is opened here: a
+        // damaged archive could answer with wrong hits or fail partway.
+        let opened = match opened {
+            Ok(reader) if !known => {
+                let k = key.clone();
+                tokio::task::spawn_blocking(move || chronik_storage::archive_health::check(&k, &reader).map(|()| reader))
+                    .await
+                    .unwrap_or_else(|e| Err(chronik_common::Error::Internal(format!("verify task: {e}"))))
+            }
+            other => other,
+        };
         let bytes = match (&opened, known, &dir) {
             (Ok(_), false, Some(d)) => {
                 let d = d.clone();

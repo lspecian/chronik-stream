@@ -563,7 +563,21 @@ fn merged_key(source_key: &str, min: i64, max: i64) -> String {
 /// Open a source archive for merging: a local plain tar in place; anything
 /// else downloaded — a plain tar read from memory, a `.tar.gz` unpacked into
 /// `scratch` (kept until the merge is written).
+/// Open a source archive, checked against its checksums: merging a damaged
+/// archive would carry the damage into the merged one (and delete the
+/// original). A damaged source is recorded (`archive_health`) and rebuilt.
 pub(crate) async fn open_source(store: &Arc<dyn ObjectStore>, key: &str, scratch: &std::path::Path) -> Result<TantivySegmentReader> {
+    if crate::archive_health::is_damaged(key) {
+        return Err(Error::Storage(format!("{key} is damaged (awaiting rebuild)")));
+    }
+    let reader = open_source_unchecked(store, key, scratch).await?;
+    let key = key.to_string();
+    tokio::task::spawn_blocking(move || crate::archive_health::check(&key, &reader).map(|()| reader))
+        .await
+        .map_err(|e| Error::Internal(format!("verify task: {e}")))?
+}
+
+async fn open_source_unchecked(store: &Arc<dyn ObjectStore>, key: &str, scratch: &std::path::Path) -> Result<TantivySegmentReader> {
     if let Some(path) = store.local_path(key).filter(|p| p.is_file()) {
         if let Some(reader) = TantivySegmentReader::open_tar_file(&path)? {
             return Ok(reader);
