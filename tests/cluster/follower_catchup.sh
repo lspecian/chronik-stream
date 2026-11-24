@@ -30,6 +30,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${CHRONIK_BIN:-$ROOT/target/release/chronik-server}"
 DIR="$ROOT/tests/cluster"
+. "$DIR/segment_text.sh"
 LOGS="$DIR/logs"
 PREFIX_N="${CATCHUP_PREFIX:-100}"
 GAP_N="${CATCHUP_GAP:-120}"
@@ -117,9 +118,9 @@ produce() { # $1=first $2=last $3=acks $4=tag $5=brokers
 # segment files and the WAL copy is deleted (v2.16.9 — before that the delete
 # silently did nothing, so the WAL alone used to hold everything).
 records_on_node() { # $1 = node, $2 = tag
-  grep -aoE "$2-[0-9]+" "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log \
-      "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment 2>/dev/null \
-    | sed 's/^[^:]*://' | sort -u | wc -l
+  seg_text "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log \
+      "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment \
+    | grep -aoE "$2-[0-9]+" | sort -u | wc -l
 }
 
 wait_for_all_replicas() { # $1 = tag, $2 = expected count

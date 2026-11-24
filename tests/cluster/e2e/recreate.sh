@@ -14,7 +14,14 @@ cd $REPO
 up() { for i in $(seq 90); do $K/kafka-topics.sh --bootstrap-server $1 --list >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
 ends() { $K/kafka-get-offsets.sh --bootstrap-server $B --topic $T 2>/dev/null | sort | paste -sd' '; }
 walfiles() { find tests/cluster/data/node*/wal/$T -name '*.log' -size +0 2>/dev/null | wc -l; }
-old_archived() { grep -alE "old-[0-9]+" tests/cluster/data/node*/segments/segments/$T/*/*.segment 2>/dev/null | wc -l; }
+. tests/cluster/segment_text.sh
+old_archived() { # segment files holding an old record
+  local f n=0
+  for f in tests/cluster/data/node*/segments/segments/$T/*/*.segment; do
+    seg_text "$f" | grep -aqE "old-[0-9]+" && n=$((n + 1))
+  done
+  echo $n
+}
 check() {
   local out recs olds dupo
   out=$(timeout 60 kcat -C -b $B -t $T -p 0 -o beginning -e -q -f '%o %s\n' 2>/dev/null)
@@ -28,7 +35,11 @@ CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1 || { echo "FAIL: 
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $T --partitions 1 --replication-factor 3 >/dev/null 2>&1; sleep 8
 seq 1 $N | sed 's/^/old-/' | kcat -P -b $B -t $T -p 0 -X acks=all -X batch.num.messages=20
 for i in $(seq 40); do sleep 10; [ "$(walfiles)" = 0 ] && break; done
-echo "setup: old topic archived ($(old_archived) segment file(s) across nodes), WAL left: $(walfiles)"
+setup_archived=$(old_archived)
+echo "setup: old topic archived ($setup_archived segment file(s) across nodes), WAL left: $(walfiles)"
+# Nothing archived means nothing for the delete to purge: the check below
+# would pass without testing anything.
+[ "$setup_archived" -gt 0 ] || { echo "FAIL: setup archived nothing"; ./tests/cluster/stop.sh >/dev/null 2>&1; exit 1; }
 $K/kafka-topics.sh --bootstrap-server $B --delete --topic $T >/dev/null 2>&1; sleep 15
 echo "after delete: old-topic segment files left on all nodes: $(old_archived)"
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $T --partitions 1 --replication-factor 3 >/dev/null 2>&1; sleep 8
