@@ -881,15 +881,26 @@ impl GroupManager {
         // Not resident. It may still be persisted with committed offsets, in
         // which case it is Empty — whatever members the stored record lists are
         // stale, since nothing is connected.
+        let empty = |protocol_type: String| GroupDescription {
+            state: GroupState::Empty.as_str().to_string(),
+            protocol_type,
+            protocol: String::new(),
+            members: Vec::new(),
+        };
         match self.metadata_store.get_consumer_group(group_id).await {
             Ok(Some(stored)) if stored.state != GroupState::Dead.as_str() => {
-                Some(GroupDescription {
-                    state: GroupState::Empty.as_str().to_string(),
-                    protocol_type: stored.protocol_type,
-                    protocol: String::new(),
-                    members: Vec::new(),
-                })
+                return Some(empty(stored.protocol_type));
             }
+            Ok(Some(_)) => return None,
+            _ => {}
+        }
+        // Known only by its committed offsets: the group record lives on the
+        // broker that coordinated it before coordination moved (a catalog
+        // leader change, or the upgrade to catalog-coordinated groups), or
+        // nothing ever joined it (offsets committed by an admin tool). Kafka
+        // describes such a group as Empty with no protocol type.
+        match self.metadata_store.list_consumer_offsets(group_id).await {
+            Ok(offsets) if !offsets.is_empty() => Some(empty(String::new())),
             _ => None,
         }
     }
@@ -3264,6 +3275,40 @@ mod tests {
         let manager = Arc::new(GroupManager::new(metadata_store));
 
         assert!(manager.describe_group("never-existed").await.is_none());
+    }
+
+    /// A group this broker knows only by its committed offsets describes as
+    /// Empty, as in Kafka.
+    ///
+    /// After the upgrade to catalog-coordinated groups (or any catalog leader
+    /// change) the coordinator can be a broker that never held the group's
+    /// record: only the broker that coordinated it before does. Committed
+    /// offsets are catalog state, so the new coordinator sees them, and
+    /// `kafka-consumer-groups --describe` failed with GROUP_ID_NOT_FOUND
+    /// whenever the leader was not that broker.
+    #[tokio::test]
+    async fn describe_reports_an_offsets_only_group_as_empty() {
+        let metadata_store = Arc::new(InMemoryMetadataStore::new());
+        metadata_store
+            .commit_offset(chronik_common::metadata::ConsumerOffset {
+                group_id: "g-offsets".to_string(),
+                topic: "t".to_string(),
+                partition: 0,
+                offset: 42,
+                metadata: None,
+                commit_timestamp: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let manager = Arc::new(GroupManager::new(metadata_store));
+
+        let described = manager
+            .describe_group("g-offsets")
+            .await
+            .expect("a group with committed offsets exists and must be describable");
+        assert_eq!(described.state, GroupState::Empty.as_str());
+        assert!(described.members.is_empty());
+        assert_eq!(manager.group_status("g-offsets").await, Some(false), "describe and status agree");
     }
 
     /// Listing persisted groups must not resurrect a deleted one.
