@@ -31,7 +31,10 @@ const AGG_QUERIES = {
     aggs: { per_minute: { date_histogram: { field: 'ts', fixed_interval: '1m' } } },
   },
 };
-const ALL = __ENV.AGGS === '1' ? Object.assign({}, QUERIES, AGG_QUERIES) : QUERIES;
+const EVERY = __ENV.AGGS === '1' ? Object.assign({}, QUERIES, AGG_QUERIES) : QUERIES;
+// ONLY=name[,name]: just those queries (profiling one query type).
+const ONLY = (__ENV.ONLY || '').split(',').filter((s) => s);
+const ALL = ONLY.length ? Object.fromEntries(Object.entries(Object.assign({}, QUERIES, AGG_QUERIES)).filter(([k]) => ONLY.includes(k))) : EVERY;
 
 const thresholds = {};
 for (const name of Object.keys(ALL)) thresholds[`http_req_duration{q:${name}}`] = ['p(99)<600000'];

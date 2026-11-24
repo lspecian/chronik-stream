@@ -247,3 +247,69 @@ marker-document freshness, disk and RSS, at 1M and 10M records, single node and
 the local 3-node cluster. `crates/chronik-search/examples/plain_tantivy_bench.rs`
 stays the reference ceiling (it reads the corpus as NDJSON; the generator moves
 to main with the harness).
+
+`tests/search_bench/run.sh` (Chronik) and `tests/search_bench/opensearch.sh`
+(OpenSearch 2.19.1 in Docker, explicit mapping, 4 GB heap) run the same corpus,
+the same measurements and the same k6 query mix (`queries.js`; `AGGS=1` adds the
+aggregations, `ONLY=<query>` runs one query type for profiling).
+
+## 11. Status (2026-11-24)
+
+Built, beyond Phase A and B: per-archive result cache (§6), archive
+verification with automatic rebuild and a scrub (§7), reindex (§7), coverage
+checker (§7), score-gated ranking, newest-first match_all walk, mimalloc.
+Not built: declared typed / timeseries profiles (the fast JSON field made them
+unnecessary for ranges and aggregations), Phase C, index-once-not-RF-times,
+the CI perf guard.
+
+1M documents, one node, same machine, same day (8 query clients, 60 s):
+
+| | Chronik | OpenSearch |
+|---|---|---|
+| Ingest (Kafka produce vs `_bulk`) | 1.9 s, 11 CPU s | 5.1 s, 62 CPU s |
+| All documents searchable, from the first sent | 4.1 s | 5.9 s |
+| Searchable after acknowledgement (marker) | 1.9–2.7 s | 0.8 s |
+| Memory after the run | 0.6 GB | 5.4 GB |
+| Disk | 394 MB | 391 MB |
+| Query rounds (6 queries each) | 62.0K | 60.3K |
+| match_text p50 / p99 | 1.00 / 2.65 ms | 0.73 / 2.33 ms |
+| term p50 / p99 | 1.69 / 3.78 ms | 2.80 / 5.60 ms |
+| bool text + filter p50 / p99 | 1.29 / 2.98 ms | 1.44 / 3.69 ms |
+| match_all p50 / p99 | 0.83 / 2.91 ms | 0.63 / 2.10 ms |
+| range + terms agg p50 / p99 | 0.30 / 1.27 ms | 0.40 / 2.02 ms |
+| date_histogram p50 / p99 | 1.12 / 5.58 ms | 1.03 / 3.01 ms |
+
+Freshness after acknowledgement is bounded by hot indexing on one partition
+(8 writer threads, half the cores, stemming analyzer): Chronik acknowledges
+writes before indexing them, OpenSearch after.
+
+10M documents, one partition, same harness (`AGGS=1`). Chronik with the
+archive fixes and default settings (archives unmerged at query time, 48 of
+them):
+
+| | Chronik | OpenSearch |
+|---|---|---|
+| Ingest | **21.3 s**, 260 CPU s | 33.6 s, 300 CPU s |
+| Marker searchable after it was sent | 22.4 s | **2.5 s** |
+| Every record searchable, after the marker | 125 s (181 s before the archive fixes) | **immediately** |
+| Memory after the run | **2.9 GB** | 7.7 GB |
+| Disk | 3.5 GB | **2.7 GB** |
+| Query rounds (60 s) | 7.3K | **14.2K** |
+| match_text p50 / p99 | 10.3 / 21.1 ms | **0.95 / 2.3 ms** |
+| term p50 / p99 | 17.3 / 28.6 ms | 17.6 / 26.5 ms |
+| bool text + filter p50 / p99 | 12.3 / 23.0 ms | **4.6 / 6.9 ms** |
+| match_all p50 / p99 | 1.6 / 6.3 ms | **0.7 / 1.6 ms** |
+| range + terms agg p50 / p99 | 0.56 / 3.2 ms | 0.53 / 1.7 ms |
+| date_histogram p50 / p99 | 20.6 / 31.1 ms | **7.1 / 11.6 ms** |
+
+Open at 10M:
+
+- **Burst coverage.** A partition taking records faster than it archives
+  them (~80K/s per partition: 1.9 s of Tantivy per 210K-record segment,
+  segments one after another) exceeds the hot index's hard cap
+  (`CHRONIK_HOT_TEXT_HARD_MAX_DOCS`, 1M) and the excess is unsearchable until
+  archived; `chronik_search_unsearchable_offsets` reports it. Options: archive
+  segments of one partition concurrently, size the cap by memory, or slow
+  produce acknowledgements while a partition is over it.
+- **Query latency.** Not explained by archive count: with the archives merged
+  to 5, match_text p50 was 15.7 ms (worse). Needs a profile at this size.

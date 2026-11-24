@@ -5,7 +5,8 @@
 #
 # Usage: run.sh <chronik-binary> <corpus-dir> <work-dir> [label]
 # Env: PARTITIONS (1), CONC (parallel producers, 8), VUS (8), DURATION (60s),
-#      AGGS=1 (also time the aggregation queries), K6_IMAGE, extra CHRONIK_* vars
+#      AGGS=1 (also time the aggregation queries), SETTLE_SECS (60: wait before
+#      the query load, for archiving and merges), K6_IMAGE, extra CHRONIK_* vars
 #      pass through to the server.
 # Needs: KAFKA_HOME, kcat, jq, docker (for k6).
 #
@@ -66,7 +67,17 @@ hist=$(search '{"size":0,"query":{"match_all":{}},"aggs":{"m":{"date_histogram":
 echo "  range 10-20 min + terms(service): $range"
 echo "  date_histogram 1m over all: $hist"
 
-sleep 60 # background archiving / merges settle
+# Every record searchable, not just the newest: a burst can outrun archiving,
+# and the answers above are then short. Counted from when the marker was sent.
+all_s=-1
+for _ in $(seq 1800); do
+  [ "$(search '{"size":0,"track_total_hits":true,"query":{"match_all":{}}}' | jq -r '.hits.total.value' 2>/dev/null)" = $((N + 1)) ] \
+    && { all_s=$(since "$t1"); break; }
+  sleep 0.5
+done
+echo "  every record searchable ${all_s}s after the marker was sent"
+
+sleep "${SETTLE_SECS:-60}" # background archiving / merges settle
 archives=$(find "$DATA" \( -name '*.tar' -o -name '*.tar.gz' \) -path "*/$T/*" | wc -l)
 disk=$(du -sm "$DATA" | cut -f1); rss=$(rss_mb)
 echo "  archives: $archives; disk: ${disk} MB; RSS: ${rss} MB; produce CPU: $(awk -v a="$cpu0" -v b="$cpu1" 'BEGIN { printf "%.1f", b - a }') s"
@@ -74,10 +85,10 @@ echo "  archives: $archives; disk: ${disk} MB; RSS: ${rss} MB; produce CPU: $(aw
 echo "  queries: $VUS concurrent for $DURATION"
 lat=$(docker run --rm --network host -e BASE=$API -e TOPIC=$T -e VUS="$VUS" -e DURATION="$DURATION" -e AGGS="${AGGS:-0}" \
   -i "$K6_IMAGE" run --quiet - < "$HERE/queries.js" 2>/dev/null)
-jq -n --arg label "$LABEL" --argjson n "$N" --arg produce "$produce_s" --arg fresh "$fresh_s" \
+jq -n --arg label "$LABEL" --argjson n "$N" --arg produce "$produce_s" --arg fresh "$fresh_s" --arg all "$all_s" \
   --arg answers "$answers" --arg range "$range" --arg hist "$hist" --argjson archives "$archives" \
   --argjson disk "$disk" --argjson rss "$rss" --argjson latency "${lat:-{\}}" \
-  '{label: $label, docs: $n, produce_s: ($produce|tonumber), searchable_after_s: ($fresh|tonumber),
+  '{label: $label, docs: $n, produce_s: ($produce|tonumber), searchable_after_s: ($fresh|tonumber), all_searchable_after_s: ($all|tonumber),
     answers: ($answers | split("\n")), range: $range, histogram: $hist, archives: $archives,
     disk_mb: $disk, rss_mb: $rss, latency: $latency}' > "$RES"
 jq -c '.latency | to_entries[] | select(.value["p(50)"] != null) | {q: .key, p50: .value["p(50)"], p99: .value["p(99)"], n: .value.count}' "$RES" | sed 's/^/  /'
