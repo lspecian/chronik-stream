@@ -1,11 +1,20 @@
-//! Merge runs of small archived index segments into larger ones.
+//! Merge runs of archived index segments into larger ones, by size tier.
 //!
-//! The WalIndexer archives whatever a run found, so a topic written in small
-//! bursts piles up small archives: thunderbird's nodes hold 6,000–13,000, the
-//! median 26–263 KB. Every one is a separate index to open, filter and search,
-//! and a search across all topics pays that per archive. This merges, per
-//! partition, runs of consecutive small archives into one, with Tantivy's own
-//! segment merge (no re-tokenizing; stored documents copied as they are).
+//! The WalIndexer archives each sealed WAL segment separately, so archives
+//! pile up: small ones from topics written in bursts (thunderbird's nodes held
+//! 6,000–13,000, median 26–263 KB) and, on busy partitions, one ~50 MB archive
+//! per 250 MB segment — six per million small records, without end. Every one
+//! is a separate index to open, filter and search. This merges, per partition,
+//! runs of consecutive archives of the same size tier into one, with Tantivy's
+//! own segment merge (no re-tokenizing; stored documents copied as they are).
+//!
+//! Tiers (see [`tier`]) grow by `min_run`: archives under `tier_base_bytes`
+//! are tier 0, then each tier spans a factor of `min_run`. Merging `min_run`
+//! archives of one tier yields one of the next, so a record is rewritten about
+//! once per tier (log of the archive size), and a partition holds at most a
+//! few archives per tier: their number grows with the logarithm of its data,
+//! up to archives of `target_bytes`. (Merging any small archive into a growing
+//! neighbour instead rewrites that neighbour on every pass.)
 //!
 //! Safety:
 //! - Only archives whose offset ranges are contiguous are merged: a merged
@@ -35,8 +44,11 @@ use tracing::{debug, info, warn};
 pub struct MergePolicy {
     /// A merged archive is kept under this size (`CHRONIK_ARCHIVE_MERGE_TARGET_BYTES`).
     pub target_bytes: u64,
-    /// Fewest archives worth merging in one run.
+    /// Fewest archives worth merging in one run, and the factor between size
+    /// tiers.
     pub min_run: usize,
+    /// Archives under this size are all tier 0 (`CHRONIK_ARCHIVE_MERGE_TIER_BASE_BYTES`).
+    pub tier_base_bytes: u64,
     /// Unreferenced archive files older than this are swept (crash leftovers;
     /// `CHRONIK_ARCHIVE_ORPHAN_AGE_SECS`).
     pub orphan_age: Duration,
@@ -47,8 +59,11 @@ pub struct MergePolicy {
 impl Default for MergePolicy {
     fn default() -> Self {
         Self {
-            target_bytes: 64 * 1024 * 1024,
+            // Archives are unpacked into the search cache (4 GB by default)
+            // to be searched; a few of the largest must fit at once.
+            target_bytes: 1024 * 1024 * 1024,
             min_run: 4,
+            tier_base_bytes: 16 * 1024 * 1024,
             orphan_age: Duration::from_secs(3600),
             grace: Duration::from_secs(60),
         }
@@ -90,18 +105,36 @@ fn run_key(run: &[SegmentMetadata]) -> String {
     run.iter().map(|s| s.segment_id.as_str()).collect::<Vec<_>>().join("|")
 }
 
+/// The size tier of an archive of `size` bytes: 0 under `tier_base_bytes`,
+/// then one more per factor of `min_run`.
+pub fn tier(size: u64, policy: &MergePolicy) -> u32 {
+    let base = policy.tier_base_bytes.max(1);
+    if size < base {
+        return 0;
+    }
+    let factor = policy.min_run.max(2) as u64;
+    let mut t = 1;
+    let mut bound = base.saturating_mul(factor);
+    while size >= bound && bound < u64::MAX {
+        t += 1;
+        bound = bound.saturating_mul(factor);
+    }
+    t
+}
+
 /// The runs worth merging among a partition's archives: consecutive,
-/// contiguous, each under half the target, together under the target, at
-/// least `min_run` long.
+/// contiguous, of one size tier, together under the target, at least
+/// `min_run` long.
 pub fn plan(mut archives: Vec<SegmentMetadata>, policy: &MergePolicy) -> Vec<Vec<SegmentMetadata>> {
     archives.sort_by_key(|s| s.min_offset);
-    let small = |s: &SegmentMetadata| s.size_bytes < policy.target_bytes / 2;
     let mut runs = Vec::new();
     let mut run: Vec<SegmentMetadata> = Vec::new();
     let mut run_bytes = 0u64;
+    let mut run_tier = 0u32;
     for s in archives {
+        let s_tier = tier(s.size_bytes, policy);
         let continues = run.last().is_some_and(|last: &SegmentMetadata| s.min_offset == last.max_offset + 1)
-            && small(&s)
+            && s_tier == run_tier
             && run_bytes + s.size_bytes <= policy.target_bytes;
         if !continues {
             if run.len() >= policy.min_run {
@@ -109,7 +142,10 @@ pub fn plan(mut archives: Vec<SegmentMetadata>, policy: &MergePolicy) -> Vec<Vec
             }
             run.clear();
             run_bytes = 0;
-            if !small(&s) {
+            run_tier = s_tier;
+            // An archive that could never join `min_run` of its kind under
+            // the target starts nothing.
+            if s.size_bytes.saturating_mul(policy.min_run as u64) > policy.target_bytes {
                 continue;
             }
         }
@@ -564,6 +600,9 @@ pub fn spawn(store: Arc<dyn ObjectStore>, index: Arc<SegmentIndex>) {
     if let Some(t) = env("CHRONIK_ARCHIVE_MERGE_TARGET_BYTES").and_then(|v| v.parse().ok()) {
         policy.target_bytes = t;
     }
+    if let Some(t) = env("CHRONIK_ARCHIVE_MERGE_TIER_BASE_BYTES").and_then(|v| v.parse().ok()) {
+        policy.tier_base_bytes = t;
+    }
     policy.grace = Duration::from_secs(secs("CHRONIK_ARCHIVE_MERGE_GRACE_SECS", 60));
     policy.orphan_age = Duration::from_secs(secs("CHRONIK_ARCHIVE_ORPHAN_AGE_SECS", 3600));
     let delay = Duration::from_secs(secs("CHRONIK_ARCHIVE_MERGE_DELAY_SECS", 300));
@@ -599,9 +638,74 @@ mod tests {
         }
     }
 
+    fn tiered(target: u64, min_run: usize, base: u64) -> MergePolicy {
+        MergePolicy { target_bytes: target, min_run, tier_base_bytes: base, orphan_age: Duration::ZERO, grace: Duration::ZERO }
+    }
+
+    #[test]
+    fn tiers_grow_by_the_run_length() {
+        let p = tiered(1 << 40, 4, 16);
+        let tiers: Vec<u32> = [0, 15, 16, 63, 64, 255, 256, 1023, 1024].iter().map(|s| tier(*s, &p)).collect();
+        assert_eq!(tiers, vec![0, 0, 1, 1, 2, 2, 3, 3, 4]);
+        assert_eq!(tier(u64::MAX, &p), tier(u64::MAX, &p)); // terminates
+    }
+
+    #[test]
+    fn plans_runs_of_one_tier_only() {
+        let p = tiered(10_000, 4, 16);
+        // Four tier-2 archives (64..255) then four tier-1 (16..63), contiguous.
+        let mut archives: Vec<_> = (0..4).map(|i| seg(i * 10, i * 10 + 9, 100)).collect();
+        archives.extend((4..8).map(|i| seg(i * 10, i * 10 + 9, 40)));
+        let spans: Vec<(i64, i64)> =
+            plan(archives, &p).iter().map(|r| (r[0].min_offset, r.last().unwrap().max_offset)).collect();
+        assert_eq!(spans, vec![(0, 39), (40, 79)]);
+        // Alternating tiers: nothing has three of a kind in a row.
+        let mixed: Vec<_> = (0..8).map(|i| seg(i * 10, i * 10 + 9, if i % 2 == 0 { 100 } else { 40 })).collect();
+        assert!(plan(mixed, &p).is_empty());
+    }
+
+    /// Steady ingest of ~46 MB archives (one per sealed 250 MB WAL segment),
+    /// a merge pass after every new archive: the archive count stays roughly
+    /// logarithmic and each byte is rewritten a few times, not once per pass.
+    #[test]
+    fn tiered_merging_keeps_archive_count_and_rewrites_low() {
+        const MB: u64 = 1024 * 1024;
+        let p = MergePolicy::default();
+        let mut archives: Vec<SegmentMetadata> = Vec::new();
+        let mut written = 0u64; // bytes written by merges
+        let incoming = 600u64;
+        for i in 0..incoming as i64 {
+            archives.push(seg(i * 1000, i * 1000 + 999, 46 * MB));
+            loop {
+                let runs = plan(archives.clone(), &p);
+                if runs.is_empty() {
+                    break;
+                }
+                for run in runs {
+                    let ids: std::collections::HashSet<_> = run.iter().map(|s| s.segment_id.clone()).collect();
+                    let size: u64 = run.iter().map(|s| s.size_bytes).sum();
+                    written += size;
+                    archives.retain(|s| !ids.contains(&s.segment_id));
+                    archives.push(seg(run[0].min_offset, run.last().unwrap().max_offset, size));
+                }
+            }
+        }
+        // Every offset still covered exactly once.
+        archives.sort_by_key(|s| s.min_offset);
+        assert_eq!(archives[0].min_offset, 0);
+        assert!(archives.windows(2).all(|w| w[1].min_offset == w[0].max_offset + 1));
+        assert_eq!(archives.last().unwrap().max_offset, incoming as i64 * 1000 - 1);
+        // 600 archives (27.6 GB) end as ~736 MB archives plus a short tail of
+        // smaller tiers, instead of 600.
+        assert!(archives.len() <= 50, "{} archives", archives.len());
+        assert!(archives.iter().all(|s| s.size_bytes <= p.target_bytes));
+        let rewrites = written as f64 / (incoming * 46 * MB) as f64;
+        assert!(rewrites <= 3.0, "each byte rewritten {rewrites:.1} times");
+    }
+
     #[test]
     fn plans_only_contiguous_runs_of_small_archives() {
-        let policy = MergePolicy { target_bytes: 1000, min_run: 3, orphan_age: Duration::ZERO, grace: Duration::ZERO };
+        let policy = tiered(1000, 3, 1000);
         let archives = vec![
             seg(0, 9, 100), seg(10, 19, 100), seg(20, 29, 100), // run A
             seg(30, 39, 900),                                   // too big: breaks the run
@@ -693,7 +797,7 @@ mod tests {
     }
 
     fn policy() -> MergePolicy {
-        MergePolicy { target_bytes: 64 * 1024 * 1024, min_run: 3, orphan_age: Duration::from_secs(3600), grace: Duration::ZERO }
+        MergePolicy { target_bytes: 64 * 1024 * 1024, min_run: 3, tier_base_bytes: 16 * 1024 * 1024, orphan_age: Duration::from_secs(3600), grace: Duration::ZERO }
     }
 
     #[tokio::test]
