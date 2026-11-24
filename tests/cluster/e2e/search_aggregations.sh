@@ -60,6 +60,12 @@ check() { # topic where
   expect "avg" "$(search $t '{"size":0,"aggs":{"a":{"avg":{"field":"latency_ms"}}}}' | jq -r '.aggregations.a.value * 1000 | round / 1000 | tostring' | awk '{ printf "%.3f", $1 }')" "$want_avg"
   expect "track_total_hits" "$(search $t '{"size":5,"track_total_hits":true,"query":{"term":{"level":"ERROR"}}}' | jq -c '[.hits.total.value, (.hits.hits | length)]')" \
     "[$(str level | grep -c '^ERROR$'),5]"
+  # Record-time ranges: archives outside the window are not opened.
+  local future=$(( $(date +%s) * 1000 + 3600000 ))
+  expect "record time after now: nothing, every archive skipped" \
+    "$(search $t "{\"size\":1,\"query\":{\"range\":{\"timestamp\":{\"gte\":$future}}}}" | jq -c '[.hits.total.value, (._segments.skipped == ._segments.total)]')" "[0,true]"
+  expect "record time from 0: everything" \
+    "$(search $t '{"size":0,"query":{"range":{"timestamp":{"gte":0}}}}' | jq '.hits.total.value')" "$want_total"
 }
 segs() { find "$1" -path "*/$2/*" -name '*.tar' 2>/dev/null | wc -l; }
 

@@ -779,6 +779,15 @@ impl IntegratedKafkaServerBuilder {
             writer_heap_bytes: heap_bytes,
             max_docs_per_partition: max_docs,
             hard_max_docs_per_partition: hard_max_docs,
+            burst_writer_heap_bytes: std::env::var("CHRONIK_HOT_TEXT_BURST_WRITER_HEAP_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(HotTextConfig::default().burst_writer_heap_bytes),
+            max_burst_writers: std::env::var("CHRONIK_HOT_TEXT_MAX_BURST_WRITERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(HotTextConfig::default().max_burst_writers),
+            ..HotTextConfig::default()
         }));
 
         // Background commit timer — in-memory visibility flip, no disk writes.

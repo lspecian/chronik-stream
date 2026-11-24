@@ -67,6 +67,22 @@ impl RankFields {
     }
 }
 
+/// A column's values by document. When every document has one (always, in
+/// the indexes Chronik writes) its values are read directly; the default-value
+/// wrapper looked each one up through the column's optional index, about a
+/// third of the CPU of a broad query (one value per matching document, three
+/// columns).
+fn dense<T>(col: tantivy::columnar::Column<T>, default: T) -> std::sync::Arc<dyn tantivy::columnar::ColumnValues<T>>
+where
+    T: tantivy::columnar::MonotonicallyMappableToU64 + PartialOrd + Copy + Send + Sync + std::fmt::Debug + 'static,
+{
+    if col.get_cardinality() == tantivy::columnar::Cardinality::Full {
+        col.values
+    } else {
+        col.first_or_default_col(default)
+    }
+}
+
 /// The top `limit` documents of `query` in the order of [`hit_order`].
 ///
 /// Falls back to plain relevance when the index is of no layout Chronik
@@ -86,7 +102,7 @@ pub fn top_docs(
     let i64_col = |ff: &tantivy::fastfield::FastFieldReaders, name: &str| -> Getter {
         match ff.i64(name) {
             Ok(col) => {
-                let col = col.first_or_default_col(0);
+                let col = dense(col, 0);
                 Box::new(move |doc| col.get_val(doc))
             }
             Err(_) => Box::new(|_| 0),
@@ -97,7 +113,7 @@ pub fn top_docs(
         let ts: Getter = if fields.timestamp_is_date {
             match ff.date(fields.timestamp) {
                 Ok(col) => {
-                    let col = col.first_or_default_col(tantivy::DateTime::from_timestamp_millis(0));
+                    let col = dense(col, tantivy::DateTime::from_timestamp_millis(0));
                     Box::new(move |doc| col.get_val(doc).into_timestamp_secs())
                 }
                 Err(_) => Box::new(|_| 0),

@@ -105,6 +105,17 @@ pub struct HotTextConfig {
     /// when no archive covers them (counted, and logged), so a stalled indexer
     /// cannot exhaust memory.
     pub hard_max_docs_per_partition: usize,
+    /// Heap of a burst writer: a partition indexing faster than one small
+    /// writer keeps up with gets one (`CHRONIK_HOT_TEXT_BURST_WRITER_HEAP_BYTES`).
+    pub burst_writer_heap_bytes: usize,
+    /// Indexing threads of a burst writer.
+    pub burst_writer_threads: usize,
+    /// Burst writers at once, across all partitions (`CHRONIK_HOT_TEXT_MAX_BURST_WRITERS`;
+    /// 0 turns them off).
+    pub max_burst_writers: usize,
+    /// Records added between two commits (100 ms apart) that make a partition
+    /// a burst.
+    pub burst_threshold_docs: usize,
 }
 
 impl HotTextConfig {
@@ -121,6 +132,10 @@ impl Default for HotTextConfig {
             writer_heap_bytes: TANTIVY_MIN_HEAP,
             max_docs_per_partition: 100_000,
             hard_max_docs_per_partition: Self::default_hard_max(100_000),
+            burst_writer_heap_bytes: 256 * 1024 * 1024,
+            burst_writer_threads: std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(1).clamp(1, 8),
+            max_burst_writers: 4,
+            burst_threshold_docs: 2_000,
         }
     }
 }
@@ -132,6 +147,14 @@ struct HotPartitionIndex {
     /// ensure_writer/release_writer so add_batch can enforce the burst cap.
     live_writers: Arc<std::sync::atomic::AtomicUsize>,
     partition: i32,
+    /// Burst writers live across all partitions (shared, capped).
+    burst_writers: Arc<std::sync::atomic::AtomicUsize>,
+    /// This partition holds (or will create) a burst writer.
+    burst: bool,
+    /// Records added since the last commit: the indexing rate.
+    adds_since_commit: usize,
+    /// Consecutive commits a burst writer saw little work.
+    quiet_ticks: u32,
     index: Index,
     /// Lazily-held writer. A Tantivy writer costs a >=15MB heap budget plus
     /// indexing threads PER INSTANCE, and one instance per (topic, partition)
@@ -177,6 +200,7 @@ impl HotPartitionIndex {
         partition: i32,
         config: HotTextConfig,
         live_writers: Arc<std::sync::atomic::AtomicUsize>,
+        burst_writers: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Result<Self> {
         let mut schema_builder = Schema::builder();
         let topic_field = schema_builder.add_text_field("topic", STRING | STORED);
@@ -221,6 +245,10 @@ impl HotPartitionIndex {
             partition,
             index,
             live_writers,
+            burst_writers,
+            burst: false,
+            adds_since_commit: 0,
+            quiet_ticks: 0,
             // Created on first write by ensure_writer(), not up front: most
             // partitions in a many-topic deployment are idle at any moment.
             writer: None,
@@ -247,10 +275,14 @@ impl HotPartitionIndex {
     /// docs on `writer` for why it is lazy.
     fn ensure_writer(&mut self) -> Result<&mut IndexWriter> {
         if self.writer.is_none() {
-            let heap = self.config.writer_heap_bytes.max(TANTIVY_MIN_HEAP);
-            let writer = self
-                .index
-                .writer(heap)
+            let writer = if self.burst {
+                let threads = self.config.burst_writer_threads.max(1);
+                let heap = self.config.burst_writer_heap_bytes.max(TANTIVY_MIN_HEAP * threads);
+                self.index.writer_with_num_threads(threads, heap)
+            } else {
+                self.index.writer(self.config.writer_heap_bytes.max(TANTIVY_MIN_HEAP))
+            };
+            let writer = writer
                 .map_err(|e| anyhow!("create hot writer for {}-{}: {}", self.topic, self.partition, e))?;
             self.writer = Some(writer);
             self.live_writers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -267,6 +299,10 @@ impl HotPartitionIndex {
         if self.writer.take().is_some() {
             self.live_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+        if std::mem::take(&mut self.burst) {
+            self.burst_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.quiet_ticks = 0;
     }
 
     fn add_batch(&mut self, docs: &[HotDoc]) -> Result<()> {
@@ -303,6 +339,7 @@ impl HotPartitionIndex {
         }
         self.dirty = true;
         self.idle_ticks = 0;
+        self.adds_since_commit += docs.len();
 
         for d in docs {
             self.doc_count += 1;
@@ -419,6 +456,50 @@ impl HotPartitionIndex {
             key: get_text(self.key_field),
             value: get_text(self.value_field).unwrap_or_default(),
         })
+    }
+
+    /// After a commit (nothing pending): give a bursting partition a large
+    /// writer, and take it back once the burst is over.
+    ///
+    /// One small writer (the minimum heap: one indexing thread) indexes about
+    /// 60K records/s, so a 1M-record burst took ~15 s to become searchable; a
+    /// large one, ~2 s. Small by default because every active partition holds
+    /// a writer and thousands of them once exhausted memory; large ones are
+    /// capped across all partitions (`max_burst_writers`).
+    fn adapt_writer(&mut self) {
+        let adds = std::mem::take(&mut self.adds_since_commit);
+        let threshold = self.config.burst_threshold_docs.max(1);
+        if self.burst {
+            // Back to small after ~5 s of commits well under the burst rate.
+            self.quiet_ticks = if adds * 4 < threshold { self.quiet_ticks + 1 } else { 0 };
+            if self.quiet_ticks >= 50 && !self.dirty {
+                self.release_writer();
+            }
+            return;
+        }
+        if adds < threshold || self.dirty {
+            return;
+        }
+        let max = self.config.max_burst_writers;
+        let reserved = self
+            .burst_writers
+            .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .is_ok();
+        if !reserved {
+            return;
+        }
+        // The writer is clean (just committed): replacing it loses nothing.
+        self.release_writer();
+        self.burst = true;
+        if let Err(e) = self.ensure_writer() {
+            debug!(topic = %self.topic, partition = self.partition, "hot: burst writer not created: {}", e);
+            self.burst = false;
+            self.burst_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            trace!(topic = %self.topic, partition = self.partition, adds, "hot: burst writer");
+        }
     }
 
     /// Docs with offsets in `[lo, hi]`.
@@ -580,6 +661,8 @@ pub struct HotTextIndex {
     config: HotTextConfig,
     /// Live writers across all partitions of THIS index — the burst-cap input.
     live_writers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Burst (large) writers across all partitions of this index.
+    burst_writers: Arc<std::sync::atomic::AtomicUsize>,
     /// Highest offset an archive covers, per partition, as announced by the
     /// indexer (or found in the catalogue at boot). Kept apart from the
     /// partition entries so it survives an idle partition being reaped. Only
@@ -595,6 +678,7 @@ impl HotTextIndex {
             partitions: DashMap::new(),
             config,
             live_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            burst_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             archived: DashMap::new(),
             unarchived_warned_at: std::sync::atomic::AtomicU64::new(0),
         }
@@ -609,6 +693,7 @@ impl HotTextIndex {
             partition,
             self.config.clone(),
             Arc::clone(&self.live_writers),
+            Arc::clone(&self.burst_writers),
         )?;
         let arc = Arc::new(RwLock::new(part));
         self.partitions
@@ -735,6 +820,7 @@ impl HotTextIndex {
                     trace!(topic, partition, "hot text: merged away deleted docs");
                     chronik_monitoring::MetricsRecorder::record_hot_text_purge();
                 }
+                guard.adapt_writer();
                 false
             } else {
                 // Idle tick: no adds or deletes since the last flip.
@@ -1274,11 +1360,52 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    /// A partition indexing many records between commits gets a burst writer,
+    /// at most `max_burst_writers` across partitions, released once idle;
+    /// nothing is lost when the writer is swapped.
+    #[tokio::test]
+    async fn bursting_partitions_get_a_large_writer_within_the_cap() {
+        let idx = HotTextIndex::new(HotTextConfig {
+            burst_writer_heap_bytes: 64_000_000,
+            burst_writer_threads: 2,
+            max_burst_writers: 1,
+            burst_threshold_docs: 50,
+            ..HotTextConfig::default()
+        });
+        let burst = |p: i32| {
+            let idx = &idx;
+            async move {
+                let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload")).collect();
+                idx.add_batch("t", p, &docs).await.unwrap();
+                idx.commit("t", p).await.unwrap();
+            }
+        };
+        let live = |idx: &HotTextIndex| idx.burst_writers.load(std::sync::atomic::Ordering::Relaxed);
+        burst(0).await;
+        assert_eq!(live(&idx), 1, "partition 0 bursts");
+        burst(1).await;
+        assert_eq!(live(&idx), 1, "the cap holds: partition 1 stays small");
+        // Records added after the swap are indexed by the burst writer.
+        let more: Vec<HotDoc> = (100..150).map(|i| make_doc(i, "payload")).collect();
+        idx.add_batch("t", 0, &more).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(idx.search_partition("t", 0, "payload", 1000).await.unwrap().len(), 150);
+        assert_eq!(idx.search_partition("t", 1, "payload", 1000).await.unwrap().len(), 100);
+        // Idle: the writer goes, and the burst slot with it.
+        for _ in 0..3 {
+            idx.commit("t", 0).await.unwrap();
+        }
+        assert_eq!(live(&idx), 0);
+        burst(1).await;
+        assert_eq!(live(&idx), 1, "the freed slot is reused");
+    }
+
     fn capped(max: usize, hard: usize) -> HotTextIndex {
         HotTextIndex::new(HotTextConfig {
             writer_heap_bytes: 15_000_000,
             max_docs_per_partition: max,
             hard_max_docs_per_partition: hard,
+            ..HotTextConfig::default()
         })
     }
 

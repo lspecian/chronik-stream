@@ -678,6 +678,12 @@ async fn search_cold_segments(
     use futures::stream::{self, StreamExt};
 
     let mut out = ColdSearch { segments: segments.len(), ..Default::default() };
+    // Archives whose records all lie outside the query's required record-time
+    // window cannot hold a hit (counted as skipped).
+    let window = required_time_window(request.query.as_ref());
+    let before = segments.len();
+    segments.retain(|s| segment_in_window(s, window));
+    out.skipped += before - segments.len();
     let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) else {
         return out;
     };
@@ -769,6 +775,53 @@ async fn search_cold_segments(
     out
 }
 
+/// The record-timestamp window (inclusive, epoch ms) every hit of `query`
+/// must fall in: from `range`s on the record timestamp at the top level or in
+/// a bool's `must`/`filter`. Unbounded when there is none.
+fn required_time_window(query: Option<&QueryDsl>) -> (i64, i64) {
+    fn visit(q: &QueryDsl, lo: &mut i64, hi: &mut i64) {
+        match q {
+            QueryDsl::Range(r) => {
+                for (field, c) in &r.field_range {
+                    if !matches!(field.as_str(), "timestamp" | "_ts" | "_timestamp") {
+                        continue;
+                    }
+                    let n = |v: &Option<serde_json::Value>| v.as_ref().and_then(|v| v.as_i64());
+                    if let Some(v) = n(&c.gte) {
+                        *lo = (*lo).max(v);
+                    }
+                    if let Some(v) = n(&c.gt) {
+                        *lo = (*lo).max(v.saturating_add(1));
+                    }
+                    if let Some(v) = n(&c.lte) {
+                        *hi = (*hi).min(v);
+                    }
+                    if let Some(v) = n(&c.lt) {
+                        *hi = (*hi).min(v.saturating_sub(1));
+                    }
+                }
+            }
+            QueryDsl::Bool(b) => {
+                for c in b.must.iter().chain(b.filter.iter()) {
+                    visit(c, lo, hi);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+    if let Some(q) = query {
+        visit(q, &mut lo, &mut hi);
+    }
+    (lo, hi)
+}
+
+/// Whether an archived segment can hold a record in the window. A segment
+/// whose catalogue entry has no timestamps (0) is always searched.
+fn segment_in_window(seg: &chronik_storage::segment_index::SegmentMetadata, (lo, hi): (i64, i64)) -> bool {
+    seg.max_timestamp <= 0 || (seg.max_timestamp >= lo && seg.min_timestamp <= hi)
+}
+
 /// A topic's exact count, and aggregations when `aggs` is set, over every
 /// archived segment and hot partition this node counts (`_chronik_partitions`,
 /// all when unset). Each record once: the hot index contributes only offsets
@@ -812,9 +865,10 @@ async fn count_and_aggregate(
     // Archived segments.
     if let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) {
         let segments = wal_indexer.segment_index().get_segments_for_topic(topic).await.unwrap_or_default();
+        let window = required_time_window(request.query.as_ref());
         let store = wal_indexer.object_store();
         let shared = Arc::new((request.clone(), aggs.cloned()));
-        let mut parts = stream::iter(segments.into_iter().filter(|s| counts(s.partition)).map(|seg| {
+        let mut parts = stream::iter(segments.into_iter().filter(|s| counts(s.partition) && segment_in_window(s, window)).map(|seg| {
             let (cache, store, shared) = (cache.clone(), store.clone(), shared.clone());
             async move {
                 let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
@@ -2831,6 +2885,34 @@ mod search_limit_tests {
 
     fn request(body: serde_json::Value) -> SearchRequest {
         serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn record_time_ranges_bound_which_archives_are_searched() {
+        let window = |body: serde_json::Value| required_time_window(request(body).query.as_ref());
+        assert_eq!(window(serde_json::json!({})), (i64::MIN, i64::MAX));
+        assert_eq!(window(serde_json::json!({"query": {"range": {"timestamp": {"gte": 100, "lt": 200}}}})), (100, 199));
+        // Inside bool must/filter, combined; should/must_not do not bound.
+        assert_eq!(
+            window(serde_json::json!({"query": {"bool": {
+                "filter": [{"range": {"timestamp": {"gt": 100}}}, {"term": {"level": "ERROR"}}],
+                "must": [{"range": {"_ts": {"lte": 500}}}],
+                "should": [{"range": {"timestamp": {"gte": 400}}}]
+            }}})),
+            (101, 500)
+        );
+        // A JSON field is not the record timestamp.
+        assert_eq!(window(serde_json::json!({"query": {"range": {"ts": {"gte": 100}}}})), (i64::MIN, i64::MAX));
+
+        let seg = |min, max| chronik_storage::segment_index::SegmentMetadata {
+            segment_id: String::new(), topic: "t".into(), partition: 0, min_offset: 0, max_offset: 9,
+            record_count: 10, min_timestamp: min, max_timestamp: max, object_store_path: String::new(),
+            size_bytes: 0, created_at: 0, compression: String::new(),
+        };
+        assert!(segment_in_window(&seg(100, 199), (150, 300)));
+        assert!(!segment_in_window(&seg(100, 199), (200, 300)));
+        assert!(!segment_in_window(&seg(100, 199), (0, 99)));
+        assert!(segment_in_window(&seg(0, 0), (200, 300)), "unknown timestamps are searched");
     }
 
     #[test]
