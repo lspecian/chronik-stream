@@ -169,7 +169,7 @@ See [tests/cluster/README.md](tests/cluster/README.md) for details.
 Chronik implements a 3-tier storage system for infinite retention:
 
 **Tier 1 (Hot - WAL)**: `<1ms` latency, local disk, GroupCommitWal with bincode
-**Tier 2 (Warm - Segments)**: `1-10ms` latency, S3/GCS/Azure/local, raw message data
+**Tier 2 (Warm - Segments)**: `1-10ms` latency, S3/GCS/Azure/local, raw message data (the WAL batches, zstd-compressed; segments written up to v2.19.2 are plain and still read)
 **Tier 3 (Cold - Tantivy)**: `100-500ms` latency, S3/GCS/Azure/local, searchable indexes
 
 ### Object Store Configuration

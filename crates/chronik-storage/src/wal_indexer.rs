@@ -1802,10 +1802,10 @@ impl WalIndexer {
             .max()
             .unwrap_or(0);
 
-        // Serialize all CanonicalRecords using bincode
-        // This preserves the exact data including compressed_records_wire_bytes
-        let serialized_data = bincode::serialize(canonical_records)
-            .map_err(|e| Error::Internal(format!("Failed to serialize canonical records: {}", e)))?;
+        // The batches exactly as the WAL holds them (original wire bytes
+        // included, so fetch serves them with their producer CRCs), compressed.
+        let serialized_data = crate::archive::encode_raw_segment(canonical_records)
+            .map_err(|e| Error::Internal(format!("Failed to encode raw segment: {}", e)))?;
 
         let data_size = serialized_data.len() as u64;
 
@@ -2863,8 +2863,8 @@ impl WalIndexer {
                 }
             };
 
-            // Deserialize CanonicalRecords
-            let canonical_records: Vec<CanonicalRecord> = match bincode::deserialize(&data) {
+            // Decode the raw segment (compressed or plain)
+            let canonical_records: Vec<CanonicalRecord> = match crate::archive::decode_raw_segment(&data) {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(

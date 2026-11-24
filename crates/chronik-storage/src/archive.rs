@@ -19,6 +19,44 @@ use tracing::{debug, info, warn};
 use crate::object_store::storage::ObjectStore;
 use crate::segment_index::SegmentIndex;
 
+/// Leads a zstd-compressed raw segment. Read as the bincode length prefix of an
+/// uncompressed segment it would announce ~10^18 batches, so the two formats
+/// cannot be confused.
+const RAW_SEGMENT_ZSTD_MAGIC: &[u8; 8] = b"CHRNKZ1\n";
+
+/// zstd level for raw segments: written once per sealed WAL segment in the
+/// background indexer, read on every archive fetch.
+const RAW_SEGMENT_ZSTD_LEVEL: i32 = 3;
+
+/// A raw segment's bytes: the WAL's batches (bincode `Vec<CanonicalRecord>`,
+/// original wire bytes included), zstd-compressed behind
+/// [`RAW_SEGMENT_ZSTD_MAGIC`]. Up to v2.19.2 they were stored uncompressed,
+/// most of a node's archive footprint; [`decode_raw_segment`] reads both.
+pub fn encode_raw_segment(records: &[crate::canonical_record::CanonicalRecord]) -> chronik_common::Result<Vec<u8>> {
+    let plain = bincode::serialize(records)
+        .map_err(|e| chronik_common::Error::Internal(format!("serialize raw segment: {e}")))?;
+    let mut out = Vec::with_capacity(plain.len() / 3 + RAW_SEGMENT_ZSTD_MAGIC.len());
+    out.extend_from_slice(RAW_SEGMENT_ZSTD_MAGIC);
+    zstd::stream::copy_encode(plain.as_slice(), &mut out, RAW_SEGMENT_ZSTD_LEVEL)
+        .map_err(|e| chronik_common::Error::Internal(format!("compress raw segment: {e}")))?;
+    Ok(out)
+}
+
+/// The batches of a raw segment, compressed or (written before compression)
+/// plain.
+pub fn decode_raw_segment(data: &[u8]) -> chronik_common::Result<Vec<crate::canonical_record::CanonicalRecord>> {
+    let decoded;
+    let plain = match data.strip_prefix(RAW_SEGMENT_ZSTD_MAGIC.as_slice()) {
+        Some(compressed) => {
+            decoded = zstd::stream::decode_all(compressed)
+                .map_err(|e| chronik_common::Error::Internal(format!("decompress raw segment: {e}")))?;
+            decoded.as_slice()
+        }
+        None => data,
+    };
+    bincode::deserialize(plain).map_err(|e| chronik_common::Error::Internal(format!("deserialize raw segment: {e}")))
+}
+
 /// One raw segment in the archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchivedSegment {
@@ -279,6 +317,54 @@ async fn remove_indexed_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical_record::{CanonicalRecord, CanonicalRecordEntry, CompressionType, TimestampType};
+
+    fn batches(n: i64) -> Vec<CanonicalRecord> {
+        (0..n)
+            .map(|b| CanonicalRecord {
+                base_offset: b * 100,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                base_sequence: -1,
+                is_transactional: false,
+                is_control: false,
+                compression: CompressionType::None,
+                timestamp_type: TimestampType::CreateTime,
+                base_timestamp: 1_700_000_000_000,
+                max_timestamp: 1_700_000_000_099,
+                records: (b * 100..b * 100 + 100)
+                    .map(|o| CanonicalRecordEntry {
+                        offset: o,
+                        timestamp: 1_700_000_000_000 + o,
+                        key: None,
+                        value: Some(format!("{{\"level\":\"INFO\",\"service\":\"svc-{}\",\"message\":\"request handled\"}}", o % 7).into_bytes()),
+                        headers: vec![],
+                        attributes: 0,
+                    })
+                    .collect(),
+                compressed_records_wire_bytes: Some(vec![7u8; 300]),
+                original_v1_wire_format: None,
+                original_v2_wire_format: None,
+            })
+            .collect()
+    }
+
+    /// Written compressed, read back identical; a segment written before
+    /// compression (plain bincode) still reads.
+    #[test]
+    fn raw_segments_round_trip_compressed_and_plain_ones_still_read() {
+        let records = batches(20);
+        let plain = bincode::serialize(&records).unwrap();
+        let encoded = encode_raw_segment(&records).unwrap();
+        assert!(encoded.starts_with(RAW_SEGMENT_ZSTD_MAGIC));
+        assert!(encoded.len() * 4 < plain.len(), "{} compressed vs {} plain", encoded.len(), plain.len());
+        assert_eq!(bincode::serialize(&decode_raw_segment(&encoded).unwrap()).unwrap(), plain);
+        assert_eq!(bincode::serialize(&decode_raw_segment(&plain).unwrap()).unwrap(), plain);
+        // An empty segment, and garbage, behave.
+        assert!(decode_raw_segment(&encode_raw_segment(&[]).unwrap()).unwrap().is_empty());
+        assert!(decode_raw_segment(b"CHRNKZ1\nnot zstd").is_err());
+    }
 
     #[test]
     fn keys_round_trip_and_reject_anything_else() {
