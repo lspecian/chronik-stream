@@ -313,3 +313,36 @@ Open at 10M:
   produce acknowledgements while a partition is over it.
 - **Query latency.** Not explained by archive count: with the archives merged
   to 5, match_text p50 was 15.7 ms (worse). Needs a profile at this size.
+
+### Burst coverage (2026-11-24, later)
+
+Fixed in two layers, measured on the 10M one-partition burst:
+
+| | Archived one segment at a time | Pipelined + indexer wake (default) | + `searchable.throttle.enabled` |
+|---|---|---|---|
+| Ingest | 21 s | 21–31 s | 95 s |
+| Every record searchable, after the marker | 181 s | 54–57 s | 2 s |
+| Answers right after the burst | short | short | exact |
+| Acknowledged records ever unsearchable | up to ~5M | up to ~5M, for under a minute | none (coverage checks: 0) |
+
+- Archiving indexed every record twice and built one segment at a time;
+  segments are now prepared ahead in parallel and published in order
+  (truncation epoch guards prepared work). ~230K records/s per partition.
+- A partition whose hot index is half full of unarchived records wakes the
+  indexer and has its active segment sealed.
+- Throttle (opt-in, per topic): produce waits before writing until the
+  partition's pending records (held, queued, admitted) plus the batch fit in
+  80% of the hot cap; admission is reserved atomically, since a pipelining
+  client sends many requests at once.
+- The hot index forgot its archived watermark on any late record, which
+  under load left archived records untrimmable until the hard cap evicted
+  them as unarchived; topic deletion and truncation now reset it instead.
+
+Tried and not kept: the hot index on disk (no-fsync Tantivy directory, cap
+10M) closed the gap without throttling (0 coverage warnings, every record
+searchable ~1 s after the marker) but the index reached 12.5 GB (~1.25 KB a
+record: value, headers and JSON field are all indexed and stored), kept
+growing after archiving caught up (trimming only marks deletions; merging
+10M docs does not keep up), memory doubled and queries ran 6x slower. It
+needs reclaim once the archive covers a partition (rebuild rather than
+merge) and faster hot ingestion (it lagged 25 s) before it can be a default.

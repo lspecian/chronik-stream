@@ -6,7 +6,8 @@
 # Usage: run.sh <chronik-binary> <corpus-dir> <work-dir> [label]
 # Env: PARTITIONS (1), CONC (parallel producers, 8), VUS (8), DURATION (60s),
 #      AGGS=1 (also time the aggregation queries), SETTLE_SECS (60: wait before
-#      the query load, for archiving and merges), K6_IMAGE, extra CHRONIK_* vars
+#      the query load, for archiving and merges), TOPIC_CONFIG (topic configs
+#      to set, kafka-configs syntax), K6_IMAGE, extra CHRONIK_* vars
 #      pass through to the server.
 # Needs: KAFKA_HOME, kcat, jq, docker (for k6).
 #
@@ -34,6 +35,7 @@ for _ in $(seq 60); do curl -fs "$API/health" >/dev/null 2>&1 && break; sleep 1;
 cpu() { awk '{ printf "%.1f", ($14 + $15) / 100 }' /proc/$PID/stat; }
 rss_mb() { awk '/VmRSS/ { printf "%d", $2 / 1024 }' /proc/$PID/status; }
 $K/kafka-topics.sh --bootstrap-server $B --create --topic $T --partitions "$PARTITIONS" --replication-factor 1 >/dev/null 2>&1
+[ -n "${TOPIC_CONFIG:-}" ] && $K/kafka-configs.sh --bootstrap-server $B --alter --entity-type topics --entity-name $T --add-config "$TOPIC_CONFIG" >/dev/null
 sleep 2
 search() { curl -s -m 60 -X POST "$API/$T/_search" -H 'Content-Type: application/json' -d "$1"; }
 

@@ -173,6 +173,8 @@ pub struct UnifiedMetrics {
     pub search_unsearchable_partitions: AtomicU64, // Partitions with any (last coverage check)
     pub archives_damaged: AtomicU64,           // Archives failing their checksums, awaiting or unable to get a rebuild
     pub archives_repaired: AtomicU64,          // Damaged archives rebuilt from the raw tier
+    pub search_throttle_ms: AtomicU64,          // Produce time spent waiting for search headroom (searchable.throttle.enabled)
+    pub search_throttle_timeouts: AtomicU64,    // Throttled produce batches written after the longest wait
     pub hot_text_searches: AtomicU64,          // Search calls
     pub hot_text_search_latency_us_sum: AtomicU64,
     pub hot_text_search_count: AtomicU64,
@@ -353,6 +355,8 @@ impl UnifiedMetrics {
             search_unsearchable_partitions: AtomicU64::new(0),
             archives_damaged: AtomicU64::new(0),
             archives_repaired: AtomicU64::new(0),
+            search_throttle_ms: AtomicU64::new(0),
+            search_throttle_timeouts: AtomicU64::new(0),
             hot_text_searches: AtomicU64::new(0),
             hot_text_search_latency_us_sum: AtomicU64::new(0),
             hot_text_search_count: AtomicU64::new(0),
@@ -869,6 +873,12 @@ impl UnifiedMetrics {
         output.push_str("# HELP chronik_archives_repaired_total Damaged archives rebuilt from the raw tier\n");
         output.push_str("# TYPE chronik_archives_repaired_total counter\n");
         output.push_str(&format!("chronik_archives_repaired_total {}\n", self.archives_repaired.load(Ordering::Relaxed)));
+        output.push_str("# HELP chronik_produce_search_throttle_ms_total Produce time spent waiting for search headroom (searchable.throttle.enabled)\n");
+        output.push_str("# TYPE chronik_produce_search_throttle_ms_total counter\n");
+        output.push_str(&format!("chronik_produce_search_throttle_ms_total {}\n", self.search_throttle_ms.load(Ordering::Relaxed)));
+        output.push_str("# HELP chronik_produce_search_throttle_timeouts_total Throttled produce batches written after the longest wait, still over the limit\n");
+        output.push_str("# TYPE chronik_produce_search_throttle_timeouts_total counter\n");
+        output.push_str(&format!("chronik_produce_search_throttle_timeouts_total {}\n", self.search_throttle_timeouts.load(Ordering::Relaxed)));
 
         output.push_str("# HELP chronik_hot_text_events_total Hot text index lifecycle events\n");
         output.push_str("# TYPE chronik_hot_text_events_total counter\n");
@@ -1342,6 +1352,13 @@ impl MetricsRecorder {
     }
     pub fn record_archive_repaired() {
         global_metrics().archives_repaired.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_search_throttle(waited_ms: u64, timed_out: bool) {
+        let m = global_metrics();
+        m.search_throttle_ms.fetch_add(waited_ms, Ordering::Relaxed);
+        if timed_out {
+            m.search_throttle_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
     }
     pub fn record_hot_text_search(duration: std::time::Duration) {
         let us = duration.as_micros() as u64;

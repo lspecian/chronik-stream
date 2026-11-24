@@ -194,6 +194,20 @@ struct HotPartitionIndex {
     config: HotTextConfig,
 }
 
+impl Drop for HotPartitionIndex {
+    /// A partition dropped with a writer (its topic deleted, `forget_topic`)
+    /// gives back its writer counts, or the caps on live and burst writers
+    /// would count it forever.
+    fn drop(&mut self) {
+        if self.writer.take().is_some() {
+            self.live_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if std::mem::take(&mut self.burst) {
+            self.burst_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl HotPartitionIndex {
     fn new(
         topic: String,
@@ -536,6 +550,23 @@ impl HotPartitionIndex {
         Ok(evicted)
     }
 
+    /// Drop every doc at or above `from` (the log was cut there). Returns
+    /// how many went.
+    fn drop_from(&mut self, from: i64) -> Result<usize> {
+        if self.max_offset.is_none_or(|max| max < from) {
+            return Ok(0);
+        }
+        let before = self.doc_count;
+        let query = self.offset_range(from, i64::MAX);
+        self.ensure_writer()?
+            .delete_query(Box::new(query))
+            .map_err(|e| anyhow!("hot delete: {}", e))?;
+        self.dirty = true;
+        self.make_visible()?;
+        self.recompute_counters()?;
+        Ok(before.saturating_sub(self.doc_count))
+    }
+
     /// Live docs and their offset range, from the reader as it stands.
     fn recompute_counters(&mut self) -> Result<()> {
         let searcher = self.reader.searcher();
@@ -670,6 +701,15 @@ pub struct HotTextIndex {
     archived: DashMap<(String, i32), i64>,
     /// When the last "evicted before archived" warning was logged (unix s).
     unarchived_warned_at: std::sync::atomic::AtomicU64,
+    /// Docs each partition held at its last commit, readable without the
+    /// partition lock (produce consults it for throttled topics).
+    held: DashMap<(String, i32), usize>,
+    /// Records handed to the hot index by produce and not yet added (the
+    /// hand-off is asynchronous, and under a burst it queues).
+    queued: DashMap<(String, i32), usize>,
+    /// Records of throttled topics admitted by produce and not yet handed
+    /// over (see `try_reserve`).
+    reserved: DashMap<(String, i32), usize>,
 }
 
 impl HotTextIndex {
@@ -681,6 +721,9 @@ impl HotTextIndex {
             burst_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             archived: DashMap::new(),
             unarchived_warned_at: std::sync::atomic::AtomicU64::new(0),
+            held: DashMap::new(),
+            queued: DashMap::new(),
+            reserved: DashMap::new(),
         }
     }
 
@@ -721,24 +764,101 @@ impl HotTextIndex {
         self.config.hard_max_docs_per_partition
     }
 
+    /// Records of the partition the hot index holds or will hold: docs at its
+    /// last commit plus those handed over and not yet added. Past the soft cap
+    /// they are records no archive covers yet.
+    pub fn pending_docs(&self, topic: &str, partition: i32) -> usize {
+        let key = (topic.to_string(), partition);
+        self.held.get(&key).map(|v| *v).unwrap_or(0)
+            + self.queued.get(&key).map(|v| *v).unwrap_or(0)
+            + self.reserved.get(&key).map(|v| *v).unwrap_or(0)
+    }
+
+    /// Admit `n` more records of the partition if, with them, it stays within
+    /// `limit` pending records (or nothing is pending, so a batch larger than
+    /// the limit is not refused forever). Check and reservation are one step,
+    /// so concurrent produce requests (a pipelining client sends many at
+    /// once) cannot all pass a check that only one of them fits. Release with
+    /// [`Self::release`] once the records were handed over (or not written).
+    pub fn try_reserve(&self, topic: &str, partition: i32, n: usize, limit: usize) -> bool {
+        let key = (topic.to_string(), partition);
+        let others = self.held.get(&key).map(|v| *v).unwrap_or(0) + self.queued.get(&key).map(|v| *v).unwrap_or(0);
+        let mut reserved = self.reserved.entry(key).or_insert(0);
+        let pending = others + *reserved;
+        if pending + n <= limit || pending == 0 {
+            *reserved += n;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// See [`Self::try_reserve`].
+    pub fn release(&self, topic: &str, partition: i32, n: usize) {
+        if let Some(mut v) = self.reserved.get_mut(&(topic.to_string(), partition)) {
+            *v = v.saturating_sub(n);
+        }
+    }
+
+    /// The topic was deleted: drop everything held for it, its archived
+    /// watermarks included, so a topic recreated under the name starts clean.
+    pub fn forget_topic(&self, topic: &str) {
+        self.partitions.retain(|(t, _), _| t != topic);
+        self.archived.retain(|(t, _), _| t != topic);
+        self.held.retain(|(t, _), _| t != topic);
+        self.queued.retain(|(t, _), _| t != topic);
+        self.reserved.retain(|(t, _), _| t != topic);
+    }
+
+    /// The partition's log was cut at `new_end` (a follower discarding a
+    /// divergent tail): drop the docs at or above it, and lower the archived
+    /// watermark below it, since the archive was cut too.
+    pub async fn truncate(&self, topic: &str, partition: i32, new_end: i64) -> Result<usize> {
+        let key = (topic.to_string(), partition);
+        if let Some(mut archived) = self.archived.get_mut(&key) {
+            *archived = (*archived).min(new_end - 1);
+        }
+        let Some(part) = self.partitions.get(&key).map(|e| e.clone()) else {
+            return Ok(0);
+        };
+        let mut guard = part.write().await;
+        let dropped = guard.drop_from(new_end)?;
+        self.held.insert(key, guard.doc_count);
+        Ok(dropped)
+    }
+
+    /// `n` records of the partition are on their way to `add_batch`. Pair
+    /// with [`Self::note_added`] once they are added (or skipped).
+    pub fn note_queued(&self, topic: &str, partition: i32, n: usize) {
+        *self.queued.entry((topic.to_string(), partition)).or_insert(0) += n;
+    }
+
+    /// See [`Self::note_queued`].
+    pub fn note_added(&self, topic: &str, partition: i32, n: usize) {
+        if let Some(mut v) = self.queued.get_mut(&(topic.to_string(), partition)) {
+            *v = v.saturating_sub(n);
+        }
+    }
+
     /// Insert a batch of docs into (topic, partition). Does not make them
     /// visible to readers â call `commit` (or rely on the background timer).
     pub async fn add_batch(&self, topic: &str, partition: i32, docs: &[HotDoc]) -> Result<()> {
         if docs.is_empty() {
             return Ok(());
         }
-        // A new record at or below the archived watermark means the watermark
-        // belongs to an earlier life of the partition (topic recreated, log
-        // truncated): forget it rather than let it license trimming records
-        // no archive holds. The next archive announces the real one.
-        if let Some(archived) = self.archived_through(topic, partition) {
-            if docs.iter().any(|d| d.offset <= archived) {
-                self.archived.remove(&(topic.to_string(), partition));
-            }
-        }
+        // A record at or below the archived watermark is usually just late:
+        // produce hands records over asynchronously, and the indexer can
+        // archive them from the WAL before they arrive here. A watermark
+        // from an earlier life of the partition is cleared where that life
+        // ends instead (`forget_topic`, `truncate`). (Clearing it on any such
+        // record, as this used to, did so on every late batch under load:
+        // archived records could then no longer be trimmed, filled the hot
+        // index to its hard cap and were evicted as if unarchived.)
         let part = self.get_or_create(topic, partition)?;
         let mut guard = part.write().await;
         guard.add_batch(docs)?;
+        // Counted from here, not from the next commit (see pending_docs).
+        self.held.insert((topic.to_string(), partition), guard.doc_count);
         chronik_monitoring::MetricsRecorder::record_hot_text_add(docs.len() as u64);
         // Burst cap: during bulk topic creation thousands of partitions acquire
         // writers within one commit window and the sequential commit timer cannot
@@ -813,6 +933,13 @@ impl HotTextIndex {
                     chronik_monitoring::MetricsRecorder::record_hot_text_evicted_unarchived(unarchived as u64);
                     self.warn_unarchived(topic, partition, unarchived, archived_through);
                 }
+                // Past the soft cap the hot index holds only records no archive
+                // covers yet. Halfway to the hard cap, ask the indexer to start
+                // on them now instead of at its next scheduled run.
+                if guard.doc_count > self.config.hard_max_docs_per_partition / 2 {
+                    chronik_storage::wal_indexer::request_indexing(topic, partition);
+                }
+                self.held.insert((topic.to_string(), partition), guard.doc_count);
                 // Deletes only mark docs; merge them away once they outnumber
                 // the live ones, or the heap grows under steady trimming. (This
                 // used to drop the whole partition, newest records included.)
@@ -839,6 +966,7 @@ impl HotTextIndex {
         };
         if remove_entry {
             self.partitions.remove(&(topic.to_string(), partition));
+            self.held.remove(&(topic.to_string(), partition));
         }
         Ok(())
     }
@@ -1299,6 +1427,40 @@ mod tests {
         }
     }
 
+    /// The throttle's admission: a batch is admitted only if it fits with
+    /// everything pending, in one step, so concurrent requests cannot all
+    /// pass; a lone oversized batch is still admitted; releasing frees room.
+    #[tokio::test]
+    async fn try_reserve_admits_only_what_fits() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        assert!(idx.try_reserve("t", 0, 600, 1_000));
+        assert!(!idx.try_reserve("t", 0, 600, 1_000), "two together exceed the limit");
+        assert!(idx.try_reserve("t", 0, 400, 1_000));
+        assert_eq!(idx.pending_docs("t", 0), 1_000);
+        idx.release("t", 0, 600);
+        assert!(idx.try_reserve("t", 0, 600, 1_000), "room again once released");
+        assert!(idx.try_reserve("t", 1, 5_000, 1_000), "nothing pending: an oversized batch is admitted");
+    }
+
+    /// What a throttled topic's produce compares with its limit: records on
+    /// their way to the hot index count before they arrive, and once added
+    /// they count as held, never neither in between.
+    #[tokio::test]
+    async fn pending_docs_counts_queued_and_held_records() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        assert_eq!(idx.pending_docs("t", 0), 0);
+        let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload")).collect();
+
+        idx.note_queued("t", 0, docs.len());
+        assert_eq!(idx.pending_docs("t", 0), 100, "queued records count before they are added");
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.note_added("t", 0, docs.len());
+        assert_eq!(idx.pending_docs("t", 0), 100, "added, not yet committed: still counted");
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(idx.pending_docs("t", 0), 100);
+        assert_eq!(idx.pending_docs("t", 1), 0, "per partition");
+    }
+
     #[tokio::test]
     async fn evict_drops_old_docs() {
         let idx = HotTextIndex::new(HotTextConfig::default());
@@ -1508,17 +1670,56 @@ mod tests {
         assert!(total <= 300, "deleted docs never reclaimed: {total} held for {} live", guard.doc_count);
     }
 
-    /// A new record at or below the archived watermark (topic recreated, log
-    /// truncated) invalidates the watermark: it must not license trimming.
+    /// Records arriving after the archive already covers them (produce hands
+    /// them over asynchronously) keep the watermark, so they are trimmed like
+    /// any archived record. Forgetting it on such a record, as add_batch used
+    /// to, left archived records untrimmable under load until the hard cap
+    /// evicted them as "unarchived".
     #[tokio::test]
-    async fn stale_archived_watermark_is_forgotten() {
+    async fn late_records_keep_the_archived_watermark() {
         let idx = capped(10, 10_000);
         idx.note_archived("t", 0, 1_000);
         let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload")).collect();
         idx.add_batch("t", 0, &docs).await.unwrap();
-        assert_eq!(idx.archived_through("t", 0), None);
+        assert_eq!(idx.archived_through("t", 0), Some(1_000));
         idx.commit("t", 0).await.unwrap();
-        assert_eq!(offsets(&idx).await.len(), 100);
+        assert_eq!(offsets(&idx).await.len(), 10, "archived records trimmed to the soft cap");
+    }
+
+    /// A deleted topic's watermark goes with it: the records of a topic
+    /// recreated under the name are never trimmed as archived.
+    #[tokio::test]
+    async fn a_deleted_topic_forgets_its_archived_watermark() {
+        let idx = capped(10, 10_000);
+        idx.note_archived("t", 0, 1_000);
+        idx.forget_topic("t");
+        assert_eq!(idx.archived_through("t", 0), None);
+        let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(offsets(&idx).await.len(), 100, "no archive covers the new topic's records");
+    }
+
+    /// A cut log: the docs at and above the cut go, the watermark drops below
+    /// it, and records written after the cut (the same offsets, new records)
+    /// are kept until archived.
+    #[tokio::test]
+    async fn truncation_drops_the_cut_and_lowers_the_watermark() {
+        let idx = capped(10, 10_000);
+        let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload old")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        idx.note_archived("t", 0, 80);
+
+        assert_eq!(idx.truncate("t", 0, 50).await.unwrap(), 50);
+        assert_eq!(idx.archived_through("t", 0), Some(49));
+        assert!(offsets(&idx).await.iter().all(|&o| o < 50));
+
+        let docs: Vec<HotDoc> = (50..100).map(|i| make_doc(i, "payload new")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        let held = offsets(&idx).await;
+        assert!((50..100).all(|o| held.contains(&o)), "records after the cut are kept: {held:?}");
     }
 
     #[tokio::test]
