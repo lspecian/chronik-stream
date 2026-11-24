@@ -128,6 +128,25 @@ operation (§6) rewrites history when wanted.
 
 ### 4.2 Phase B — profiles, typed archives, time buckets (1–2 weeks)
 
+**As built (2026-11-24):** instead of declared typed fields per topic, the JSON
+field became a fast (columnar) field in archives and the hot index, so ranges
+and aggregations work on every JSON field with no configuration — like an
+OpenSearch dynamic mapping, which also keeps keyword doc values for strings.
+Cost on the 1M-record benchmark: disk 301 → 354 MB (still under OpenSearch's
+392 MB). Aggregations run on Tantivy's distributed collector (terms, histogram,
+date_histogram as a millisecond histogram, range, stats, avg/sum/min/max,
+cardinality, percentiles), partials merged per node and across the cluster;
+each record counted once (hot only above the archived watermark, each node
+only the partitions it leads). Exact totals for `size: 0`, aggregations and
+`track_total_hits: true`. Declared typed / timeseries profiles stay possible
+for index sorting and time pruning if measurements call for them.
+
+Also found and fixed: query field names were tried with a `_` prepended, so a
+JSON field named like an archive's internal column (`ts` -> `_ts`) silently
+resolved to it.
+
+Original plan:
+
 - Indexer builds archives with the topic's profile schema; hot index too.
 - `timeseries`: archives cut at bucket boundaries as well as at WAL seals;
   index sorted newest-first so top-N by time is a prefix read.

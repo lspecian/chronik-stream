@@ -970,6 +970,13 @@ The Unified API provides a single endpoint for all query and admin operations:
 | `/subjects` | GET | List Schema Registry subjects |
 | `/health` | GET | Health check |
 
+### Full-text search (`/_search`, `/{topic}/_search`)
+
+Elasticsearch query DSL over a searchable topic's records (hot index + archives). A field name is a record field (`value`, `key`, `offset`, `partition`, `timestamp`, `headers`, `topic`) or a path in the record's JSON value (`level`, `user.name`); internal archive columns only by their exact `_` name. Since the JSON field is columnar (archives written from this version; older ones answer neither):
+- `range` on JSON numbers and strings; `term`/`match` as before.
+- Aggregations on `/{topic}/_search`: terms, histogram, `date_histogram` (fixed intervals; run as a millisecond histogram, keys in ms with `key_as_string`), range, stats, avg/sum/min/max, cardinality, percentiles; `x.keyword` means `x`. Partials merge across archives, hot partitions and nodes (`topic_aggs.rs`).
+- Exact `hits.total` for `size: 0`, aggregations or `track_total_hits: true`; otherwise the total is what the page collection saw (`gte`). Each record is counted once: hot only above its partition's archived watermark, and each node only the partitions it leads.
+
 ### Background Processing
 
 **All columnar/vector processing happens AFTER produce in the WalIndexer background pipeline:**

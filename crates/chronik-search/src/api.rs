@@ -142,6 +142,19 @@ pub struct SearchRequest {
     /// Unset: `CHRONIK_SEARCH_TIMEOUT_MS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// `true`: count every match exactly (also implied by `size: 0` and by
+    /// aggregations). Otherwise the total is what the page collection saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_total_hits: Option<serde_json::Value>,
+    /// Chronik, set by the cluster fan-out: the partitions this node counts
+    /// and aggregates (the ones it leads), so each record is counted once.
+    /// Unset: all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub _chronik_partitions: Option<Vec<i32>>,
+    /// Chronik, set by the cluster fan-out: answer the count and aggregations
+    /// as a mergeable partial (`_chronik_partial`) for the coordinator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub _chronik_partial: bool,
 }
 
 fn default_size() -> usize {
@@ -308,6 +321,10 @@ pub struct SearchResponse {
     /// Elasticsearch clients ignore it). Summed across nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub _segments: Option<SegmentStats>,
+    /// A node's count and aggregations before finalising, when the request
+    /// asked for a partial (cluster fan-out). Never in a client's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub _chronik_partial: Option<crate::topic_aggs::Partial>,
 }
 
 /// See [`SearchResponse::_segments`].

@@ -1605,6 +1605,7 @@ async fn run_cluster_mode(
         let fanout_router = unified_api::search_handler::search_router_with_fanout(
             api.clone(),
             query_router.clone(),
+            server.metadata_store().clone(),
         );
         info!("✓ Search router upgraded to fan-out mode for distributed queries");
         Some(fanout_router)

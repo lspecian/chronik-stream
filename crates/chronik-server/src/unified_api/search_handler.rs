@@ -81,12 +81,14 @@ pub fn search_router(search_api: Arc<SearchApi>) -> axum::Router {
 pub fn search_router_with_fanout(
     search_api: Arc<SearchApi>,
     query_router: Arc<super::query_router::QueryRouter>,
+    metadata_store: Arc<dyn chronik_common::metadata::MetadataStore>,
 ) -> axum::Router {
     use axum::routing::{delete, get, post, put};
 
     let fanout_state = SearchFanoutState {
         search_api: search_api.clone(),
         query_router,
+        metadata_store,
     };
 
     // Fan-out-aware search endpoints
@@ -122,6 +124,9 @@ pub fn search_router_with_fanout(
 struct SearchFanoutState {
     search_api: Arc<SearchApi>,
     query_router: Arc<super::query_router::QueryRouter>,
+    /// For the partition map: which partitions this node leads, read fresh
+    /// for counts and aggregations.
+    metadata_store: Arc<dyn chronik_common::metadata::MetadataStore>,
 }
 
 /// Run a local search handler and read its `SearchResponse` back. A non-200
@@ -167,6 +172,7 @@ fn empty_search_response() -> chronik_search::api::SearchResponse {
         },
         aggregations: None,
         _segments: None,
+        _chronik_partial: None,
     }
 }
 
@@ -179,7 +185,31 @@ fn shard_request(request: &chronik_search::api::SearchRequest) -> chronik_search
     let mut shard = request.clone();
     shard.size = request.from.saturating_add(request.size);
     shard.from = 0;
+    // Each node counts the partitions it leads itself.
+    shard._chronik_partitions = None;
     shard
+}
+
+/// Turn the merged partial (each node's count and aggregations over the
+/// partitions it leads) into the exact total and the final aggregations.
+#[cfg(feature = "search")]
+fn finish_counts(
+    request: &chronik_search::api::SearchRequest,
+    merged: &mut chronik_search::api::SearchResponse,
+    unanswered: usize,
+) {
+    let Some(partial) = merged._chronik_partial.take() else { return };
+    let exact = unanswered == 0 && !merged.timed_out;
+    merged.hits.total = chronik_search::api::TotalHits {
+        value: partial.count,
+        relation: if exact { "eq" } else { "gte" }.to_string(),
+    };
+    if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
+        match chronik_search::topic_aggs::TopicAggs::prepare(aggs).and_then(|t| t.finalize(partial.aggs)) {
+            Ok(v) => merged.aggregations = Some(v),
+            Err(e) => tracing::warn!("finalising aggregations failed: {}", e),
+        }
+    }
 }
 
 /// Search this node and every peer at the same time, and merge.
@@ -219,8 +249,11 @@ where
     let Some(fan_out) = fan_out else {
         // The local search answered the whole window: page it here too.
         return match local {
-            Ok(resp) => axum::Json(super::query_router::merge_search_responses(resp, Vec::new(), from, size))
-                .into_response(),
+            Ok(resp) => {
+                let mut merged = super::query_router::merge_search_responses(resp, Vec::new(), from, size);
+                finish_counts(&request, &mut merged, 0);
+                axum::Json(merged).into_response()
+            }
             Err(error_response) => error_response,
         };
     };
@@ -242,6 +275,7 @@ where
             // `_shards.failed` has to say so, or a search that missed a node is
             // indistinguishable from one where that node held no match (issue #57).
             super::query_router::note_unanswered_peers(&mut merged, unanswered);
+            finish_counts(&request, &mut merged, unanswered);
             axum::Json(merged).into_response()
         }
         Err(error_response) if fan_out.responses.is_empty() => error_response,
@@ -255,6 +289,7 @@ where
             // The local search failed, so this answer is short by this node
             // too — count it with the peers that did not reply.
             super::query_router::note_unanswered_peers(&mut merged, unanswered + 1);
+            finish_counts(&request, &mut merged, unanswered + 1);
             axum::Json(merged).into_response()
         }
     }
@@ -310,7 +345,30 @@ async fn search_index_fanout(
     // A forwarded request is a peer's share of a fan-out and already asks for
     // the whole window; otherwise this node is one shard of its own fan-out.
     let forwarded = super::query_router::is_forwarded_request(&headers);
-    let local_request = if forwarded { request.clone() } else { shard_request(&request) };
+    let mut request = request;
+    // An exact count or aggregations: every node (this one too) answers a
+    // partial over the partitions it leads; the merge adds them up.
+    if !forwarded
+        && chronik_search::topic_aggs::wants_exact_count(
+            request.size,
+            request.track_total_hits.as_ref(),
+            request.aggs.is_some() || request.aggregations.is_some(),
+        )
+    {
+        request._chronik_partial = true;
+    }
+    let mut local_request = if forwarded { request.clone() } else { shard_request(&request) };
+    // Counting: which partitions this node leads, read fresh — a topic created
+    // after the map was filled is otherwise unknown ("count everything", so
+    // every replica counted), and leadership moves.
+    if local_request._chronik_partial {
+        state.query_router.refresh_partition_map(state.metadata_store.as_ref(), &index).await;
+    }
+    local_request._chronik_partitions = state.query_router.led_partitions(&index).await.map(|led| {
+        let mut led: Vec<i32> = led.into_iter().collect();
+        led.sort_unstable();
+        led
+    });
     let local_index = index.clone();
     let local = async move {
         chronik_search::handlers::search_index(

@@ -846,6 +846,31 @@ impl HotTextIndex {
     /// query string), this path preserves the structure of bool queries â
     /// `bool.must` actually ANDs its clauses, `bool.should` actually ORs,
     /// etc.
+    /// Run `f` on each partition of `topic` with its archived watermark (the
+    /// highest offset an archive is known to cover), its index and a
+    /// searcher, collecting what it returns. For counts and aggregations,
+    /// which must skip what the archive already holds.
+    pub async fn collect_topic<R, F>(&self, topic: &str, mut f: F) -> Vec<R>
+    where
+        F: FnMut(i32, Option<i64>, &tantivy::Index, &tantivy::Searcher) -> Option<R> + Send,
+    {
+        let keys: Vec<(String, i32)> =
+            self.partitions.iter().filter(|e| e.key().0 == topic).map(|e| e.key().clone()).collect();
+        let mut out = Vec::new();
+        for (t, p) in keys {
+            let Some(entry) = self.partitions.get(&(t.clone(), p)) else { continue };
+            let part = entry.clone();
+            drop(entry);
+            let archived = self.archived_through(&t, p);
+            let guard = part.read().await;
+            let searcher = guard.reader.searcher();
+            if let Some(r) = f(p, archived, &guard.index, &searcher) {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     pub async fn search_topic_structured<F>(
         &self,
         topic: &str,

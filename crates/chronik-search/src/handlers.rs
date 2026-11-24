@@ -387,6 +387,7 @@ pub async fn search_all(
         },
         aggregations: None,
         _segments,
+        _chronik_partial: None,
     };
 
     // Cache the response — skip when hot path active (would cache stale NRT
@@ -520,6 +521,38 @@ pub async fn search_index(
     // Every source returned its top `from + size`; page the merged list once.
     let (hits, found) = crate::ranking::page(hits, request.from, request.size);
 
+    // Exact count and aggregations over the topic's records (an index made
+    // through the REST document API answers its own, above).
+    let mut total = TotalHits {
+        value: found as u64,
+        relation: total_relation(found, request.from + request.size, timed_out).to_string(),
+    };
+    let mut partial = None;
+    let topic_aggs_req = request.aggs.as_ref().or(request.aggregations.as_ref());
+    if api.indices.get(&index).is_none()
+        && crate::topic_aggs::wants_exact_count(request.size, request.track_total_hits.as_ref(), topic_aggs_req.is_some())
+    {
+        let prepared = match topic_aggs_req.map(crate::topic_aggs::TopicAggs::prepare).transpose() {
+            Ok(p) => p,
+            Err(e) => return Err(error_response("illegal_argument_exception", &e.to_string(), StatusCode::BAD_REQUEST)),
+        };
+        let (counted, complete) = count_and_aggregate(&api, &index, &request, prepared.as_ref(), deadline).await;
+        timed_out |= !complete && tokio::time::Instant::now() >= deadline;
+        if request._chronik_partial {
+            partial = Some(counted);
+        } else {
+            total = TotalHits {
+                value: counted.count,
+                relation: if complete { "eq" } else { "gte" }.to_string(),
+            };
+            if let Some(prepared) = &prepared {
+                aggregations = Some(prepared.finalize(counted.aggs).map_err(|e| {
+                    error_response("illegal_argument_exception", &e.to_string(), StatusCode::BAD_REQUEST)
+                })?);
+            }
+        }
+    }
+
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
 
     let response = SearchResponse {
@@ -532,15 +565,13 @@ pub async fn search_index(
             failed: 0,
         },
         hits: HitsInfo {
-            total: TotalHits {
-                value: found as u64,
-                relation: total_relation(found, request.from + request.size, timed_out).to_string(),
-            },
+            total,
             max_score: hits.first().and_then(|h| h._score),
             hits,
         },
         aggregations,
         _segments,
+        _chronik_partial: partial,
     };
     
     Ok(Json(response))
@@ -736,6 +767,118 @@ async fn search_cold_segments(
         );
     }
     out
+}
+
+/// A topic's exact count, and aggregations when `aggs` is set, over every
+/// archived segment and hot partition this node counts (`_chronik_partitions`,
+/// all when unset). Each record once: the hot index contributes only offsets
+/// above its partition's archived watermark. Returns the partial and whether
+/// it is complete (false when a source could not answer the query, e.g. a
+/// range over an archive written without JSON columns, or the time limit).
+async fn count_and_aggregate(
+    api: &SearchApi,
+    topic: &str,
+    request: &SearchRequest,
+    aggs: Option<&crate::topic_aggs::TopicAggs>,
+    deadline: tokio::time::Instant,
+) -> (crate::topic_aggs::Partial, bool) {
+    use crate::topic_aggs::{collect, Partial};
+    use futures::stream::{self, StreamExt};
+
+    let allowed: Option<std::collections::HashSet<i32>> =
+        request._chronik_partitions.as_ref().map(|p| p.iter().copied().collect());
+    let counts = |p: i32| allowed.as_ref().map_or(true, |a| a.contains(&p));
+    let mut total = Partial::default();
+    let mut complete = true;
+
+    // One source: the request's query and aggregations against its schema.
+    let run = |index: &tantivy::Index, searcher: &tantivy::Searcher, floor: Option<(tantivy::schema::Field, i64)>| -> Result<Partial> {
+        let schema = index.schema();
+        let mut query: Box<dyn TantivyQuery> = match &request.query {
+            Some(dsl) => build_tantivy_query(dsl, &schema, Some(index))?,
+            None => Box::new(AllQuery),
+        };
+        if let Some((offset, above)) = floor {
+            let range = RangeQuery::new(
+                std::ops::Bound::Excluded(Term::from_field_i64(offset, above)),
+                std::ops::Bound::Unbounded,
+            );
+            query = Box::new(BooleanQuery::new(vec![(Occur::Must, query), (Occur::Must, Box::new(range))]));
+        }
+        let aggs = aggs.map(|a| a.for_schema(&schema)).transpose()?;
+        collect(searcher, &*query, aggs)
+    };
+
+    // Archived segments.
+    if let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) {
+        let segments = wal_indexer.segment_index().get_segments_for_topic(topic).await.unwrap_or_default();
+        let store = wal_indexer.object_store();
+        let shared = Arc::new((request.clone(), aggs.cloned()));
+        let mut parts = stream::iter(segments.into_iter().filter(|s| counts(s.partition)).map(|seg| {
+            let (cache, store, shared) = (cache.clone(), store.clone(), shared.clone());
+            async move {
+                let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
+                    Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
+                })?;
+                tokio::task::spawn_blocking(move || {
+                    let (request, aggs) = (&shared.0, shared.1.as_ref());
+                    let index = reader.index();
+                    let schema = index.schema();
+                    let query: Box<dyn TantivyQuery> = match &request.query {
+                        Some(dsl) => build_tantivy_query(dsl, &schema, Some(index))?,
+                        None => Box::new(AllQuery),
+                    };
+                    let aggs = aggs.map(|a| a.for_schema(&schema)).transpose()?;
+                    collect(&reader.searcher(), &*query, aggs)
+                })
+                .await
+                .map_err(|e| Error::Internal(format!("count task failed: {}", e)))?
+            }
+        }))
+        .buffered(cold_search_concurrency());
+        loop {
+            match tokio::time::timeout_at(deadline, parts.next()).await {
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(Ok(part))) => {
+                    if let Err(e) = total.merge(part) {
+                        debug!("count/aggregation merge failed: {}", e);
+                        complete = false;
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    debug!(topic, "archive could not answer the count/aggregations: {}", e);
+                    complete = false;
+                }
+            }
+        }
+    }
+
+    // Hot partitions: only what no archive holds yet.
+    if let Some(hot) = api.hot_text_index.as_ref() {
+        let parts = hot
+            .collect_topic(topic, |p, archived, index, searcher| {
+                if !counts(p) {
+                    return None;
+                }
+                let offset = index.schema().get_field("offset").ok()?;
+                Some(run(index, searcher, archived.map(|a| (offset, a))))
+            })
+            .await;
+        for part in parts {
+            match part.and_then(|p| total.merge(p)) {
+                Ok(()) => {}
+                Err(e) => {
+                    debug!(topic, "hot index could not answer the count/aggregations: {}", e);
+                    complete = false;
+                }
+            }
+        }
+    }
+    (total, complete)
 }
 
 /// For a query whose hits all score alike, whether the segments searched so far
@@ -1260,36 +1403,39 @@ async fn search_in_index(
     Ok(hits)
 }
 
-/// v2.5.5: Look up a field by name, tolerating the two Chronik schema
-/// conventions — plain (`value`, `key`, `offset`, …) used by the hot text
-/// index and the WAL-archived TantivyIndexer, and underscore-prefixed
-/// (`_value`, `_key`, `_offset`, …) used by the realtime indexer. A user
-/// writing `{"match": {"value": "foo"}}` should get hits from every
-/// source they have, not just the one whose schema happens to match
-/// their spelling.
+/// The record's own fields and how each schema spells them: plain (`value`,
+/// `offset`, `timestamp`, …) in the hot index, underscored (`_value`, `_offset`,
+/// `_ts`, …) in archives and legacy indexes. A query on one of these names
+/// means the record field in every source; any other name is a field of the
+/// record's JSON value.
+const RECORD_FIELDS: &[(&str, &[&str])] = &[
+    ("value", &["value", "_value"]),
+    ("key", &["key", "_key"]),
+    ("offset", &["offset", "_offset"]),
+    ("partition", &["partition", "_partition"]),
+    ("timestamp", &["timestamp", "_ts", "_timestamp"]),
+    ("headers", &["headers", "_headers"]),
+    ("topic", &["topic"]),
+];
+
+/// The schema field a query's field name means, if it is a record field (or,
+/// spelled with a leading `_`, an internal column named exactly so).
 ///
-/// Resolution order:
-///   1. exact name the user wrote
-///   2. same name with a leading `_` added (when user wrote `value`, try `_value`)
-///   3. same name with a leading `_` stripped (when user wrote `_value`, try `value`)
-///
-/// Returns `Err` only when none of the three variants exist in the schema.
+/// Up to v2.19.2 any name was tried with a `_` added, so a JSON field named
+/// like an archive's internal column minus the underscore (`ts`, `sequence`,
+/// `compression`, …) resolved to that column: a range on a JSON `ts` compared
+/// against archived records' Kafka timestamps and matched nothing.
 fn resolve_field(
     schema: &tantivy::schema::Schema,
     field_name: &str,
 ) -> std::result::Result<tantivy::schema::Field, ()> {
-    if let Ok(f) = schema.get_field(field_name) {
-        return Ok(f);
+    for (name, spellings) in RECORD_FIELDS {
+        if field_name == *name || spellings.contains(&field_name) {
+            return spellings.iter().find_map(|s| schema.get_field(s).ok()).ok_or(());
+        }
     }
-    if !field_name.starts_with('_') {
-        let prefixed = format!("_{}", field_name);
-        if let Ok(f) = schema.get_field(&prefixed) {
-            return Ok(f);
-        }
-    } else if let Some(stripped) = field_name.strip_prefix('_') {
-        if let Ok(f) = schema.get_field(stripped) {
-            return Ok(f);
-        }
+    if field_name.starts_with('_') {
+        return schema.get_field(field_name).map_err(|_| ());
     }
     Err(())
 }
@@ -1693,15 +1839,28 @@ pub(crate) fn build_tantivy_query(
 
             let field = match resolve_target(schema, field_name)? {
                 FieldTarget::Schema(field) => field,
-                // Tantivy 0.24 runs a range over a JSON path only when the JSON
-                // field is a fast (columnar) field, which would add a column
-                // per JSON path per document to every hot and archived index.
-                // Refused here rather than failing inside the search.
-                FieldTarget::JsonPath(_, path) => {
-                    return Err(Error::InvalidInput(format!(
-                        "Range queries on JSON fields ({}) are not supported",
-                        path
-                    )));
+                // Tantivy runs a range over a JSON path only when the JSON
+                // field is fast (columnar). Indexes written since it is
+                // (json_index::json_field_options) answer; older archives are
+                // refused here, so that source contributes nothing rather
+                // than failing inside the search.
+                FieldTarget::JsonPath(json, path) => {
+                    if !schema.get_field_entry(json).field_type().is_fast() {
+                        return Err(Error::InvalidInput(format!(
+                            "Range queries on JSON fields ({}) need an index written with JSON columns",
+                            path
+                        )));
+                    }
+                    let (lower, upper) = range_bounds(range_clause, |v| match v {
+                        serde_json::Value::Number(n) => json_number_term(json, &path, n),
+                        serde_json::Value::String(s) => {
+                            let mut term = Term::from_field_json_path(json, &path, true);
+                            term.append_type_and_str(s);
+                            Ok(term)
+                        }
+                        other => Err(Error::InvalidInput(format!("Range bound must be a number or string, got {}", other))),
+                    })?;
+                    return Ok(Box::new(RangeQuery::new(lower, upper)));
                 }
                 FieldTarget::LegacyFullText(_) => {
                     return Err(Error::InvalidInput(format!(
@@ -1726,6 +1885,23 @@ pub(crate) fn build_tantivy_query(
                         v.as_u64()
                             .map(|u| Term::from_field_u64(field, u))
                             .ok_or_else(|| Error::InvalidInput("Range bound must be a non-negative integer".to_string()))
+                    })?;
+                    Ok(Box::new(RangeQuery::new(lower, upper)))
+                }
+                FieldType::F64(_) => {
+                    let (lower, upper) = range_bounds(range_clause, |v| {
+                        v.as_f64()
+                            .map(|f| Term::from_field_f64(field, f))
+                            .ok_or_else(|| Error::InvalidInput("Range bound must be a number".to_string()))
+                    })?;
+                    Ok(Box::new(RangeQuery::new(lower, upper)))
+                }
+                // The record timestamp (`timestamp` -> `_ts`): epoch millis.
+                FieldType::Date(_) => {
+                    let (lower, upper) = range_bounds(range_clause, |v| {
+                        v.as_i64()
+                            .map(|ms| Term::from_field_date(field, tantivy::DateTime::from_timestamp_millis(ms)))
+                            .ok_or_else(|| Error::InvalidInput("Range bound must be epoch milliseconds".to_string()))
                     })?;
                     Ok(Box::new(RangeQuery::new(lower, upper)))
                 }
@@ -2313,6 +2489,22 @@ mod hot_merge_tests {
         assert!(resolve_field(&hot, "_value").is_ok(), "_value → value");
         assert!(resolve_field(&hot, "_key").is_ok(), "_key → key");
         assert!(resolve_field(&hot, "value").is_ok(), "value exact");
+
+        // An archive's internal columns: reachable by their record name or
+        // their exact name, never by a JSON field's name minus the `_`.
+        let archive = {
+            let mut b = Schema::builder();
+            b.add_date_field("_ts", tantivy::schema::INDEXED | tantivy::schema::FAST);
+            b.add_i64_field("_sequence", STORED);
+            b.add_i64_field("_offset", tantivy::schema::INDEXED);
+            b.build()
+        };
+        assert_eq!(resolve_field(&archive, "timestamp"), archive.get_field("_ts").map_err(|_| ()));
+        assert_eq!(resolve_field(&archive, "_ts"), archive.get_field("_ts").map_err(|_| ()));
+        assert_eq!(resolve_field(&archive, "offset"), archive.get_field("_offset").map_err(|_| ()));
+        assert!(resolve_field(&archive, "ts").is_err(), "a JSON `ts` is not the record timestamp");
+        assert!(resolve_field(&archive, "sequence").is_err(), "a JSON `sequence` is not an internal column");
+        assert!(resolve_field(&archive, "_sequence").is_ok(), "exact internal name");
     }
 
     /// Issue #2 regression: extract_simple_query_text must NOT flatten bool.
@@ -2488,13 +2680,30 @@ mod json_field_tests {
         assert_eq!(hits(&idx, serde_json::json!({"term": {"ok": false}})), vec![1]);
     }
 
-    /// Tantivy 0.24 cannot range over a JSON path without a fast field; the
-    /// query is refused up front instead of failing inside the search.
+    /// The JSON field is fast, so ranges over JSON paths answer (up to v2.19.2
+    /// they were refused: no JSON columns). Integers and floats compare as
+    /// numbers, whichever the bound is.
     #[test]
-    fn ranges_on_json_fields_are_refused() {
+    fn ranges_on_json_fields_answer() {
         let idx = index(false);
-        let dsl: QueryDsl =
-            serde_json::from_value(serde_json::json!({"range": {"n": {"gte": 3}}})).unwrap();
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"n": {"gte": 3}}})), vec![0, 1]);
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"n": {"gt": 3}}})), vec![1]);
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"n": {"gte": 2, "lt": 5}}})), vec![0, 3]);
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"n": {"lte": 2.5}}})), vec![3]);
+    }
+
+    /// An archive written before the JSON field was fast cannot range over
+    /// it: refused up front, so that source contributes nothing.
+    #[test]
+    fn ranges_on_json_fields_without_columns_are_refused() {
+        let mut b = Schema::builder();
+        b.add_i64_field("offset", INDEXED | STORED);
+        let old = chronik_storage::json_index::json_field_options();
+        let old = tantivy::schema::JsonObjectOptions::default()
+            .set_indexing_options(old.get_text_indexing_options().unwrap().clone());
+        b.add_json_field(chronik_storage::json_index::JSON_FIELD, old);
+        let idx = tantivy::Index::create_in_ram(b.build());
+        let dsl: QueryDsl = serde_json::from_value(serde_json::json!({"range": {"n": {"gte": 3}}})).unwrap();
         assert!(build_tantivy_query(&dsl, &idx.schema(), Some(&idx)).is_err());
     }
 
