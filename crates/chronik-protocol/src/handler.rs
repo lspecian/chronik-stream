@@ -6042,7 +6042,13 @@ impl ProtocolHandler {
         use chronik_common::metadata::traits::{PartitionAssignment, TopicConfig};
 
         // Validation already done in handle_create_topics.
-        let retention_ms = topic.configs.get("retention.ms").and_then(|v| v.parse().ok());
+        // Kafka's default (7 days) unless the request sets it; -1 keeps
+        // everything. (Auto-created topics get the same default.)
+        let retention_ms = match topic.configs.get("retention.ms").and_then(|v| v.trim().parse::<i64>().ok()) {
+            Some(ms) if ms < 0 => None,
+            Some(ms) => Some(ms),
+            None => TopicConfig::default().retention_ms,
+        };
         let segment_bytes = topic
             .configs
             .get("segment.bytes")

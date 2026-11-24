@@ -123,8 +123,8 @@ operation (§6) rewrites history when wanted.
 - Compress raw-tier segments that arrive uncompressed (zstd) when they are
   written to tier 2.
 - `segment_compaction.rs`: deleted (never wired; its retention deleted search
-  indexes only, leaving raw and Parquet copies). Open: topic `retention.ms` is
-  not enforced on archived data at all; archives are kept forever.
+  indexes only, leaving raw and Parquet copies). Topic `retention.ms` /
+  `retention.bytes` are now enforced on the archive (`retention.rs`).
 
 ### 4.2 Phase B — profiles, typed archives, time buckets (1–2 weeks)
 

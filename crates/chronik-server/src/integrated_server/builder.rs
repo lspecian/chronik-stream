@@ -1734,6 +1734,13 @@ impl IntegratedKafkaServerBuilder {
             crate::columnar_catchup::spawn(metadata_store.clone(), wal_indexer.clone(), fetch_handler);
         }
 
+        // Topic retention over the archive (retention.ms / retention.bytes),
+        // and archive cleanup below a DeleteRecords' log start.
+        if let Some(produce) = self.produce_handler_base.clone() {
+            let hot = crate::retention::HotIndexes { text: self.hot_text_index.clone(), vector: self.hot_vector_index.clone() };
+            crate::retention::spawn(metadata_store.clone(), wal_indexer.clone(), produce, hot);
+        }
+
         // Merge runs of small archives into larger ones, in the background
         // (CHRONIK_ARCHIVE_MERGE=false turns it off).
         chronik_storage::archive_merge::spawn(wal_indexer.object_store(), wal_indexer.segment_index().clone());

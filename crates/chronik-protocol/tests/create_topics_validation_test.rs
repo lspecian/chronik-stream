@@ -165,9 +165,17 @@ async fn test_config_validation_retention_ms() {
     let error_code = parse_error_code(&response);
     assert_eq!(error_code, 0); // Success
     
-    // Verify topic was created with correct config
+    // Verify topic was created with correct config: -1 is stored as no limit
+    // (None), as the catalog stores a -1 set by AlterConfigs.
     let topic_meta = metadata_store.get_topic("infinite-retention").await.unwrap().unwrap();
-    assert_eq!(topic_meta.config.retention_ms, Some(-1));
+    assert_eq!(topic_meta.config.retention_ms, None);
+
+    // Without retention.ms a topic gets Kafka's default, 7 days.
+    let request = encode_create_topics_request(vec![("default-retention", 1, 1, HashMap::new())], 5000, false, 0);
+    let response = handler.handle_request(&request).await.unwrap();
+    assert_eq!(parse_error_code(&response), 0);
+    let topic_meta = metadata_store.get_topic("default-retention").await.unwrap().unwrap();
+    assert_eq!(topic_meta.config.retention_ms, Some(604_800_000));
 }
 
 #[tokio::test]

@@ -649,6 +649,29 @@ impl PartitionIndex {
         Ok(())
     }
 
+    /// Drop every vector below `offset` (records deleted by retention or
+    /// DeleteRecords). The graph still links the dropped points, so it is
+    /// discarded, with any build in flight; searches brute-force the remaining
+    /// vectors (exact) until the next rebuild. Returns how many were dropped.
+    fn drop_below(&mut self, offset: i64) -> usize {
+        let floor = offset.max(0) as u64;
+        let before = self.vector_count();
+        self.built_vectors.retain(|(id, _)| *id >= floor);
+        self.pending_vectors.retain(|(id, _)| *id >= floor);
+        self.quantized_built.retain(|(id, _)| *id >= floor);
+        self.quantized_pending.retain(|(id, _)| *id >= floor);
+        self.known_offsets.retain(|id| *id >= floor);
+        let dropped = before - self.vector_count();
+        if dropped > 0 {
+            self.euclidean_index = None;
+            self.cosine_index = None;
+            self.dot_index = None;
+            self.instance = NEXT_INDEX_INSTANCE.fetch_add(1, Ordering::Relaxed);
+            self.build_in_flight = false;
+        }
+        dropped
+    }
+
     /// Total vector count across both tiers.
     fn vector_count(&self) -> usize {
         self.built_vectors.len() + self.pending_vectors.len()
@@ -1561,6 +1584,17 @@ impl VectorIndexManager {
     }
 
     /// Clear index for a topic-partition
+    /// Drop a partition's vectors below `offset`, for every model. Returns how
+    /// many were dropped.
+    pub async fn drop_below(&self, topic: &str, partition: i32, offset: i64) -> usize {
+        let mut indexes = self.indexes.write().await;
+        indexes
+            .iter_mut()
+            .filter(|(k, _)| k.topic == topic && k.partition == partition)
+            .map(|(_, index)| index.drop_below(offset))
+            .sum()
+    }
+
     pub async fn clear_partition(&self, topic: &str, partition: i32) {
         let key = TopicPartitionKey::new(topic, partition);
         let mut indexes = self.indexes.write().await;
@@ -4195,6 +4229,40 @@ mod snapshot_dedup_tests {
         manager.save_partition_index("t", 0).await.unwrap();
         let saved: PartitionIndexSnapshot = bincode::deserialize(&tokio::fs::read(&path).await.unwrap()).unwrap();
         assert_eq!(saved.vectors.len(), 150, "the duplicates are not saved again");
+    }
+
+    /// Retention / DeleteRecords: vectors below the log start leave the index
+    /// (built graph included) and its next snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vectors_below_an_offset_are_dropped_from_search_and_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = VectorIndexManager::new(VectorIndexConfig {
+            base_path: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let snapshot = PartitionIndexSnapshot {
+            config: HnswIndexConfig { dimensions: 3, ..Default::default() },
+            vectors: (0..150u64).map(|o| (o, vec![1.0, 0.0, o as f32 / 1000.0])).collect(),
+            last_offset: Some(149),
+            quantizer: None,
+            model_id: DEFAULT_MODEL_ID.to_string(),
+            known_offsets: Vec::new(),
+        };
+        let path = manager.index_path("t", 0);
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&path, bincode::serialize(&snapshot).unwrap()).await.unwrap();
+        manager.load_partition_index("t", 0).await.unwrap();
+
+        assert_eq!(manager.drop_below("t", 0, 100).await, 100);
+        assert_eq!(manager.drop_below("t", 0, 100).await, 0, "idempotent");
+        assert_eq!(manager.drop_below("t", 1, 100).await, 0, "other partitions untouched");
+        assert_eq!(manager.get_topic_stats("t").await.total_vectors, 50);
+        let hits = manager.search("t", 0, &[1.0, 0.0, 0.0], 150).await.unwrap();
+        assert_eq!(hits.len(), 50);
+        assert!(hits.iter().all(|(o, _)| *o >= 100), "{hits:?}");
+        manager.save_partition_index("t", 0).await.unwrap();
+        let saved: PartitionIndexSnapshot = bincode::deserialize(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert!(saved.vectors.iter().all(|(o, _)| *o >= 100) && saved.vectors.len() == 50);
     }
 
     #[test]
