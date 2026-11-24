@@ -5,7 +5,6 @@ pub mod canonical_record;
 pub mod tantivy_segment;
 pub mod wal_indexer;
 pub mod segment_index;
-pub mod segment_compaction;
 pub mod index;
 pub mod object_store;
 pub mod record_batch;
@@ -73,6 +72,3 @@ pub use segment_index::{
     ParquetSegmentMetadata, ParquetIndexStats, CombinedIndexStats,
 };
 pub use text_analysis::register_analyzer;
-pub use segment_compaction::{
-    SegmentCompactor, CompactionConfig, CompactionStrategy, CompactionStats,
-};

@@ -122,8 +122,9 @@ operation (§6) rewrites history when wanted.
   time bucket.
 - Compress raw-tier segments that arrive uncompressed (zstd) when they are
   written to tier 2.
-- Decide `segment_compaction.rs`: an older retention/cleanup module not wired
-  into the server. Adopt its retention ideas into the merge pass or delete it.
+- `segment_compaction.rs`: deleted (never wired; its retention deleted search
+  indexes only, leaving raw and Parquet copies). Open: topic `retention.ms` is
+  not enforced on archived data at all; archives are kept forever.
 
 ### 4.2 Phase B — profiles, typed archives, time buckets (1–2 weeks)
 
