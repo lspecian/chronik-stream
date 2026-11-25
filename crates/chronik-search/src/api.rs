@@ -315,7 +315,7 @@ pub struct SearchResponse {
     pub _shards: ShardInfo,
     pub hits: HitsInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aggregations: Option<serde_json::Value>,
+    pub aggregations: Option<Box<serde_json::value::RawValue>>,
     /// How many archived segments could hold a hit, how many were searched,
     /// and how many were skipped by their term filter (Chronik-specific;
     /// Elasticsearch clients ignore it). Summed across nodes.

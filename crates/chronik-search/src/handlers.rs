@@ -257,10 +257,14 @@ fn merge_hot_and_cold_hits(hot: Vec<Hit>, cold: Vec<Hit>) -> Vec<Hit> {
 }
 
 /// Search all indices
+/// A search handler's answer, typed: the unified API merges this node's answer
+/// with its peers' without encoding it to JSON and parsing it back.
+pub type SearchResult = std::result::Result<Json<SearchResponse>, (StatusCode, Json<crate::api::ErrorResponse>)>;
+
 pub async fn search_all(
     State(api): State<Arc<SearchApi>>,
     Json(request): Json<SearchRequest>,
-) -> impl IntoResponse {
+) -> SearchResult {
     let start = SystemTime::now();
     let deadline = search_deadline(&request, tokio::time::Instant::now());
     if let Err(reason) = crate::ranking::check_result_window(request.from, request.size) {
@@ -342,7 +346,7 @@ pub async fn search_all(
         };
         match segments {
             Ok(segments) => {
-                let cold = search_cold_segments(&api, segments, &request, deadline).await;
+                let cold = search_cold_segments(&api, segments, &request, deadline, None).await;
                 timed_out = cold.timed_out;
                 _segments = Some(cold.stats());
                 all_hits.extend(cold.hits);
@@ -407,7 +411,7 @@ pub async fn search_index(
     Path(index): Path<String>,
     State(api): State<Arc<SearchApi>>,
     Json(request): Json<SearchRequest>,
-) -> impl IntoResponse {
+) -> SearchResult {
     let start = SystemTime::now();
     let deadline = search_deadline(&request, tokio::time::Instant::now());
     if let Err(reason) = crate::ranking::check_result_window(request.from, request.size) {
@@ -444,9 +448,11 @@ pub async fn search_index(
                 state.reader.clone(),
                 state.schema.clone(),
             );
+            let value = agg_executor
+                .execute(query, aggs.clone())
+                .map_err(|e| search_error(Error::Internal(format!("Aggregation failed: {}", e))))?;
             aggregations = Some(
-                agg_executor
-                    .execute(query, aggs.clone())
+                serde_json::value::to_raw_value(&value)
                     .map_err(|e| search_error(Error::Internal(format!("Aggregation failed: {}", e))))?,
             );
         }
@@ -486,12 +492,19 @@ pub async fn search_index(
     // indexer stopped, and skipping the archives whenever it answered served
     // the topic from that stale copy. Records found in both are deduplicated
     // when the page is cut (`crate::ranking::page`).
+    // The hot index first: it holds the newest records, which win ties, so
+    // its page bounds what an archive must beat (crate::ranking::Floor).
+    let hot_hits = match api.hot_text_index {
+        Some(_) => Some(search_hot_topic(&api, &index, &request).await),
+        None => None,
+    };
+    let seed = hot_hits.as_deref().and_then(|h| floor_of(h, request.from.saturating_add(request.size)));
     let mut timed_out = false;
     let mut _segments = None;
     if let Some(wal_indexer) = api.wal_indexer() {
         match wal_indexer.segment_index().get_segments_for_topic(&index).await {
             Ok(segments) => {
-                let cold = search_cold_segments(&api, segments, &request, deadline).await;
+                let cold = search_cold_segments(&api, segments, &request, deadline, seed).await;
                 // Archived segments exist: the topic is known even when none
                 // of them matches. Counting it only when it returned hits
                 // turned every no-match query on an archived topic into "no
@@ -515,11 +528,9 @@ pub async fn search_index(
     }
 
     // HP-1.3: merge with hot index hits; hot wins on (_index, _id) dedup.
-    let hits = if api.hot_text_index.is_some() {
-        let hot_hits = search_hot_topic(&api, &index, &request).await;
-        merge_hot_and_cold_hits(hot_hits, cold_hits)
-    } else {
-        cold_hits
+    let hits = match hot_hits {
+        Some(hot_hits) => merge_hot_and_cold_hits(hot_hits, cold_hits),
+        None => cold_hits,
     };
     // Every source returned its top `from + size`; page the merged list once.
     let (hits, found) = crate::ranking::page(hits, request.from, request.size);
@@ -677,6 +688,7 @@ async fn search_cold_segments(
     mut segments: Vec<chronik_storage::segment_index::SegmentMetadata>,
     request: &SearchRequest,
     deadline: tokio::time::Instant,
+    seed: Option<crate::ranking::Floor>,
 ) -> ColdSearch {
     use futures::stream::{self, StreamExt};
 
@@ -709,6 +721,15 @@ async fn search_cold_segments(
     // an archive out for this query, so none is consulted.
     let requirement = crate::prefilter::Requirement::of(request.query.as_ref());
     let requirement = (term_filters_enabled() && requirement.can_skip()).then(|| Arc::new(requirement));
+    // Segments are ranked on their rank columns alone and only the documents
+    // that make the merged top `window` are read afterwards: reading every
+    // segment's own top `window` (and building its `_source`) was ~a fifth of
+    // the CPU of a text query over 48 archives, for 10 hits kept of 480 read.
+    // An explicit `sort` orders by `_source` fields, so it still reads them.
+    let two_phase = request.sort.is_none();
+    // The `window`-th best (score, second) ranked so far: later segments pass
+    // over what cannot beat it (crate::ranking::Floor).
+    let floor = Arc::new(std::sync::Mutex::new(seed));
     let request = Arc::new(request.clone());
 
     // Results come back in segment order (`buffered`, not `buffer_unordered`),
@@ -716,8 +737,8 @@ async fn search_cold_segments(
     // list — which is what makes the early stop below exact. `Ok(None)` is a
     // segment its term filter ruled out.
     let mut searches = stream::iter(segments.into_iter().map(|seg| {
-        let (cache, store, request, requirement) =
-            (cache.clone(), store.clone(), request.clone(), requirement.clone());
+        let (cache, store, request, requirement, floor) =
+            (cache.clone(), store.clone(), request.clone(), requirement.clone(), floor.clone());
         async move {
             if let Some(req) = requirement {
                 if let Some(filter) = cache.term_filter(store.as_ref(), &seg.object_store_path).await {
@@ -730,12 +751,35 @@ async fn search_cold_segments(
                 Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
             })?;
             tokio::task::spawn_blocking(move || {
-                let mut hits =
-                    search_tantivy_index(&seg.topic, reader.index(), &reader.searcher(), &request)?;
+                let searcher = reader.searcher();
+                if two_phase {
+                    let Some(query) = index_query(&seg.topic, reader.index(), &request) else {
+                        return Ok(Some(Found::Hits(Vec::new())));
+                    };
+                    let floor = *floor.lock().unwrap();
+                    let limit = request.from.saturating_add(request.size);
+                    let ranked = crate::ranking::ranked_docs(&searcher, &*query, limit, floor)
+                        .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
+                    if let Some(ranked) = ranked {
+                        let source = Arc::new(CandidateSource { topic: seg.topic.clone(), reader, searcher });
+                        return Ok(Some(Found::Ranked(
+                            ranked
+                                .into_iter()
+                                .map(|(key, addr)| Candidate {
+                                    key,
+                                    partition: seg.partition as i64,
+                                    addr,
+                                    source: source.clone(),
+                                })
+                                .collect(),
+                        )));
+                    }
+                }
+                let mut hits = search_tantivy_index(&seg.topic, reader.index(), &searcher, &request)?;
                 for h in &mut hits {
                     h._index = seg.topic.clone();
                 }
-                Ok::<_, Error>(Some(hits))
+                Ok::<_, Error>(Some(Found::Hits(hits)))
             })
             .await
             .map_err(|e| Error::Internal(format!("segment search task failed: {}", e)))?
@@ -743,6 +787,7 @@ async fn search_cold_segments(
     }))
     .buffered(cold_search_concurrency());
 
+    let mut candidates: Vec<Candidate> = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, searches.next()).await {
             Err(_) => {
@@ -752,7 +797,17 @@ async fn search_cold_segments(
             Ok(None) => break,
             Ok(Some(result)) => {
                 match result {
-                    Ok(Some(mut hits)) => out.hits.append(&mut hits),
+                    Ok(Some(Found::Hits(mut hits))) => out.hits.append(&mut hits),
+                    Ok(Some(Found::Ranked(mut ranked))) => {
+                        candidates.append(&mut ranked);
+                        if candidates.len() >= window {
+                            keep_best_candidates(&mut candidates, window);
+                        }
+                        if candidates.len() >= window {
+                            let kth = &candidates[window - 1].key;
+                            *floor.lock().unwrap() = Some((kth.score, kth.timestamp_s));
+                        }
+                    }
                     Ok(None) => out.skipped += 1,
                     Err(e) => debug!("cold segment skipped: {}", e),
                 }
@@ -764,10 +819,21 @@ async fn search_cold_segments(
                     out.hits.sort_by(crate::ranking::hit_order);
                     out.hits.truncate(window.saturating_mul(2));
                 }
-                if unranked && can_stop_unranked(&out.hits, window, newest.get(out.searched)) {
-                    break;
+                if unranked {
+                    let mut kept: Vec<RankBound> = out.hits.iter().map(RankBound::of_hit).collect();
+                    kept.extend(candidates.iter().map(Candidate::bound));
+                    if can_stop_unranked(kept, window, newest.get(out.searched)) {
+                        break;
+                    }
                 }
             }
+        }
+    }
+    if !candidates.is_empty() {
+        keep_best_candidates(&mut candidates, window);
+        match tokio::task::spawn_blocking(move || read_candidates(candidates)).await {
+            Ok(mut hits) => out.hits.append(&mut hits),
+            Err(e) => debug!("reading ranked archive documents failed: {}", e),
         }
     }
     if out.timed_out {
@@ -840,13 +906,13 @@ async fn count_and_aggregate(
     aggs: Option<&crate::topic_aggs::TopicAggs>,
     deadline: tokio::time::Instant,
 ) -> (crate::topic_aggs::Partial, bool) {
-    use crate::topic_aggs::{collect, Partial};
+    use crate::topic_aggs::{collect, Merger, Partial};
     use futures::stream::{self, StreamExt};
 
     let allowed: Option<std::collections::HashSet<i32>> =
         request._chronik_partitions.as_ref().map(|p| p.iter().copied().collect());
     let counts = |p: i32| allowed.as_ref().map_or(true, |a| a.contains(&p));
-    let mut total = Partial::default();
+    let mut total = Merger::default();
     let mut complete = true;
 
     // One source: the request's query and aggregations against its schema.
@@ -878,54 +944,84 @@ async fn count_and_aggregate(
             request.query.as_ref(),
             request.aggs.as_ref().or(request.aggregations.as_ref()),
         );
-        let mut parts = stream::iter(segments.into_iter().filter(|s| counts(s.partition) && segment_in_window(s, window)).map(|seg| {
-            let (cache, store, shared, request_key) = (cache.clone(), store.clone(), shared.clone(), request_key.clone());
-            async move {
-                // An archive never changes: its share of this request may be known already.
-                if let Some(cached) = request_key.as_ref().and_then(|k| results.get(&seg, k)) {
-                    return Ok((*cached).clone());
-                }
-                let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
-                    Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
-                })?;
-                let part = tokio::task::spawn_blocking(move || {
-                    let (request, aggs) = (&shared.0, shared.1.as_ref());
-                    let index = reader.index();
-                    let schema = index.schema();
-                    let query: Box<dyn TantivyQuery> = match &request.query {
-                        Some(dsl) => build_tantivy_query(dsl, &schema, Some(index))?,
-                        None => Box::new(AllQuery),
-                    };
-                    let aggs = aggs.map(|a| a.for_schema(&schema)).transpose()?;
-                    collect(&reader.searcher(), &*query, aggs)
-                })
-                .await
-                .map_err(|e| Error::Internal(format!("count task failed: {}", e)))?;
-                if let (Ok(part), Some(k)) = (&part, &request_key) {
-                    results.put(&seg, k, Arc::new(part.clone()));
-                }
-                part
+        let segments: Vec<_> =
+            segments.into_iter().filter(|s| counts(s.partition) && segment_in_window(s, window)).collect();
+        // The same archives answered this request before: their merged share.
+        if let Some(cached) = request_key.as_ref().and_then(|k| results.get_merged(&segments, k)) {
+            if let Err(e) = total.push((*cached).clone()) {
+                debug!("count/aggregation merge failed: {}", e);
+                complete = false;
             }
-        }))
-        .buffered(cold_search_concurrency());
-        loop {
-            match tokio::time::timeout_at(deadline, parts.next()).await {
-                Err(_) => {
-                    complete = false;
-                    break;
+        } else {
+            let set = request_key.as_ref().map(|_| segments.clone());
+            let mut archived = Merger::default();
+            let mut every_archive = true;
+            let mut parts = stream::iter(segments.into_iter().map(|seg| {
+                let (cache, store, shared, request_key) = (cache.clone(), store.clone(), shared.clone(), request_key.clone());
+                async move {
+                    // An archive never changes: its share of this request may be known already.
+                    if let Some(cached) = request_key.as_ref().and_then(|k| results.get(&seg, k)) {
+                        return Ok((*cached).clone());
+                    }
+                    let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
+                        Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
+                    })?;
+                    let part = tokio::task::spawn_blocking(move || {
+                        let (request, aggs) = (&shared.0, shared.1.as_ref());
+                        let index = reader.index();
+                        let schema = index.schema();
+                        let query: Box<dyn TantivyQuery> = match &request.query {
+                            Some(dsl) => build_tantivy_query(dsl, &schema, Some(index))?,
+                            None => Box::new(AllQuery),
+                        };
+                        let aggs = aggs.map(|a| a.for_schema(&schema)).transpose()?;
+                        collect(&reader.searcher(), &*query, aggs)
+                    })
+                    .await
+                    .map_err(|e| Error::Internal(format!("count task failed: {}", e)))?;
+                    if let (Ok(part), Some(k)) = (&part, &request_key) {
+                        results.put(&seg, k, Arc::new(part.clone()));
+                    }
+                    part
                 }
-                Ok(None) => break,
-                Ok(Some(Ok(part))) => {
-                    if let Err(e) = total.merge(part) {
-                        debug!("count/aggregation merge failed: {}", e);
-                        complete = false;
+            }))
+            .buffered(cold_search_concurrency());
+            loop {
+                match tokio::time::timeout_at(deadline, parts.next()).await {
+                    Err(_) => {
+                        every_archive = false;
+                        break;
+                    }
+                    Ok(None) => break,
+                    Ok(Some(Ok(part))) => {
+                        if let Err(e) = archived.push(part) {
+                            debug!("count/aggregation merge failed: {}", e);
+                            every_archive = false;
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        debug!(topic, "archive could not answer the count/aggregations: {}", e);
+                        every_archive = false;
                     }
                 }
-                Ok(Some(Err(e))) => {
-                    debug!(topic, "archive could not answer the count/aggregations: {}", e);
-                    complete = false;
+            }
+            drop(parts);
+            match archived.finish() {
+                Ok(archived) => {
+                    if let (true, Some(set), Some(k)) = (every_archive, &set, &request_key) {
+                        results.put_merged(set, k, Arc::new(archived.clone()));
+                    }
+                    if let Err(e) = total.push(archived) {
+                        debug!("count/aggregation merge failed: {}", e);
+                        every_archive = false;
+                    }
+                }
+                Err(e) => {
+                    debug!("count/aggregation merge failed: {}", e);
+                    every_archive = false;
                 }
             }
+            complete &= every_archive;
         }
     }
 
@@ -941,7 +1037,7 @@ async fn count_and_aggregate(
             })
             .await;
         for part in parts {
-            match part.and_then(|p| total.merge(p)) {
+            match part.and_then(|p| total.push(p)) {
                 Ok(()) => {}
                 Err(e) => {
                     debug!(topic, "hot index could not answer the count/aggregations: {}", e);
@@ -950,7 +1046,13 @@ async fn count_and_aggregate(
             }
         }
     }
-    (total, complete)
+    match total.finish() {
+        Ok(total) => (total, complete),
+        Err(e) => {
+            debug!(topic, "count/aggregation merge failed: {}", e);
+            (Partial::default(), false)
+        }
+    }
 }
 
 /// For a query whose hits all score alike, whether the segments searched so far
@@ -960,14 +1062,13 @@ async fn count_and_aggregate(
 /// strictly older than the `window`-th hit, nothing unsearched can rank above
 /// any hit kept. (Equal timestamps go on searching: the tie-break could still
 /// favour the unsearched record.)
-fn can_stop_unranked(hits: &[Hit], window: usize, next: Option<&RankBound>) -> bool {
-    if hits.len() < window || window == 0 {
+fn can_stop_unranked(mut keys: Vec<RankBound>, window: usize, next: Option<&RankBound>) -> bool {
+    if keys.len() < window || window == 0 {
         return false;
     }
     let Some(next) = next else {
         return true; // nothing left to search
     };
-    let mut keys: Vec<RankBound> = hits.iter().map(RankBound::of_hit).collect();
     // The window-th best kept, by the order the merge uses.
     let (_, kth, _) = keys.select_nth_unstable_by(window - 1, |a, b| b.cmp(a));
     next < kth
@@ -1022,6 +1123,101 @@ impl Ord for RankBound {
             .then_with(|| other.partition.cmp(&self.partition))
             .then_with(|| self.offset.cmp(&other.offset))
     }
+}
+
+/// The `window`-th best `(score, second)` of hits another source found, the
+/// floor an archive must beat; `None` while they are fewer than `window`.
+fn floor_of(hits: &[Hit], window: usize) -> Option<crate::ranking::Floor> {
+    let mut seen = std::collections::HashSet::new();
+    let mut distinct: Vec<&Hit> = hits.iter().filter(|h| seen.insert((&h._index, &h._id))).collect();
+    if window == 0 || distinct.len() < window {
+        return None;
+    }
+    let (_, kth, _) = distinct.select_nth_unstable_by(window - 1, |a, b| crate::ranking::hit_order(a, b));
+    Some((kth._score.unwrap_or(0.0), crate::ranking::rank_second(kth)?))
+}
+
+/// What one archived segment answered: ranked documents not yet read, or
+/// hits (an index without rank columns, or a request with an explicit sort).
+enum Found {
+    Ranked(Vec<Candidate>),
+    Hits(Vec<Hit>),
+}
+
+/// The open archive a [`Candidate`] is read from.
+struct CandidateSource {
+    topic: String,
+    /// Keeps the unpacked segment open until its documents are read.
+    reader: Arc<chronik_storage::tantivy_segment::TantivySegmentReader>,
+    searcher: tantivy::Searcher,
+}
+
+/// A document an archived segment ranked in its top `window`, by its rank
+/// key alone; read only if it makes the merged top `window`.
+struct Candidate {
+    key: crate::ranking::RankKey,
+    /// The archive's partition (an archive holds one; its rank columns do not
+    /// repeat it).
+    partition: i64,
+    addr: tantivy::DocAddress,
+    source: Arc<CandidateSource>,
+}
+
+impl Candidate {
+    fn bound(&self) -> RankBound {
+        RankBound {
+            second: self.key.timestamp_s,
+            topic: self.source.topic.clone(),
+            partition: self.partition,
+            offset: self.key.offset,
+        }
+    }
+
+    /// The order of the hits they become ([`crate::ranking::hit_order`]):
+    /// score, newest second, topic, lowest partition, highest offset.
+    fn order(a: &Self, b: &Self) -> std::cmp::Ordering {
+        b.key
+            .score
+            .total_cmp(&a.key.score)
+            .then_with(|| b.key.timestamp_s.cmp(&a.key.timestamp_s))
+            .then_with(|| a.source.topic.cmp(&b.source.topic))
+            .then_with(|| a.partition.cmp(&b.partition))
+            .then_with(|| b.key.offset.cmp(&a.key.offset))
+    }
+}
+
+/// Keeps the best `window` candidates, best first, one per record (two
+/// archives briefly overlap while a merge swaps them in).
+fn keep_best_candidates(candidates: &mut Vec<Candidate>, window: usize) {
+    candidates.sort_by(Candidate::order);
+    // Not `dedup_by`: the two copies of a record score differently (each
+    // archive has its own term statistics), so they need not be adjacent.
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert((c.source.topic.clone(), c.partition, c.key.offset)));
+    candidates.truncate(window);
+}
+
+/// Reads the candidates' documents into hits, archive by archive; an archive
+/// that cannot be read is left out (as a segment that fails its search is).
+fn read_candidates(candidates: Vec<Candidate>) -> Vec<Hit> {
+    let mut by_source: Vec<(Arc<CandidateSource>, Vec<(tantivy::Score, tantivy::DocAddress)>)> = Vec::new();
+    for c in candidates {
+        match by_source.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &c.source)) {
+            Some((_, docs)) => docs.push((c.key.score, c.addr)),
+            None => by_source.push((c.source, vec![(c.key.score, c.addr)])),
+        }
+    }
+    let mut hits = Vec::new();
+    for (source, docs) in by_source {
+        match hits_of_docs(&source.topic, source.reader.index(), &source.searcher, docs) {
+            Ok(found) => hits.extend(found.into_iter().map(|mut h| {
+                h._index = source.topic.clone();
+                h
+            })),
+            Err(e) => debug!(topic = %source.topic, "reading archived documents failed: {}", e),
+        }
+    }
+    hits
 }
 
 /// What a cold search found.
@@ -1218,7 +1414,21 @@ fn search_tantivy_index(
     if request.size == 0 {
         return Ok(Vec::new());
     }
+    let Some(query) = index_query(index_name, index, request) else {
+        return Ok(Vec::new());
+    };
 
+    // Execute search
+    // The source's top `from + size`, unskipped: the merge pages once
+    // (crate::ranking). Skipping `from` here skipped it once per segment.
+    let top_docs = crate::ranking::top_docs(searcher, &*query, request.from.saturating_add(request.size))
+        .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
+    hits_of_docs(index_name, index, searcher, top_docs)
+}
+
+/// The request's query against one index; `None` when the index cannot
+/// answer it (its schema lacks a field the query names).
+fn index_query(index_name: &str, index: &tantivy::Index, request: &SearchRequest) -> Option<Box<dyn TantivyQuery>> {
     // Build query - for WAL indices, we'll do a match_all by default
     // since we don't have the schema mapping readily available.
     //
@@ -1231,27 +1441,30 @@ fn search_tantivy_index(
     // when cold sources were added in v2.5.4). Return empty from this source
     // instead; other sources (hot, in-memory REST) still contribute.
     let schema = index.schema();
-    let query: Box<dyn TantivyQuery> = if let Some(query_dsl) = &request.query {
+    if let Some(query_dsl) = &request.query {
         match build_tantivy_query(query_dsl, &schema, Some(index)) {
-            Ok(q) => q,
+            Ok(q) => Some(q),
             Err(e) => {
                 debug!(
                     "Skipping disk index {} for this query (schema mismatch: {})",
                     index_name, e
                 );
-                return Ok(Vec::new());
+                None
             }
         }
     } else {
-        Box::new(AllQuery)
-    };
+        Some(Box::new(AllQuery))
+    }
+}
 
-    // Execute search
-    // The source's top `from + size`, unskipped: the merge pages once
-    // (crate::ranking). Skipping `from` here skipped it once per segment.
-    let top_docs = crate::ranking::top_docs(searcher, &*query, request.from.saturating_add(request.size))
-        .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
-
+/// The hits for documents of one index, in the order given.
+fn hits_of_docs(
+    index_name: &str,
+    index: &tantivy::Index,
+    searcher: &tantivy::Searcher,
+    top_docs: impl IntoIterator<Item = (tantivy::Score, tantivy::DocAddress)>,
+) -> Result<Vec<Hit>> {
+    let schema = index.schema();
     // Collect results
     let mut hits = Vec::new();
     for (score, doc_address) in top_docs {
@@ -3041,6 +3254,10 @@ mod unranked_stop_tests {
         }
     }
 
+    fn bounds(hits: &[Hit]) -> Vec<RankBound> {
+        hits.iter().map(RankBound::of_hit).collect()
+    }
+
     #[test]
     fn stops_only_when_nothing_unsearched_can_rank_higher() {
         let hits: Vec<Hit> = [100, 90, 80, 70].into_iter().map(at).collect();
@@ -3048,19 +3265,19 @@ mod unranked_stop_tests {
         // highest offset.
         let seg = |max_ms: i64, max_offset: i64| RankBound { second: max_ms.div_euclid(1000), topic: "t".into(), partition: 0, offset: max_offset };
         // Not a full window yet.
-        assert!(!can_stop_unranked(&hits[..2], 3, Some(&seg(10_000, 10))));
+        assert!(!can_stop_unranked(bounds(&hits[..2]), 3, Some(&seg(10_000, 10))));
         // The 3rd best is (80 s, offset 80); the next segment's newest is older: done.
-        assert!(can_stop_unranked(&hits, 3, Some(&seg(79_999, 1_000))));
+        assert!(can_stop_unranked(bounds(&hits), 3, Some(&seg(79_999, 1_000))));
         // Same second: the offset breaks the tie. Lower offsets cannot win...
-        assert!(can_stop_unranked(&hits, 3, Some(&seg(80_000, 79))));
+        assert!(can_stop_unranked(bounds(&hits), 3, Some(&seg(80_000, 79))));
         // ...higher ones can: keep going.
-        assert!(!can_stop_unranked(&hits, 3, Some(&seg(80_999, 81))));
+        assert!(!can_stop_unranked(bounds(&hits), 3, Some(&seg(80_999, 81))));
         // A lower partition wins a tie in the second.
-        assert!(!can_stop_unranked(&hits, 3, Some(&RankBound { partition: -1, ..seg(80_000, 0) })));
+        assert!(!can_stop_unranked(bounds(&hits), 3, Some(&RankBound { partition: -1, ..seg(80_000, 0) })));
         // A newer record could be in the next segment.
-        assert!(!can_stop_unranked(&hits, 3, Some(&seg(95_000, 0))));
+        assert!(!can_stop_unranked(bounds(&hits), 3, Some(&seg(95_000, 0))));
         // Nothing left.
-        assert!(can_stop_unranked(&hits, 3, None));
+        assert!(can_stop_unranked(bounds(&hits), 3, None));
     }
 }
 
