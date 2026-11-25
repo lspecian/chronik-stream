@@ -134,6 +134,7 @@ async fn search_hot_topic(
     api: &Arc<SearchApi>,
     topic: &str,
     request: &SearchRequest,
+    stats: Option<&crate::corpus_stats::CorpusStats>,
 ) -> Vec<Hit> {
     let Some(hot_idx) = api.hot_text_index.as_ref() else {
         return Vec::new();
@@ -148,7 +149,7 @@ async fn search_hot_topic(
     }
 
     if let Some(query_text) = extract_simple_query_text(dsl) {
-        return match hot_idx.search_topic(topic, &query_text, k).await {
+        return match hot_idx.search_topic_with(topic, &query_text, k, stats).await {
             Ok(hits) => hits.into_iter().map(hot_hit_to_es_hit).collect(),
             Err(e) => {
                 debug!("hot text search for topic {} failed: {}", topic, e);
@@ -160,13 +161,14 @@ async fn search_hot_topic(
     // Structured DSL: build the Tantivy query against each partition's schema.
     let dsl_owned = dsl.clone();
     let result = hot_idx
-        .search_topic_structured(
+        .search_topic_structured_with(
             topic,
             move |schema, index| {
                 build_tantivy_query(&dsl_owned, schema, Some(index))
                     .map_err(|e| anyhow::anyhow!("build_tantivy_query: {}", e))
             },
             k,
+            stats,
         )
         .await;
     match result {
@@ -180,7 +182,7 @@ async fn search_hot_topic(
 
 /// HP-1.3: Query the hot index across every known topic and return ES-shaped Hits.
 /// Routes to the same simple-vs-structured split as `search_hot_topic`.
-async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest) -> Vec<Hit> {
+async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest, stats: &TopicStats) -> Vec<Hit> {
     let Some(hot_idx) = api.hot_text_index.as_ref() else {
         return Vec::new();
     };
@@ -207,20 +209,21 @@ async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest) -> Vec<Hi
             }
         }
         match simple_text.as_ref() {
-            Some(q) => match hot_idx.search_topic(&topic, q, k).await {
+            Some(q) => match hot_idx.search_topic_with(&topic, q, k, stats.get(&topic).map(|s| &**s)).await {
                 Ok(hits) => out.extend(hits.into_iter().map(hot_hit_to_es_hit)),
                 Err(e) => debug!("hot text search for topic {} failed: {}", topic, e),
             },
             None => {
                 let dsl_owned = dsl.clone();
                 let result = hot_idx
-                    .search_topic_structured(
+                    .search_topic_structured_with(
                         &topic,
                         move |schema, index| {
                             build_tantivy_query(&dsl_owned, schema, Some(index))
                                 .map_err(|e| anyhow::anyhow!("build_tantivy_query: {}", e))
                         },
                         k,
+                        stats.get(&topic).map(|s| &**s),
                     )
                     .await;
                 match result {
@@ -338,21 +341,41 @@ pub async fn search_all(
     // segment index.
     let mut timed_out = false;
     let mut _segments = None;
-    if let Some(wal_indexer) = api.wal_indexer() {
-        let index = wal_indexer.segment_index();
-        let segments = match request.index {
-            Some(ref idx) => index.get_segments_for_topic(idx).await,
-            None => index.get_all_segments().await,
-        };
-        match segments {
-            Ok(segments) => {
-                let cold = search_cold_segments(&api, segments, &request, deadline, None).await;
-                timed_out = cold.timed_out;
-                _segments = Some(cold.stats());
-                all_hits.extend(cold.hits);
+    let segments = match api.wal_indexer() {
+        Some(wal_indexer) => {
+            let index = wal_indexer.segment_index();
+            let segments = match request.index {
+                Some(ref idx) => index.get_segments_for_topic(idx).await,
+                None => index.get_all_segments().await,
+            };
+            match segments {
+                Ok(segments) => Some(segments),
+                Err(e) => {
+                    debug!("segment lookup for the cold search failed: {}", e);
+                    None
+                }
             }
-            Err(e) => debug!("segment lookup for the cold search failed: {}", e),
         }
+        None => None,
+    };
+    // Each topic's indexes score with that topic's statistics
+    // (crate::corpus_stats), the hot index first: its page bounds what an
+    // archive must beat (crate::ranking::Floor).
+    let mut hot_topics: Vec<String> = match api.hot_text_index.as_ref() {
+        Some(hot) => hot.partition_keys().into_iter().map(|(t, _)| t).collect(),
+        None => Vec::new(),
+    };
+    hot_topics.retain(|t| request.index.as_ref().is_none_or(|i| i == t));
+    hot_topics.sort();
+    hot_topics.dedup();
+    let stats = search_stats(&api, segments.as_deref().unwrap_or_default(), &hot_topics, &request, deadline).await;
+    let hot_hits = if hot_enabled { Some(search_hot_all(&api, &request, &stats).await) } else { None };
+    let seed = hot_hits.as_deref().and_then(|h| floor_of(h, request.from.saturating_add(request.size)));
+    if let Some(segments) = segments {
+        let cold = search_cold_segments(&api, segments, &request, deadline, seed, &stats).await;
+        timed_out = cold.timed_out;
+        _segments = Some(cold.stats());
+        all_hits.extend(cold.hits);
     }
 
     // Filter by index/topic name if specified in request body
@@ -361,8 +384,7 @@ pub async fn search_all(
     }
 
     // HP-1.3: merge with hot index hits (NRT), preferring hot on dedup.
-    if hot_enabled {
-        let hot_hits = search_hot_all(&api, &request).await;
+    if let Some(hot_hits) = hot_hits {
         if !hot_hits.is_empty() {
             debug!("hot text index contributed {} hits", hot_hits.len());
         }
@@ -494,30 +516,38 @@ pub async fn search_index(
     // when the page is cut (`crate::ranking::page`).
     // The hot index first: it holds the newest records, which win ties, so
     // its page bounds what an archive must beat (crate::ranking::Floor).
+    let segments = match api.wal_indexer() {
+        Some(wal_indexer) => match wal_indexer.segment_index().get_segments_for_topic(&index).await {
+            Ok(segments) => Some(segments),
+            Err(e) => {
+                debug!(topic = %index, "segment lookup for the cold search failed: {}", e);
+                None
+            }
+        },
+        None => None,
+    };
+    // Every index scores with the topic's statistics, so equal texts score
+    // equally in the hot index and every archive (crate::corpus_stats).
+    let stats = search_stats(&api, segments.as_deref().unwrap_or_default(), &[index.clone()], &request, deadline).await;
     let hot_hits = match api.hot_text_index {
-        Some(_) => Some(search_hot_topic(&api, &index, &request).await),
+        Some(_) => Some(search_hot_topic(&api, &index, &request, stats.get(&index).map(|s| &**s)).await),
         None => None,
     };
     let seed = hot_hits.as_deref().and_then(|h| floor_of(h, request.from.saturating_add(request.size)));
     let mut timed_out = false;
     let mut _segments = None;
-    if let Some(wal_indexer) = api.wal_indexer() {
-        match wal_indexer.segment_index().get_segments_for_topic(&index).await {
-            Ok(segments) => {
-                let cold = search_cold_segments(&api, segments, &request, deadline, seed).await;
-                // Archived segments exist: the topic is known even when none
-                // of them matches. Counting it only when it returned hits
-                // turned every no-match query on an archived topic into "no
-                // such index" once the hot index was off.
-                if cold.segments > 0 {
-                    have_any_cold_source = true;
-                }
-                timed_out = cold.timed_out;
-                _segments = Some(cold.stats());
-                cold_hits.extend(cold.hits);
-            }
-            Err(e) => debug!(topic = %index, "segment lookup for the cold search failed: {}", e),
+    if let Some(segments) = segments {
+        let cold = search_cold_segments(&api, segments, &request, deadline, seed, &stats).await;
+        // Archived segments exist: the topic is known even when none of them
+        // matches. Counting it only when it returned hits turned every
+        // no-match query on an archived topic into "no such index" once the
+        // hot index was off.
+        if cold.segments > 0 {
+            have_any_cold_source = true;
         }
+        timed_out = cold.timed_out;
+        _segments = Some(cold.stats());
+        cold_hits.extend(cold.hits);
     }
 
     // If no cold source was found AND the hot path is off, preserve the
@@ -661,6 +691,76 @@ async fn search_wal_indices_for_topic(
     Ok(all_hits)
 }
 
+/// Per topic, the BM25 statistics of every index a scored search reads: its
+/// hot partitions and each archive it may match (crate::corpus_stats). Empty
+/// for a search that does not rank by relevance (`match_all`, no sort), or
+/// returns no hits.
+///
+/// The archives are those the cold search will consider: inside the query's
+/// record-time window and not ruled out by their term filter (an archive a
+/// filter rules out holds none of the required terms, so it would add only
+/// documents and tokens). Opening them is what the cold search does next
+/// anyway, from the same cache. Stops at `deadline`, with the statistics of
+/// what it opened: still one set of numbers for every index.
+type TopicStats = std::collections::HashMap<String, Arc<crate::corpus_stats::CorpusStats>>;
+
+async fn search_stats(
+    api: &SearchApi,
+    segments: &[chronik_storage::segment_index::SegmentMetadata],
+    hot_topics: &[String],
+    request: &SearchRequest,
+    deadline: tokio::time::Instant,
+) -> TopicStats {
+    use futures::stream::{self, StreamExt};
+
+    let mut by_topic: std::collections::HashMap<String, Vec<tantivy::Searcher>> = Default::default();
+    if is_unranked(request) || request.size == 0 {
+        return TopicStats::new();
+    }
+    if let Some(hot) = api.hot_text_index.as_ref() {
+        for topic in hot_topics {
+            by_topic.entry(topic.clone()).or_default().extend(hot.searchers(topic).await);
+        }
+    }
+    if let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) {
+        let window = required_time_window(request.query.as_ref());
+        let requirement = crate::prefilter::Requirement::of(request.query.as_ref());
+        let requirement = (term_filters_enabled() && requirement.can_skip()).then(|| Arc::new(requirement));
+        let store = wal_indexer.object_store();
+        let wanted: Vec<(String, String)> = segments
+            .iter()
+            .filter(|s| segment_in_window(s, window))
+            .map(|s| (s.topic.clone(), s.object_store_path.clone()))
+            .collect();
+        let mut opened = stream::iter(wanted.into_iter().map(|(topic, path)| {
+            let (cache, store, requirement) = (cache.clone(), store.clone(), requirement.clone());
+            async move {
+                if let Some(req) = requirement {
+                    if let Some(filter) = cache.term_filter(store.as_ref(), &path).await {
+                        if !req.may_match(&filter) {
+                            return None;
+                        }
+                    }
+                }
+                let reader = cache.reader(store, &path).await.ok()?;
+                Some((topic, reader.searcher()))
+            }
+        }))
+        .buffer_unordered(cold_search_concurrency());
+        loop {
+            match tokio::time::timeout_at(deadline, opened.next()).await {
+                Ok(Some(Some((topic, searcher)))) => by_topic.entry(topic).or_default().push(searcher),
+                Ok(Some(None)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+    by_topic
+        .into_iter()
+        .map(|(topic, sources)| (topic, Arc::new(crate::corpus_stats::CorpusStats::new(sources))))
+        .collect()
+}
+
 /// Search a topic's cold Tantivy segments via the WalIndexer's object store.
 ///
 /// This is the fix for the 0e37747 regression: the WalIndexer writes each
@@ -689,6 +789,7 @@ async fn search_cold_segments(
     request: &SearchRequest,
     deadline: tokio::time::Instant,
     seed: Option<crate::ranking::Floor>,
+    stats: &TopicStats,
 ) -> ColdSearch {
     use futures::stream::{self, StreamExt};
 
@@ -746,9 +847,10 @@ async fn search_cold_segments(
     // so "the segments searched so far" is always a prefix of the newest-first
     // list — which is what makes the early stop below exact. `Ok(None)` is a
     // segment its term filter ruled out.
-    let mut searches = stream::iter(segments.into_iter().map(|seg| {
+    let search_one = |seg: chronik_storage::segment_index::SegmentMetadata| {
         let (cache, store, request, requirement, floor) =
             (cache.clone(), store.clone(), request.clone(), requirement.clone(), floor.clone());
+        let stats = stats.get(&seg.topic).cloned();
         async move {
             if let Some(req) = requirement {
                 if let Some(filter) = cache.term_filter(store.as_ref(), &seg.object_store_path).await {
@@ -768,7 +870,7 @@ async fn search_cold_segments(
                     };
                     let floor = *floor.lock().unwrap();
                     let limit = request.from.saturating_add(request.size);
-                    let ranked = crate::ranking::ranked_docs(&searcher, &*query, limit, floor)
+                    let ranked = crate::ranking::ranked_docs(&searcher, &*query, limit, floor, stats.as_deref())
                         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
                     if let Some(ranked) = ranked {
                         let source = Arc::new(CandidateSource { topic: seg.topic.clone(), reader, searcher });
@@ -794,8 +896,16 @@ async fn search_cold_segments(
             .await
             .map_err(|e| Error::Internal(format!("segment search task failed: {}", e)))?
         }
-    }))
-    .buffered(cold_search_concurrency());
+    };
+    // With no floor yet (no hot page), a ranked search runs the newest
+    // segment alone first: it usually fills the page, and its floor lets
+    // every older segment skip what cannot beat it. Started together, the
+    // first `concurrency` segments each ranked every match without one.
+    let alone = usize::from(!unranked && seed.is_none() && two_phase).min(segments.len());
+    let rest = segments.split_off(alone);
+    let mut searches = stream::iter(segments.into_iter().map(&search_one))
+        .buffered(1)
+        .chain(stream::iter(rest.into_iter().map(&search_one)).buffered(cold_search_concurrency()));
 
     let mut candidates: Vec<Candidate> = Vec::new();
     loop {

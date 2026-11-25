@@ -376,3 +376,32 @@ Chronik's JSON field: Tantivy keeps no fieldnorms for JSON fields and writes
 zero block maxima, so `for_each_pruning` skips nearly every match (8 of 5,000
 in a minimal index). Using it needs block maxima written for unnormed fields
 (a Tantivy change) and archives rebuilt (`POST /admin/reindex`).
+
+### Scoring with the topic's statistics, and Block-WAND (2026-11-25)
+
+Each Tantivy index used to score with its own BM25 statistics, so the same
+message scored differently in every archive and "newest first among equal
+scores" never held across indexes: on 10M records, `timeout` ranked the newest
+20,136 matches (6.43448) below a million-offset-older archive's (6.44069), and
+`level: ERROR` answered with records 3.5M offsets old. Every index a search
+reads now scores with the summed statistics of all of them (`corpus_stats.rs`;
+Elasticsearch's `dfs_query_then_fetch`), per-segment values cached for good
+(segments never change). Ranked searches prune with Block-WAND again, on the
+Tantivy fork (docs/TANTIVY_FORK.md), and a ranked search with no floor yet
+runs its newest archive alone first so the others start with one.
+
+10M records, 48 archives (merging off), 8 VUs, 60 s, p50:
+
+| | before | Block-WAND | + topic statistics |
+|---|---|---|---|
+| rounds | 18,377 | 20,012 | 24,721 |
+| match_text | 4.24 ms | 3.48 ms | 3.17 ms |
+| term | 6.89 ms | 5.75 ms | 3.20 ms |
+| bool | 7.13 ms | 6.84 ms | 6.34 ms |
+| match_all | 1.25 ms | 1.21 ms | 0.68 ms |
+
+OpenSearch on the same corpus and day: 14,250 rounds; match_text 0.96 ms,
+bool 4.56 ms, match_all 0.65 ms. What remains is per-archive overhead: each of
+48 archives builds a scorer and looks up its terms per query.
+Test: `tests/cluster/e2e/search_scoring_across_archives.sh` (fails on the
+previous binary: the oldest copies ranked first).

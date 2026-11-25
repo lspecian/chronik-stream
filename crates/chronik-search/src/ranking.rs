@@ -20,6 +20,8 @@ use tantivy::collector::TopDocs;
 use tantivy::query::Query;
 use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader};
 
+use crate::corpus_stats::CorpusStats;
+
 /// The per-document rank inside one Tantivy index; compared field by field,
 /// highest wins (TopDocs keeps the largest keys). `neg_partition` puts lower
 /// partitions first among equal timestamps, as [`hit_order`] does.
@@ -110,12 +112,35 @@ pub fn top_docs(
     query: &dyn Query,
     limit: usize,
 ) -> tantivy::Result<Vec<(Score, DocAddress)>> {
+    top_docs_with(searcher, query, limit, None)
+}
+
+/// [`top_docs`] scored with `stats` (the statistics of every index the search
+/// reads) instead of this index's own.
+pub fn top_docs_with(
+    searcher: &Searcher,
+    query: &dyn Query,
+    limit: usize,
+    stats: Option<&CorpusStats>,
+) -> tantivy::Result<Vec<(Score, DocAddress)>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
-    match ranked_docs(searcher, query, limit, None)? {
+    match ranked_docs(searcher, query, limit, None, stats)? {
         Some(ranked) => Ok(ranked.into_iter().map(|(key, addr)| (key.score, addr)).collect()),
-        None => searcher.search(query, &TopDocs::with_limit(limit).order_by_score()),
+        None => search_scored(searcher, query, &TopDocs::with_limit(limit).order_by_score(), stats),
+    }
+}
+
+fn search_scored<C: tantivy::collector::Collector>(
+    searcher: &Searcher,
+    query: &dyn Query,
+    collector: &C,
+    stats: Option<&CorpusStats>,
+) -> tantivy::Result<C::Fruit> {
+    match stats {
+        Some(stats) => searcher.search_with_statistics_provider(query, collector, &stats.provider(searcher.schema())),
+        None => searcher.search(query, collector),
     }
 }
 
@@ -128,6 +153,7 @@ pub(crate) fn ranked_docs(
     query: &dyn Query,
     limit: usize,
     floor: Option<Floor>,
+    stats: Option<&CorpusStats>,
 ) -> tantivy::Result<Option<Vec<(RankKey, DocAddress)>>> {
     let Some(fields) = RankFields::detect(searcher.schema()) else {
         return Ok(None);
@@ -139,8 +165,7 @@ pub(crate) fn ranked_docs(
         return Ok(Some(newest_of_all(searcher, fields, limit, floor)));
     }
     Ok(Some(
-        searcher
-            .search(query, &RankCollector { fields, limit, floor })?
+        search_scored(searcher, query, &RankCollector { fields, limit, floor }, stats)?
             .into_iter()
             .map(|held| (held.0, held.1))
             .collect(),
@@ -784,7 +809,7 @@ mod tests {
         // documents strictly below it, whether it is passed per document or
         // lets whole segments and postings blocks be skipped.
         for (name, query) in queries {
-            let all = ranked_docs(&searcher, query, 5_000, None).unwrap().unwrap();
+            let all = ranked_docs(&searcher, query, 5_000, None, None).unwrap().unwrap();
             let newest = all.iter().map(|(k, _)| k.timestamp_s).max().unwrap();
             let mut floors: Vec<Floor> = [0usize, 3, 50, 398, 399, 1_000]
                 .iter()
@@ -801,7 +826,7 @@ mod tests {
                         .filter(|(k, _)| !below_floor(Some(floor), k.score, || k.timestamp_s).0)
                         .map(|(_, a)| *a)
                         .collect();
-                    let got: Vec<DocAddress> = ranked_docs(&searcher, query, limit, Some(floor))
+                    let got: Vec<DocAddress> = ranked_docs(&searcher, query, limit, Some(floor), None)
                         .unwrap()
                         .unwrap()
                         .into_iter()
