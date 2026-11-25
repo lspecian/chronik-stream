@@ -1081,15 +1081,19 @@ mod tests {
         let stranded = tokio::time::timeout(Duration::from_secs(10), create(&c.h(old), "stranded")).await.unwrap();
         assert_eq!(stranded, Err(ProposeError::OutcomeUnknown));
 
-        // The majority elects one of its own and keeps going.
-        let new = loop {
-            let l = others.iter().copied().find(|&i| c.h(i).status().is_leader);
-            if let Some(l) = l {
-                break l;
+        // The majority elects one of its own and keeps going. Its first
+        // leader can be deposed before applying (two nodes racing to elect),
+        // so propose to whichever of them leads until one applies it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let r = loop {
+            if let Some(l) = others.iter().copied().find(|&i| c.h(i).status().is_leader) {
+                match create(&c.h(l), "majority").await {
+                    Ok(r) => break r,
+                    Err(e) => assert!(Instant::now() < deadline, "majority never applied: {e}"),
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        let r = create(&c.h(new), "majority").await.unwrap();
         c.router.heal();
         c.settle(r.index).await;
         for id in &c.ids {
@@ -1123,9 +1127,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_whole_cluster_restart_keeps_everything() {
         let mut c = Cluster::new(&[1, 2, 3], config);
-        let h = c.h(c.leader().await);
         for i in 0..30 {
-            create(&h, &format!("r{}", i)).await.unwrap();
+            c.create_on_leader(&format!("r{}", i)).await;
         }
         for id in c.ids.clone() {
             c.stop(id);
@@ -1133,8 +1136,7 @@ mod tests {
         for id in c.ids.clone() {
             c.start(id);
         }
-        let h = c.h(c.leader().await);
-        let r = create(&h, "r0").await.unwrap();
+        let r = c.create_on_leader("r0").await;
         assert_eq!(r.result, b"exists");
         c.settle(r.index).await;
         for id in &c.ids {
