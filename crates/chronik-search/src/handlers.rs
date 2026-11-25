@@ -698,7 +698,7 @@ async fn search_cold_segments(
     let window = required_time_window(request.query.as_ref());
     let before = segments.len();
     segments.retain(|s| segment_in_window(s, window));
-    out.skipped += before - segments.len();
+    out.pruned += before - segments.len();
     let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) else {
         return out;
     };
@@ -713,8 +713,18 @@ async fn search_cold_segments(
     segments.sort_by(|a, b| {
         RankBound::of_segment(b).cmp(&RankBound::of_segment(a)).then_with(|| a.object_store_path.cmp(&b.object_store_path))
     });
-    let newest: Vec<RankBound> = segments.iter().map(RankBound::of_segment).collect();
     let unranked = is_unranked(request);
+    // Hits that all score alike (1.0) rank by recency alone: an archive whose
+    // newest record is a second older than the page another source already
+    // filled (the hot index: `seed`) cannot place one, and is not searched.
+    if let (true, Some((score, second))) = (unranked, seed) {
+        if score >= 1.0 {
+            let before = segments.len();
+            segments.retain(|s| s.max_timestamp <= 0 || (score == 1.0 && s.max_timestamp.div_euclid(1000) >= second));
+            out.pruned += before - segments.len();
+        }
+    }
+    let newest: Vec<RankBound> = segments.iter().map(RankBound::of_segment).collect();
     let store = wal_indexer.object_store();
     // The terms a hit must contain, to skip archives whose term filter proves
     // they hold none (crate::prefilter). `None` when no filter could ever rule
@@ -1230,6 +1240,10 @@ struct ColdSearch {
     searched: usize,
     /// Of those, how many their term filter ruled out without opening.
     skipped: usize,
+    /// Ruled out before the search began (outside the query's time window,
+    /// or older than a page another source already filled): not in
+    /// `searched`.
+    pruned: usize,
     /// The time limit stopped the search before every segment was searched.
     timed_out: bool,
 }
@@ -1238,8 +1252,11 @@ impl ColdSearch {
     fn stats(&self) -> crate::api::SegmentStats {
         crate::api::SegmentStats {
             total: self.segments as u64,
-            searched: (self.searched - self.skipped) as u64,
-            skipped: self.skipped as u64,
+            // `skipped` is a part of `searched`; `pruned` is not. (The time window
+            // used to count as skipped only, and `searched` wrapped round to
+            // ~1.8e19 when it ruled out more archives than were opened.)
+            searched: self.searched.saturating_sub(self.skipped) as u64,
+            skipped: (self.skipped + self.pruned) as u64,
         }
     }
 }
