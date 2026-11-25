@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.1] - 2026-11-25
+
+### Fixed
+
+- **A broker could stop answering for good while topics were being
+  created.** The background watermark sync held a lock on the partition map
+  across each metadata write; new partitions (auto-create, followers being
+  installed) queued for that lock on every runtime thread, and nothing could
+  release it. The process stayed up and served nothing. Present since 2.2;
+  reproduced on 2.20.0 with 16 concurrent auto-creates. The WAL's
+  stale-segment sealer had the same flaw. Concurrent topic creation is also
+  far faster: 1,500 auto-creates now take about 11 s.
+- **Idempotent retries were acknowledged before the original was written.**
+  A producer that timed out and resent a batch while the first attempt was
+  still being written got DUPLICATE_SEQUENCE_NUMBER, which clients treat as
+  success, for records not yet in the log (with `acks=all`, not yet
+  replicated). A resend now waits for its original; if the original failed
+  before reaching the log, the resend is written.
+- `POST /admin/reindex` counted archives that a merge replaced during the
+  run as failed ("Object not found"); they are now counted as raced.
+- A duplicate retry is no longer logged at ERROR.
+
 ## [2.20.0] - 2026-11-25
 
 ### Upgrade notes

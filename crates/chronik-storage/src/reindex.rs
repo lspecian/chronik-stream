@@ -127,6 +127,16 @@ pub async fn rebuild(indexer: &WalIndexer, entry: &SegmentMetadata, force: bool,
     Ok(Outcome::Rebuilt)
 }
 
+/// Whether the catalogue still lists this exact archive (same file).
+async fn still_registered(indexer: &WalIndexer, entry: &SegmentMetadata) -> bool {
+    indexer
+        .segment_index()
+        .get_segments_for_partition(&entry.topic, entry.partition)
+        .await
+        .map(|segments| segments.iter().any(|s| s.object_store_path == entry.object_store_path))
+        .unwrap_or(true)
+}
+
 /// Rebuild every archive of `topic` (all topics when `None`), updating
 /// `progress` as it goes. Archives already current are skipped unless
 /// `force`.
@@ -155,7 +165,18 @@ pub async fn run(
     }
     info!(topic = ?topic, archives = archives.len(), force, "reindex started");
     for entry in &archives {
-        let outcome = rebuild(&indexer, entry, force, grace).await;
+        // The list was taken at the start; a merge (or a repair) may have
+        // replaced this archive since, and deleted its file after the grace
+        // period. That is a race, not a failure: its replacement is checked
+        // on the next pass.
+        let outcome = if !still_registered(&indexer, entry).await {
+            Ok(Outcome::Raced)
+        } else {
+            match rebuild(&indexer, entry, force, grace).await {
+                Err(_) if !still_registered(&indexer, entry).await => Ok(Outcome::Raced),
+                other => other,
+            }
+        };
         let mut p = progress.lock().unwrap();
         p.checked += 1;
         match outcome {

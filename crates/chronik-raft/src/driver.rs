@@ -913,6 +913,22 @@ mod tests {
             }
         }
 
+        /// Propose `create:<name>` to the current leader, again to whoever
+        /// leads next if leadership moves before it is applied. A leader that
+        /// was just elected can be deposed by a slow follower's election
+        /// (seen on the CI runner: OutcomeUnknown). Creating a name twice is
+        /// harmless in this state machine, so a retry is what a client does.
+        async fn create_on_leader(&self, name: &str) -> Applied {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match create(&self.h(self.leader().await), name).await {
+                    Ok(applied) => return applied,
+                    Err(e) => assert!(Instant::now() < deadline, "create {name} never applied: {e}"),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
         /// Wait until every running node has applied `index`.
         async fn settle(&self, index: u64) {
             for d in self.drivers.values() {
@@ -941,8 +957,8 @@ mod tests {
         for id in [1, 2, 3] {
             assert!(c.sms[&id].set().contains("restored"), "node {id} did not restore");
         }
-        let leader = c.leader().await;
-        let applied = create(&c.h(leader), "after").await.unwrap();
+        c.leader().await;
+        let applied = c.create_on_leader("after").await;
         assert!(applied.index > 50, "committed at {} inside the restored range", applied.index);
         assert!(applied.term > 3);
         c.settle(applied.index).await;
@@ -982,7 +998,7 @@ mod tests {
             create(&c.h(follower), "x").await,
             Err(ProposeError::NotLeader { leader: Some(leader) })
         );
-        let r = create(&c.h(leader), "x").await.unwrap();
+        let r = c.create_on_leader("x").await;
         c.settle(r.index).await;
         for id in &c.ids {
             assert_eq!(c.sms[id].set(), BTreeSet::from(["x".to_string()]), "node {}", id);
@@ -1038,12 +1054,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn leader_failover_and_rejoin() {
         let mut c = Cluster::new(&[1, 2, 3], config);
+        c.create_on_leader("before").await;
         let old = c.leader().await;
-        create(&c.h(old), "before").await.unwrap();
         c.stop(old);
         let new = c.leader().await;
         assert_ne!(new, old);
-        let r = create(&c.h(new), "after").await.unwrap();
+        let r = c.create_on_leader("after").await;
         c.start(old);
         c.settle(r.index).await;
         let want = BTreeSet::from(["before".to_string(), "after".to_string()]);
@@ -1065,15 +1081,19 @@ mod tests {
         let stranded = tokio::time::timeout(Duration::from_secs(10), create(&c.h(old), "stranded")).await.unwrap();
         assert_eq!(stranded, Err(ProposeError::OutcomeUnknown));
 
-        // The majority elects one of its own and keeps going.
-        let new = loop {
-            let l = others.iter().copied().find(|&i| c.h(i).status().is_leader);
-            if let Some(l) = l {
-                break l;
+        // The majority elects one of its own and keeps going. Its first
+        // leader can be deposed before applying (two nodes racing to elect),
+        // so propose to whichever of them leads until one applies it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let r = loop {
+            if let Some(l) = others.iter().copied().find(|&i| c.h(i).status().is_leader) {
+                match create(&c.h(l), "majority").await {
+                    Ok(r) => break r,
+                    Err(e) => assert!(Instant::now() < deadline, "majority never applied: {e}"),
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        let r = create(&c.h(new), "majority").await.unwrap();
         c.router.heal();
         c.settle(r.index).await;
         for id in &c.ids {
@@ -1094,7 +1114,7 @@ mod tests {
         c.stop(down);
         let mut last = 0;
         for i in 0..100 {
-            last = create(&c.h(leader), &format!("k{}", i)).await.unwrap().index;
+            last = c.create_on_leader(&format!("k{}", i)).await.index;
         }
         c.start(down);
         c.settle(last).await;
@@ -1107,9 +1127,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_whole_cluster_restart_keeps_everything() {
         let mut c = Cluster::new(&[1, 2, 3], config);
-        let h = c.h(c.leader().await);
         for i in 0..30 {
-            create(&h, &format!("r{}", i)).await.unwrap();
+            c.create_on_leader(&format!("r{}", i)).await;
         }
         for id in c.ids.clone() {
             c.stop(id);
@@ -1117,8 +1136,7 @@ mod tests {
         for id in c.ids.clone() {
             c.start(id);
         }
-        let h = c.h(c.leader().await);
-        let r = create(&h, "r0").await.unwrap();
+        let r = c.create_on_leader("r0").await;
         assert_eq!(r.result, b"exists");
         c.settle(r.index).await;
         for id in &c.ids {
@@ -1150,7 +1168,7 @@ mod tests {
         let leader = c.leader().await;
         let mut last = 0;
         for i in 0..20 {
-            last = create(&c.h(leader), &format!("w{}", i)).await.unwrap().index;
+            last = c.create_on_leader(&format!("w{}", i)).await.index;
         }
         c.settle(last).await;
         let victim = *c.ids.iter().find(|&&i| i != leader).unwrap();
@@ -1171,6 +1189,6 @@ mod tests {
         assert!(failed.contains("lost raft state"), "{}", failed);
         assert!(failed.contains("CHRONIK_CLUSTER_JOIN"), "{}", failed);
         // The rest of the cluster keeps working.
-        create(&c.h(leader), "after-wipe").await.unwrap();
+        c.create_on_leader("after-wipe").await;
     }
 }
