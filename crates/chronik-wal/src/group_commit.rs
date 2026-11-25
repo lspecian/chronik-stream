@@ -2193,6 +2193,21 @@ impl GroupCommitWal {
         }
     }
 
+    /// Every partition's commit queue, copied out of the map.
+    ///
+    /// Never iterate `partition_queues` across an `.await`: the iterator holds
+    /// a shard's read lock, and a task suspended with it keeps it, while the
+    /// first write to a partition creates its queue under that shard's write
+    /// lock, synchronously, on a runtime thread. Enough of those and no thread
+    /// is left to resume the iterating task: the broker stops for good (the
+    /// same freeze `ProduceHandler::partition_snapshot` describes).
+    fn partition_queue_snapshot(&self) -> Vec<((String, i32), Arc<PartitionCommitQueue>)> {
+        self.partition_queues
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect()
+    }
+
     /// Seal segments that have been idle for longer than the threshold.
     /// This ensures data gets indexed even if topics go quiet.
     /// Returns the number of segments sealed.
@@ -2200,8 +2215,9 @@ impl GroupCommitWal {
         let mut sealed_count = 0;
         let threshold = Duration::from_secs(max_idle_secs);
 
-        for entry in self.partition_queues.iter() {
-            let ((topic, partition), queue) = entry.pair();
+        // A snapshot, never the map itself: see `partition_queue_snapshot`.
+        for ((topic, partition), queue) in self.partition_queue_snapshot() {
+            let (topic, partition, queue) = (&topic, &partition, &queue);
 
             // Check segment age
             let segment_age = {
@@ -2323,8 +2339,9 @@ impl GroupCommitWal {
         let queue_count = self.partition_queues.len();
         info!("Found {} partition queues to seal", queue_count);
 
-        for entry in self.partition_queues.iter() {
-            let ((topic, partition), queue) = entry.pair();
+        // A snapshot, never the map itself: see `partition_queue_snapshot`.
+        for ((topic, partition), queue) in self.partition_queue_snapshot() {
+            let (topic, partition, queue) = (&topic, &partition, &queue);
 
             // Get current segment size (note: this is unflushed buffer size, not file size)
             let current_size = queue.segment_size_bytes.load(std::sync::atomic::Ordering::Relaxed);

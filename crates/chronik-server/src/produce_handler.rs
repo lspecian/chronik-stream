@@ -1402,6 +1402,26 @@ impl ProduceHandler {
         Ok(())
     }
 
+    /// Every partition's state, copied out of the map.
+    ///
+    /// Never iterate `partition_states` across an `.await`: the iterator
+    /// holds a shard's read lock, and a task suspended with it keeps it.
+    /// Creating a partition state takes that shard's write lock synchronously
+    /// on a runtime thread. The background watermark sync did exactly this
+    /// (one metadata write per partition, awaited inside the loop): when
+    /// topics were being created, every runtime thread ended up parked on the
+    /// write lock and the sync task, the only one able to release it, could
+    /// never run again. The broker stopped answering anything, for good.
+    /// Reproduced with 16 concurrent auto-creates on a local cluster (v2.20.0
+    /// and earlier); the stacks showed all 16 workers in
+    /// `install_partition_state` waiting on this map.
+    fn partition_snapshot(&self) -> Vec<((String, i32), Arc<PartitionState>)> {
+        self.partition_states
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect()
+    }
+
     /// Clear all partition buffers (used before WAL recovery to prevent duplicates - v1.3.52+)
     ///
     /// This is called during server startup BEFORE WAL recovery to ensure we start with
@@ -1844,9 +1864,9 @@ impl ProduceHandler {
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
                 // Sync watermarks for each partition asynchronously
-                for entry in handler_for_watermark.partition_states.iter() {
-                    let (topic, partition) = entry.key();
-                    let state = entry.value();
+                // A snapshot, never the map itself: see `partition_snapshot`.
+                for ((topic, partition), state) in handler_for_watermark.partition_snapshot() {
+                    let (topic, partition) = (&topic, &partition);
 
                     let high_watermark = state.high_watermark.load(Ordering::SeqCst) as i64;
                     let log_start_offset = state.log_start_offset.load(Ordering::SeqCst) as i64;
@@ -4121,10 +4141,8 @@ impl ProduceHandler {
     
     /// Force flush all partitions (useful for testing)
     pub async fn flush_all_partitions(&self) -> Result<()> {
-        for entry in self.partition_states.iter() {
-            let (topic, partition) = entry.key();
-            let state = entry.value();
-            self.flush_partition(topic, *partition, state).await?;
+        for ((topic, partition), state) in self.partition_snapshot() {
+            self.flush_partition(&topic, partition, &state).await?;
         }
 
         Ok(())
@@ -4168,9 +4186,8 @@ impl ProduceHandler {
     
     /// Check and rotate segments if needed
     async fn check_and_rotate_segments(&self) -> Result<()> {
-        for entry in self.partition_states.iter() {
-            let (topic, partition) = entry.key();
-            let state = entry.value();
+        for ((topic, partition), state) in self.partition_snapshot() {
+            let (topic, partition, state) = (&topic, &partition, &state);
             let segment_created_ms = state.segment_created.load(Ordering::Relaxed);
             let segment_age = Duration::from_millis(
                 Instant::now().duration_since(state.start_time).as_millis() as u64 - segment_created_ms
@@ -4442,10 +4459,8 @@ impl ProduceHandler {
         self.running.store(false, Ordering::SeqCst);
 
         // Flush all partitions
-        for entry in self.partition_states.iter() {
-            let (topic, partition) = entry.key();
-            let state = entry.value();
-            if let Err(e) = self.flush_partition(topic, *partition, state).await {
+        for ((topic, partition), state) in self.partition_snapshot() {
+            if let Err(e) = self.flush_partition(&topic, partition, &state).await {
                 error!("Error flushing partition {}-{} during shutdown: {}", topic, partition, e);
             }
         }
