@@ -162,3 +162,15 @@ inherits = "release"
 [patch.crates-io]
 raft = { path = "crates/raft" }
 raft-proto = { path = "crates/raft-proto" }
+# Tantivy fork: 0.27.0 plus fixes upstream has not merged yet. Branch
+# `chronik` of github.com/lspecian/tantivy, pinned by rev; see
+# docs/TANTIVY_FORK.md for what it carries and how to rebase it.
+tantivy = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }
+tantivy-bitpacker = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }
+tantivy-columnar = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }
+tantivy-common = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }
+tantivy-query-grammar = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }
+tantivy-sstable = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }
+tantivy-stacker = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }
+tantivy-tokenizer-api = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }
+ownedbytes = { git = "https://github.com/lspecian/tantivy", rev = "ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e" }

@@ -328,11 +328,45 @@ impl tantivy::collector::Collector for RankCollector {
         true
     }
 
+    /// Lets the query skip postings blocks that cannot beat what is held
+    /// (Block-WAND), as `TopDocs` does. Needs the Tantivy fork: upstream 0.27
+    /// stores zero block maxima for fields without fieldnorms, the JSON field
+    /// among them, and pruning on those drops real hits (quickwit-oss/tantivy
+    /// #3230).
+    fn collect_segment(
+        &self,
+        weight: &dyn tantivy::query::Weight,
+        ord: tantivy::SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Vec<Held>> {
+        use tantivy::collector::SegmentCollector;
+        let mut child = self.for_segment(ord, segment)?;
+        let alive = segment.alive_bitset();
+        weight.for_each_pruning(child.threshold(), segment, &mut |doc, score| {
+            if !alive.is_some_and(|a| a.is_deleted(doc)) {
+                child.collect(doc, score);
+            }
+            child.threshold()
+        })?;
+        Ok(child.harvest())
+    }
+
     fn merge_fruits(&self, fruits: Vec<Vec<Held>>) -> tantivy::Result<Vec<Held>> {
         let mut all: Vec<Held> = fruits.into_iter().flatten().collect();
         all.sort_unstable_by(|a, b| b.cmp(a));
         all.truncate(self.limit);
         Ok(all)
+    }
+}
+
+impl RankSegmentCollector {
+    /// The score a document must exceed to be passed to `collect`: just below
+    /// the least one that can still place, since an equal score places when
+    /// its record is newer (the floor's, once no record here is as new, not).
+    fn threshold(&self) -> Score {
+        let floor = self.floor.map(|(s, _)| if self.older_than_floor { s } else { s.next_down() });
+        let held = (self.best.len() == self.limit).then(|| self.best.peek().expect("limit > 0").0 .0 .score.next_down());
+        floor.into_iter().chain(held).fold(Score::MIN, Score::max)
     }
 }
 
@@ -654,6 +688,15 @@ mod tests {
         let off = sb.add_i64_field("_offset", INDEXED | STORED | FAST);
         let body = sb.add_text_field("body", TEXT);
         let tag = sb.add_text_field("tag", tantivy::schema::STRING);
+        // Like the archives' `_json`: no fieldnorms, so no stored block maxima
+        // (Tantivy upstream returns wrong top hits when pruning these).
+        let json = sb.add_json_field(
+            "j",
+            tantivy::schema::JsonObjectOptions::default().set_indexing_options(
+                tantivy::schema::TextFieldIndexing::default()
+                    .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
+            ),
+        );
         let index = tantivy::Index::create_in_ram(sb.build());
         let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
         let mut o = 0i64;
@@ -667,6 +710,10 @@ mod tests {
                 d.add_i64(off, o);
                 d.add_text(body, &text);
                 d.add_text(tag, ["red", "green", "blue"][(o % 7 % 3) as usize]);
+                let mut obj = std::collections::BTreeMap::new();
+                obj.insert("msg".to_string(), tantivy::schema::OwnedValue::Str(text.clone()));
+                obj.insert("level".to_string(), tantivy::schema::OwnedValue::Str(["error", "info"][(o % 11 % 2) as usize].into()));
+                d.add_object(json, obj);
                 w.add_document(d).unwrap();
                 o += 1;
             }
@@ -710,7 +757,16 @@ mod tests {
             (Occur::Must, Box::new(union.clone()) as Box<dyn Query>),
             (Occur::Must, Box::new(tantivy::query::ConstScoreQuery::new(term(tag, "green"), 0.0))),
         ]);
-        let queries: [(&str, &dyn Query); 5] = [
+        let parser = tantivy::query::QueryParser::for_index(&index, vec![]);
+        let json_term = parser.parse_query("j.msg:alpha").unwrap();
+        let json_union = parser.parse_query("j.msg:alpha OR j.msg:filler").unwrap();
+        let json_and = parser.parse_query("+j.msg:alpha +j.level:error").unwrap();
+        let json_filtered = BooleanQuery::new(vec![(Occur::Must, term(body, "alpha")), (Occur::Must, parser.parse_query("j.level:error").unwrap())]);
+        let queries: [(&str, &dyn Query); 9] = [
+            ("json_term", &*json_term),
+            ("json_union", &*json_union),
+            ("json_and", &*json_and),
+            ("json_filtered", &json_filtered),
             ("bm25", &text),
             ("constant", &equal_scores),
             ("union", &union),

@@ -6158,8 +6158,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 [[package]]
 name = "ownedbytes"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fbd56f7631767e61784dc43f8580f403f4475bd4aaa4da003e6295e1bab4a7e"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -8459,8 +8458,7 @@ dependencies = [
 [[package]]
 name = "tantivy"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad1ebacf6bc124b741ffbfb088f9835cb55e1e2ff57e182e9219e3efa1377b97"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -8514,8 +8512,7 @@ dependencies = [
 [[package]]
 name = "tantivy-bitpacker"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c803ac72b3356f48fe4a399a03e058addd5c94e793e0bb7c6bcc224b238fcd7"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "bitpacking",
 ]
@@ -8523,8 +8520,7 @@ dependencies = [
 [[package]]
 name = "tantivy-columnar"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95101fe3dd4a76156bdeff8d14ad41c547f2c1bce7ee0d23fdb6f95599f312ec"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "downcast-rs",
  "fastdivide",
@@ -8540,8 +8536,7 @@ dependencies = [
 [[package]]
 name = "tantivy-common"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66d062ce97f2a26f2a7b2ed5d926a62241f762e4395ac110eb5c18f3b4a13b71"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -8564,8 +8559,7 @@ dependencies = [
 [[package]]
 name = "tantivy-query-grammar"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef6729a14fc5c5a662ee549a176640743577ef35c70ae7e86f0ca07fa83d161"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "fnv",
  "nom",
@@ -8577,8 +8571,7 @@ dependencies = [
 [[package]]
 name = "tantivy-sstable"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d6b3567417750e8aeb6e7c9c5ae8701376c07c06d51991050825832c2f8c431"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "futures-util",
  "itertools 0.14.0",
@@ -8591,8 +8584,7 @@ dependencies = [
 [[package]]
 name = "tantivy-stacker"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4213e34acf53de44ab4778aafec3c6800a781be6a7c1906579acdc23c114d94"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "murmurhash32",
  "tantivy-common",
@@ -8601,8 +8593,7 @@ dependencies = [
 [[package]]
 name = "tantivy-tokenizer-api"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac258c2c6390673f2685813afeeafcb8c4e0ee7de8dd3fc46838dcc37263f98"
+source = "git+https://github.com/lspecian/tantivy?rev=ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e#ec4f46ff1e1fc9898e4da7b00be1cfd938dfd21e"
 dependencies = [
  "serde",
 ]
