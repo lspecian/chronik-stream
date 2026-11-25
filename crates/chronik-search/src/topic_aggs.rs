@@ -276,7 +276,7 @@ fn translate(aggs: &Value, prefix: &str, dates: &mut HashSet<String>) -> Result<
 }
 
 /// The schema field (or JSON path) a user field name means in `schema`.
-fn resolve_agg_field(schema: &Schema, name: &str) -> String {
+pub(crate) fn resolve_agg_field(schema: &Schema, name: &str) -> String {
     let name = name.strip_suffix(".keyword").unwrap_or(name);
     if name.starts_with(chronik_storage::json_index::JSON_FIELD) {
         return name.to_string();

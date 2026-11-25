@@ -21,6 +21,7 @@ use tantivy::query::Query;
 use tantivy::{DocAddress, DocId, Score, Searcher, SegmentReader};
 
 use crate::corpus_stats::CorpusStats;
+use crate::sort::SortSpec;
 
 /// The per-document rank inside one Tantivy index; compared field by field,
 /// highest wins (TopDocs keeps the largest keys). `neg_partition` puts lower
@@ -165,7 +166,7 @@ pub fn top_docs_with(
     }
 }
 
-fn search_scored<C: tantivy::collector::Collector>(
+pub(crate) fn search_scored<C: tantivy::collector::Collector>(
     searcher: &Searcher,
     query: &dyn Query,
     collector: &C,
@@ -709,16 +710,42 @@ pub fn check_result_window(from: usize, size: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// One page of `hits`: sorted by [`hit_order`], each record once (by `_index`
+/// One page of `hits`: in [`order_hits`] order, each record once (by `_index`
 /// and `_id`, keeping its best-ranked copy — a record can come from both a
-/// leftover RealtimeIndexer index and an archive), `from` skipped, `size`
-/// kept. Returns the page and how many distinct candidates there were.
-pub fn page(mut hits: Vec<Hit>, from: usize, size: usize) -> (Vec<Hit>, usize) {
-    hits.sort_by(hit_order);
+/// leftover RealtimeIndexer index and an archive, and from every replica),
+/// `from` skipped, `size` kept. With a sort that does not use `_score`, hits
+/// carry no score, as in Elasticsearch. Returns the page and how many
+/// distinct candidates there were.
+pub fn page(mut hits: Vec<Hit>, from: usize, size: usize, sort: Option<&SortSpec>) -> (Vec<Hit>, usize) {
+    order_hits(&mut hits, sort);
     let mut seen = std::collections::HashSet::with_capacity(hits.len());
     hits.retain(|h| seen.insert((h._index.clone(), h._id.clone())));
     let found = hits.len();
-    (hits.into_iter().skip(from).take(size).collect(), found)
+    let scored = sort.is_none_or(SortSpec::scores);
+    let page = hits
+        .into_iter()
+        .skip(from)
+        .take(size)
+        .map(|mut h| {
+            if !scored {
+                h._score = None;
+            }
+            h
+        })
+        .collect();
+    (page, found)
+}
+
+/// Hits in the order of the request's `sort` (by their `sort` values), ties
+/// and requests without one in [`hit_order`].
+pub fn order_hits(hits: &mut [Hit], sort: Option<&SortSpec>) {
+    match sort {
+        Some(spec) => hits.sort_by(|a, b| {
+            spec.compare(a.sort.as_deref().unwrap_or_default(), b.sort.as_deref().unwrap_or_default())
+                .then_with(|| hit_order(a, b))
+        }),
+        None => hits.sort_by(hit_order),
+    }
 }
 
 #[cfg(test)]
@@ -1110,6 +1137,7 @@ mod tests {
             _score: Some(score),
             _source: serde_json::json!({"timestamp": ts * 1000, "partition": p, "offset": off}),
             highlight: None,
+            sort: None,
         }
     }
 
@@ -1130,11 +1158,11 @@ mod tests {
     #[test]
     fn pages_tile_the_list() {
         let all: Vec<Hit> = (0..25).map(|i| hit("t", 1.0, 1000 + (i % 7), i % 3, i)).collect();
-        let (whole, n) = page(all.clone(), 0, 100);
+        let (whole, n) = page(all.clone(), 0, 100, None);
         assert_eq!(n, 25);
         let mut tiled = Vec::new();
         for from in (0..25).step_by(10) {
-            tiled.extend(page(all.clone(), from, 10).0);
+            tiled.extend(page(all.clone(), from, 10, None).0);
         }
         let ids = |v: &[Hit]| v.iter().map(|h| h._id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&tiled), ids(&whole));

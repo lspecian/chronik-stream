@@ -201,6 +201,7 @@ where
     use axum::response::IntoResponse;
 
     let (from, size) = (request.from, request.size);
+    let sort = chronik_search::sort::SortSpec::of(request.sort.as_deref());
     let shard = shard_request(&request);
     let peers = state.query_router.all_peers();
     let (local, fan_out) = tokio::join!(local_search_response_of(local), async {
@@ -220,7 +221,7 @@ where
         // The local search answered the whole window: page it here too.
         return match local {
             Ok(resp) => {
-                let mut merged = super::query_router::merge_search_responses(resp, Vec::new(), from, size);
+                let mut merged = super::query_router::merge_search_responses(resp, Vec::new(), from, size, sort.as_ref());
                 finish_counts(&request, &mut merged, 0);
                 axum::Json(merged).into_response()
             }
@@ -240,7 +241,7 @@ where
     match local {
         Ok(local_resp) => {
             let mut merged =
-                super::query_router::merge_search_responses(local_resp, fan_out.responses, from, size);
+                super::query_router::merge_search_responses(local_resp, fan_out.responses, from, size, sort.as_ref());
             // Hits are ranked, so a partial answer is still worth serving — but
             // `_shards.failed` has to say so, or a search that missed a node is
             // indistinguishable from one where that node held no match (issue #57).
@@ -255,6 +256,7 @@ where
                 fan_out.responses,
                 from,
                 size,
+                sort.as_ref(),
             );
             // The local search failed, so this answer is short by this node
             // too — count it with the peers that did not reply.

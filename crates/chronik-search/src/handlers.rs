@@ -119,6 +119,7 @@ fn hot_hit_to_es_hit(hit: crate::hot_text_index::HotHit) -> Hit {
         _score: Some(hit.score),
         _source: serde_json::Value::Object(source),
         highlight: None,
+        sort: hit.sort,
     }
 }
 
@@ -147,9 +148,10 @@ async fn search_hot_topic(
     if request.size == 0 {
         return Vec::new(); // no page to fill (counts and aggregations run separately)
     }
+    let sort = crate::sort::SortSpec::of(request.sort.as_deref());
 
     if let Some(query_text) = extract_simple_query_text(dsl) {
-        return match hot_idx.search_topic_with(topic, &query_text, k, stats).await {
+        return match hot_idx.search_topic_with(topic, &query_text, k, stats, sort.as_ref()).await {
             Ok(hits) => hits.into_iter().map(hot_hit_to_es_hit).collect(),
             Err(e) => {
                 debug!("hot text search for topic {} failed: {}", topic, e);
@@ -169,6 +171,7 @@ async fn search_hot_topic(
             },
             k,
             stats,
+            sort.as_ref(),
         )
         .await;
     match result {
@@ -201,6 +204,7 @@ async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest, stats: &T
     // The whole window: page `from` of the merge may come from here.
     let k = request.from.saturating_add(request.size);
     let simple_text = extract_simple_query_text(dsl);
+    let sort = crate::sort::SortSpec::of(request.sort.as_deref());
     let mut out = Vec::new();
     for topic in topics {
         if let Some(filter) = &request.index {
@@ -209,7 +213,7 @@ async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest, stats: &T
             }
         }
         match simple_text.as_ref() {
-            Some(q) => match hot_idx.search_topic_with(&topic, q, k, stats.get(&topic).map(|s| &**s)).await {
+            Some(q) => match hot_idx.search_topic_with(&topic, q, k, stats.get(&topic).map(|s| &**s), sort.as_ref()).await {
                 Ok(hits) => out.extend(hits.into_iter().map(hot_hit_to_es_hit)),
                 Err(e) => debug!("hot text search for topic {} failed: {}", topic, e),
             },
@@ -224,6 +228,7 @@ async fn search_hot_all(api: &Arc<SearchApi>, request: &SearchRequest, stats: &T
                         },
                         k,
                         stats.get(&topic).map(|s| &**s),
+                        sort.as_ref(),
                     )
                     .await;
                 match result {
@@ -391,7 +396,7 @@ pub async fn search_all(
         all_hits = merge_hot_and_cold_hits(hot_hits, all_hits);
     }
     // Every source returned its top `from + size`; page the merged list once.
-    let (all_hits, found) = crate::ranking::page(all_hits, request.from, request.size);
+    let (all_hits, found) = crate::ranking::page(all_hits, request.from, request.size, crate::sort::SortSpec::of(request.sort.as_deref()).as_ref());
 
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
 
@@ -563,7 +568,7 @@ pub async fn search_index(
         None => cold_hits,
     };
     // Every source returned its top `from + size`; page the merged list once.
-    let (hits, found) = crate::ranking::page(hits, request.from, request.size);
+    let (hits, found) = crate::ranking::page(hits, request.from, request.size, crate::sort::SortSpec::of(request.sort.as_deref()).as_ref());
 
     // Exact count and aggregations over the topic's records (an index made
     // through the REST document API answers its own, above).
@@ -714,7 +719,10 @@ async fn search_stats(
     use futures::stream::{self, StreamExt};
 
     let mut by_topic: std::collections::HashMap<String, Vec<tantivy::Searcher>> = Default::default();
-    if is_unranked(request) || request.size == 0 {
+    // Statistics matter only to relevance scores: none for a search that
+    // does not rank, or sorts by other keys only.
+    let sorted_without_scores = crate::sort::SortSpec::of(request.sort.as_deref()).is_some_and(|s| !s.scores());
+    if is_unranked(request) || request.size == 0 || sorted_without_scores {
         return TopicStats::new();
     }
     if let Some(hot) = api.hot_text_index.as_ref() {
@@ -836,8 +844,10 @@ async fn search_cold_segments(
     // that make the merged top `window` are read afterwards: reading every
     // segment's own top `window` (and building its `_source`) was ~a fifth of
     // the CPU of a text query over 48 archives, for 10 hits kept of 480 read.
-    // An explicit `sort` orders by `_source` fields, so it still reads them.
-    let two_phase = request.sort.is_none();
+    // A `sort` (crate::sort) orders each segment by its sort keys instead,
+    // and its hits carry their sort values for the merge.
+    let sort = crate::sort::SortSpec::of(request.sort.as_deref());
+    let two_phase = sort.is_none();
     // The `window`-th best (score, second) ranked so far: later segments pass
     // over what cannot beat it (crate::ranking::Floor).
     let floor = Arc::new(std::sync::Mutex::new(seed));
@@ -936,7 +946,7 @@ async fn search_cold_segments(
                 // duplicates the merge will drop, and bound memory on a
                 // ranked query that reads thousands of segments.
                 if out.hits.len() > window.saturating_mul(2) {
-                    out.hits.sort_by(crate::ranking::hit_order);
+                    crate::ranking::order_hits(&mut out.hits, sort.as_ref());
                     out.hits.truncate(window.saturating_mul(2));
                 }
                 if unranked {
@@ -1548,9 +1558,29 @@ fn search_tantivy_index(
     // Execute search
     // The source's top `from + size`, unskipped: the merge pages once
     // (crate::ranking). Skipping `from` here skipped it once per segment.
-    let top_docs = crate::ranking::top_docs(searcher, &*query, request.from.saturating_add(request.size))
+    let window = request.from.saturating_add(request.size);
+    if let Some(spec) = crate::sort::SortSpec::of(request.sort.as_deref()) {
+        let sorted = crate::sort::top_sorted(searcher, &*query, &spec, window, None)
+            .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
+        return sorted_hits(sorted, |docs| hits_of_docs(index_name, index, searcher, docs));
+    }
+    let top_docs = crate::ranking::top_docs(searcher, &*query, window)
         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
     hits_of_docs(index_name, index, searcher, top_docs)
+}
+
+/// Hits for sorted documents (crate::sort), each with its sort values:
+/// `build` turns (score, address) pairs into hits in the same order.
+fn sorted_hits(
+    sorted: Vec<(Vec<serde_json::Value>, tantivy::Score, tantivy::DocAddress)>,
+    build: impl FnOnce(Vec<(tantivy::Score, tantivy::DocAddress)>) -> Result<Vec<Hit>>,
+) -> Result<Vec<Hit>> {
+    let (values, docs): (Vec<_>, Vec<_>) = sorted.into_iter().map(|(v, s, a)| (v, (s, a))).unzip();
+    let mut hits = build(docs)?;
+    for (hit, v) in hits.iter_mut().zip(values) {
+        hit.sort = Some(v);
+    }
+    Ok(hits)
 }
 
 /// The request's query against one index; `None` when the index cannot
@@ -1622,6 +1652,7 @@ fn hits_of_docs(
                 _score: Some(score),
                 _source: serde_json::Value::Object(source),
                 highlight: None,
+                sort: None,
             });
             continue;
         }
@@ -1678,6 +1709,7 @@ fn hits_of_docs(
             _score: Some(score),
             _source: serde_json::Value::Object(source),
             highlight: None,
+            sort: None,
         });
     }
 
@@ -1805,12 +1837,25 @@ async fn search_in_index(
     };
 
     // Execute search
-    let top_docs = searcher.search(&*query, &TopDocs::with_limit(request.from.saturating_add(request.size)).order_by_score())
-        .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?;
-    
+    let window = request.from.saturating_add(request.size);
+    let top_docs: Vec<(Option<Vec<serde_json::Value>>, tantivy::Score, tantivy::DocAddress)> =
+        match crate::sort::SortSpec::of(request.sort.as_deref()) {
+            Some(spec) => crate::sort::top_sorted(&searcher, &*query, &spec, window, None)
+                .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?
+                .into_iter()
+                .map(|(v, s, a)| (Some(v), s, a))
+                .collect(),
+            None => searcher
+                .search(&*query, &TopDocs::with_limit(window).order_by_score())
+                .map_err(|e| Error::Internal(format!("Search failed: {}", e)))?
+                .into_iter()
+                .map(|(s, a)| (None, s, a))
+                .collect(),
+        };
+
     // Collect results
     let mut hits = Vec::new();
-    for (score, doc_address) in top_docs {
+    for (sort_values, score, doc_address) in top_docs {
         let doc: tantivy::TantivyDocument = searcher.doc(doc_address)
             .map_err(|e| Error::Internal(format!("Failed to retrieve document: {}", e)))?;
         
@@ -1857,6 +1902,7 @@ async fn search_in_index(
             _score: Some(score),
             _source: serde_json::Value::Object(source),
             highlight,
+            sort: sort_values,
         });
     }
     
@@ -2881,6 +2927,7 @@ mod hot_merge_tests {
             _score: Some(score),
             _source: serde_json::json!({}),
             highlight: None,
+            sort: None,
         }
     }
 
@@ -3039,6 +3086,7 @@ mod hot_merge_tests {
             score: 0.75,
             key: Some("k1".into()),
             value: "payload text".into(),
+            sort: None,
         };
         let es = hot_hit_to_es_hit(hh);
         assert_eq!(es._index, "orders");
@@ -3378,6 +3426,7 @@ mod unranked_stop_tests {
             _score: Some(1.0),
             _source: serde_json::json!({"timestamp": ts * 1000, "partition": 0, "offset": ts}),
             highlight: None,
+            sort: None,
         }
     }
 
@@ -3503,7 +3552,7 @@ mod legacy_index_tests {
         for idx in sources {
             hits.extend(search_tantivy_index("orders", idx, &query_searcher(idx).unwrap(), &window).unwrap());
         }
-        crate::ranking::page(hits, from, size).0.into_iter().map(|h| h._id).collect()
+        crate::ranking::page(hits, from, size, None).0.into_iter().map(|h| h._id).collect()
     }
 
     #[test]

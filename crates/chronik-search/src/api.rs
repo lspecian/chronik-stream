@@ -290,7 +290,19 @@ pub struct GeoPolygonQuery {
 #[serde(untagged)]
 pub enum SortClause {
     Field(String),
-    Object(HashMap<String, SortOrder>),
+    Object(HashMap<String, SortOrderSpec>),
+}
+
+/// A sort key's order: `"desc"`, or `{"order": "desc"}` as Elasticsearch also
+/// accepts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SortOrderSpec {
+    Order(SortOrder),
+    Options {
+        #[serde(default)]
+        order: Option<SortOrder>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,6 +393,10 @@ pub struct Hit {
     pub _source: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlight: Option<HashMap<String, Vec<String>>>,
+    /// The hit's values of the request's sort keys (crate::sort), as in
+    /// Elasticsearch; absent when the request has no `sort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Vec<serde_json::Value>>,
 }
 
 /// Index document request
