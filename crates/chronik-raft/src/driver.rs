@@ -913,6 +913,22 @@ mod tests {
             }
         }
 
+        /// Propose `create:<name>` to the current leader, again to whoever
+        /// leads next if leadership moves before it is applied. A leader that
+        /// was just elected can be deposed by a slow follower's election
+        /// (seen on the CI runner: OutcomeUnknown). Creating a name twice is
+        /// harmless in this state machine, so a retry is what a client does.
+        async fn create_on_leader(&self, name: &str) -> Applied {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match create(&self.h(self.leader().await), name).await {
+                    Ok(applied) => return applied,
+                    Err(e) => assert!(Instant::now() < deadline, "create {name} never applied: {e}"),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
         /// Wait until every running node has applied `index`.
         async fn settle(&self, index: u64) {
             for d in self.drivers.values() {
@@ -1038,12 +1054,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn leader_failover_and_rejoin() {
         let mut c = Cluster::new(&[1, 2, 3], config);
+        c.create_on_leader("before").await;
         let old = c.leader().await;
-        create(&c.h(old), "before").await.unwrap();
         c.stop(old);
         let new = c.leader().await;
         assert_ne!(new, old);
-        let r = create(&c.h(new), "after").await.unwrap();
+        let r = c.create_on_leader("after").await;
         c.start(old);
         c.settle(r.index).await;
         let want = BTreeSet::from(["before".to_string(), "after".to_string()]);
