@@ -346,3 +346,33 @@ growing after archiving caught up (trimming only marks deletions; merging
 10M docs does not keep up), memory doubled and queries ran 6x slower. It
 needs reclaim once the archive covers a partition (rebuild rather than
 merge) and faster hot ingestion (it lagged 25 s) before it can be a default.
+
+### Query latency at 10M (2026-11-25, branch perf/search-query-latency)
+
+Same corpus, machine and day; 10M records, one partition, 48 archives
+(unmerged), 8 query clients for 60 s, `AGGS=1`:
+
+| | Chronik before | Chronik after | OpenSearch 2.19.1 |
+|---|---|---|---|
+| Query rounds | 7.3K | **18.4K** | 14.3K |
+| match_text p50 | 9.9 ms | 4.2 ms | **0.96 ms** |
+| term p50 | 17.0 ms | **6.9 ms** | 18.0 ms |
+| bool text + filter p50 | 12.0 ms | 7.1 ms | **4.6 ms** |
+| match_all p50 | 1.5 ms | 1.25 ms | **0.65 ms** |
+| range + terms agg p50 | 0.54 ms | **0.47 ms** | 0.53 ms |
+| date_histogram p50 | 21.6 ms | **4.4 ms** | 6.7 ms |
+| Memory | 3.1 GB | **3.1 GB** | 7.2 GB |
+
+What changed: archives are ranked on their rank columns and only the page's
+documents are read; a floor (the hot index's page, then the best so far)
+lets later archives pass over documents that cannot place; archived rank
+columns are opened once; aggregation partials merge pairwise, the merged
+share of an unchanged archive set is cached, and final aggregations are
+written straight from Tantivy's result. Answers are identical.
+
+Still behind on a single text term: OpenSearch scores it with block-max
+WAND and visits a few blocks. Tantivy's block-max pruning cannot be used on
+Chronik's JSON field: Tantivy keeps no fieldnorms for JSON fields and writes
+zero block maxima, so `for_each_pruning` skips nearly every match (8 of 5,000
+in a minimal index). Using it needs block maxima written for unnormed fields
+(a Tantivy change) and archives rebuilt (`POST /admin/reindex`).
