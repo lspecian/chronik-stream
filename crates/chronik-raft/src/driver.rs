@@ -957,8 +957,8 @@ mod tests {
         for id in [1, 2, 3] {
             assert!(c.sms[&id].set().contains("restored"), "node {id} did not restore");
         }
-        let leader = c.leader().await;
-        let applied = create(&c.h(leader), "after").await.unwrap();
+        c.leader().await;
+        let applied = c.create_on_leader("after").await;
         assert!(applied.index > 50, "committed at {} inside the restored range", applied.index);
         assert!(applied.term > 3);
         c.settle(applied.index).await;
@@ -998,7 +998,7 @@ mod tests {
             create(&c.h(follower), "x").await,
             Err(ProposeError::NotLeader { leader: Some(leader) })
         );
-        let r = create(&c.h(leader), "x").await.unwrap();
+        let r = c.create_on_leader("x").await;
         c.settle(r.index).await;
         for id in &c.ids {
             assert_eq!(c.sms[id].set(), BTreeSet::from(["x".to_string()]), "node {}", id);
@@ -1110,7 +1110,7 @@ mod tests {
         c.stop(down);
         let mut last = 0;
         for i in 0..100 {
-            last = create(&c.h(leader), &format!("k{}", i)).await.unwrap().index;
+            last = c.create_on_leader(&format!("k{}", i)).await.index;
         }
         c.start(down);
         c.settle(last).await;
@@ -1166,7 +1166,7 @@ mod tests {
         let leader = c.leader().await;
         let mut last = 0;
         for i in 0..20 {
-            last = create(&c.h(leader), &format!("w{}", i)).await.unwrap().index;
+            last = c.create_on_leader(&format!("w{}", i)).await.index;
         }
         c.settle(last).await;
         let victim = *c.ids.iter().find(|&&i| i != leader).unwrap();
@@ -1187,6 +1187,6 @@ mod tests {
         assert!(failed.contains("lost raft state"), "{}", failed);
         assert!(failed.contains("CHRONIK_CLUSTER_JOIN"), "{}", failed);
         // The rest of the cluster keeps working.
-        create(&c.h(leader), "after-wipe").await.unwrap();
+        c.create_on_leader("after-wipe").await;
     }
 }
