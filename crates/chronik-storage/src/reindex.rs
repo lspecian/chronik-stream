@@ -1,10 +1,12 @@
 //! Rebuild a node's archived search indexes from its raw tier.
 //!
 //! Every archived record is also kept as raw batches (`segments/…`, see
-//! `archive`). A reindex re-reads them and writes each archive anew with the
-//! current schema: archives written before the JSON field had columns answer
-//! neither range queries nor aggregations, and a rebuilt one does. Also a
-//! repair: an archive is rebuilt whole from the records it covers.
+//! `archive`). A reindex re-reads them and writes each archive anew as the
+//! current version writes it: archives written before the JSON field had
+//! columns answer neither range queries nor aggregations, and archives written
+//! before v2.20.2 keep their records in offset order, which makes ranked
+//! searches read every tie; a rebuilt one has both. Also a repair: an archive
+//! is rebuilt whole from the records it covers.
 //!
 //! Safety, as for merges (`archive_merge`):
 //! - An archive is rebuilt only when the raw tier holds every record it
@@ -64,13 +66,17 @@ pub struct Progress {
     pub last_error: Option<String>,
 }
 
-/// Whether an archive's schema is the current one: its JSON field has
-/// columns (ranges and aggregations need them).
-pub fn is_current(schema: &tantivy::schema::Schema) -> bool {
-    schema
+/// Whether an archive is written as current versions write it: its JSON
+/// field has columns (ranges and aggregations need them), and it keeps its
+/// records newest first (`tantivy_segment::archive_settings`; ranked searches
+/// stop reading ties early, and merges keep the order).
+pub fn is_current(index: &tantivy::Index) -> bool {
+    let schema = index.schema();
+    let json_columns = schema
         .get_field(crate::json_index::JSON_FIELD)
         .map(|f| schema.get_field_entry(f).field_type().is_fast())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    json_columns && index.settings() == &crate::tantivy_segment::archive_settings()
 }
 
 /// Rebuild one archive from the raw tier (see the module docs).
@@ -79,7 +85,7 @@ pub async fn rebuild(indexer: &WalIndexer, entry: &SegmentMetadata, force: bool,
     if !force {
         let scratch = tempfile::tempdir().map_err(|e| Error::Internal(format!("reindex temp dir: {e}")))?;
         let reader = crate::archive_merge::open_source(&store, &entry.object_store_path, scratch.path()).await?;
-        if is_current(&reader.index().schema()) {
+        if is_current(reader.index()) {
             return Ok(Outcome::Current);
         }
     }

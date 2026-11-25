@@ -433,11 +433,14 @@ pub async fn merge_run(
     for (i, s) in run.iter().enumerate() {
         readers.push(open_source(store, &s.object_store_path, &work.path().join(format!("src-{i}"))).await?);
     }
-    let schema = readers[0].index().schema();
-    if readers.iter().any(|r| r.index().schema() != schema) {
-        // Archives written by different versions (fields were added over
-        // time) cannot be merged together: merge each stretch of one schema.
-        let schemas: Vec<_> = readers.iter().map(|r| r.index().schema()).collect();
+    // Archives written by different versions cannot be merged together:
+    // fields were added over time, and archives written since v2.20.2 keep
+    // their records newest first (index sorting, `archive_settings`) while
+    // older ones are in offset order. Merge each stretch of one kind.
+    let kind = |r: &TantivySegmentReader| (r.index().schema(), r.index().settings().clone());
+    let first_kind = kind(&readers[0]);
+    if readers.iter().any(|r| kind(r) != first_kind) {
+        let schemas: Vec<_> = readers.iter().map(kind).collect();
         drop(readers);
         let (mut merges, mut archives, mut raced) = (0, 0, false);
         let mut start = 0;
@@ -754,6 +757,110 @@ mod tests {
             encryption: None,
         };
         Arc::from(ObjectStoreFactory::create(config).await.unwrap())
+    }
+
+    /// An archive of 10 records from `base` whose timestamps are seconds apart
+    /// and out of offset order (as producers' own timestamps can be), written
+    /// with `settings`, registered.
+    async fn spread_archive(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentIndex>, base: i64, settings: tantivy::IndexSettings) {
+        let ts = |o: i64| 1_700_000_000_000 + ((o * 7919) % 50) * 1000 + o;
+        let records = (base..base + 10)
+            .map(|o| CanonicalRecordEntry {
+                offset: o,
+                timestamp: ts(o),
+                key: None,
+                value: Some(format!("{{\"n\":{o}}}").into_bytes()),
+                headers: vec![],
+                attributes: 0,
+            })
+            .collect();
+        let batch = CanonicalRecord {
+            base_offset: base,
+            partition_leader_epoch: 0,
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            is_transactional: false,
+            is_control: false,
+            compression: CompressionType::None,
+            timestamp_type: TimestampType::CreateTime,
+            base_timestamp: ts(base),
+            max_timestamp: (base..base + 10).map(ts).max().unwrap(),
+            records,
+            compressed_records_wire_bytes: None,
+            original_v1_wire_format: None,
+            original_v2_wire_format: None,
+        };
+        let mut w = TantivySegmentWriter::with_settings("t".into(), 0, base, settings).unwrap();
+        w.write_batch(&batch).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let (path, _) = w.commit_and_serialize(out.path()).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        let key = format!("idx/t/partition-0/segment-{}-{}.tar", base, base + 9);
+        let size = data.len() as u64;
+        store.put(&key, bytes::Bytes::from(data)).await.unwrap();
+        index
+            .add_segment(SegmentMetadata { object_store_path: key, size_bytes: size, ..seg(base, base + 9, size) })
+            .await
+            .unwrap();
+    }
+
+    /// Whether every segment of the archive at `key` holds its records newest
+    /// (highest offset) first, and the archive says so (its index settings).
+    async fn newest_first(store: &Arc<dyn ObjectStore>, key: &str) -> (bool, bool) {
+        let reader = TantivySegmentReader::from_archive_bytes(store.get(key).await.unwrap()).unwrap();
+        let declared = reader.index().settings() == &crate::tantivy_segment::archive_settings();
+        let searcher = reader.searcher();
+        let ordered = searcher.segment_readers().iter().all(|s| {
+            let off = s.fast_fields().i64("_offset").unwrap();
+            let offsets: Vec<i64> = (0..s.max_doc()).map(|d| off.first(d).unwrap()).collect();
+            offsets.windows(2).all(|w| w[0] > w[1])
+        });
+        (declared, ordered)
+    }
+
+    #[tokio::test]
+    async fn archives_keep_their_records_newest_first_through_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(dir.path()).await;
+        let index = Arc::new(SegmentIndex::new());
+        for base in [0, 10, 20, 30] {
+            spread_archive(&store, &index, base, crate::tantivy_segment::archive_settings()).await;
+            let key = format!("idx/t/partition-0/segment-{}-{}.tar", base, base + 9);
+            assert_eq!(newest_first(&store, &key).await, (true, true), "written archive {key}");
+        }
+        let outcome = merge_all(&store, &index, &policy(), &mut Default::default()).await;
+        assert_eq!((outcome.merges, outcome.archives_merged), (1, 4));
+        let segs = index.get_segments_for_partition("t", 0).await.unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(newest_first(&store, &segs[0].object_store_path).await, (true, true), "merged archive");
+        let reader = TantivySegmentReader::from_archive_bytes(store.get(&segs[0].object_store_path).await.unwrap()).unwrap();
+        let offsets: Vec<i64> = reader.query_by_offset_range(0, 40).unwrap().iter().map(|r| r.offset).collect();
+        assert_eq!(offsets, (0..40).collect::<Vec<_>>(), "every record, read back in offset order");
+    }
+
+    /// Archives of earlier versions (offset order) and newest-first ones are
+    /// merged stretch by stretch, never together.
+    #[tokio::test]
+    async fn offset_order_and_newest_first_archives_merge_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(dir.path()).await;
+        let index = Arc::new(SegmentIndex::new());
+        for base in [0, 10, 20, 30] {
+            spread_archive(&store, &index, base, tantivy::IndexSettings::default()).await;
+        }
+        for base in [40, 50, 60, 70] {
+            spread_archive(&store, &index, base, crate::tantivy_segment::archive_settings()).await;
+        }
+        let outcome = merge_all(&store, &index, &policy(), &mut Default::default()).await;
+        assert_eq!((outcome.merges, outcome.archives_merged), (2, 8));
+        let segs = index.get_segments_for_partition("t", 0).await.unwrap();
+        let spans: Vec<(i64, i64)> = segs.iter().map(|s| (s.min_offset, s.max_offset)).collect();
+        assert_eq!(spans, vec![(0, 39), (40, 79)]);
+        // Also shows an archive written without the setting is oldest first,
+        // so the order above is the sorting's doing.
+        assert_eq!(newest_first(&store, &segs[0].object_store_path).await, (false, false), "older stretch stays as it was");
+        assert_eq!(newest_first(&store, &segs[1].object_store_path).await, (true, true));
     }
 
     /// `n` archives of 10 records each (offsets 0..10n), registered, in either

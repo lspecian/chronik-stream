@@ -405,3 +405,39 @@ bool 4.56 ms, match_all 0.65 ms. What remains is per-archive overhead: each of
 48 archives builds a scorer and looks up its terms per query.
 Test: `tests/cluster/e2e/search_scoring_across_archives.sh` (fails on the
 previous binary: the oldest copies ranked first).
+
+### Archives highest offset first (2026-11-25)
+
+Merging the 48 archives of the 10M benchmark into 3 (the production default)
+made searches slower, not faster: match_all 0.68 -> 27 ms, term 3.2 -> 12 ms.
+Equal scores rank newest first, but archives held records oldest first, and
+Tantivy reads matches in document order, so every later tie beat the ones
+held and a 3.3M-record archive was read whole. These 10M records span about
+30 seconds (330K records a second), so even sorting by timestamp left each
+second oldest first.
+
+Archives are now written with Tantivy index sorting on `_offset` descending
+(`tantivy_segment::archive_settings`); merges keep it, and runs of the two
+orders merge separately. A document later in such a segment has a lower
+offset than every earlier one, so it beats an equal-scoring one only with a
+newer second; per block of 1,024 documents, the newest second from there to
+the end bounds that. Once nothing later can place, ties stop being read (the
+collector's threshold becomes strict, so Block-WAND skips them) and match_all
+stops walking. The merged archives here have 18 late-stamped records in 3.7M
+(concurrent producers); they cost only their blocks. Older archives keep
+working as before; a plain `POST /admin/reindex` rewrites them.
+
+10M records, 3 merged archives, 8 VUs, 60 s, p50 (answers identical):
+
+| | merged, oldest first | merged, highest offset first | OpenSearch |
+|---|---|---|---|
+| rounds | 6,482 | 36,777 | 14,250 |
+| match_text | 5.31 ms | 0.44 ms | 0.96 ms |
+| term | 10.13 ms | 0.42 ms | 17.96 ms |
+| bool | 12.90 ms | 7.43 ms | 4.56 ms |
+| match_all | 35.67 ms | 0.26 ms | 0.65 ms |
+| range + terms agg | 0.34 ms | 0.17 ms | 0.53 ms |
+| date_histogram | 4.06 ms | 3.33 ms | 6.70 ms |
+
+Still behind: bool (a text match AND a filter term): the intersection seeks
+through postings with a single-level skip list (quickwit-oss/tantivy#3287).

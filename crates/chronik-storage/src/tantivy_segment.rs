@@ -106,6 +106,26 @@ fn add_json_document(doc: &mut TantivyDocument, json_field: Field, value: &[u8])
     }
 }
 
+/// Archives keep their records newest first: highest offset first (Tantivy
+/// index sorting on `_offset`, descending; merges of such archives stay
+/// sorted). Search ranks equal scores by timestamp second, then offset, newest
+/// first, and Tantivy reads matches in document order: when an archive's
+/// timestamps do not go back as offsets rise (broker timestamps never do,
+/// producer timestamps rarely), its document order is that rank order, so a
+/// search stops reading ties once its page is full and `match_all` reads only
+/// its first records. Stored oldest first, every tie beat the ones before it,
+/// and a 3.3M-record merged archive was read whole on every search (match_all
+/// 27 ms, a common term 12 ms at 10M records).
+///
+/// Not `_ts`: a sort keeps records of one second in the order they were
+/// added, oldest first, and a burst puts hundreds of thousands in one second.
+pub fn archive_settings() -> tantivy::IndexSettings {
+    tantivy::IndexSettings {
+        sort_by_field: Some(tantivy::IndexSortByField { field: "_offset".to_string(), order: tantivy::Order::Desc }),
+        ..Default::default()
+    }
+}
+
 /// Metadata for a Tantivy segment
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentMetadata {
@@ -160,13 +180,27 @@ pub struct TantivySegmentWriter {
 impl TantivySegmentWriter {
     /// A writer whose index is built on disk; finish with `commit_and_serialize`.
     pub fn new(topic: String, partition: i32, base_offset: i64) -> Result<Self> {
+        Self::with_settings(topic, partition, base_offset, archive_settings())
+    }
+
+    /// [`Self::new`] with other index settings: tests write archives as
+    /// earlier versions did (offset order) with it.
+    pub(crate) fn with_settings(
+        topic: String,
+        partition: i32,
+        base_offset: i64,
+        settings: tantivy::IndexSettings,
+    ) -> Result<Self> {
         let dir = tempfile::tempdir()
             .map_err(|e| Error::Internal(format!("Failed to create temp dir: {}", e)))?;
         let index_dir = dir.path().join("index");
         fs::create_dir_all(&index_dir)
             .map_err(|e| Error::Internal(format!("Failed to create index dir: {}", e)))?;
         let (schema, _) = SchemaFields::build_schema();
-        let index = Index::create_in_dir(&index_dir, schema)
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_dir(&index_dir)
             .map_err(|e| Error::Internal(format!("Failed to create disk index: {}", e)))?;
         Self::with_index(index, Some(dir), topic, partition, base_offset)
     }
@@ -174,7 +208,12 @@ impl TantivySegmentWriter {
     /// A writer whose index stays in memory; finish with `commit`.
     pub fn new_in_ram(topic: String, partition: i32, base_offset: i64) -> Result<Self> {
         let (schema, _) = SchemaFields::build_schema();
-        Self::with_index(Index::create_in_ram(schema), None, topic, partition, base_offset)
+        let index = Index::builder()
+            .schema(schema)
+            .settings(archive_settings())
+            .create_in_ram()
+            .map_err(|e| Error::Internal(format!("Failed to create RAM index: {}", e)))?;
+        Self::with_index(index, None, topic, partition, base_offset)
     }
 
     fn with_index(

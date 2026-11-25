@@ -60,6 +60,12 @@ struct RankFields {
     offset: &'static str,
     /// Absent when the index holds a single partition.
     partition: Option<&'static str>,
+    /// Every segment keeps its documents highest offset first (an archive
+    /// written with `archive_settings`; one partition): a document scoring
+    /// the same as an earlier one ranks higher only with a newer timestamp
+    /// second, so once no document still to come is newer
+    /// ([`RankColumns::newest_from`]) ties stop being read.
+    newest_first: bool,
 }
 
 impl RankFields {
@@ -72,18 +78,45 @@ impl RankFields {
             schema.get_field(name).map(|f| schema.get_field_entry(f).is_fast()).unwrap_or(false)
         };
         let candidates = [
-            RankFields { timestamp: ARCHIVE_TIMESTAMP, timestamp_is_date: true, offset: "_offset", partition: None },
+            RankFields {
+                timestamp: ARCHIVE_TIMESTAMP,
+                timestamp_is_date: true,
+                offset: "_offset",
+                partition: None,
+                newest_first: false,
+            },
             RankFields {
                 timestamp: "_timestamp",
                 timestamp_is_date: true,
                 offset: "_offset",
                 partition: Some("_partition"),
+                newest_first: false,
             },
-            RankFields { timestamp: "timestamp", timestamp_is_date: false, offset: "offset", partition: None },
+            RankFields {
+                timestamp: "timestamp",
+                timestamp_is_date: false,
+                offset: "offset",
+                partition: None,
+                newest_first: false,
+            },
         ];
         candidates.into_iter().find(|c| {
             fast(c.timestamp) && fast(c.offset) && c.partition.map_or(true, |p| fast(p))
         })
+    }
+
+    /// [`Self::detect`], noting whether the index keeps documents newest first.
+    fn of(searcher: &Searcher) -> Option<Self> {
+        let fields = Self::detect(searcher.schema())?;
+        let newest_first = fields.timestamp == ARCHIVE_TIMESTAMP
+            && fields.partition.is_none()
+            && searcher
+                .index()
+                .settings()
+                .sort_by_field
+                .as_ref()
+                .is_some_and(|s| s.field == fields.offset && s.order == tantivy::Order::Desc);
+        Some(Self { newest_first, ..fields })
     }
 }
 
@@ -155,7 +188,7 @@ pub(crate) fn ranked_docs(
     floor: Option<Floor>,
     stats: Option<&CorpusStats>,
 ) -> tantivy::Result<Option<Vec<(RankKey, DocAddress)>>> {
-    let Some(fields) = RankFields::detect(searcher.schema()) else {
+    let Some(fields) = RankFields::of(searcher) else {
         return Ok(None);
     };
     if limit == 0 {
@@ -231,7 +264,18 @@ struct RankColumns {
     ts: TsColumn,
     offset: Option<Col>,
     partition: Option<Col>,
+    /// In a segment kept highest offset first (`RankFields::newest_first`):
+    /// per block of `SUFFIX_BLOCK` documents, the newest second of every
+    /// document from that block to the end. Built once per segment (one pass
+    /// over the timestamp column). Exact rank order would need timestamps
+    /// that never rise along the segment; a few records stamped late by one
+    /// producer among several (18 in a 3.7M-record archive at 10M) cost only
+    /// the blocks around them.
+    newest_after: Option<Box<[i64]>>,
 }
+
+/// Documents per block of `RankColumns::newest_after`.
+const SUFFIX_BLOCK_SHIFT: u32 = 10;
 
 enum TsColumn {
     Date(std::sync::Arc<dyn tantivy::columnar::ColumnValues<tantivy::DateTime>>),
@@ -251,7 +295,32 @@ impl RankColumns {
         } else {
             i64col(fields.timestamp).map_or(TsColumn::Missing, TsColumn::Millis)
         };
-        RankColumns { ts, offset: i64col(fields.offset), partition: fields.partition.and_then(i64col) }
+        let mut cols =
+            RankColumns { ts, offset: i64col(fields.offset), partition: fields.partition.and_then(i64col), newest_after: None };
+        if fields.newest_first && !matches!(cols.ts, TsColumn::Missing) {
+            let max_doc = segment.max_doc();
+            let blocks = (max_doc as usize).div_ceil(1 << SUFFIX_BLOCK_SHIFT);
+            let mut newest = vec![i64::MIN; blocks];
+            for doc in 0..max_doc {
+                let b = (doc >> SUFFIX_BLOCK_SHIFT) as usize;
+                newest[b] = newest[b].max(cols.second(doc));
+            }
+            for b in (0..blocks.saturating_sub(1)).rev() {
+                newest[b] = newest[b].max(newest[b + 1]);
+            }
+            cols.newest_after = Some(newest.into_boxed_slice());
+        }
+        cols
+    }
+
+    /// No document at or after `doc` has a newer second than this. Only for a
+    /// segment kept highest offset first (else the segment's newest).
+    #[inline]
+    fn newest_from(&self, doc: DocId) -> i64 {
+        match &self.newest_after {
+            Some(n) => n.get((doc >> SUFFIX_BLOCK_SHIFT) as usize).copied().unwrap_or(i64::MIN),
+            None => self.newest_second(),
+        }
     }
 
     /// The segment's columns for `fields`, from the cache when it holds them.
@@ -325,9 +394,16 @@ struct RankSegmentCollector {
     ord: tantivy::SegmentOrdinal,
     limit: usize,
     floor: Option<Floor>,
-    /// The segment holds no record as new as the floor's second: a document
-    /// scoring the same as the floor cannot place, whatever its timestamp.
-    older_than_floor: bool,
+    /// No document still to come is newer than this second: the segment's
+    /// newest, and in a segment kept highest offset first, the newest from
+    /// the last document collected on ([`RankColumns::newest_from`]). A
+    /// document scoring the same as the floor cannot place once the floor is
+    /// newer.
+    bound_second: i64,
+    /// The segment is kept highest offset first: every document still to
+    /// come has a lower offset than every one held, so one scoring the same
+    /// as the worst held beats it only with a newer second.
+    newest_first: bool,
     cols: std::sync::Arc<RankColumns>,
     /// The best held; the root is the worst of them.
     best: std::collections::BinaryHeap<std::cmp::Reverse<Held>>,
@@ -343,7 +419,8 @@ impl tantivy::collector::Collector for RankCollector {
             ord,
             limit: self.limit,
             floor: self.floor,
-            older_than_floor: self.floor.is_some_and(|(_, second)| cols.newest_second() < second),
+            bound_second: cols.newest_second(),
+            newest_first: cols.newest_after.is_some(),
             cols,
             best: std::collections::BinaryHeap::with_capacity(self.limit + 1),
         })
@@ -387,10 +464,18 @@ impl tantivy::collector::Collector for RankCollector {
 impl RankSegmentCollector {
     /// The score a document must exceed to be passed to `collect`: just below
     /// the least one that can still place, since an equal score places when
-    /// its record is newer (the floor's, once no record here is as new, not).
+    /// its record is newer; that score itself where no record still to come
+    /// can be newer (`bound_second`, `newest_first`).
     fn threshold(&self) -> Score {
-        let floor = self.floor.map(|(s, _)| if self.older_than_floor { s } else { s.next_down() });
-        let held = (self.best.len() == self.limit).then(|| self.best.peek().expect("limit > 0").0 .0 .score.next_down());
+        let floor = self.floor.map(|(s, t)| if self.bound_second < t { s } else { s.next_down() });
+        let held = (self.best.len() == self.limit).then(|| {
+            let worst = &self.best.peek().expect("limit > 0").0 .0;
+            if self.newest_first && self.bound_second <= worst.timestamp_s {
+                worst.score
+            } else {
+                worst.score.next_down()
+            }
+        });
         floor.into_iter().chain(held).fold(Score::MIN, Score::max)
     }
 }
@@ -399,12 +484,17 @@ impl tantivy::collector::SegmentCollector for RankSegmentCollector {
     type Fruit = Vec<Held>;
 
     fn collect(&mut self, doc: DocId, score: Score) {
-        let (below, mut timestamp_s) = match self.floor {
-            Some((s, _)) if score == s && self.older_than_floor => (true, None),
-            floor => below_floor(floor, score, || self.cols.second(doc)),
-        };
-        if below {
-            return;
+        let mut timestamp_s = None;
+        if self.newest_first {
+            self.bound_second = self.cols.newest_from(doc);
+        }
+        if let Some((s, t)) = self.floor {
+            if score < s {
+                return;
+            }
+            if score == s && (self.bound_second < t || *timestamp_s.get_or_insert_with(|| self.cols.second(doc)) < t) {
+                return;
+            }
         }
         if self.best.len() == self.limit {
             let worst = &self.best.peek().expect("limit > 0").0 .0;
@@ -506,12 +596,31 @@ fn newest_of_all(searcher: &Searcher, fields: RankFields, limit: usize, floor: O
             break; // no later segment can do better
         }
         // Newest documents first: records are mostly added in time order, so
-        // walking backwards fills `best` at once and every older document is
-        // then passed over on one comparison. Forwards, each newer document
-        // replaced one held (a heap pop and push per document).
+        // walking from the newest fills `best` at once and every older
+        // document is then passed over on one comparison. From the oldest,
+        // each newer document replaced one held (a heap pop and push per
+        // document). In a segment kept highest offset first the newest come
+        // first, and the walk stops once no document from here on can place:
+        // none is newer than the worst held, nor as new with a higher offset
+        // (offsets only fall from here). The worst held may come from another
+        // segment, so its offset is compared rather than assumed higher.
         let reader = &readers[seg.ord as usize];
         let alive = reader.alive_bitset();
-        for doc in (0..reader.max_doc()).rev() {
+        let ordered = seg.cols.newest_after.is_some();
+        let docs: Box<dyn Iterator<Item = DocId>> =
+            if fields.newest_first { Box::new(0..reader.max_doc()) } else { Box::new((0..reader.max_doc()).rev()) };
+        for doc in docs {
+            if ordered {
+                let newest = seg.cols.newest_from(doc);
+                let beaten = best.len() == limit
+                    && best.peek().is_some_and(|w| {
+                        let w = &w.0 .0;
+                        newest < w.timestamp_s || (newest == w.timestamp_s && seg.cols.offset(doc) < w.offset)
+                    });
+                if newest < oldest_s || beaten {
+                    break;
+                }
+            }
             if alive.is_some_and(|a| a.is_deleted(doc)) {
                 continue;
             }
@@ -616,6 +725,19 @@ pub fn page(mut hits: Vec<Hit>, from: usize, size: usize) -> (Vec<Hit>, usize) {
 mod tests {
     use super::*;
 
+    /// An index in insertion order, or highest offset first as archives are
+    /// written (`chronik_storage::tantivy_segment::archive_settings`).
+    fn new_index(schema: tantivy::schema::Schema, newest_first: bool) -> tantivy::Index {
+        if !newest_first {
+            return tantivy::Index::create_in_ram(schema);
+        }
+        let settings = tantivy::IndexSettings {
+            sort_by_field: Some(tantivy::IndexSortByField { field: "_offset".to_string(), order: tantivy::Order::Desc }),
+            ..Default::default()
+        };
+        tantivy::Index::builder().schema(schema).settings(settings).create_in_ram().unwrap()
+    }
+
     /// Every record in one second (a burst): offsets break the tie, and the
     /// segment-skipping top-N still matches ranking every document.
     #[test]
@@ -657,18 +779,29 @@ mod tests {
     #[test]
     fn match_all_skips_segments_without_changing_the_answer() {
         use tantivy::schema::{Schema, FAST, INDEXED, STORED};
-        for (date, ts_name, off_name) in [(true, "_ts", "_offset"), (false, "timestamp", "offset")] {
+        // sorted: highest offset first, as archives are written; burst: every
+        // timestamp rising with the offset, ~140 records a second, a few
+        // stamped 3 s late (several producers on one partition); otherwise
+        // some records are stamped far in the past.
+        for (date, ts_name, off_name, sorted, burst) in
+            [
+                (true, "_ts", "_offset", false, false),
+                (true, "_ts", "_offset", true, false),
+                (true, "_ts", "_offset", true, true),
+                (false, "timestamp", "offset", false, false),
+            ]
+        {
             let mut sb = Schema::builder();
             let ts = if date { sb.add_date_field(ts_name, INDEXED | STORED | FAST) } else { sb.add_i64_field(ts_name, INDEXED | STORED | FAST) };
             let off = sb.add_i64_field(off_name, INDEXED | STORED | FAST);
-            let index = tantivy::Index::create_in_ram(sb.build());
+            let index = new_index(sb.build(), sorted);
             let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
             // 8 commits = 8 segments; ms timestamps mostly rising with offset,
             // every 7th record from the past, several per second.
             let mut o = 0i64;
             for _ in 0..8 {
                 for _ in 0..300 {
-                    let ms = if o % 7 == 0 { 1_000 + o * 3 } else { 1_000_000 + o * 300 };
+                    let ms = if burst { 1_000_000 + o * 7 - if o % 997 == 0 { 3_000 } else { 0 } } else if o % 7 == 0 { 1_000 + o * 3 } else { 1_000_000 + o * 300 };
                     let mut d = tantivy::TantivyDocument::new();
                     if date {
                         d.add_date(ts, tantivy::DateTime::from_timestamp_millis(ms));
@@ -685,18 +818,117 @@ mod tests {
             w.commit().unwrap();
             let reader = index.reader().unwrap();
             let searcher = reader.searcher();
+            let fields = RankFields::of(&searcher).unwrap();
+            for r in searcher.segment_readers() {
+                assert_eq!(RankColumns::of(r, fields).newest_after.is_some(), sorted, "kept highest offset first");
+            }
             assert!(searcher.segment_readers().len() > 1);
             // Same scores (1.0), but not an AllQuery: ranks every document.
             let every = tantivy::query::BooleanQuery::new(vec![(
                 tantivy::query::Occur::Must,
                 Box::new(tantivy::query::AllQuery) as Box<dyn Query>,
             )]);
+            // Independent of both: every document's whole key.
+            let reference = |limit: usize| -> Vec<DocAddress> {
+                let (ts_name, off_name) = (ts_name.to_string(), off_name.to_string());
+                let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
+                    let ff = segment.fast_fields();
+                    let of = ff.i64(&off_name).unwrap();
+                    let second: Box<dyn Fn(DocId) -> i64> = if date {
+                        let t = ff.date(&ts_name).unwrap();
+                        Box::new(move |d| t.first(d).unwrap().into_timestamp_secs())
+                    } else {
+                        let t = ff.i64(&ts_name).unwrap();
+                        Box::new(move |d| t.first(d).unwrap().div_euclid(1000))
+                    };
+                    move |doc: DocId, score: Score| RankKey {
+                        score,
+                        timestamp_s: second(doc),
+                        neg_partition: 0,
+                        offset: of.first(doc).unwrap(),
+                    }
+                });
+                searcher.search(&tantivy::query::AllQuery, &collector).unwrap().into_iter().map(|(_, a)| a).collect()
+            };
             for limit in [1, 10, 299, 300, 301, 2_000, 5_000] {
                 let fast = top_docs(&searcher, &tantivy::query::AllQuery, limit).unwrap();
                 let full = top_docs(&searcher, &every, limit).unwrap();
                 let addrs = |v: &[(Score, DocAddress)]| v.iter().map(|(_, a)| *a).collect::<Vec<_>>();
-                assert_eq!(addrs(&fast), addrs(&full), "date={date} limit={limit}");
+                assert_eq!(addrs(&fast), reference(limit), "match_all date={date} sorted={sorted} burst={burst} limit={limit}");
+                assert_eq!(addrs(&full), reference(limit), "ranked date={date} sorted={sorted} burst={burst} limit={limit}");
                 assert!(fast.iter().all(|(s, _)| *s == 1.0));
+            }
+        }
+    }
+
+    /// In indexes kept highest offset first, reading stops only where nothing
+    /// later can place: (a) the 1,500 highest offsets stamped 10 minutes in
+    /// the past (a producer with a slow clock), so the newest seconds lie past
+    /// whole blocks of older ones; (b) two segments of one second with
+    /// interleaved offsets (an archive written by several indexing threads),
+    /// so a segment read later still holds higher offsets than the worst
+    /// held. Every answer equals ranking every document.
+    #[test]
+    fn newest_first_segments_stop_only_where_nothing_later_can_place() {
+        use tantivy::schema::{Schema, FAST, INDEXED, STORED, TEXT};
+        for case in ["slow clock", "interleaved segments"] {
+            let mut sb = Schema::builder();
+            let ts = sb.add_date_field("_ts", INDEXED | STORED | FAST);
+            let off = sb.add_i64_field("_offset", INDEXED | STORED | FAST);
+            let body = sb.add_text_field("body", TEXT);
+            let index = new_index(sb.build(), true);
+            let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            let doc = |o: i64, ms: i64| {
+                let mut d = tantivy::TantivyDocument::new();
+                d.add_date(ts, tantivy::DateTime::from_timestamp_millis(ms));
+                d.add_i64(off, o);
+                d.add_text(body, "timeout");
+                d
+            };
+            match case {
+                "slow clock" => {
+                    const N: i64 = 6_000;
+                    for o in 0..N {
+                        let ms = 1_000_000_000 + o * 20 - if o >= N - 1_500 { 600_000 } else { 0 };
+                        w.add_document(doc(o, ms)).unwrap();
+                    }
+                    w.commit().unwrap();
+                }
+                _ => {
+                    for parity in [0, 1] {
+                        for o in (parity..3_000).step_by(2) {
+                            w.add_document(doc(o, 1_000_000_000 + (o / 1_000) * 1_000)).unwrap();
+                        }
+                        w.commit().unwrap();
+                    }
+                }
+            }
+            let searcher = index.reader().unwrap().searcher();
+            let fields = RankFields::of(&searcher).unwrap();
+            assert!(searcher.segment_readers().iter().all(|r| RankColumns::of(r, fields).newest_after.is_some()));
+            let reference = |query: &dyn Query, limit: usize| -> Vec<DocAddress> {
+                let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
+                    let ff = segment.fast_fields();
+                    let (t, of) = (ff.date("_ts").unwrap(), ff.i64("_offset").unwrap());
+                    move |doc: DocId, score: Score| RankKey {
+                        score,
+                        timestamp_s: t.first(doc).unwrap().into_timestamp_secs(),
+                        neg_partition: 0,
+                        offset: of.first(doc).unwrap(),
+                    }
+                });
+                searcher.search(query, &collector).unwrap().into_iter().map(|(_, a)| a).collect()
+            };
+            let term = tantivy::query::TermQuery::new(
+                tantivy::Term::from_field_text(body, "timeout"),
+                tantivy::schema::IndexRecordOption::WithFreqs,
+            );
+            let addrs = |v: Vec<(Score, DocAddress)>| v.into_iter().map(|(_, a)| a).collect::<Vec<_>>();
+            for limit in [1, 10, 100, 1_000, 2_000] {
+                let all = addrs(top_docs(&searcher, &tantivy::query::AllQuery, limit).unwrap());
+                assert_eq!(all, reference(&tantivy::query::AllQuery, limit), "{case}: match_all limit={limit}");
+                let scored = addrs(top_docs(&searcher, &term, limit).unwrap());
+                assert_eq!(scored, reference(&term, limit), "{case}: term limit={limit}");
             }
         }
     }
@@ -722,117 +954,125 @@ mod tests {
                     .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
             ),
         );
-        let index = tantivy::Index::create_in_ram(sb.build());
-        let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
-        let mut o = 0i64;
-        for _ in 0..6 {
-            for _ in 0..3_000 {
-                // "alpha" 0-3 times in documents of 3 lengths: scores repeat a lot.
-                let text = format!("{} {}", "alpha ".repeat((o % 4) as usize), "filler ".repeat((o % 3) as usize * 4));
-                let ms = if o % 5 == 0 { 50_000 - o } else { 1_000_000 + o * 250 };
-                let mut d = tantivy::TantivyDocument::new();
-                d.add_date(ts, tantivy::DateTime::from_timestamp_millis(ms));
-                d.add_i64(off, o);
-                d.add_text(body, &text);
-                d.add_text(tag, ["red", "green", "blue"][(o % 7 % 3) as usize]);
-                let mut obj = std::collections::BTreeMap::new();
-                obj.insert("msg".to_string(), tantivy::schema::OwnedValue::Str(text.clone()));
-                obj.insert("level".to_string(), tantivy::schema::OwnedValue::Str(["error", "info"][(o % 11 % 2) as usize].into()));
-                d.add_object(json, obj);
-                w.add_document(d).unwrap();
-                o += 1;
-            }
-            w.commit().unwrap();
-        }
-        w.delete_term(tantivy::Term::from_field_i64(off, 1203));
-        w.delete_term(tantivy::Term::from_field_i64(off, 9_001));
-        w.commit().unwrap();
-        let searcher = index.reader().unwrap().searcher();
-        assert!(searcher.segment_readers().len() > 1);
-
-        let reference = |query: &dyn Query, limit: usize| -> Vec<DocAddress> {
-            let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
-                let ff = segment.fast_fields();
-                let t = ff.date("_ts").unwrap();
-                let of = ff.i64("_offset").unwrap();
-                move |doc: DocId, score: Score| RankKey {
-                    score,
-                    timestamp_s: t.first(doc).unwrap().into_timestamp_secs(),
-                    neg_partition: 0,
-                    offset: of.first(doc).unwrap(),
+        let schema = sb.build();
+        // In offset order, and newest second first as archives are written.
+        for (sorted, burst) in [(false, false), (true, false), (true, true)] {
+            let index = new_index(schema.clone(), sorted);
+            let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            let mut o = 0i64;
+            for _ in 0..6 {
+                for _ in 0..3_000 {
+                    // "alpha" 0-3 times in documents of 3 lengths: scores repeat a lot.
+                    let text = format!("{} {}", "alpha ".repeat((o % 4) as usize), "filler ".repeat((o % 3) as usize * 4));
+                    let ms = if burst { 1_000_000 + o * 7 - if o % 997 == 0 { 3_000 } else { 0 } } else if o % 5 == 0 { 50_000 - o } else { 1_000_000 + o * 250 };
+                    let mut d = tantivy::TantivyDocument::new();
+                    d.add_date(ts, tantivy::DateTime::from_timestamp_millis(ms));
+                    d.add_i64(off, o);
+                    d.add_text(body, &text);
+                    d.add_text(tag, ["red", "green", "blue"][(o % 7 % 3) as usize]);
+                    let mut obj = std::collections::BTreeMap::new();
+                    obj.insert("msg".to_string(), tantivy::schema::OwnedValue::Str(text.clone()));
+                    obj.insert("level".to_string(), tantivy::schema::OwnedValue::Str(["error", "info"][(o % 11 % 2) as usize].into()));
+                    d.add_object(json, obj);
+                    w.add_document(d).unwrap();
+                    o += 1;
                 }
-            });
-            searcher.search(query, &collector).unwrap().into_iter().map(|(_, a)| a).collect()
-        };
-        let text = tantivy::query::TermQuery::new(
-            tantivy::Term::from_field_text(body, "alpha"),
-            tantivy::schema::IndexRecordOption::WithFreqs,
-        );
-        let equal_scores = tantivy::query::ConstScoreQuery::new(Box::new(text.clone()), 1.0);
-        let term = |f, w: &str| -> Box<dyn Query> {
-            Box::new(tantivy::query::TermQuery::new(
-                tantivy::Term::from_field_text(f, w),
-                tantivy::schema::IndexRecordOption::WithFreqs,
-            ))
-        };
-        use tantivy::query::{BooleanQuery, Occur};
-        let union = BooleanQuery::new(vec![(Occur::Should, term(body, "alpha")), (Occur::Should, term(body, "filler"))]);
-        let filtered = BooleanQuery::new(vec![(Occur::Must, term(body, "alpha")), (Occur::Must, term(tag, "red"))]);
-        let must_filter = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(union.clone()) as Box<dyn Query>),
-            (Occur::Must, Box::new(tantivy::query::ConstScoreQuery::new(term(tag, "green"), 0.0))),
-        ]);
-        let parser = tantivy::query::QueryParser::for_index(&index, vec![]);
-        let json_term = parser.parse_query("j.msg:alpha").unwrap();
-        let json_union = parser.parse_query("j.msg:alpha OR j.msg:filler").unwrap();
-        let json_and = parser.parse_query("+j.msg:alpha +j.level:error").unwrap();
-        let json_filtered = BooleanQuery::new(vec![(Occur::Must, term(body, "alpha")), (Occur::Must, parser.parse_query("j.level:error").unwrap())]);
-        let queries: [(&str, &dyn Query); 9] = [
-            ("json_term", &*json_term),
-            ("json_union", &*json_union),
-            ("json_and", &*json_and),
-            ("json_filtered", &json_filtered),
-            ("bm25", &text),
-            ("constant", &equal_scores),
-            ("union", &union),
-            ("filtered", &filtered),
-            ("must_filter", &must_filter),
-        ];
-        for limit in [1, 7, 100, 399, 1_000, 5_000, 20_000] {
-            for (name, query) in queries {
-                let got: Vec<DocAddress> = top_docs(&searcher, query, limit).unwrap().into_iter().map(|(_, a)| a).collect();
-                assert_eq!(got, reference(query, limit), "{name} limit={limit}");
+                w.commit().unwrap();
             }
-        }
+            w.delete_term(tantivy::Term::from_field_i64(off, 1203));
+            w.delete_term(tantivy::Term::from_field_i64(off, 9_001));
+            w.commit().unwrap();
+            let searcher = index.reader().unwrap().searcher();
+            let fields = RankFields::of(&searcher).unwrap();
+            for r in searcher.segment_readers() {
+                assert_eq!(RankColumns::of(r, fields).newest_after.is_some(), sorted, "kept highest offset first");
+            }
+            assert!(searcher.segment_readers().len() > 1);
 
-        // A floor (another source's `limit`-th best) leaves out exactly the
-        // documents strictly below it, whether it is passed per document or
-        // lets whole segments and postings blocks be skipped.
-        for (name, query) in queries {
-            let all = ranked_docs(&searcher, query, 5_000, None, None).unwrap().unwrap();
-            let newest = all.iter().map(|(k, _)| k.timestamp_s).max().unwrap();
-            let mut floors: Vec<Floor> = [0usize, 3, 50, 398, 399, 1_000]
-                .iter()
-                .filter_map(|&i| all.get(i))
-                .flat_map(|(k, _)| [(k.score, k.timestamp_s), (k.score, k.timestamp_s + 1), (k.score.next_down(), k.timestamp_s)])
-                .collect();
-            floors.push((all[0].0.score, newest + 1)); // only a higher score places
-            floors.push((0.0, i64::MIN));
-            for floor in floors {
-                for limit in [1, 7, 100, 1_000] {
-                    let expected: Vec<DocAddress> = all
-                        .iter()
-                        .take(limit)
-                        .filter(|(k, _)| !below_floor(Some(floor), k.score, || k.timestamp_s).0)
-                        .map(|(_, a)| *a)
-                        .collect();
-                    let got: Vec<DocAddress> = ranked_docs(&searcher, query, limit, Some(floor), None)
-                        .unwrap()
-                        .unwrap()
-                        .into_iter()
-                        .map(|(_, a)| a)
-                        .collect();
-                    assert_eq!(got, expected, "{name} limit={limit} floor={floor:?}");
+            let reference = |query: &dyn Query, limit: usize| -> Vec<DocAddress> {
+                let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
+                    let ff = segment.fast_fields();
+                    let t = ff.date("_ts").unwrap();
+                    let of = ff.i64("_offset").unwrap();
+                    move |doc: DocId, score: Score| RankKey {
+                        score,
+                        timestamp_s: t.first(doc).unwrap().into_timestamp_secs(),
+                        neg_partition: 0,
+                        offset: of.first(doc).unwrap(),
+                    }
+                });
+                searcher.search(query, &collector).unwrap().into_iter().map(|(_, a)| a).collect()
+            };
+            let text = tantivy::query::TermQuery::new(
+                tantivy::Term::from_field_text(body, "alpha"),
+                tantivy::schema::IndexRecordOption::WithFreqs,
+            );
+            let equal_scores = tantivy::query::ConstScoreQuery::new(Box::new(text.clone()), 1.0);
+            let term = |f, w: &str| -> Box<dyn Query> {
+                Box::new(tantivy::query::TermQuery::new(
+                    tantivy::Term::from_field_text(f, w),
+                    tantivy::schema::IndexRecordOption::WithFreqs,
+                ))
+            };
+            use tantivy::query::{BooleanQuery, Occur};
+            let union = BooleanQuery::new(vec![(Occur::Should, term(body, "alpha")), (Occur::Should, term(body, "filler"))]);
+            let filtered = BooleanQuery::new(vec![(Occur::Must, term(body, "alpha")), (Occur::Must, term(tag, "red"))]);
+            let must_filter = BooleanQuery::new(vec![
+                (Occur::Must, Box::new(union.clone()) as Box<dyn Query>),
+                (Occur::Must, Box::new(tantivy::query::ConstScoreQuery::new(term(tag, "green"), 0.0))),
+            ]);
+            let parser = tantivy::query::QueryParser::for_index(&index, vec![]);
+            let json_term = parser.parse_query("j.msg:alpha").unwrap();
+            let json_union = parser.parse_query("j.msg:alpha OR j.msg:filler").unwrap();
+            let json_and = parser.parse_query("+j.msg:alpha +j.level:error").unwrap();
+            let json_filtered = BooleanQuery::new(vec![(Occur::Must, term(body, "alpha")), (Occur::Must, parser.parse_query("j.level:error").unwrap())]);
+            let queries: [(&str, &dyn Query); 9] = [
+                ("json_term", &*json_term),
+                ("json_union", &*json_union),
+                ("json_and", &*json_and),
+                ("json_filtered", &json_filtered),
+                ("bm25", &text),
+                ("constant", &equal_scores),
+                ("union", &union),
+                ("filtered", &filtered),
+                ("must_filter", &must_filter),
+            ];
+            for limit in [1, 7, 100, 399, 1_000, 5_000, 20_000] {
+                for (name, query) in queries {
+                    let got: Vec<DocAddress> = top_docs(&searcher, query, limit).unwrap().into_iter().map(|(_, a)| a).collect();
+                    assert_eq!(got, reference(query, limit), "{name} sorted={sorted} burst={burst} limit={limit}");
+                }
+            }
+
+            // A floor (another source's `limit`-th best) leaves out exactly the
+            // documents strictly below it, whether it is passed per document or
+            // lets whole segments and postings blocks be skipped.
+            for (name, query) in queries {
+                let all = ranked_docs(&searcher, query, 5_000, None, None).unwrap().unwrap();
+                let newest = all.iter().map(|(k, _)| k.timestamp_s).max().unwrap();
+                let mut floors: Vec<Floor> = [0usize, 3, 50, 398, 399, 1_000]
+                    .iter()
+                    .filter_map(|&i| all.get(i))
+                    .flat_map(|(k, _)| [(k.score, k.timestamp_s), (k.score, k.timestamp_s + 1), (k.score.next_down(), k.timestamp_s)])
+                    .collect();
+                floors.push((all[0].0.score, newest + 1)); // only a higher score places
+                floors.push((0.0, i64::MIN));
+                for floor in floors {
+                    for limit in [1, 7, 100, 1_000] {
+                        let expected: Vec<DocAddress> = all
+                            .iter()
+                            .take(limit)
+                            .filter(|(k, _)| !below_floor(Some(floor), k.score, || k.timestamp_s).0)
+                            .map(|(_, a)| *a)
+                            .collect();
+                        let got: Vec<DocAddress> = ranked_docs(&searcher, query, limit, Some(floor), None)
+                            .unwrap()
+                            .unwrap()
+                            .into_iter()
+                            .map(|(_, a)| a)
+                            .collect();
+                        assert_eq!(got, expected, "{name} sorted={sorted} burst={burst} limit={limit} floor={floor:?}");
+                    }
                 }
             }
         }
