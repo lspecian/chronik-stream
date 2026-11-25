@@ -1538,13 +1538,16 @@ const RECORD_FIELDS: &[(&str, &[&str])] = &[
     ("topic", &["topic"]),
 ];
 
-/// The schema field a query's field name means, if it is a record field (or,
-/// spelled with a leading `_`, an internal column named exactly so).
+/// The schema field a query's field name means: a record field under either
+/// spelling, or a field of the schema named exactly so (an archive's internal
+/// `_` column, or a field of an index created with explicit mappings).
 ///
-/// Up to v2.19.2 any name was tried with a `_` added, so a JSON field named
-/// like an archive's internal column minus the underscore (`ts`, `sequence`,
-/// `compression`, …) resolved to that column: a range on a JSON `ts` compared
-/// against archived records' Kafka timestamps and matched nothing.
+/// Up to v2.19.2 any name was also tried with a `_` added, so a JSON field
+/// named like an archive's internal column minus the underscore (`ts`,
+/// `sequence`, `compression`, …) resolved to that column: a range on a JSON
+/// `ts` compared against archived records' Kafka timestamps and matched
+/// nothing. Archive schemas name every non-record field with a `_`, so an
+/// exact match never captures a JSON field.
 fn resolve_field(
     schema: &tantivy::schema::Schema,
     field_name: &str,
@@ -1554,10 +1557,7 @@ fn resolve_field(
             return spellings.iter().find_map(|s| schema.get_field(s).ok()).ok_or(());
         }
     }
-    if field_name.starts_with('_') {
-        return schema.get_field(field_name).map_err(|_| ());
-    }
-    Err(())
+    schema.get_field(field_name).map_err(|_| ())
 }
 
 /// What a field name in a query refers to in one particular index.
@@ -2609,6 +2609,14 @@ mod hot_merge_tests {
         assert!(resolve_field(&hot, "_value").is_ok(), "_value → value");
         assert!(resolve_field(&hot, "_key").is_ok(), "_key → key");
         assert!(resolve_field(&hot, "value").is_ok(), "value exact");
+
+        // An index created with explicit mappings: its own fields by name.
+        let mapped = {
+            let mut b = Schema::builder();
+            b.add_text_field("content", TEXT | STORED);
+            b.build()
+        };
+        assert!(resolve_field(&mapped, "content").is_ok(), "a mapped field by its exact name");
 
         // An archive's internal columns: reachable by their record name or
         // their exact name, never by a JSON field's name minus the `_`.
