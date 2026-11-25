@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.0] - 2026-11-25
+
+### Upgrade notes
+
+- **New topics get Kafka's retention defaults** (7 days, no size limit),
+  explicit CreateTopics without `retention.ms` included; up to 2.19.2 they
+  were kept forever. Before rolling a cluster to this version, run
+  `scripts/keep_existing_topics_forever.sh <bootstrap> --apply` so its
+  existing topics keep everything.
+- After rolling, call `POST /admin/reindex` (admin key) on each node:
+  archives written before this version need it for ranges and aggregations
+  on JSON fields.
+
+### Added
+
+- **Range queries and aggregations on JSON fields** in `/_search` and
+  `/{topic}/_search`: terms, histogram, `date_histogram`, range, stats,
+  avg/sum/min/max, cardinality, percentiles, merged across archives, the hot
+  index and nodes. Exact `hits.total` for `size: 0`, aggregations or
+  `track_total_hits`.
+- **`POST /admin/reindex`** rebuilds a node's archived search indexes from
+  the raw tier (`GET` reports progress).
+- **Archive verification**: archives are checked against their checksums on
+  first open, on merge and by a daily scrub; a damaged one is skipped and
+  rebuilt automatically, and listed in `GET /admin/reindex` until then.
+  Metrics `chronik_archives_damaged`, `chronik_archives_repaired_total`.
+- **Coverage metric** `chronik_search_unsearchable_offsets` /
+  `_partitions`: acknowledged records no search can find (should be 0).
+- **`retention.ms` and `retention.bytes` enforced on archived data**, as in
+  Kafka; DeleteRecords now also removes records from search, SQL and vectors.
+- **`searchable.throttle.enabled`** (per topic, off by default): produce
+  waits until the partition's hot index has room, so a burst faster than
+  archiving slows down instead of leaving records unsearchable until
+  archived. Metrics `chronik_produce_search_throttle_ms_total`,
+  `_timeouts_total`.
+- Per-archive cache of count and aggregation results
+  (`CHRONIK_SEARCH_RESULT_CACHE_BYTES`, 64 MB).
+
+### Changed
+
+- **Archiving is several times faster.** Each record was indexed twice;
+  now once, and a partition's sealed segments are prepared in parallel
+  (`CHRONIK_ARCHIVE_BUILD_CONCURRENCY`) and published in order. A
+  10M-record burst into one partition is fully searchable ~55 s after it
+  ends (181 s before); a partition under pressure wakes the indexer at once.
+- Raw archive segments are stored zstd-compressed (17.7x smaller); plain
+  ones are still read.
+- Archives merge by size tier, so a partition's archive count grows with the
+  logarithm of its data.
+- `match_all` ranks newest-first without reading every record; ranking reads
+  record times only for documents that can still place.
+- mimalloc is the global allocator (higher query throughput, about a third
+  of the memory, half the produce CPU).
+- Hot index freshness under bursts: large writers for partitions taking
+  2,000+ records per 100 ms (a 1M-record burst searchable in ~2 s, was 15 s).
+
+### Fixed
+
+- **`kafka-consumer-groups --describe` answered GROUP_ID_NOT_FOUND** after
+  the upgrade to catalog-coordinated groups whenever the catalog leader was
+  not the broker that coordinated the group before; a group known only by
+  its committed offsets now describes as Empty.
+- **The hot index made archived records unsearchable early under load**: it
+  forgot a partition's archived watermark on any late record, so archived
+  records could no longer be trimmed and were evicted at the hard cap as if
+  unarchived. Topic deletion and truncation reset it instead.
+- A burst into one partition larger than `CHRONIK_HOT_TEXT_MAX_DOCS` answered
+  nothing from the hot index until archived; the hot index now evicts only
+  archived offsets.
+- A JSON field named like an internal archive column minus its `_` (`ts`,
+  `sequence`, ...) resolved to that column.
+- Archive metadata recorded `max_timestamp` as `i64::MIN`.
+
 ## [2.19.2] - 2026-11-23
 
 ### Fixed
