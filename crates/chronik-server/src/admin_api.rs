@@ -69,6 +69,86 @@ pub struct AdminApiState {
     pub isr_tracker: Option<Arc<IsrTracker>>,
     /// Phase 5: Schema Registry for Confluent-compatible schema management
     pub schema_registry: Arc<SchemaRegistry>,
+    /// Rebuilding this node's archived search indexes (`POST /admin/reindex`).
+    /// None where the server has no archive (tests, the legacy admin port).
+    pub reindex: Option<ReindexState>,
+}
+
+/// This node's archive indexer and the progress of its reindex.
+#[derive(Clone)]
+pub struct ReindexState {
+    pub indexer: Arc<chronik_storage::WalIndexer>,
+    pub progress: Arc<std::sync::Mutex<chronik_storage::reindex::Progress>>,
+}
+
+impl ReindexState {
+    pub fn new(indexer: Arc<chronik_storage::WalIndexer>) -> Self {
+        Self { indexer, progress: Default::default() }
+    }
+}
+
+/// `POST /admin/reindex` body.
+#[derive(Debug, Deserialize, Default)]
+pub struct ReindexRequest {
+    /// One topic; all topics when absent.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// Also rebuild archives that already have the current schema (a repair).
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Start rebuilding this node's archived search indexes from its raw tier,
+/// in the background (one archive at a time). Archives written before the
+/// JSON field had columns answer neither ranges nor aggregations until
+/// rebuilt. On a cluster each node holds its own archives: call each node.
+async fn handle_reindex(
+    State(state): State<AdminApiState>,
+    body: Option<Json<ReindexRequest>>,
+) -> Response {
+    let Some(reindex) = state.reindex.clone() else {
+        return (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"error": "this server has no archive to reindex"}))).into_response();
+    };
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+    {
+        let p = reindex.progress.lock().unwrap();
+        if p.running {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "a reindex is already running", "progress": *p}))).into_response();
+        }
+    }
+    {
+        // Running from now, so a second request cannot start another.
+        let mut p = reindex.progress.lock().unwrap();
+        *p = chronik_storage::reindex::Progress { running: true, topic: request.topic.clone(), force: request.force, ..Default::default() };
+    }
+    let grace = std::time::Duration::from_secs(
+        std::env::var("CHRONIK_ARCHIVE_MERGE_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
+    );
+    tokio::spawn(chronik_storage::reindex::run(
+        reindex.indexer.clone(),
+        request.topic.clone(),
+        request.force,
+        grace,
+        reindex.progress.clone(),
+    ));
+    (StatusCode::ACCEPTED, Json(serde_json::json!({"started": true, "topic": request.topic, "force": request.force}))).into_response()
+}
+
+/// Progress of this node's reindex.
+async fn handle_reindex_status(State(state): State<AdminApiState>) -> Response {
+    match state.reindex {
+        Some(reindex) => {
+            // Progress, plus the archives found damaged and awaiting (or
+            // unable to get) a rebuild from the raw tier.
+            let mut body = serde_json::to_value(reindex.progress.lock().unwrap().clone()).unwrap_or_default();
+            body["damaged"] = chronik_storage::archive_health::damaged_archives()
+                .into_iter()
+                .map(|(archive, reason)| serde_json::json!({"archive": archive, "reason": reason}))
+                .collect();
+            Json(body).into_response()
+        }
+        None => (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"error": "this server has no archive to reindex"}))).into_response(),
+    }
 }
 
 /// Request to add a new node to the cluster
@@ -1058,7 +1138,9 @@ async fn admin_not_found() -> Response {
                 "GET /admin/status",
                 "POST /admin/add-node",
                 "POST /admin/remove-node",
-                "POST /admin/rebalance"
+                "POST /admin/rebalance",
+                "POST /admin/reindex",
+                "GET /admin/reindex"
             ],
             "schema_registry": [
                 "GET /subjects",
@@ -1080,6 +1162,7 @@ pub fn create_admin_router(state: AdminApiState) -> Router {
         .route("/admin/remove-node", post(handle_node_removal))
         .route("/admin/status", get(handle_status))
         .route("/admin/rebalance", post(handle_rebalance))
+        .route("/admin/reindex", post(handle_reindex).get(handle_reindex_status))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Health check is public
@@ -1169,6 +1252,7 @@ pub async fn start_admin_api(
         api_key: effective_key,
         isr_tracker,
         schema_registry,
+        reindex: None,
     };
 
     let app = create_admin_router(state);

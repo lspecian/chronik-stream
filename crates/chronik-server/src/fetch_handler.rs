@@ -1359,7 +1359,7 @@ impl FetchHandler {
                 Ok(segment) => segment,
                 Err(_) => {
                     let mut canonicals: Vec<chronik_storage::canonical_record::CanonicalRecord> =
-                        match bincode::deserialize(&data) {
+                        match chronik_storage::archive::decode_raw_segment(&data) {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::warn!(
@@ -2057,9 +2057,9 @@ impl FetchHandler {
                 segment_data.len(), object_key
             );
 
-            // Deserialize as Vec<CanonicalRecord> (WalIndexer format)
-            // This is bincode-serialized CanonicalRecords from WAL
-            let canonical_records: Vec<CanonicalRecord> = match bincode::deserialize(&segment_data) {
+            // The WalIndexer's raw segment: the WAL's CanonicalRecords,
+            // zstd-compressed (or plain, if written before compression)
+            let canonical_records: Vec<CanonicalRecord> = match chronik_storage::archive::decode_raw_segment(&segment_data) {
                 Ok(records) => records,
                 Err(e) => {
                     error!(

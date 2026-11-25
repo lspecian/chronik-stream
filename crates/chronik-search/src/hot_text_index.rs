@@ -20,13 +20,14 @@
 //! - `value`      TEXT  | STORED
 //! - `headers`    TEXT  | STORED
 
+use std::ops::Bound;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use tantivy::{
-    collector::TopDocs,
-    query::QueryParser,
+    collector::{Count, TopDocs},
+    query::{QueryParser, RangeQuery},
     schema::{Field, NumericOptions, Schema, STORED, STRING, TEXT},
     Index, IndexReader, IndexWriter, ReloadPolicy, Term,
 };
@@ -96,8 +97,33 @@ fn hot_hit_order(a: &HotHit, b: &HotHit) -> std::cmp::Ordering {
 pub struct HotTextConfig {
     /// Writer heap budget in bytes (Tantivy requires >= 15MB).
     pub writer_heap_bytes: usize,
-    /// Max docs per partition before eviction rebuilds the index.
+    /// Docs per partition kept once an archive covers the older ones. Offsets
+    /// no archive covers yet are kept beyond this (up to the hard cap): the
+    /// hot index is the only place they can be searched.
     pub max_docs_per_partition: usize,
+    /// Memory bound per partition: past it the oldest docs are dropped even
+    /// when no archive covers them (counted, and logged), so a stalled indexer
+    /// cannot exhaust memory.
+    pub hard_max_docs_per_partition: usize,
+    /// Heap of a burst writer: a partition indexing faster than one small
+    /// writer keeps up with gets one (`CHRONIK_HOT_TEXT_BURST_WRITER_HEAP_BYTES`).
+    pub burst_writer_heap_bytes: usize,
+    /// Indexing threads of a burst writer.
+    pub burst_writer_threads: usize,
+    /// Burst writers at once, across all partitions (`CHRONIK_HOT_TEXT_MAX_BURST_WRITERS`;
+    /// 0 turns them off).
+    pub max_burst_writers: usize,
+    /// Records added between two commits (100 ms apart) that make a partition
+    /// a burst.
+    pub burst_threshold_docs: usize,
+}
+
+impl HotTextConfig {
+    /// The hard cap when none is configured: ten times the soft cap. A burst
+    /// is kept until its archive is written (up to about a minute of ingest).
+    pub fn default_hard_max(max_docs_per_partition: usize) -> usize {
+        max_docs_per_partition.saturating_mul(10)
+    }
 }
 
 impl Default for HotTextConfig {
@@ -105,6 +131,11 @@ impl Default for HotTextConfig {
         Self {
             writer_heap_bytes: TANTIVY_MIN_HEAP,
             max_docs_per_partition: 100_000,
+            hard_max_docs_per_partition: Self::default_hard_max(100_000),
+            burst_writer_heap_bytes: 256 * 1024 * 1024,
+            burst_writer_threads: std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(1).clamp(1, 8),
+            max_burst_writers: 4,
+            burst_threshold_docs: 2_000,
         }
     }
 }
@@ -116,6 +147,14 @@ struct HotPartitionIndex {
     /// ensure_writer/release_writer so add_batch can enforce the burst cap.
     live_writers: Arc<std::sync::atomic::AtomicUsize>,
     partition: i32,
+    /// Burst writers live across all partitions (shared, capped).
+    burst_writers: Arc<std::sync::atomic::AtomicUsize>,
+    /// This partition holds (or will create) a burst writer.
+    burst: bool,
+    /// Records added since the last commit: the indexing rate.
+    adds_since_commit: usize,
+    /// Consecutive commits a burst writer saw little work.
+    quiet_ticks: u32,
     index: Index,
     /// Lazily-held writer. A Tantivy writer costs a >=15MB heap budget plus
     /// indexing threads PER INSTANCE, and one instance per (topic, partition)
@@ -155,12 +194,27 @@ struct HotPartitionIndex {
     config: HotTextConfig,
 }
 
+impl Drop for HotPartitionIndex {
+    /// A partition dropped with a writer (its topic deleted, `forget_topic`)
+    /// gives back its writer counts, or the caps on live and burst writers
+    /// would count it forever.
+    fn drop(&mut self) {
+        if self.writer.take().is_some() {
+            self.live_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if std::mem::take(&mut self.burst) {
+            self.burst_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl HotPartitionIndex {
     fn new(
         topic: String,
         partition: i32,
         config: HotTextConfig,
         live_writers: Arc<std::sync::atomic::AtomicUsize>,
+        burst_writers: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Result<Self> {
         let mut schema_builder = Schema::builder();
         let topic_field = schema_builder.add_text_field("topic", STRING | STORED);
@@ -205,6 +259,10 @@ impl HotPartitionIndex {
             partition,
             index,
             live_writers,
+            burst_writers,
+            burst: false,
+            adds_since_commit: 0,
+            quiet_ticks: 0,
             // Created on first write by ensure_writer(), not up front: most
             // partitions in a many-topic deployment are idle at any moment.
             writer: None,
@@ -231,10 +289,14 @@ impl HotPartitionIndex {
     /// docs on `writer` for why it is lazy.
     fn ensure_writer(&mut self) -> Result<&mut IndexWriter> {
         if self.writer.is_none() {
-            let heap = self.config.writer_heap_bytes.max(TANTIVY_MIN_HEAP);
-            let writer = self
-                .index
-                .writer(heap)
+            let writer = if self.burst {
+                let threads = self.config.burst_writer_threads.max(1);
+                let heap = self.config.burst_writer_heap_bytes.max(TANTIVY_MIN_HEAP * threads);
+                self.index.writer_with_num_threads(threads, heap)
+            } else {
+                self.index.writer(self.config.writer_heap_bytes.max(TANTIVY_MIN_HEAP))
+            };
+            let writer = writer
                 .map_err(|e| anyhow!("create hot writer for {}-{}: {}", self.topic, self.partition, e))?;
             self.writer = Some(writer);
             self.live_writers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -251,6 +313,10 @@ impl HotPartitionIndex {
         if self.writer.take().is_some() {
             self.live_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+        if std::mem::take(&mut self.burst) {
+            self.burst_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.quiet_ticks = 0;
     }
 
     fn add_batch(&mut self, docs: &[HotDoc]) -> Result<()> {
@@ -287,6 +353,7 @@ impl HotPartitionIndex {
         }
         self.dirty = true;
         self.idle_ticks = 0;
+        self.adds_since_commit += docs.len();
 
         for d in docs {
             self.doc_count += 1;
@@ -405,50 +472,71 @@ impl HotPartitionIndex {
         })
     }
 
-    /// Drop all docs with offset <= threshold.
+    /// After a commit (nothing pending): give a bursting partition a large
+    /// writer, and take it back once the burst is over.
+    ///
+    /// One small writer (the minimum heap: one indexing thread) indexes about
+    /// 60K records/s, so a 1M-record burst took ~15 s to become searchable; a
+    /// large one, ~2 s. Small by default because every active partition holds
+    /// a writer and thousands of them once exhausted memory; large ones are
+    /// capped across all partitions (`max_burst_writers`).
+    fn adapt_writer(&mut self) {
+        let adds = std::mem::take(&mut self.adds_since_commit);
+        let threshold = self.config.burst_threshold_docs.max(1);
+        if self.burst {
+            // Back to small after ~5 s of commits well under the burst rate.
+            self.quiet_ticks = if adds * 4 < threshold { self.quiet_ticks + 1 } else { 0 };
+            if self.quiet_ticks >= 50 && !self.dirty {
+                self.release_writer();
+            }
+            return;
+        }
+        if adds < threshold || self.dirty {
+            return;
+        }
+        let max = self.config.max_burst_writers;
+        let reserved = self
+            .burst_writers
+            .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .is_ok();
+        if !reserved {
+            return;
+        }
+        // The writer is clean (just committed): replacing it loses nothing.
+        self.release_writer();
+        self.burst = true;
+        if let Err(e) = self.ensure_writer() {
+            debug!(topic = %self.topic, partition = self.partition, "hot: burst writer not created: {}", e);
+            self.burst = false;
+            self.burst_writers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            trace!(topic = %self.topic, partition = self.partition, adds, "hot: burst writer");
+        }
+    }
+
+    /// Docs with offsets in `[lo, hi]`.
+    fn offset_range(&self, lo: i64, hi: i64) -> RangeQuery {
+        RangeQuery::new(
+            Bound::Included(Term::from_field_i64(self.offset_field, lo)),
+            Bound::Included(Term::from_field_i64(self.offset_field, hi)),
+        )
+    }
+
+    /// Drop all docs with offset <= threshold: one range delete, then the
+    /// counters from the offset fast field (no stored document is decoded).
     fn evict_up_to(&mut self, threshold: i64) -> Result<usize> {
-        // Tantivy lacks a range-delete, so we delete matching docs by term.
-        // For bulk eviction (common after cold flush of a whole segment) this
-        // is O(evicted). If the workload requires it we can switch to a
-        // rebuild-from-surviving-offsets strategy later.
+        if self.min_offset.is_none_or(|min| min > threshold) {
+            return Ok(0);
+        }
         let evicted_before = self.doc_count;
-
-        // Collect surviving offsets first â needed only if we rebuild.
-        let searcher = self.reader.searcher();
-        let mut to_delete: Vec<i64> = Vec::new();
-        for seg_reader in searcher.segment_readers() {
-            let store_reader = seg_reader
-                .get_store_reader(0)
-                .map_err(|e| anyhow!("hot store reader: {}", e))?;
-            for doc_id in 0..seg_reader.max_doc() {
-                if seg_reader.is_deleted(doc_id) {
-                    continue;
-                }
-                let doc: tantivy::TantivyDocument = store_reader
-                    .get(doc_id)
-                    .map_err(|e| anyhow!("hot store get: {}", e))?;
-                if let Some(off) = doc
-                    .get_first(self.offset_field)
-                    .and_then(|v| tantivy::schema::Value::as_i64(&v))
-                {
-                    if off <= threshold {
-                        to_delete.push(off);
-                    }
-                }
-            }
-        }
-
-        if !to_delete.is_empty() {
-            let offset_field = self.offset_field;
-            let writer = self.ensure_writer()?;
-            for off in &to_delete {
-                writer.delete_term(Term::from_field_i64(offset_field, *off));
-            }
-            self.dirty = true;
-            self.make_visible()?;
-        }
-
-        // Recompute counters from the post-commit reader.
+        let query = self.offset_range(i64::MIN, threshold);
+        self.ensure_writer()?
+            .delete_query(Box::new(query))
+            .map_err(|e| anyhow!("hot delete: {}", e))?;
+        self.dirty = true;
+        self.make_visible()?;
         self.recompute_counters()?;
 
         let evicted = evicted_before.saturating_sub(self.doc_count);
@@ -462,27 +550,37 @@ impl HotPartitionIndex {
         Ok(evicted)
     }
 
+    /// Drop every doc at or above `from` (the log was cut there). Returns
+    /// how many went.
+    fn drop_from(&mut self, from: i64) -> Result<usize> {
+        if self.max_offset.is_none_or(|max| max < from) {
+            return Ok(0);
+        }
+        let before = self.doc_count;
+        let query = self.offset_range(from, i64::MAX);
+        self.ensure_writer()?
+            .delete_query(Box::new(query))
+            .map_err(|e| anyhow!("hot delete: {}", e))?;
+        self.dirty = true;
+        self.make_visible()?;
+        self.recompute_counters()?;
+        Ok(before.saturating_sub(self.doc_count))
+    }
+
+    /// Live docs and their offset range, from the reader as it stands.
     fn recompute_counters(&mut self) -> Result<()> {
         let searcher = self.reader.searcher();
         let mut count = 0usize;
         let mut min: Option<i64> = None;
         let mut max: Option<i64> = None;
         for seg_reader in searcher.segment_readers() {
-            let store_reader = seg_reader
-                .get_store_reader(0)
-                .map_err(|e| anyhow!("hot store reader: {}", e))?;
-            for doc_id in 0..seg_reader.max_doc() {
-                if seg_reader.is_deleted(doc_id) {
-                    continue;
-                }
+            let offsets = seg_reader
+                .fast_fields()
+                .i64("offset")
+                .map_err(|e| anyhow!("hot offset column: {}", e))?;
+            for doc_id in seg_reader.doc_ids_alive() {
                 count += 1;
-                let doc: tantivy::TantivyDocument = store_reader
-                    .get(doc_id)
-                    .map_err(|e| anyhow!("hot store get: {}", e))?;
-                if let Some(off) = doc
-                    .get_first(self.offset_field)
-                    .and_then(|v| tantivy::schema::Value::as_i64(&v))
-                {
+                if let Some(off) = offsets.first(doc_id) {
                     min = Some(min.map_or(off, |m| m.min(off)));
                     max = Some(max.map_or(off, |m| m.max(off)));
                 }
@@ -499,8 +597,8 @@ impl HotPartitionIndex {
     }
 
     /// HP-1.7: Total doc count across segments INCLUDING tombstoned deletes.
-    /// Tantivy's `delete_term` marks docs invisible but keeps their bytes
-    /// in segments until merge, so this is the honest proxy for RAM pressure.
+    /// Tantivy's deletes mark docs invisible but keep their bytes in segments
+    /// until merge, so this is the honest proxy for RAM pressure.
     fn total_including_deleted(&self) -> usize {
         let searcher = self.reader.searcher();
         searcher
@@ -510,28 +608,81 @@ impl HotPartitionIndex {
             .sum()
     }
 
-    /// HP-1.7: When the partition's doc count exceeds `max_docs_per_partition`,
-    /// evict the oldest offsets so RAM stays bounded. Called from the commit
-    /// timer, so eviction piggy-backs on an existing visibility flip and does
-    /// not add disk I/O.
+    /// Keep the partition near `max_docs_per_partition` without making any
+    /// record unsearchable. Called from the commit timer.
     ///
-    /// Strategy: keep a sliding window of the most-recent `max_docs_per_partition`
-    /// offsets. Offsets below `max_offset - max_docs` are dropped. Since WAL
-    /// offsets are dense in the common case, this keeps doc count within ~2Ã
-    /// the cap even with batch-level granularity.
-    fn trim_to_capacity(&mut self) -> Result<usize> {
+    /// Only offsets an archive covers (`archived_through`, the highest
+    /// archived offset) are dropped, and of those only what lies outside the
+    /// newest `max_docs_per_partition` offsets. Until the indexer archives a
+    /// burst, the hot index is the only place it can be searched, so it grows
+    /// past the soft cap. `hard_max_docs_per_partition` bounds that: past it
+    /// the oldest docs go regardless, and how many of them no archive covered
+    /// is returned so the caller can count and report them.
+    ///
+    /// Returns `(evicted, evicted_unarchived)`.
+    fn trim_to_capacity(&mut self, archived_through: Option<i64>) -> Result<(usize, usize)> {
         if !self.over_capacity() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let Some(max_off) = self.max_offset else {
-            return Ok(0);
+            return Ok((0, 0));
         };
-        let keep = self.config.max_docs_per_partition as i64;
-        let threshold = max_off.saturating_sub(keep);
-        if threshold < 0 {
-            return Ok(0);
+        let covered = archived_through.unwrap_or(-1);
+        let window = max_off.saturating_sub(self.config.max_docs_per_partition as i64);
+        let mut threshold = window.min(covered);
+        let mut unarchived = 0usize;
+        if self.doc_count > self.config.hard_max_docs_per_partition {
+            let hard = max_off.saturating_sub(self.config.hard_max_docs_per_partition as i64);
+            if hard > threshold {
+                threshold = hard;
+                if hard > covered {
+                    let lost = self.offset_range(covered.saturating_add(1), hard);
+                    unarchived = self
+                        .reader
+                        .searcher()
+                        .search(&lost, &Count)
+                        .map_err(|e| anyhow!("hot count: {}", e))?;
+                }
+            }
         }
-        self.evict_up_to(threshold)
+        if threshold < 0 {
+            return Ok((0, 0));
+        }
+        Ok((self.evict_up_to(threshold)?, unarchived))
+    }
+
+    /// Reclaim the memory of deleted docs once they outnumber the live ones
+    /// (and the soft cap): merge every segment, which drops them. Deleting
+    /// only marks docs; under steady trimming the marked bytes would otherwise
+    /// grow without bound. Merging costs O(live docs) and runs after at least
+    /// as many deletes, so it is amortised O(1) per evicted doc.
+    ///
+    /// Returns whether a merge ran. A merge the writer's own merge policy is
+    /// already running on these segments is refused by Tantivy; that is not
+    /// an error, the next commit retries.
+    fn purge_deleted(&mut self) -> Result<bool> {
+        let deleted = self.total_including_deleted().saturating_sub(self.doc_count);
+        if deleted < self.doc_count.max(self.config.max_docs_per_partition.max(1)) {
+            return Ok(false);
+        }
+        let segments = self
+            .index
+            .searchable_segment_ids()
+            .map_err(|e| anyhow!("hot segments: {}", e))?;
+        if segments.is_empty() {
+            return Ok(false);
+        }
+        match self.ensure_writer()?.merge(&segments).wait() {
+            Ok(_) => {}
+            Err(e) => {
+                debug!(topic = %self.topic, partition = self.partition, "hot: merge deferred: {}", e);
+                return Ok(false);
+            }
+        }
+        self.reader
+            .reload()
+            .map_err(|e| anyhow!("hot reader reload: {}", e))?;
+        Ok(true)
     }
 }
 
@@ -541,6 +692,24 @@ pub struct HotTextIndex {
     config: HotTextConfig,
     /// Live writers across all partitions of THIS index — the burst-cap input.
     live_writers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Burst (large) writers across all partitions of this index.
+    burst_writers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Highest offset an archive covers, per partition, as announced by the
+    /// indexer (or found in the catalogue at boot). Kept apart from the
+    /// partition entries so it survives an idle partition being reaped. Only
+    /// offsets at or below it may be trimmed.
+    archived: DashMap<(String, i32), i64>,
+    /// When the last "evicted before archived" warning was logged (unix s).
+    unarchived_warned_at: std::sync::atomic::AtomicU64,
+    /// Docs each partition held at its last commit, readable without the
+    /// partition lock (produce consults it for throttled topics).
+    held: DashMap<(String, i32), usize>,
+    /// Records handed to the hot index by produce and not yet added (the
+    /// hand-off is asynchronous, and under a burst it queues).
+    queued: DashMap<(String, i32), usize>,
+    /// Records of throttled topics admitted by produce and not yet handed
+    /// over (see `try_reserve`).
+    reserved: DashMap<(String, i32), usize>,
 }
 
 impl HotTextIndex {
@@ -549,6 +718,12 @@ impl HotTextIndex {
             partitions: DashMap::new(),
             config,
             live_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            burst_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            archived: DashMap::new(),
+            unarchived_warned_at: std::sync::atomic::AtomicU64::new(0),
+            held: DashMap::new(),
+            queued: DashMap::new(),
+            reserved: DashMap::new(),
         }
     }
 
@@ -561,11 +736,108 @@ impl HotTextIndex {
             partition,
             self.config.clone(),
             Arc::clone(&self.live_writers),
+            Arc::clone(&self.burst_writers),
         )?;
         let arc = Arc::new(RwLock::new(part));
         self.partitions
             .insert((topic.to_string(), partition), arc.clone());
         Ok(arc)
+    }
+
+    /// Record that an archive covers the partition up to `max_offset`
+    /// (inclusive). Never lowers what is known.
+    pub fn note_archived(&self, topic: &str, partition: i32, max_offset: i64) {
+        self.archived
+            .entry((topic.to_string(), partition))
+            .and_modify(|v| *v = (*v).max(max_offset))
+            .or_insert(max_offset);
+    }
+
+    /// Highest offset an archive is known to cover for the partition.
+    pub fn archived_through(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.archived.get(&(topic.to_string(), partition)).map(|v| *v)
+    }
+
+    /// Most docs a partition holds before records no archive covers are
+    /// dropped. Warm-up reads at most this many.
+    pub fn hard_max_docs(&self) -> usize {
+        self.config.hard_max_docs_per_partition
+    }
+
+    /// Records of the partition the hot index holds or will hold: docs at its
+    /// last commit plus those handed over and not yet added. Past the soft cap
+    /// they are records no archive covers yet.
+    pub fn pending_docs(&self, topic: &str, partition: i32) -> usize {
+        let key = (topic.to_string(), partition);
+        self.held.get(&key).map(|v| *v).unwrap_or(0)
+            + self.queued.get(&key).map(|v| *v).unwrap_or(0)
+            + self.reserved.get(&key).map(|v| *v).unwrap_or(0)
+    }
+
+    /// Admit `n` more records of the partition if, with them, it stays within
+    /// `limit` pending records (or nothing is pending, so a batch larger than
+    /// the limit is not refused forever). Check and reservation are one step,
+    /// so concurrent produce requests (a pipelining client sends many at
+    /// once) cannot all pass a check that only one of them fits. Release with
+    /// [`Self::release`] once the records were handed over (or not written).
+    pub fn try_reserve(&self, topic: &str, partition: i32, n: usize, limit: usize) -> bool {
+        let key = (topic.to_string(), partition);
+        let others = self.held.get(&key).map(|v| *v).unwrap_or(0) + self.queued.get(&key).map(|v| *v).unwrap_or(0);
+        let mut reserved = self.reserved.entry(key).or_insert(0);
+        let pending = others + *reserved;
+        if pending + n <= limit || pending == 0 {
+            *reserved += n;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// See [`Self::try_reserve`].
+    pub fn release(&self, topic: &str, partition: i32, n: usize) {
+        if let Some(mut v) = self.reserved.get_mut(&(topic.to_string(), partition)) {
+            *v = v.saturating_sub(n);
+        }
+    }
+
+    /// The topic was deleted: drop everything held for it, its archived
+    /// watermarks included, so a topic recreated under the name starts clean.
+    pub fn forget_topic(&self, topic: &str) {
+        self.partitions.retain(|(t, _), _| t != topic);
+        self.archived.retain(|(t, _), _| t != topic);
+        self.held.retain(|(t, _), _| t != topic);
+        self.queued.retain(|(t, _), _| t != topic);
+        self.reserved.retain(|(t, _), _| t != topic);
+    }
+
+    /// The partition's log was cut at `new_end` (a follower discarding a
+    /// divergent tail): drop the docs at or above it, and lower the archived
+    /// watermark below it, since the archive was cut too.
+    pub async fn truncate(&self, topic: &str, partition: i32, new_end: i64) -> Result<usize> {
+        let key = (topic.to_string(), partition);
+        if let Some(mut archived) = self.archived.get_mut(&key) {
+            *archived = (*archived).min(new_end - 1);
+        }
+        let Some(part) = self.partitions.get(&key).map(|e| e.clone()) else {
+            return Ok(0);
+        };
+        let mut guard = part.write().await;
+        let dropped = guard.drop_from(new_end)?;
+        self.held.insert(key, guard.doc_count);
+        Ok(dropped)
+    }
+
+    /// `n` records of the partition are on their way to `add_batch`. Pair
+    /// with [`Self::note_added`] once they are added (or skipped).
+    pub fn note_queued(&self, topic: &str, partition: i32, n: usize) {
+        *self.queued.entry((topic.to_string(), partition)).or_insert(0) += n;
+    }
+
+    /// See [`Self::note_queued`].
+    pub fn note_added(&self, topic: &str, partition: i32, n: usize) {
+        if let Some(mut v) = self.queued.get_mut(&(topic.to_string(), partition)) {
+            *v = v.saturating_sub(n);
+        }
     }
 
     /// Insert a batch of docs into (topic, partition). Does not make them
@@ -574,9 +846,19 @@ impl HotTextIndex {
         if docs.is_empty() {
             return Ok(());
         }
+        // A record at or below the archived watermark is usually just late:
+        // produce hands records over asynchronously, and the indexer can
+        // archive them from the WAL before they arrive here. A watermark
+        // from an earlier life of the partition is cleared where that life
+        // ends instead (`forget_topic`, `truncate`). (Clearing it on any such
+        // record, as this used to, did so on every late batch under load:
+        // archived records could then no longer be trimmed, filled the hot
+        // index to its hard cap and were evicted as if unarchived.)
         let part = self.get_or_create(topic, partition)?;
         let mut guard = part.write().await;
         guard.add_batch(docs)?;
+        // Counted from here, not from the next commit (see pending_docs).
+        self.held.insert((topic.to_string(), partition), guard.doc_count);
         chronik_monitoring::MetricsRecorder::record_hot_text_add(docs.len() as u64);
         // Burst cap: during bulk topic creation thousands of partitions acquire
         // writers within one commit window and the sequential commit timer cannot
@@ -589,13 +871,14 @@ impl HotTextIndex {
             guard.release_writer();
         }
         if guard.over_capacity() {
-            // Over-capacity is recovered by the commit-timer trim + hard-reset
-            // path (HP-1.7). Just trace here â noisy at bulk throughput.
+            // Over-capacity is recovered by the commit-timer trim once an
+            // archive covers the oldest docs. Just trace here: noisy at bulk
+            // throughput.
             trace!(
                 topic, partition,
                 doc_count = guard.doc_count,
                 limit = self.config.max_docs_per_partition,
-                "hot text: over capacity (will be trimmed/reset on next commit)"
+                "hot text: over capacity (trimmed on commit once archived)"
             );
         }
         Ok(())
@@ -616,6 +899,7 @@ impl HotTextIndex {
     /// one Tantivy writer per partition held forever OOM-killed nodes at a few
     /// thousand topics.
     pub async fn commit(&self, topic: &str, partition: i32) -> Result<()> {
+        let archived_through = self.archived_through(topic, partition);
         let remove_entry = {
             let Some(entry) = self.partitions.get(&(topic.to_string(), partition)) else {
                 return Ok(());
@@ -638,34 +922,33 @@ impl HotTextIndex {
                     let lag = (now_ms - ts_ms).max(0) as u64;
                     chronik_monitoring::MetricsRecorder::record_hot_text_visibility_lag(lag);
                 }
-                // HP-1.7: bound RAM â drop offsets outside the sliding window.
-                let trimmed = guard.trim_to_capacity()?;
+                // Bound RAM: drop archived offsets outside the sliding window
+                // (and, past the hard cap, the oldest regardless).
+                let (trimmed, unarchived) = guard.trim_to_capacity(archived_through)?;
                 if trimmed > 0 {
                     trace!(topic, partition, trimmed, "hot text: trimmed on commit");
                     chronik_monitoring::MetricsRecorder::record_hot_text_trim(trimmed as u64);
                 }
-                // HP-1.7: Tantivy's delete_term marks docs as tombstones but does
-                // not reclaim their bytes in a RAMDirectory until merge. Under
-                // sustained high-throughput ingest the heap grows unboundedly.
-                // When the total (live + tombstoned) count is â¥ 2Ã the cap we
-                // drop the partition entirely and let the next add_batch recreate
-                // it fresh. The coverage gap is brief and cold search continues
-                // to serve these offsets.
-                if guard.total_including_deleted()
-                    >= 2 * guard.config.max_docs_per_partition.max(1)
-                {
-                    tracing::debug!(
-                        hot_path = "text",
-                        event = "partition_reset",
-                        topic,
-                        partition,
-                        "hot text: resetting partition RAMDirectory to reclaim tombstones"
-                    );
-                    chronik_monitoring::MetricsRecorder::record_hot_text_reset();
-                    true
-                } else {
-                    false
+                if unarchived > 0 {
+                    chronik_monitoring::MetricsRecorder::record_hot_text_evicted_unarchived(unarchived as u64);
+                    self.warn_unarchived(topic, partition, unarchived, archived_through);
                 }
+                // Past the soft cap the hot index holds only records no archive
+                // covers yet. Halfway to the hard cap, ask the indexer to start
+                // on them now instead of at its next scheduled run.
+                if guard.doc_count > self.config.hard_max_docs_per_partition / 2 {
+                    chronik_storage::wal_indexer::request_indexing(topic, partition);
+                }
+                self.held.insert((topic.to_string(), partition), guard.doc_count);
+                // Deletes only mark docs; merge them away once they outnumber
+                // the live ones, or the heap grows under steady trimming. (This
+                // used to drop the whole partition, newest records included.)
+                if guard.purge_deleted()? {
+                    trace!(topic, partition, "hot text: merged away deleted docs");
+                    chronik_monitoring::MetricsRecorder::record_hot_text_purge();
+                }
+                guard.adapt_writer();
+                false
             } else {
                 // Idle tick: no adds or deletes since the last flip.
                 guard.idle_ticks = guard.idle_ticks.saturating_add(1);
@@ -683,8 +966,32 @@ impl HotTextIndex {
         };
         if remove_entry {
             self.partitions.remove(&(topic.to_string(), partition));
+            self.held.remove(&(topic.to_string(), partition));
         }
         Ok(())
+    }
+
+    /// Records were dropped before any archive held them: they answer no
+    /// search until the indexer catches up. Logged at most once a minute.
+    fn warn_unarchived(&self, topic: &str, partition: i32, count: usize, archived_through: Option<i64>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.unarchived_warned_at.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) >= 60
+            && self
+                .unarchived_warned_at
+                .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
+        {
+            warn!(
+                topic, partition, count, ?archived_through,
+                hard_cap = self.config.hard_max_docs_per_partition,
+                "hot text: hard cap reached, dropped records no archive holds yet; they are unsearchable \
+                 until indexed (raise CHRONIK_HOT_TEXT_HARD_MAX_DOCS or check indexer lag)"
+            );
+        }
     }
 
     /// Flip buffer visibility across every known partition. Coarse test helper.
@@ -753,6 +1060,31 @@ impl HotTextIndex {
     /// query string), this path preserves the structure of bool queries â
     /// `bool.must` actually ANDs its clauses, `bool.should` actually ORs,
     /// etc.
+    /// Run `f` on each partition of `topic` with its archived watermark (the
+    /// highest offset an archive is known to cover), its index and a
+    /// searcher, collecting what it returns. For counts and aggregations,
+    /// which must skip what the archive already holds.
+    pub async fn collect_topic<R, F>(&self, topic: &str, mut f: F) -> Vec<R>
+    where
+        F: FnMut(i32, Option<i64>, &tantivy::Index, &tantivy::Searcher) -> Option<R> + Send,
+    {
+        let keys: Vec<(String, i32)> =
+            self.partitions.iter().filter(|e| e.key().0 == topic).map(|e| e.key().clone()).collect();
+        let mut out = Vec::new();
+        for (t, p) in keys {
+            let Some(entry) = self.partitions.get(&(t.clone(), p)) else { continue };
+            let part = entry.clone();
+            drop(entry);
+            let archived = self.archived_through(&t, p);
+            let guard = part.read().await;
+            let searcher = guard.reader.searcher();
+            if let Some(r) = f(p, archived, &guard.index, &searcher) {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     pub async fn search_topic_structured<F>(
         &self,
         topic: &str,
@@ -842,6 +1174,13 @@ impl HotTextIndex {
         guard.doc_count
     }
 
+    /// The lowest and highest offsets the partition's hot index holds.
+    pub async fn offset_range(&self, topic: &str, partition: i32) -> Option<(i64, i64)> {
+        let part = self.partitions.get(&(topic.to_string(), partition))?.clone();
+        let guard = part.read().await;
+        guard.min_offset.zip(guard.max_offset)
+    }
+
     pub fn partition_keys(&self) -> Vec<(String, i32)> {
         self.partitions.iter().map(|e| e.key().clone()).collect()
     }
@@ -849,6 +1188,7 @@ impl HotTextIndex {
     /// HP-1.4: Detached eviction helper used by the `ColdFlushListener` impl.
     /// Spawns a tokio task; safe to call from non-async contexts.
     fn spawn_eviction(self: &Arc<Self>, topic: String, partition: i32, max_offset: i64) {
+        self.note_archived(&topic, partition, max_offset);
         let this = Arc::clone(self);
         tokio::spawn(async move {
             match this.evict_up_to(&topic, partition, max_offset).await {
@@ -1087,6 +1427,40 @@ mod tests {
         }
     }
 
+    /// The throttle's admission: a batch is admitted only if it fits with
+    /// everything pending, in one step, so concurrent requests cannot all
+    /// pass; a lone oversized batch is still admitted; releasing frees room.
+    #[tokio::test]
+    async fn try_reserve_admits_only_what_fits() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        assert!(idx.try_reserve("t", 0, 600, 1_000));
+        assert!(!idx.try_reserve("t", 0, 600, 1_000), "two together exceed the limit");
+        assert!(idx.try_reserve("t", 0, 400, 1_000));
+        assert_eq!(idx.pending_docs("t", 0), 1_000);
+        idx.release("t", 0, 600);
+        assert!(idx.try_reserve("t", 0, 600, 1_000), "room again once released");
+        assert!(idx.try_reserve("t", 1, 5_000, 1_000), "nothing pending: an oversized batch is admitted");
+    }
+
+    /// What a throttled topic's produce compares with its limit: records on
+    /// their way to the hot index count before they arrive, and once added
+    /// they count as held, never neither in between.
+    #[tokio::test]
+    async fn pending_docs_counts_queued_and_held_records() {
+        let idx = HotTextIndex::new(HotTextConfig::default());
+        assert_eq!(idx.pending_docs("t", 0), 0);
+        let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload")).collect();
+
+        idx.note_queued("t", 0, docs.len());
+        assert_eq!(idx.pending_docs("t", 0), 100, "queued records count before they are added");
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.note_added("t", 0, docs.len());
+        assert_eq!(idx.pending_docs("t", 0), 100, "added, not yet committed: still counted");
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(idx.pending_docs("t", 0), 100);
+        assert_eq!(idx.pending_docs("t", 1), 0, "per partition");
+    }
+
     #[tokio::test]
     async fn evict_drops_old_docs() {
         let idx = HotTextIndex::new(HotTextConfig::default());
@@ -1155,58 +1529,197 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    /// A partition indexing many records between commits gets a burst writer,
+    /// at most `max_burst_writers` across partitions, released once idle;
+    /// nothing is lost when the writer is swapped.
     #[tokio::test]
-    async fn commit_hard_resets_partition_under_ram_pressure() {
-        let config = HotTextConfig {
-            writer_heap_bytes: 15_000_000,
-            max_docs_per_partition: 50,
+    async fn bursting_partitions_get_a_large_writer_within_the_cap() {
+        let idx = HotTextIndex::new(HotTextConfig {
+            burst_writer_heap_bytes: 64_000_000,
+            burst_writer_threads: 2,
+            max_burst_writers: 1,
+            burst_threshold_docs: 50,
+            ..HotTextConfig::default()
+        });
+        let burst = |p: i32| {
+            let idx = &idx;
+            async move {
+                let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload")).collect();
+                idx.add_batch("t", p, &docs).await.unwrap();
+                idx.commit("t", p).await.unwrap();
+            }
         };
-        let idx = HotTextIndex::new(config);
-        // Produce enough docs across several batches to build up tombstones.
-        for base in (0..5).map(|i| i * 100) {
-            let docs: Vec<HotDoc> = (base..base + 100)
-                .map(|o| make_doc(o, "payload"))
-                .collect();
-            idx.add_batch("t", 0, &docs).await.unwrap();
+        let live = |idx: &HotTextIndex| idx.burst_writers.load(std::sync::atomic::Ordering::Relaxed);
+        burst(0).await;
+        assert_eq!(live(&idx), 1, "partition 0 bursts");
+        burst(1).await;
+        assert_eq!(live(&idx), 1, "the cap holds: partition 1 stays small");
+        // Records added after the swap are indexed by the burst writer.
+        let more: Vec<HotDoc> = (100..150).map(|i| make_doc(i, "payload")).collect();
+        idx.add_batch("t", 0, &more).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(idx.search_partition("t", 0, "payload", 1000).await.unwrap().len(), 150);
+        assert_eq!(idx.search_partition("t", 1, "payload", 1000).await.unwrap().len(), 100);
+        // Idle: the writer goes, and the burst slot with it.
+        for _ in 0..3 {
             idx.commit("t", 0).await.unwrap();
         }
-        // Each commit trimmed live docs but accumulated tombstones. At some
-        // point the partition is reset â after reset it's absent from the map.
-        // Either way, total live docs should be bounded.
-        let remaining = idx.doc_count("t", 0).await;
-        assert!(
-            remaining <= 50,
-            "post-reset live doc count {} should be â¤ 50",
-            remaining
-        );
+        assert_eq!(live(&idx), 0);
+        burst(1).await;
+        assert_eq!(live(&idx), 1, "the freed slot is reused");
     }
 
-    #[tokio::test]
-    async fn commit_trims_to_capacity() {
-        let config = HotTextConfig {
+    fn capped(max: usize, hard: usize) -> HotTextIndex {
+        HotTextIndex::new(HotTextConfig {
             writer_heap_bytes: 15_000_000,
-            max_docs_per_partition: 100,
-        };
-        let idx = HotTextIndex::new(config);
+            max_docs_per_partition: max,
+            hard_max_docs_per_partition: hard,
+            ..HotTextConfig::default()
+        })
+    }
+
+    async fn offsets(idx: &HotTextIndex) -> Vec<i64> {
+        let mut o: Vec<i64> = idx
+            .search_partition("t", 0, "payload", 100_000)
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.offset)
+            .collect();
+        o.sort_unstable();
+        o
+    }
+
+    /// Over the soft cap, nothing no archive covers is trimmed: before any
+    /// archive the hot index is the only place those records can be found.
+    #[tokio::test]
+    async fn commit_keeps_unarchived_docs_over_the_soft_cap() {
+        let idx = capped(100, 10_000);
         let docs: Vec<HotDoc> = (0..500).map(|i| make_doc(i, "payload")).collect();
         idx.add_batch("t", 0, &docs).await.unwrap();
-        assert_eq!(idx.doc_count("t", 0).await, 500);
-
-        // commit triggers the trim because we're over capacity
         idx.commit("t", 0).await.unwrap();
+        assert_eq!(offsets(&idx).await, (0..500).collect::<Vec<_>>());
+    }
 
-        // After trim: max_offset=499, threshold=499-100=399 â offsets >399 survive â 100 docs
-        let remaining = idx.doc_count("t", 0).await;
-        assert!(
-            remaining <= 100,
-            "doc count {} should be â¤ 100 after trim",
-            remaining
-        );
-        // Oldest offsets should be gone
-        let hits = idx.search_partition("t", 0, "payload", 200).await.unwrap();
-        for h in &hits {
-            assert!(h.offset > 399, "offset {} should have been trimmed", h.offset);
+    /// Once an archive covers the oldest docs, the trim drops those outside
+    /// the newest `max_docs_per_partition` offsets, and nothing above the
+    /// archived watermark.
+    #[tokio::test]
+    async fn commit_trims_only_archived_offsets() {
+        let idx = capped(100, 10_000);
+        let docs: Vec<HotDoc> = (0..500).map(|i| make_doc(i, "payload")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        idx.note_archived("t", 0, 299);
+        idx.add_batch("t", 0, &[make_doc(500, "payload")]).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(offsets(&idx).await, (300..=500).collect::<Vec<_>>());
+
+        // Archived past the window: the window bounds what stays.
+        idx.note_archived("t", 0, 450);
+        idx.add_batch("t", 0, &[make_doc(501, "payload")]).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(offsets(&idx).await, (402..=501).collect::<Vec<_>>());
+    }
+
+    /// The hard cap bounds memory even when nothing is archived, and reports
+    /// how many records it dropped that no archive held.
+    #[tokio::test]
+    async fn hard_cap_bounds_memory_and_counts_unarchived() {
+        let idx = capped(50, 200);
+        let docs: Vec<HotDoc> = (0..500).map(|i| make_doc(i, "payload")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        let part = idx.get_or_create("t", 0).unwrap();
+        let mut guard = part.write().await;
+        guard.make_visible().unwrap();
+        let (evicted, unarchived) = guard.trim_to_capacity(None).unwrap();
+        assert_eq!((evicted, unarchived), (300, 300));
+        assert_eq!(guard.doc_count, 200);
+        assert_eq!(guard.min_offset, Some(300));
+
+        // Partly archived: only the part above the watermark counts as lost.
+        let more: Vec<HotDoc> = (500..800).map(|i| make_doc(i, "payload")).collect();
+        guard.add_batch(&more).unwrap();
+        guard.make_visible().unwrap();
+        let (evicted, unarchived) = guard.trim_to_capacity(Some(399)).unwrap();
+        assert_eq!((evicted, unarchived), (300, 200));
+        assert_eq!(guard.min_offset, Some(600));
+    }
+
+    /// Steady trimming leaves deleted docs behind; they are merged away
+    /// instead of the partition being dropped (which lost the newest records
+    /// too), and every live record stays searchable.
+    #[tokio::test]
+    async fn steady_trimming_purges_deleted_docs_and_keeps_newest() {
+        let idx = capped(50, 10_000);
+        for round in 0..20i64 {
+            let base = round * 100;
+            let docs: Vec<HotDoc> = (base..base + 100).map(|o| make_doc(o, "payload")).collect();
+            idx.add_batch("t", 0, &docs).await.unwrap();
+            idx.note_archived("t", 0, base + 49);
+            idx.commit("t", 0).await.unwrap();
+            assert_eq!(
+                offsets(&idx).await,
+                (base + 50..base + 100).collect::<Vec<_>>(),
+                "round {round}"
+            );
         }
+        let part = idx.get_or_create("t", 0).unwrap();
+        let guard = part.read().await;
+        let total = guard.total_including_deleted();
+        assert!(total <= 300, "deleted docs never reclaimed: {total} held for {} live", guard.doc_count);
+    }
+
+    /// Records arriving after the archive already covers them (produce hands
+    /// them over asynchronously) keep the watermark, so they are trimmed like
+    /// any archived record. Forgetting it on such a record, as add_batch used
+    /// to, left archived records untrimmable under load until the hard cap
+    /// evicted them as "unarchived".
+    #[tokio::test]
+    async fn late_records_keep_the_archived_watermark() {
+        let idx = capped(10, 10_000);
+        idx.note_archived("t", 0, 1_000);
+        let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        assert_eq!(idx.archived_through("t", 0), Some(1_000));
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(offsets(&idx).await.len(), 10, "archived records trimmed to the soft cap");
+    }
+
+    /// A deleted topic's watermark goes with it: the records of a topic
+    /// recreated under the name are never trimmed as archived.
+    #[tokio::test]
+    async fn a_deleted_topic_forgets_its_archived_watermark() {
+        let idx = capped(10, 10_000);
+        idx.note_archived("t", 0, 1_000);
+        idx.forget_topic("t");
+        assert_eq!(idx.archived_through("t", 0), None);
+        let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        assert_eq!(offsets(&idx).await.len(), 100, "no archive covers the new topic's records");
+    }
+
+    /// A cut log: the docs at and above the cut go, the watermark drops below
+    /// it, and records written after the cut (the same offsets, new records)
+    /// are kept until archived.
+    #[tokio::test]
+    async fn truncation_drops_the_cut_and_lowers_the_watermark() {
+        let idx = capped(10, 10_000);
+        let docs: Vec<HotDoc> = (0..100).map(|i| make_doc(i, "payload old")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        idx.note_archived("t", 0, 80);
+
+        assert_eq!(idx.truncate("t", 0, 50).await.unwrap(), 50);
+        assert_eq!(idx.archived_through("t", 0), Some(49));
+        assert!(offsets(&idx).await.iter().all(|&o| o < 50));
+
+        let docs: Vec<HotDoc> = (50..100).map(|i| make_doc(i, "payload new")).collect();
+        idx.add_batch("t", 0, &docs).await.unwrap();
+        idx.commit("t", 0).await.unwrap();
+        let held = offsets(&idx).await;
+        assert!((50..100).all(|o| held.contains(&o)), "records after the cut are kept: {held:?}");
     }
 
     #[tokio::test]

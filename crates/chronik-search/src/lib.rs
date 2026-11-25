@@ -13,6 +13,8 @@ pub mod cold_cache;
 pub mod ranking;
 pub mod prefilter;
 pub mod legacy_index;
+pub mod topic_aggs;
+pub mod result_cache;
 
 pub use api::SearchApi;
 pub use indexer::{TantivyIndexer, IndexerConfig, SearchResult};

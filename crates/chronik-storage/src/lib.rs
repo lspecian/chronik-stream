@@ -5,7 +5,6 @@ pub mod canonical_record;
 pub mod tantivy_segment;
 pub mod wal_indexer;
 pub mod segment_index;
-pub mod segment_compaction;
 pub mod index;
 pub mod object_store;
 pub mod record_batch;
@@ -28,6 +27,8 @@ pub mod json_index;
 pub mod term_filter;
 pub mod tar_directory;
 pub mod archive_merge;
+pub mod reindex;
+pub mod archive_health;
 // v2.2.7 Phase 5: Deleted metadata_wal_adapter.rs (old WAL adapter, replaced by Raft)
 
 pub use canonical_record::{
@@ -73,6 +74,3 @@ pub use segment_index::{
     ParquetSegmentMetadata, ParquetIndexStats, CombinedIndexStats,
 };
 pub use text_analysis::register_analyzer;
-pub use segment_compaction::{
-    SegmentCompactor, CompactionConfig, CompactionStrategy, CompactionStats,
-};

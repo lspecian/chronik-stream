@@ -67,6 +67,22 @@ impl RankFields {
     }
 }
 
+/// A column's values by document. When every document has one (always, in
+/// the indexes Chronik writes) its values are read directly; the default-value
+/// wrapper looked each one up through the column's optional index, about a
+/// third of the CPU of a broad query (one value per matching document, three
+/// columns).
+fn dense<T>(col: tantivy::columnar::Column<T>, default: T) -> std::sync::Arc<dyn tantivy::columnar::ColumnValues<T>>
+where
+    T: tantivy::columnar::MonotonicallyMappableToU64 + PartialOrd + Copy + Send + Sync + std::fmt::Debug + 'static,
+{
+    if col.get_cardinality() == tantivy::columnar::Cardinality::Full {
+        col.values
+    } else {
+        col.first_or_default_col(default)
+    }
+}
+
 /// The top `limit` documents of `query` in the order of [`hit_order`].
 ///
 /// Falls back to plain relevance when the index is of no layout Chronik
@@ -82,47 +98,259 @@ pub fn top_docs(
     let Some(fields) = RankFields::detect(searcher.schema()) else {
         return searcher.search(query, &TopDocs::with_limit(limit).order_by_score());
     };
-    type Getter = Box<dyn Fn(DocId) -> i64 + Send + Sync>;
-    let i64_col = |ff: &tantivy::fastfield::FastFieldReaders, name: &str| -> Getter {
-        match ff.i64(name) {
-            Ok(col) => {
-                let col = col.first_or_default_col(0);
-                Box::new(move |doc| col.get_val(doc))
-            }
-            Err(_) => Box::new(|_| 0),
-        }
-    };
-    let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
+    if query.downcast_ref::<tantivy::query::AllQuery>().is_some() {
+        return Ok(newest_of_all(searcher, fields, limit));
+    }
+    Ok(searcher
+        .search(query, &RankCollector { fields, limit })?
+        .into_iter()
+        .map(|held| (held.0.score, held.1))
+        .collect())
+}
+
+/// A [`RankKey`] with a total order: on equal keys the lower document address
+/// ranks higher (as Tantivy's `TopDocs` breaks ties).
+#[derive(PartialEq)]
+struct Held(RankKey, DocAddress);
+impl Eq for Held {}
+impl PartialOrd for Held {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Held {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal).then_with(|| other.1.cmp(&self.1))
+    }
+}
+
+/// The top `limit` documents by [`RankKey`], reading a document's columns
+/// only when it could still place: once `limit` are held, a document scoring
+/// below the worst of them is passed over on its score alone, and one scoring
+/// the same is passed over on its timestamp before partition and offset are
+/// read. `TopDocs::tweak_score` built the whole key (three column reads) for
+/// every matching document — most of the CPU of a text or term query matching
+/// many records.
+struct RankCollector {
+    fields: RankFields,
+    limit: usize,
+}
+
+type Getter = Box<dyn Fn(DocId) -> i64 + Send + Sync>;
+
+struct RankSegmentCollector {
+    ord: tantivy::SegmentOrdinal,
+    limit: usize,
+    ts: Getter,
+    offset: Getter,
+    partition: Getter,
+    /// The best held; the root is the worst of them.
+    best: std::collections::BinaryHeap<std::cmp::Reverse<Held>>,
+}
+
+impl tantivy::collector::Collector for RankCollector {
+    type Fruit = Vec<Held>;
+    type Child = RankSegmentCollector;
+
+    fn for_segment(&self, ord: tantivy::SegmentOrdinal, segment: &SegmentReader) -> tantivy::Result<Self::Child> {
         let ff = segment.fast_fields();
-        let ts: Getter = if fields.timestamp_is_date {
-            match ff.date(fields.timestamp) {
+        let i64_col = |name: &str| -> Getter {
+            match ff.i64(name) {
                 Ok(col) => {
-                    let col = col.first_or_default_col(tantivy::DateTime::from_timestamp_millis(0));
+                    let col = dense(col, 0);
+                    Box::new(move |doc| col.get_val(doc))
+                }
+                Err(_) => Box::new(|_| 0),
+            }
+        };
+        let ts: Getter = if self.fields.timestamp_is_date {
+            match ff.date(self.fields.timestamp) {
+                Ok(col) => {
+                    let col = dense(col, tantivy::DateTime::from_timestamp_millis(0));
                     Box::new(move |doc| col.get_val(doc).into_timestamp_secs())
                 }
                 Err(_) => Box::new(|_| 0),
             }
         } else {
-            let ms = i64_col(ff, fields.timestamp);
+            let ms = i64_col(self.fields.timestamp);
             Box::new(move |doc| ms(doc).div_euclid(1000))
         };
-        let off = i64_col(ff, fields.offset);
-        let part: Getter = match fields.partition {
-            Some(p) => i64_col(ff, p),
-            None => Box::new(|_| 0),
-        };
-        move |doc: DocId, score: Score| RankKey {
-            score,
-            timestamp_s: ts(doc),
-            neg_partition: -part(doc),
-            offset: off(doc),
+        Ok(RankSegmentCollector {
+            ord,
+            limit: self.limit,
+            ts,
+            offset: i64_col(self.fields.offset),
+            partition: match self.fields.partition {
+                Some(p) => i64_col(p),
+                None => Box::new(|_| 0),
+            },
+            best: std::collections::BinaryHeap::with_capacity(self.limit + 1),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn merge_fruits(&self, fruits: Vec<Vec<Held>>) -> tantivy::Result<Vec<Held>> {
+        let mut all: Vec<Held> = fruits.into_iter().flatten().collect();
+        all.sort_unstable_by(|a, b| b.cmp(a));
+        all.truncate(self.limit);
+        Ok(all)
+    }
+}
+
+impl tantivy::collector::SegmentCollector for RankSegmentCollector {
+    type Fruit = Vec<Held>;
+
+    fn collect(&mut self, doc: DocId, score: Score) {
+        let mut timestamp_s = None;
+        if self.best.len() == self.limit {
+            let worst = &self.best.peek().expect("limit > 0").0 .0;
+            if score < worst.score {
+                return;
+            }
+            if score == worst.score {
+                let ts = (self.ts)(doc);
+                if ts < worst.timestamp_s {
+                    return;
+                }
+                timestamp_s = Some(ts);
+            }
         }
-    });
-    Ok(searcher
-        .search(query, &collector)?
-        .into_iter()
-        .map(|(key, addr)| (key.score, addr))
-        .collect())
+        let key = RankKey {
+            score,
+            timestamp_s: timestamp_s.unwrap_or_else(|| (self.ts)(doc)),
+            neg_partition: -(self.partition)(doc),
+            offset: (self.offset)(doc),
+        };
+        let held = Held(key, DocAddress::new(self.ord, doc));
+        if self.best.len() < self.limit {
+            self.best.push(std::cmp::Reverse(held));
+        } else if self.best.peek().is_some_and(|w| held > w.0) {
+            self.best.pop();
+            self.best.push(std::cmp::Reverse(held));
+        }
+    }
+
+    fn harvest(self) -> Vec<Held> {
+        self.best.into_iter().map(|r| r.0).collect()
+    }
+}
+
+/// The top `limit` documents of an index for `match_all`, in rank order,
+/// without reading every document.
+///
+/// Every document scores the same (1.0, as Tantivy's all-query scores), so
+/// the order is timestamp, partition, offset. Segments are visited newest
+/// first by the largest timestamp their column holds, and once `limit`
+/// documents are held, a segment whose newest record is older than the
+/// `limit`-th one cannot place any (equal seconds are still visited: the tie
+/// is broken by partition and offset). An archive's segments cover
+/// consecutive offset ranges, so typically one segment is read instead of all
+/// of them: ranking every document of a 1M-record topic was ~10 ms of CPU per
+/// `match_all`.
+fn newest_of_all(searcher: &Searcher, fields: RankFields, limit: usize) -> Vec<(Score, DocAddress)> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    /// RankKey with a total order (scores here are all 1.0).
+    #[derive(PartialEq)]
+    struct Ranked(RankKey, DocAddress);
+    impl Eq for Ranked {}
+    impl PartialOrd for Ranked {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Ranked {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal).then_with(|| other.1.cmp(&self.1))
+        }
+    }
+
+    type Col = std::sync::Arc<dyn tantivy::columnar::ColumnValues<i64>>;
+    struct Seg {
+        ord: u32,
+        /// The best key any document of the segment can have.
+        bound: RankKey,
+        ts: Box<dyn Fn(DocId) -> i64 + Send + Sync>,
+        offset: Option<Col>,
+        partition: Option<Col>,
+    }
+    let mut segments: Vec<Seg> = Vec::new();
+    for (ord, reader) in searcher.segment_readers().iter().enumerate() {
+        let ff = reader.fast_fields();
+        let i64col = |name: &str| ff.i64(name).ok().map(|c| dense(c, 0));
+        let (ts, newest_s): (Box<dyn Fn(DocId) -> i64 + Send + Sync>, i64) = if fields.timestamp_is_date {
+            match ff.date(fields.timestamp) {
+                Ok(c) => {
+                    let c = dense(c, tantivy::DateTime::from_timestamp_millis(0));
+                    let newest = c.max_value().into_timestamp_secs();
+                    (Box::new(move |d| c.get_val(d).into_timestamp_secs()), newest)
+                }
+                Err(_) => (Box::new(|_| 0), 0),
+            }
+        } else {
+            match i64col(fields.timestamp) {
+                Some(c) => {
+                    let newest = c.max_value().div_euclid(1000);
+                    (Box::new(move |d| c.get_val(d).div_euclid(1000)), newest)
+                }
+                None => (Box::new(|_| 0), 0),
+            }
+        };
+        let offset = i64col(fields.offset);
+        let partition = fields.partition.and_then(i64col);
+        let bound = RankKey {
+            score: 1.0,
+            timestamp_s: newest_s,
+            neg_partition: -partition.as_ref().map_or(0, |c| c.min_value()),
+            offset: offset.as_ref().map_or(i64::MAX, |c| c.max_value()),
+        };
+        segments.push(Seg { ord: ord as u32, bound, ts, offset, partition });
+    }
+    segments.sort_by(|a, b| b.bound.partial_cmp(&a.bound).unwrap_or(Ordering::Equal).then(a.ord.cmp(&b.ord)));
+
+    // The `limit` best seen so far; the root is the worst of them.
+    let mut best: BinaryHeap<Reverse<Ranked>> = BinaryHeap::with_capacity(limit + 1);
+    let readers = searcher.segment_readers();
+    for seg in &segments {
+        if best.len() == limit && best.peek().is_some_and(|w| seg.bound < w.0 .0) {
+            break; // no later segment can do better
+        }
+        // Newest documents first: records are mostly added in time order, so
+        // walking backwards fills `best` at once and every older document is
+        // then passed over on one comparison. Forwards, each newer document
+        // replaced one held (a heap pop and push per document).
+        let reader = &readers[seg.ord as usize];
+        let alive = reader.alive_bitset();
+        for doc in (0..reader.max_doc()).rev() {
+            if alive.is_some_and(|a| a.is_deleted(doc)) {
+                continue;
+            }
+            let timestamp_s = (seg.ts)(doc);
+            if best.len() == limit && best.peek().is_some_and(|w| timestamp_s < w.0 .0.timestamp_s) {
+                continue;
+            }
+            let key = RankKey {
+                score: 1.0,
+                timestamp_s,
+                neg_partition: -seg.partition.as_ref().map_or(0, |c| c.get_val(doc)),
+                offset: seg.offset.as_ref().map_or(0, |c| c.get_val(doc)),
+            };
+            let ranked = Ranked(key, DocAddress::new(seg.ord, doc));
+            if best.len() < limit {
+                best.push(Reverse(ranked));
+            } else if best.peek().is_some_and(|w| ranked > w.0) {
+                best.pop();
+                best.push(Reverse(ranked));
+            }
+        }
+    }
+    let mut out: Vec<Ranked> = best.into_iter().map(|r| r.0).collect();
+    out.sort_by(|a, b| b.cmp(a));
+    out.into_iter().map(|r| (r.0.score, r.1)).collect()
 }
 
 /// A hit's timestamp in whole seconds, the granularity the order uses.
@@ -198,6 +426,151 @@ pub fn page(mut hits: Vec<Hit>, from: usize, size: usize) -> (Vec<Hit>, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every record in one second (a burst): offsets break the tie, and the
+    /// segment-skipping top-N still matches ranking every document.
+    #[test]
+    fn match_all_ties_in_one_second_rank_by_offset() {
+        use tantivy::schema::{Schema, FAST, INDEXED, STORED};
+        let mut sb = Schema::builder();
+        let ts = sb.add_date_field("_ts", INDEXED | STORED | FAST);
+        let off = sb.add_i64_field("_offset", INDEXED | STORED | FAST);
+        let index = tantivy::Index::create_in_ram(sb.build());
+        let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        // Segments arrive out of offset order, as a WAL can hold batches.
+        for seg in [2i64, 0, 3, 1] {
+            for o in seg * 500..seg * 500 + 500 {
+                let mut d = tantivy::TantivyDocument::new();
+                d.add_date(ts, tantivy::DateTime::from_timestamp_millis(7_000 + (o % 900)));
+                d.add_i64(off, o);
+                w.add_document(d).unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let searcher = index.reader().unwrap().searcher();
+        let every = tantivy::query::BooleanQuery::new(vec![(
+            tantivy::query::Occur::Must,
+            Box::new(tantivy::query::AllQuery) as Box<dyn Query>,
+        )]);
+        for limit in [1, 10, 500, 501, 1999, 2000, 3000] {
+            let addrs = |v: Vec<(Score, DocAddress)>| v.into_iter().map(|(_, a)| a).collect::<Vec<_>>();
+            assert_eq!(
+                addrs(top_docs(&searcher, &tantivy::query::AllQuery, limit).unwrap()),
+                addrs(top_docs(&searcher, &every, limit).unwrap()),
+                "limit={limit}"
+            );
+        }
+    }
+
+    /// match_all's segment-skipping top-N returns exactly what ranking every
+    /// document returns: several segments, timestamps out of order across
+    /// and within them, many records sharing a second, deleted documents.
+    #[test]
+    fn match_all_skips_segments_without_changing_the_answer() {
+        use tantivy::schema::{Schema, FAST, INDEXED, STORED};
+        for (date, ts_name, off_name) in [(true, "_ts", "_offset"), (false, "timestamp", "offset")] {
+            let mut sb = Schema::builder();
+            let ts = if date { sb.add_date_field(ts_name, INDEXED | STORED | FAST) } else { sb.add_i64_field(ts_name, INDEXED | STORED | FAST) };
+            let off = sb.add_i64_field(off_name, INDEXED | STORED | FAST);
+            let index = tantivy::Index::create_in_ram(sb.build());
+            let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            // 8 commits = 8 segments; ms timestamps mostly rising with offset,
+            // every 7th record from the past, several per second.
+            let mut o = 0i64;
+            for _ in 0..8 {
+                for _ in 0..300 {
+                    let ms = if o % 7 == 0 { 1_000 + o * 3 } else { 1_000_000 + o * 300 };
+                    let mut d = tantivy::TantivyDocument::new();
+                    if date {
+                        d.add_date(ts, tantivy::DateTime::from_timestamp_millis(ms));
+                    } else {
+                        d.add_i64(ts, ms);
+                    }
+                    d.add_i64(off, o);
+                    w.add_document(d).unwrap();
+                    o += 1;
+                }
+                w.commit().unwrap();
+            }
+            w.delete_term(tantivy::Term::from_field_i64(off, 2399));
+            w.commit().unwrap();
+            let reader = index.reader().unwrap();
+            let searcher = reader.searcher();
+            assert!(searcher.segment_readers().len() > 1);
+            // Same scores (1.0), but not an AllQuery: ranks every document.
+            let every = tantivy::query::BooleanQuery::new(vec![(
+                tantivy::query::Occur::Must,
+                Box::new(tantivy::query::AllQuery) as Box<dyn Query>,
+            )]);
+            for limit in [1, 10, 299, 300, 301, 2_000, 5_000] {
+                let fast = top_docs(&searcher, &tantivy::query::AllQuery, limit).unwrap();
+                let full = top_docs(&searcher, &every, limit).unwrap();
+                let addrs = |v: &[(Score, DocAddress)]| v.iter().map(|(_, a)| *a).collect::<Vec<_>>();
+                assert_eq!(addrs(&fast), addrs(&full), "date={date} limit={limit}");
+                assert!(fast.iter().all(|(s, _)| *s == 1.0));
+            }
+        }
+    }
+
+    /// The score-gated collector returns exactly what building every
+    /// document's whole key returns (`TopDocs::tweak_score`, what it replaced):
+    /// varied BM25 scores, many equal ones, timestamps out of order and shared
+    /// seconds, several segments, a deletion.
+    #[test]
+    fn score_gated_ranking_matches_ranking_every_document() {
+        use tantivy::schema::{Schema, FAST, INDEXED, STORED, TEXT};
+        let mut sb = Schema::builder();
+        let ts = sb.add_date_field("_ts", INDEXED | STORED | FAST);
+        let off = sb.add_i64_field("_offset", INDEXED | STORED | FAST);
+        let body = sb.add_text_field("body", TEXT);
+        let index = tantivy::Index::create_in_ram(sb.build());
+        let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        let mut o = 0i64;
+        for _ in 0..6 {
+            for _ in 0..400 {
+                // "alpha" 0-3 times in documents of 3 lengths: scores repeat a lot.
+                let text = format!("{} {}", "alpha ".repeat((o % 4) as usize), "filler ".repeat((o % 3) as usize * 4));
+                let ms = if o % 5 == 0 { 50_000 - o } else { 1_000_000 + o * 250 };
+                let mut d = tantivy::TantivyDocument::new();
+                d.add_date(ts, tantivy::DateTime::from_timestamp_millis(ms));
+                d.add_i64(off, o);
+                d.add_text(body, &text);
+                w.add_document(d).unwrap();
+                o += 1;
+            }
+            w.commit().unwrap();
+        }
+        w.delete_term(tantivy::Term::from_field_i64(off, 1203));
+        w.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        assert!(searcher.segment_readers().len() > 1);
+
+        let reference = |query: &dyn Query, limit: usize| -> Vec<DocAddress> {
+            let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
+                let ff = segment.fast_fields();
+                let t = ff.date("_ts").unwrap();
+                let of = ff.i64("_offset").unwrap();
+                move |doc: DocId, score: Score| RankKey {
+                    score,
+                    timestamp_s: t.first(doc).unwrap().into_timestamp_secs(),
+                    neg_partition: 0,
+                    offset: of.first(doc).unwrap(),
+                }
+            });
+            searcher.search(query, &collector).unwrap().into_iter().map(|(_, a)| a).collect()
+        };
+        let text = tantivy::query::TermQuery::new(
+            tantivy::Term::from_field_text(body, "alpha"),
+            tantivy::schema::IndexRecordOption::WithFreqs,
+        );
+        let equal_scores = tantivy::query::ConstScoreQuery::new(Box::new(text.clone()), 1.0);
+        for limit in [1, 7, 100, 399, 1_000, 5_000] {
+            for (name, query) in [("bm25", &text as &dyn Query), ("constant", &equal_scores as &dyn Query)] {
+                let got: Vec<DocAddress> = top_docs(&searcher, query, limit).unwrap().into_iter().map(|(_, a)| a).collect();
+                assert_eq!(got, reference(query, limit), "{name} limit={limit}");
+            }
+        }
+    }
 
     fn hit(index: &str, score: f32, ts: i64, p: i64, off: i64) -> Hit {
         Hit {

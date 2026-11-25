@@ -13,6 +13,12 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use chronik_monitoring::{init_monitoring, TracingConfig};
 
+// mimalloc instead of the system allocator: search requests allocate many
+// short-lived buffers (column reads, aggregation buckets, JSON), and glibc
+// malloc/free took 7-15% of the CPU of a query load.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod integrated_server;
 mod error_handler;
 mod kafka_handler;
@@ -73,6 +79,8 @@ mod authorizer;  // Security Phase 3: maps Kafka requests onto ACL checks
 mod txn_authorization;  // ACL checks for the transactional APIs
 mod vector_catchup;  // embeds archived records a vector index is missing
 mod columnar_catchup;  // writes archived records Parquet is missing
+mod search_coverage;  // every acknowledged record searchable (metric)
+mod retention;  // retention.ms / retention.bytes over the archive
 mod schema_registry;  // Phase 5: Confluent-compatible Schema Registry
 
 use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, IntegratedKafkaServerBuilder};
@@ -1462,6 +1470,7 @@ async fn run_cluster_mode(
         None, // Uses CHRONIK_ADMIN_API_KEY env var
         server.isr_tracker(),
         schema_registry.clone(),
+        Some(server.get_wal_indexer()),
     );
     info!("✓ Admin API + Schema Registry integrated into Unified API");
 
@@ -1604,6 +1613,7 @@ async fn run_cluster_mode(
         let fanout_router = unified_api::search_handler::search_router_with_fanout(
             api.clone(),
             query_router.clone(),
+            server.metadata_store().clone(),
         );
         info!("✓ Search router upgraded to fan-out mode for distributed queries");
         Some(fanout_router)
@@ -1901,6 +1911,7 @@ async fn run_single_node_mode(
             None, // Uses CHRONIK_ADMIN_API_KEY env var
             None, // no ISR tracker in single-node
             schema_registry_single,
+            Some(server.get_wal_indexer()),
         );
 
         let _unified_handle = unified_api::start_unified_api_with_state(

@@ -60,11 +60,14 @@ Topic-level opt-out for text/SQL isn't exposed yet — disable globally if you d
 ### Hot text index
 ```bash
 CHRONIK_HOT_TEXT_COMMIT_INTERVAL_MS=100   # visibility flip cadence
-CHRONIK_HOT_TEXT_MAX_DOCS=100000          # soft cap per (topic, partition)
+CHRONIK_HOT_TEXT_MAX_DOCS=100000          # per (topic, partition), once an archive covers the rest
+CHRONIK_HOT_TEXT_HARD_MAX_DOCS=1000000    # memory bound per partition (default 10x MAX_DOCS)
 CHRONIK_HOT_TEXT_WRITER_HEAP_BYTES=15000000  # Tantivy writer heap (15MB minimum)
 ```
 
-A partition that exceeds 2× `MAX_DOCS` total docs (live + tombstones) is hard-reset — the RAMDirectory is dropped and recreated fresh on the next produce. This is how we reclaim memory that Tantivy's `delete_term` can't free (tombstones accumulate in segments until merge).
+Records leave the hot index only once an archive covers them, so every acknowledged record is searchable in one of the two. Archived records outside the newest `MAX_DOCS` offsets are trimmed on commit. Records no archive covers yet are kept past `MAX_DOCS` (a burst, until the indexer archives it, up to about a minute) up to `HARD_MAX_DOCS`; past that the oldest are dropped anyway, counted in `chronik_hot_text_docs_total{op="evicted_unarchived"}` and logged (at most once a minute), and stay unsearchable until archived. Deleted docs keep their memory until merged: once they outnumber the live ones the partition's segments are merged (`purge` event). Up to v2.19.2 the trim went by count alone and the partition was dropped whole at 2x `MAX_DOCS` (live + deleted), so a burst larger than `MAX_DOCS` answered nothing until archived.
+
+At boot the warm-up reloads the newest `MAX_DOCS` records and every record after the last archive (bounded by `HARD_MAX_DOCS`), once the archive catalogue is loaded.
 
 ### Hot vector index (per provider)
 
@@ -106,7 +109,7 @@ All hot-path metrics export as `chronik_hot_*` in the Prometheus endpoint. Key s
 - `chronik_hot_vector_batches_total{result}` — `success` / `error`
 
 ### Health
-- `chronik_hot_text_events_total{event}` — `commit` / `trim` / `reset`. A rising `reset` rate means the hot text index is being repeatedly dumped — lower produce rate, raise `MAX_DOCS`, or accept the reset churn.
+- `chronik_hot_text_events_total{event}` — `commit` / `trim` / `purge` (deleted docs merged away). `chronik_hot_text_docs_total{op="evicted_unarchived"}` above 0 means records were dropped before any archive held them: raise `HARD_MAX_DOCS` or look at indexer lag (`wal_indexer_lag_seconds`).
 - `chronik_hot_vector_queue_total{op="dropped"}` — non-zero means the embedder can't keep up with produce. Either raise queue capacity, switch to a faster provider, or lower batch window (local only — OpenAI batching is throughput-bound).
 - `chronik_hot_vector_batches_total{result="error"}` — sustained non-zero means the embedder is returning errors past its retry budget. Check `chronik_embeddings` logs.
 - `chronik_hot_vector_cache_total{result}` — `hit` / `miss`. Higher hit rate = higher embedding-cost savings. A cold start shows all misses until the hot path warms up (~1 min).
@@ -122,10 +125,10 @@ All hot-path metrics export as `chronik_hot_*` in the Prometheus endpoint. Key s
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | Freshness drifts above target on vector | Embedder is slow / hitting rate limits / unreachable | Check `chronik_hot_vector_batches_total{result="error"}` and `chronik_hot_vector_queue_total{op="dropped"}`. Cold path is still embedding — wait for next WalIndexer tick or switch to a local provider. |
-| Hot text RSS growing unboundedly | `MAX_DOCS` set too high, or produce rate exceeds trim/commit cadence | Metric: rising `reset` count means it's self-correcting. Lower `MAX_DOCS` to force smaller RAMDirectories. |
+| Hot text RSS high | Records waiting for their archive (a burst, or the indexer behind), or `MAX_DOCS` high | Bounded by `HARD_MAX_DOCS` per partition. Check indexer lag; lower `HARD_MAX_DOCS` to trade memory for an unsearchable window (counted as `evicted_unarchived`). |
 | Cold path still embedding everything | Topic has `vector.hot.enabled=false`, or hot vector disabled globally, or embedder wasn't configured | Check `chronik_hot_vector_cache_total{result="hit"}` — zero means the hot path isn't priming cold. |
 | "hot vector batcher queue full" WARN in logs | Sustained embedder backpressure | Counter: `chronik_hot_vector_queue_total{op="dropped"}`. Re-tune batch/window, or accept that cold path will fill the gap. |
-| Queries slower right after server restart | Hot text warms from WAL tail; hot vector starts empty | Wait 30s-1min. Hot text warmup runs once at startup (`CHRONIK_HOT_TEXT_MAX_DOCS` worth of WAL tail); hot vector warms naturally from new produces. |
+| Queries slower right after server restart | Hot text warms from WAL tail; hot vector starts empty | Wait 30s-1min. Hot text warmup runs once at startup (`CHRONIK_HOT_TEXT_MAX_DOCS` of WAL tail plus everything not yet archived); hot vector warms naturally from new produces. |
 
 The three hot paths degrade independently. Disabling one (via env var or CLI) doesn't affect the others. The cold path is always on.
 
@@ -135,7 +138,7 @@ The three hot paths degrade independently. Disabling one (via env var or CLI) do
 
 Structured log fields all hot-path events use:
 - `hot_path = "text" | "vector"` — discriminator
-- `event = "partition_reset" | "queue_overflow" | "embedder_error"` — for grep/Loki filters
+- `event = "queue_overflow" | "embedder_error"` — for grep/Loki filters
 - `topic`, `partition` — for partitioned systems
 
 Enable per-module debug for deeper visibility:

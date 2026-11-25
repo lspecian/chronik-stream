@@ -3783,8 +3783,21 @@ pub fn merge_search_responses(
     // One node stopping at its time limit makes the whole answer partial.
     let mut timed_out = local.timed_out;
     let mut segments = local._segments;
+    // Exact counts and aggregations: each node's partial covers the
+    // partitions it leads, so they add up (finalised by the caller).
+    let mut partial = local._chronik_partial;
 
     for peer_resp in peers {
+        if let Some(p) = peer_resp._chronik_partial {
+            match partial.as_mut() {
+                Some(mine) => {
+                    if let Err(e) = mine.merge(p) {
+                        tracing::warn!("merging a peer's count/aggregations failed: {}", e);
+                    }
+                }
+                None => partial = Some(p),
+            }
+        }
         timed_out |= peer_resp.timed_out;
         segments = chronik_search::api::SegmentStats::add(segments, peer_resp._segments);
         shards_total += peer_resp._shards.total;
@@ -3827,6 +3840,7 @@ pub fn merge_search_responses(
         },
         aggregations: local.aggregations,
         _segments: segments,
+        _chronik_partial: partial,
     }
 }
 
@@ -4733,6 +4747,7 @@ mod fan_out_completeness_tests {
                 },
                 aggregations: None,
                 _segments: None,
+                _chronik_partial: None,
             }
         }
 
@@ -4783,6 +4798,7 @@ mod fan_out_completeness_tests {
                 },
                 aggregations: None,
                 _segments: None,
+                _chronik_partial: None,
             }
         }
 

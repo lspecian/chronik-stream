@@ -18,7 +18,8 @@ ends() { $K/kafka-get-offsets.sh --bootstrap-server $B --topic $1 2>/dev/null | 
 leader() { $K/kafka-topics.sh --bootstrap-server $B --describe --topic $T 2>/dev/null | grep -P "Partition: $1\t" | awk '{print $6}'; }
 isr() { $K/kafka-topics.sh --bootstrap-server $B --describe --topic $T 2>/dev/null | grep -P "Partition: $1\t" | awk '{print $10}'; }
 readp() { timeout 60 kcat -C -b $B -t $T -p $1 -o beginning -e -q -f '%o %s\n' 2>/dev/null; }
-held() { grep -ahoE "$2-[0-9]+" tests/cluster/data/node$1/wal/$T/$3/*.log tests/cluster/data/node$1/segments/segments/$T/$3/*.segment 2>/dev/null | sort -u | wc -l; }
+. tests/cluster/segment_text.sh
+held() { seg_text tests/cluster/data/node$1/wal/$T/$3/*.log tests/cluster/data/node$1/segments/segments/$T/$3/*.segment | grep -ahoE "$2-[0-9]+" | sort -u | wc -l; }
 
 echo "=== $LABEL ($TEST_BIN)"
 CHRONIK_BIN=$TEST_BIN ./tests/cluster/start.sh >/dev/null 2>&1 || { echo "FAIL: start.sh failed (cluster not (re)started)"; exit 1; }; up localhost:9092 || { echo "cluster did not start"; exit 1; }

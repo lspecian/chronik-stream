@@ -29,6 +29,7 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${CHRONIK_BIN:-$ROOT/target/release/chronik-server}"
 DIR="$ROOT/tests/cluster"
+. "$DIR/segment_text.sh"
 LOGS="$DIR/logs"
 BOOT="localhost:9392,localhost:9393,localhost:9394"
 PREFIX_N="${DIVERGE_PREFIX:-100}"
@@ -160,14 +161,14 @@ broker_of() { # $1 = node id → its kafka address
 # servable — so this counts both. `-h` drops the file name, or the same record
 # in two files would count twice.
 records_on_node() { # $1 = node, $2 = tag
-  grep -ahoE "$2-[0-9]+" "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log \
-    "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment 2>/dev/null \
-    | sort -u | wc -l
+  seg_text "$DIR/data/alt-node$1/wal/$TOPIC"/0/*.log \
+    "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment \
+    | grep -ahoE "$2-[0-9]+" | sort -u | wc -l
 }
 
 archived_on_node() { # $1 = node, $2 = tag — the archive alone
-  grep -ahoE "$2-[0-9]+" "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment 2>/dev/null \
-    | sort -u | wc -l
+  seg_text "$DIR/data/alt-node$1/segments/segments/$TOPIC"/0/*.segment \
+    | grep -ahoE "$2-[0-9]+" | sort -u | wc -l
 }
 
 wait_for_replication() { # $1 = tag, $2 = expected count

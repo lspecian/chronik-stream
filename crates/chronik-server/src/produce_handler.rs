@@ -248,6 +248,46 @@ enum SequenceCheck {
 /// earlier batch of the same producer is known to be in progress.
 type InFlightSequences = Arc<DashMap<(i64, String, i32), Vec<i32>>>;
 
+/// Records of a throttled topic admitted into the hot index's budget
+/// (`ProduceHandler::wait_for_search_headroom`); released when the batch is
+/// done, by which time its records are counted as queued (or were not written).
+struct SearchReservation {
+    hot: Arc<HotTextIndex>,
+    topic: String,
+    partition: i32,
+    n: usize,
+}
+
+impl Drop for SearchReservation {
+    fn drop(&mut self) {
+        self.hot.release(&self.topic, self.partition, self.n);
+    }
+}
+
+/// Records in a produce request's record set, from the v2 batch headers
+/// (`recordsCount` at byte 57 of each batch), without decoding the records.
+/// A batch in an older format, or a truncated header, counts as one record.
+fn batch_record_count(records_data: &[u8]) -> usize {
+    const BATCH_OVERHEAD: usize = 12; // baseOffset (8) + batchLength (4)
+    const MAGIC_AT: usize = 16;
+    const COUNT_AT: usize = 57;
+    let mut pos = 0;
+    let mut total = 0usize;
+    while pos + BATCH_OVERHEAD <= records_data.len() {
+        let len_bytes: [u8; 4] = records_data[pos + 8..pos + 12].try_into().unwrap();
+        let batch_len = i32::from_be_bytes(len_bytes).max(0) as usize;
+        let count = if records_data.get(pos + MAGIC_AT) == Some(&2) && pos + COUNT_AT + 4 <= records_data.len() {
+            let c: [u8; 4] = records_data[pos + COUNT_AT..pos + COUNT_AT + 4].try_into().unwrap();
+            i32::from_be_bytes(c).max(1) as usize
+        } else {
+            1
+        };
+        total += count;
+        pos += BATCH_OVERHEAD + batch_len;
+    }
+    total.max(1)
+}
+
 /// Registration of one batch in [`InFlightSequences`]; removed on drop, so
 /// every exit path — success, error, early return — unregisters it.
 struct InFlightGuard {
@@ -508,6 +548,8 @@ pub struct ProduceHandler {
     /// Key: topic name, Value: (is_searchable, last_updated)
     /// TTL: 60 seconds to pick up config changes within reasonable time
     searchable_topic_cache: Arc<DashMap<String, (bool, std::time::Instant)>>,
+    /// Same shape, for `searchable.throttle.enabled`.
+    search_throttle_cache: Arc<DashMap<String, (bool, std::time::Instant)>>,
     /// Same shape as `searchable_topic_cache`, for the hot-vector check.
     /// Key: topic name, Value: (is_vector_hot_enabled, last_updated)
     /// Without it, `is_topic_vector_enabled` hit the metadata store on EVERY
@@ -727,6 +769,80 @@ impl ProduceHandler {
     /// Get reference to Raft cluster (for request forwarding)
     pub fn get_raft_cluster(&self) -> &Option<Arc<ClusterCatalog>> {
         &self.raft_cluster
+    }
+
+    /// `searchable.throttle.enabled` for `topic` (cached like
+    /// `is_topic_searchable`, so a change takes up to a minute).
+    async fn is_topic_search_throttled(&self, topic: &str) -> bool {
+        const CACHE_TTL_SECS: u64 = 60;
+        if let Some(entry) = self.search_throttle_cache.get(topic) {
+            let (throttled, at) = *entry;
+            if at.elapsed().as_secs() < CACHE_TTL_SECS {
+                return throttled;
+            }
+        }
+        match self.metadata_store.get_topic(topic).await {
+            Ok(Some(meta)) => {
+                let throttled = meta.config.is_searchable_throttle_enabled();
+                self.search_throttle_cache.insert(topic.to_string(), (throttled, std::time::Instant::now()));
+                throttled
+            }
+            _ => false,
+        }
+    }
+
+    /// For a topic with `searchable.throttle.enabled`: hold this batch, before
+    /// it is written, until the partition's hot index has room for it.
+    ///
+    /// The hot index keeps every record no archive covers yet, up to its hard
+    /// cap; past it the oldest of them become unsearchable until archived. A
+    /// burst faster than archiving reaches it, so for these topics produce
+    /// slows to the archive rate instead (the batch waits here, which holds
+    /// the producer's in-flight requests). Room means the partition's pending
+    /// records (held, on their way, and admitted by other requests) plus this
+    /// batch's stay within 80% of the cap; the batch's records are reserved
+    /// in the same step, released when the returned guard drops.
+    ///
+    /// Waits at most `CHRONIK_SEARCH_THROTTLE_MAX_WAIT_MS` (10 s) per batch,
+    /// then writes, so a stalled indexer slows producers but never stops them;
+    /// such writes count in `chronik_produce_search_throttle_timeouts_total`.
+    async fn wait_for_search_headroom(&self, topic: &str, partition: i32, records_data: &[u8]) -> Option<SearchReservation> {
+        let hot = self.hot_text_index.as_ref()?;
+        if !self.is_topic_searchable(topic).await || !self.is_topic_search_throttled(topic).await {
+            return None;
+        }
+        let n = batch_record_count(records_data);
+        let limit = hot.hard_max_docs() / 10 * 8;
+        let reservation = |hot: &Arc<HotTextIndex>| SearchReservation {
+            hot: Arc::clone(hot),
+            topic: topic.to_string(),
+            partition,
+            n,
+        };
+        if hot.try_reserve(topic, partition, n, limit) {
+            return Some(reservation(hot));
+        }
+        let max_wait = std::time::Duration::from_millis(
+            std::env::var("CHRONIK_SEARCH_THROTTLE_MAX_WAIT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(10_000),
+        );
+        let started = std::time::Instant::now();
+        chronik_storage::wal_indexer::request_indexing(topic, partition);
+        let admitted = loop {
+            if hot.try_reserve(topic, partition, n, limit) {
+                break true;
+            }
+            if started.elapsed() >= max_wait {
+                break false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let waited = started.elapsed();
+        debug!(topic, partition, waited_ms = waited.as_millis() as u64, admitted, "produce held for search headroom");
+        MetricsRecorder::record_search_throttle(waited.as_millis() as u64, !admitted);
+        admitted.then(|| reservation(hot))
     }
 
     /// v2.2.16: Check if a topic is searchable (with caching).
@@ -1019,6 +1135,13 @@ impl ProduceHandler {
         partition: i32,
         new_log_end: i64,
     ) -> Result<()> {
+        // The hot index too: the records above the cut are gone, and so are
+        // the archived ones its watermark counted.
+        if let Some(hot) = &self.hot_text_index {
+            if let Err(e) = hot.truncate(topic, partition, new_log_end).await {
+                warn!("Truncation of {}-{} to {}: hot text index not cut: {}", topic, partition, new_log_end, e);
+            }
+        }
         let key = (topic.to_string(), partition);
         let Some(state) = self.partition_states.get(&key) else {
             // No state to walk back. Creating one at the truncated end keeps
@@ -1308,6 +1431,7 @@ impl ProduceHandler {
             pipelined_pool: Arc::new(PipelinedConnectionPool::new(10000)),  // v2.2.9: Async pipelined connection pool (capacity increased from 1000 → 10000 to prevent channel blocking)
             response_pipeline: None,  // v2.2.10: Initialize as None (set via set_response_pipeline) - CRITICAL FIX #7
             searchable_topic_cache: Arc::new(DashMap::new()),  // v2.2.16: Cache for topic searchability
+            search_throttle_cache: Arc::new(DashMap::new()),
             vector_topic_cache: Arc::new(DashMap::new()),      // same, for the hot-vector check
             hot_text_index: None,  // HP-1.2: Wired via set_hot_text_index
             hot_vector_batcher: None,  // HP-2.3: Wired via set_hot_vector_batcher
@@ -2276,6 +2400,9 @@ impl ProduceHandler {
 
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         debug!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
+
+        // searchable.throttle.enabled: before anything is held or written.
+        let _search_reservation = self.wait_for_search_headroom(topic, partition, records_data).await;
 
         // A connection's earlier requests enter this partition first (see
         // `produce_order`). The turn passes once the append lock is held.
@@ -3297,6 +3424,9 @@ impl ProduceHandler {
     /// next offset or epochs would start it in the middle of a history it
     /// never had.
     pub fn forget_topic(&self, topic: &str) {
+        if let Some(hot) = &self.hot_text_index {
+            hot.forget_topic(topic);
+        }
         self.partition_states.retain(|key, _| key.0 != topic);
         self.archived_hwm_cache.retain(|key, _| key.0 != topic);
         self.leader_epochs.forget_topic(topic);
@@ -3639,19 +3769,23 @@ impl ProduceHandler {
                 headers: None,
             })
             .collect();
+        // Queued until added: throttled topics count these as pending.
+        hot_idx.note_queued(topic, partition, docs.len());
         tokio::spawn(async move {
             // HP-3 Item 1: per-topic hot opt-out. Already gated on
             // is_topic_searchable at the call site; this is the extra check
             // for `searchable.hot.enabled=false`. Doing the lookup in the
             // spawned task keeps the produce path off the metadata read.
-            if let Ok(Some(meta)) = metadata_store.get_topic(&topic_owned).await {
-                if !meta.config.is_searchable_hot_enabled() {
-                    return;
+            let hot_enabled = match metadata_store.get_topic(&topic_owned).await {
+                Ok(Some(meta)) => meta.config.is_searchable_hot_enabled(),
+                _ => true,
+            };
+            if hot_enabled {
+                if let Err(e) = hot_idx.add_batch(&topic_owned, partition, &docs).await {
+                    trace!(topic = %topic_owned, partition, "hot_text_index add_batch failed: {}", e);
                 }
             }
-            if let Err(e) = hot_idx.add_batch(&topic_owned, partition, &docs).await {
-                trace!(topic = %topic_owned, partition, "hot_text_index add_batch failed: {}", e);
-            }
+            hot_idx.note_added(&topic_owned, partition, docs.len());
         });
     }
 
@@ -4169,6 +4303,7 @@ impl Clone for ProduceHandler {
             pipelined_pool: Arc::clone(&self.pipelined_pool),  // v2.2.9: Async pipelined connection pool
             response_pipeline: self.response_pipeline.clone(),  // v2.2.10: Async response delivery (CRITICAL FIX #7)
             searchable_topic_cache: Arc::clone(&self.searchable_topic_cache),  // v2.2.16: Share cache
+            search_throttle_cache: Arc::clone(&self.search_throttle_cache),
             vector_topic_cache: Arc::clone(&self.vector_topic_cache),
             hot_text_index: self.hot_text_index.clone(),  // HP-1.2
             hot_vector_batcher: self.hot_vector_batcher.clone(),  // HP-2.3
@@ -6129,5 +6264,37 @@ pub(crate) mod tests {
             150,
             "the watermark caught up, but the log end must stay where the leader put it"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_record_count_tests {
+    use super::batch_record_count;
+
+    /// A v2 batch header (and `body` bytes of records) declaring `count` records.
+    fn v2_batch(count: i32, body: usize) -> Vec<u8> {
+        let mut b = vec![0u8; 61 + body];
+        let batch_len = (b.len() - 12) as i32;
+        b[8..12].copy_from_slice(&batch_len.to_be_bytes());
+        b[16] = 2; // magic
+        b[57..61].copy_from_slice(&count.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn counts_the_records_of_every_batch() {
+        assert_eq!(batch_record_count(&v2_batch(500, 40)), 500);
+        let mut two = v2_batch(3, 10);
+        two.extend(v2_batch(5, 7));
+        assert_eq!(batch_record_count(&two), 8, "two batches in one record set");
+    }
+
+    #[test]
+    fn unknown_shapes_count_as_one_record() {
+        assert_eq!(batch_record_count(&[]), 1);
+        let mut legacy = v2_batch(9, 0);
+        legacy[16] = 1; // magic 1: no recordsCount field
+        assert_eq!(batch_record_count(&legacy), 1);
+        assert_eq!(batch_record_count(&v2_batch(9, 0)[..30]), 1, "truncated header");
     }
 }

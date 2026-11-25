@@ -64,6 +64,7 @@ pub fn create_admin_state(
         api_key: effective_key,
         isr_tracker,
         schema_registry,
+        reindex: None,
     }
 }
 
@@ -100,14 +101,16 @@ pub fn create_admin_router_for_unified_api(
     api_key: Option<String>,
     isr_tracker: Option<Arc<IsrTracker>>,
     schema_registry: Arc<SchemaRegistry>,
+    wal_indexer: Option<Arc<chronik_storage::WalIndexer>>,
 ) -> Router {
-    let state = create_admin_state(
+    let mut state = create_admin_state(
         raft_cluster,
         metadata_store,
         api_key,
         isr_tracker,
         schema_registry,
     );
+    state.reindex = wal_indexer.map(crate::admin_api::ReindexState::new);
     admin_router(state)
 }
 

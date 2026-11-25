@@ -4,8 +4,9 @@
 # Usage: run_all.sh <binary> <label>
 # Needs: KAFKA_HOME (a Kafka distribution), LEGACY_BIN (a v2.17.0 binary, for
 # search_after_archive), SETUP_BIN (a v2.16.7 binary, for
-# straddle's setup), PREV_BIN (the previous release, for group_upgrade and
-# tantivy_cross_version), kcat and a JDK, and the legacy_index_tool example built
+# straddle's setup), PREV_BIN (the previous release, for
+# tantivy_cross_version, raw_segment_compression and reindex), GROUPS_OLD_BIN
+# (a v2.18.x binary, for group_upgrade), kcat and a JDK, and the legacy_index_tool example built
 # (cargo build --release -p chronik-search --example legacy_index_tool).
 # Logs go to tests/cluster/data/e2e/<label>/.
 # Each check starts and stops the local 3-node cluster (tests/cluster/), so
@@ -19,7 +20,8 @@ E2E="$REPO/tests/cluster/e2e"
 export KAFKA_BIN="${KAFKA_HOME:?set KAFKA_HOME to a Kafka distribution}/bin" CHRONIK_BIN=$BIN
 : "${SETUP_BIN:?set SETUP_BIN to a v2.16.7 chronik-server (straddle setup)}"
 : "${LEGACY_BIN:?set LEGACY_BIN to a v2.17.0 chronik-server (search_after_archive upgrade case)}"
-: "${PREV_BIN:?set PREV_BIN to the chronik-server of the previous release (group_upgrade, tantivy_cross_version)}"
+: "${PREV_BIN:?set PREV_BIN to the chronik-server of the previous release (tantivy_cross_version, raw_segment_compression, reindex)}"
+: "${GROUPS_OLD_BIN:?set GROUPS_OLD_BIN to a v2.18.x chronik-server (group_upgrade: an upgrade from before catalog group offsets)}"
 export LEGACY_BIN
 OUT="$REPO/tests/cluster/data/e2e/$LABEL"; mkdir -p "$OUT"
 cd "$REPO"
@@ -53,12 +55,22 @@ run search_pagination "$E2E/search_pagination.sh" "$BIN" "$LABEL"
 run legacy_index_retirement "$E2E/legacy_index_retirement.sh" "$BIN" "$LABEL"
 run archive_merge "$E2E/archive_merge.sh" "$BIN" "$LABEL"
 run archive_merge_crash "$E2E/archive_merge_crash.sh" "$BIN" "$LABEL"
+run archive_merge_tiers "$E2E/archive_merge_tiers.sh" "$BIN" "$LABEL"
 run archive_upgrade "$E2E/archive_upgrade.sh" "$BIN" "$LABEL"
 run tantivy_cross_version_up "$E2E/tantivy_cross_version.sh" "$PREV_BIN" "$BIN" "$LABEL-up"
 run tantivy_cross_version_down "$E2E/tantivy_cross_version.sh" "$BIN" "$PREV_BIN" "$LABEL-down"
+run raw_segment_compression "$E2E/raw_segment_compression.sh" "$BIN" "$PREV_BIN" "$LABEL"
 run epoch_without_history "$E2E/epoch_without_history.sh" "$BIN" "$LABEL"
 run acks0_no_response "$E2E/acks0_no_response.sh" "$BIN" "$LABEL"
 run hot_buffer_limit "$E2E/hot_buffer_limit.sh" "$BIN" "$LABEL"
+run search_coverage "$E2E/search_coverage.sh" "$BIN" "$LABEL"
+run search_aggregations "$E2E/search_aggregations.sh" "$BIN" "$LABEL"
+run reindex "$E2E/reindex.sh" "$BIN" "$PREV_BIN" "$LABEL"
+run archive_damage "$E2E/archive_damage.sh" "$BIN" "$LABEL"
+run search_coverage_metric "$E2E/search_coverage_metric.sh" "$BIN" "$LABEL"
+run search_throttle "$E2E/search_throttle.sh" "$BIN" "$LABEL"
+run retention "$E2E/retention.sh" "$BIN" "$LABEL"
+run retention_cluster "$E2E/retention_cluster.sh" "$BIN" "$LABEL"
 run projected_columns "$E2E/projected_columns.sh" "$BIN" "$LABEL"
 run columnar_catchup "$E2E/columnar_catchup.sh" "$BIN" "$LABEL"
 run vector_catchup "$E2E/vector_catchup.sh" "$BIN" "$LABEL"
@@ -69,7 +81,7 @@ run s3_roundtrip "$E2E/s3_roundtrip.sh" "$BIN" "$LABEL"
 run dr_restore "$E2E/dr_restore.sh" "$BIN" "$LABEL"
 run dr_cluster_restore "$E2E/dr_cluster_restore.sh" "$BIN" "$LABEL"
 run group_coordination "$E2E/group_coordination.sh" "$BIN" "$LABEL"
-run group_upgrade "$E2E/group_upgrade.sh" "$PREV_BIN" "$BIN" "$LABEL"
+run group_upgrade "$E2E/group_upgrade.sh" "$GROUPS_OLD_BIN" "$BIN" "$LABEL"
 run metadata_compaction "$E2E/metadata_compaction.sh" "$BIN" "$LABEL"
 run unified_api_routes "$E2E/unified_api_routes.sh" "$BIN" "$LABEL"
 run operator_kafka_admin "$E2E/operator_kafka_admin.sh" "$BIN" "$LABEL"

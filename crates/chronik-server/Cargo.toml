@@ -12,6 +12,7 @@ name = "chronik-server"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 # Core Chronik dependencies
 chronik-common = { path = "../chronik-common" }
 chronik-protocol = { path = "../chronik-protocol" }

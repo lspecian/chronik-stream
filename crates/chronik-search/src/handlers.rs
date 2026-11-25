@@ -143,6 +143,9 @@ async fn search_hot_topic(
     let dsl = request.query.as_ref().unwrap_or(&match_all);
     // The whole window: page `from` of the merge may come from here.
     let k = request.from.saturating_add(request.size);
+    if request.size == 0 {
+        return Vec::new(); // no page to fill (counts and aggregations run separately)
+    }
 
     if let Some(query_text) = extract_simple_query_text(dsl) {
         return match hot_idx.search_topic(topic, &query_text, k).await {
@@ -387,6 +390,7 @@ pub async fn search_all(
         },
         aggregations: None,
         _segments,
+        _chronik_partial: None,
     };
 
     // Cache the response — skip when hot path active (would cache stale NRT
@@ -520,6 +524,38 @@ pub async fn search_index(
     // Every source returned its top `from + size`; page the merged list once.
     let (hits, found) = crate::ranking::page(hits, request.from, request.size);
 
+    // Exact count and aggregations over the topic's records (an index made
+    // through the REST document API answers its own, above).
+    let mut total = TotalHits {
+        value: found as u64,
+        relation: total_relation(found, request.from + request.size, timed_out).to_string(),
+    };
+    let mut partial = None;
+    let topic_aggs_req = request.aggs.as_ref().or(request.aggregations.as_ref());
+    if api.indices.get(&index).is_none()
+        && crate::topic_aggs::wants_exact_count(request.size, request.track_total_hits.as_ref(), topic_aggs_req.is_some())
+    {
+        let prepared = match topic_aggs_req.map(crate::topic_aggs::TopicAggs::prepare).transpose() {
+            Ok(p) => p,
+            Err(e) => return Err(error_response("illegal_argument_exception", &e.to_string(), StatusCode::BAD_REQUEST)),
+        };
+        let (counted, complete) = count_and_aggregate(&api, &index, &request, prepared.as_ref(), deadline).await;
+        timed_out |= !complete && tokio::time::Instant::now() >= deadline;
+        if request._chronik_partial {
+            partial = Some(counted);
+        } else {
+            total = TotalHits {
+                value: counted.count,
+                relation: if complete { "eq" } else { "gte" }.to_string(),
+            };
+            if let Some(prepared) = &prepared {
+                aggregations = Some(prepared.finalize(counted.aggs).map_err(|e| {
+                    error_response("illegal_argument_exception", &e.to_string(), StatusCode::BAD_REQUEST)
+                })?);
+            }
+        }
+    }
+
     let took = start.elapsed().unwrap_or_default().as_millis() as u64;
 
     let response = SearchResponse {
@@ -532,15 +568,13 @@ pub async fn search_index(
             failed: 0,
         },
         hits: HitsInfo {
-            total: TotalHits {
-                value: found as u64,
-                relation: total_relation(found, request.from + request.size, timed_out).to_string(),
-            },
+            total,
             max_score: hits.first().and_then(|h| h._score),
             hits,
         },
         aggregations,
         _segments,
+        _chronik_partial: partial,
     };
     
     Ok(Json(response))
@@ -647,6 +681,12 @@ async fn search_cold_segments(
     use futures::stream::{self, StreamExt};
 
     let mut out = ColdSearch { segments: segments.len(), ..Default::default() };
+    // Archives whose records all lie outside the query's required record-time
+    // window cannot hold a hit (counted as skipped).
+    let window = required_time_window(request.query.as_ref());
+    let before = segments.len();
+    segments.retain(|s| segment_in_window(s, window));
+    out.skipped += before - segments.len();
     let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) else {
         return out;
     };
@@ -656,10 +696,12 @@ async fn search_cold_segments(
     }
     // Newest first, and a fixed order among equals, so the same request
     // searches the same segments in the same order.
+    // Best possible rank first (see `RankBound`): the early stop below needs
+    // every unsearched segment to rank no higher than the next one.
     segments.sort_by(|a, b| {
-        b.max_timestamp.cmp(&a.max_timestamp).then_with(|| a.object_store_path.cmp(&b.object_store_path))
+        RankBound::of_segment(b).cmp(&RankBound::of_segment(a)).then_with(|| a.object_store_path.cmp(&b.object_store_path))
     });
-    let newest: Vec<i64> = segments.iter().map(|s| s.max_timestamp).collect();
+    let newest: Vec<RankBound> = segments.iter().map(RankBound::of_segment).collect();
     let unranked = is_unranked(request);
     let store = wal_indexer.object_store();
     // The terms a hit must contain, to skip archives whose term filter proves
@@ -738,6 +780,179 @@ async fn search_cold_segments(
     out
 }
 
+/// The record-timestamp window (inclusive, epoch ms) every hit of `query`
+/// must fall in: from `range`s on the record timestamp at the top level or in
+/// a bool's `must`/`filter`. Unbounded when there is none.
+fn required_time_window(query: Option<&QueryDsl>) -> (i64, i64) {
+    fn visit(q: &QueryDsl, lo: &mut i64, hi: &mut i64) {
+        match q {
+            QueryDsl::Range(r) => {
+                for (field, c) in &r.field_range {
+                    if !matches!(field.as_str(), "timestamp" | "_ts" | "_timestamp") {
+                        continue;
+                    }
+                    let n = |v: &Option<serde_json::Value>| v.as_ref().and_then(|v| v.as_i64());
+                    if let Some(v) = n(&c.gte) {
+                        *lo = (*lo).max(v);
+                    }
+                    if let Some(v) = n(&c.gt) {
+                        *lo = (*lo).max(v.saturating_add(1));
+                    }
+                    if let Some(v) = n(&c.lte) {
+                        *hi = (*hi).min(v);
+                    }
+                    if let Some(v) = n(&c.lt) {
+                        *hi = (*hi).min(v.saturating_sub(1));
+                    }
+                }
+            }
+            QueryDsl::Bool(b) => {
+                for c in b.must.iter().chain(b.filter.iter()) {
+                    visit(c, lo, hi);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+    if let Some(q) = query {
+        visit(q, &mut lo, &mut hi);
+    }
+    (lo, hi)
+}
+
+/// Whether an archived segment can hold a record in the window. A segment
+/// whose catalogue entry has no timestamps (0) is always searched.
+fn segment_in_window(seg: &chronik_storage::segment_index::SegmentMetadata, (lo, hi): (i64, i64)) -> bool {
+    seg.max_timestamp <= 0 || (seg.max_timestamp >= lo && seg.min_timestamp <= hi)
+}
+
+/// A topic's exact count, and aggregations when `aggs` is set, over every
+/// archived segment and hot partition this node counts (`_chronik_partitions`,
+/// all when unset). Each record once: the hot index contributes only offsets
+/// above its partition's archived watermark. Returns the partial and whether
+/// it is complete (false when a source could not answer the query, e.g. a
+/// range over an archive written without JSON columns, or the time limit).
+async fn count_and_aggregate(
+    api: &SearchApi,
+    topic: &str,
+    request: &SearchRequest,
+    aggs: Option<&crate::topic_aggs::TopicAggs>,
+    deadline: tokio::time::Instant,
+) -> (crate::topic_aggs::Partial, bool) {
+    use crate::topic_aggs::{collect, Partial};
+    use futures::stream::{self, StreamExt};
+
+    let allowed: Option<std::collections::HashSet<i32>> =
+        request._chronik_partitions.as_ref().map(|p| p.iter().copied().collect());
+    let counts = |p: i32| allowed.as_ref().map_or(true, |a| a.contains(&p));
+    let mut total = Partial::default();
+    let mut complete = true;
+
+    // One source: the request's query and aggregations against its schema.
+    let run = |index: &tantivy::Index, searcher: &tantivy::Searcher, floor: Option<(tantivy::schema::Field, i64)>| -> Result<Partial> {
+        let schema = index.schema();
+        let mut query: Box<dyn TantivyQuery> = match &request.query {
+            Some(dsl) => build_tantivy_query(dsl, &schema, Some(index))?,
+            None => Box::new(AllQuery),
+        };
+        if let Some((offset, above)) = floor {
+            let range = RangeQuery::new(
+                std::ops::Bound::Excluded(Term::from_field_i64(offset, above)),
+                std::ops::Bound::Unbounded,
+            );
+            query = Box::new(BooleanQuery::new(vec![(Occur::Must, query), (Occur::Must, Box::new(range))]));
+        }
+        let aggs = aggs.map(|a| a.for_schema(&schema)).transpose()?;
+        collect(searcher, &*query, aggs)
+    };
+
+    // Archived segments.
+    if let (Some(wal_indexer), Some(cache)) = (api.wal_indexer(), api.cold_cache()) {
+        let segments = wal_indexer.segment_index().get_segments_for_topic(topic).await.unwrap_or_default();
+        let window = required_time_window(request.query.as_ref());
+        let store = wal_indexer.object_store();
+        let shared = Arc::new((request.clone(), aggs.cloned()));
+        let results = crate::result_cache::ResultCache::shared();
+        let request_key = crate::result_cache::ResultCache::request_key(
+            request.query.as_ref(),
+            request.aggs.as_ref().or(request.aggregations.as_ref()),
+        );
+        let mut parts = stream::iter(segments.into_iter().filter(|s| counts(s.partition) && segment_in_window(s, window)).map(|seg| {
+            let (cache, store, shared, request_key) = (cache.clone(), store.clone(), shared.clone(), request_key.clone());
+            async move {
+                // An archive never changes: its share of this request may be known already.
+                if let Some(cached) = request_key.as_ref().and_then(|k| results.get(&seg, k)) {
+                    return Ok((*cached).clone());
+                }
+                let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
+                    Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
+                })?;
+                let part = tokio::task::spawn_blocking(move || {
+                    let (request, aggs) = (&shared.0, shared.1.as_ref());
+                    let index = reader.index();
+                    let schema = index.schema();
+                    let query: Box<dyn TantivyQuery> = match &request.query {
+                        Some(dsl) => build_tantivy_query(dsl, &schema, Some(index))?,
+                        None => Box::new(AllQuery),
+                    };
+                    let aggs = aggs.map(|a| a.for_schema(&schema)).transpose()?;
+                    collect(&reader.searcher(), &*query, aggs)
+                })
+                .await
+                .map_err(|e| Error::Internal(format!("count task failed: {}", e)))?;
+                if let (Ok(part), Some(k)) = (&part, &request_key) {
+                    results.put(&seg, k, Arc::new(part.clone()));
+                }
+                part
+            }
+        }))
+        .buffered(cold_search_concurrency());
+        loop {
+            match tokio::time::timeout_at(deadline, parts.next()).await {
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(Ok(part))) => {
+                    if let Err(e) = total.merge(part) {
+                        debug!("count/aggregation merge failed: {}", e);
+                        complete = false;
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    debug!(topic, "archive could not answer the count/aggregations: {}", e);
+                    complete = false;
+                }
+            }
+        }
+    }
+
+    // Hot partitions: only what no archive holds yet.
+    if let Some(hot) = api.hot_text_index.as_ref() {
+        let parts = hot
+            .collect_topic(topic, |p, archived, index, searcher| {
+                if !counts(p) {
+                    return None;
+                }
+                let offset = index.schema().get_field("offset").ok()?;
+                Some(run(index, searcher, archived.map(|a| (offset, a))))
+            })
+            .await;
+        for part in parts {
+            match part.and_then(|p| total.merge(p)) {
+                Ok(()) => {}
+                Err(e) => {
+                    debug!(topic, "hot index could not answer the count/aggregations: {}", e);
+                    complete = false;
+                }
+            }
+        }
+    }
+    (total, complete)
+}
+
 /// For a query whose hits all score alike, whether the segments searched so far
 /// already hold the whole top `window`. Hits are ordered newest first
 /// ([`crate::ranking::hit_order`]) and segments are searched newest first, so
@@ -745,20 +960,68 @@ async fn search_cold_segments(
 /// strictly older than the `window`-th hit, nothing unsearched can rank above
 /// any hit kept. (Equal timestamps go on searching: the tie-break could still
 /// favour the unsearched record.)
-fn can_stop_unranked(hits: &[Hit], window: usize, next_newest: Option<&i64>) -> bool {
+fn can_stop_unranked(hits: &[Hit], window: usize, next: Option<&RankBound>) -> bool {
     if hits.len() < window || window == 0 {
         return false;
     }
-    let Some(&next_newest) = next_newest else {
+    let Some(next) = next else {
         return true; // nothing left to search
     };
-    let mut stamps: Vec<i64> = hits
-        .iter()
-        .map(|h| crate::ranking::rank_second(h).unwrap_or(i64::MIN))
-        .collect();
-    // The window-th newest, in the seconds the order compares (rank_second).
-    let (_, kth, _) = stamps.select_nth_unstable_by(window - 1, |a, b| b.cmp(a));
-    next_newest.div_euclid(1000) < *kth
+    let mut keys: Vec<RankBound> = hits.iter().map(RankBound::of_hit).collect();
+    // The window-th best kept, by the order the merge uses.
+    let (_, kth, _) = keys.select_nth_unstable_by(window - 1, |a, b| b.cmp(a));
+    next < kth
+}
+
+/// Where an unranked hit (every score equal) sorts, as `ranking::hit_order`
+/// compares: newest second, then topic, lowest partition, highest offset.
+/// Greater ranks higher. For a segment, the best any of its records can
+/// reach (newest second, highest offset): when records share seconds (every
+/// burst does) the second alone could not tell segments apart, so a search
+/// for the newest page read every archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RankBound {
+    second: i64,
+    topic: String,
+    partition: i64,
+    offset: i64,
+}
+
+impl RankBound {
+    fn of_hit(h: &Hit) -> Self {
+        let num = |k: &str| h._source.get(k).and_then(|v| v.as_i64());
+        Self {
+            second: crate::ranking::rank_second(h).unwrap_or(i64::MIN),
+            topic: h._index.clone(),
+            partition: num("partition").unwrap_or(i64::MAX),
+            offset: num("offset").unwrap_or(i64::MIN),
+        }
+    }
+
+    fn of_segment(s: &chronik_storage::segment_index::SegmentMetadata) -> Self {
+        Self {
+            second: s.max_timestamp.div_euclid(1000),
+            topic: s.topic.clone(),
+            partition: s.partition as i64,
+            offset: s.max_offset,
+        }
+    }
+}
+
+impl PartialOrd for RankBound {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankBound {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.second
+            .cmp(&other.second)
+            .then_with(|| other.topic.cmp(&self.topic))
+            .then_with(|| other.partition.cmp(&self.partition))
+            .then_with(|| self.offset.cmp(&other.offset))
+    }
 }
 
 /// What a cold search found.
@@ -1260,38 +1523,41 @@ async fn search_in_index(
     Ok(hits)
 }
 
-/// v2.5.5: Look up a field by name, tolerating the two Chronik schema
-/// conventions — plain (`value`, `key`, `offset`, …) used by the hot text
-/// index and the WAL-archived TantivyIndexer, and underscore-prefixed
-/// (`_value`, `_key`, `_offset`, …) used by the realtime indexer. A user
-/// writing `{"match": {"value": "foo"}}` should get hits from every
-/// source they have, not just the one whose schema happens to match
-/// their spelling.
+/// The record's own fields and how each schema spells them: plain (`value`,
+/// `offset`, `timestamp`, …) in the hot index, underscored (`_value`, `_offset`,
+/// `_ts`, …) in archives and legacy indexes. A query on one of these names
+/// means the record field in every source; any other name is a field of the
+/// record's JSON value.
+const RECORD_FIELDS: &[(&str, &[&str])] = &[
+    ("value", &["value", "_value"]),
+    ("key", &["key", "_key"]),
+    ("offset", &["offset", "_offset"]),
+    ("partition", &["partition", "_partition"]),
+    ("timestamp", &["timestamp", "_ts", "_timestamp"]),
+    ("headers", &["headers", "_headers"]),
+    ("topic", &["topic"]),
+];
+
+/// The schema field a query's field name means: a record field under either
+/// spelling, or a field of the schema named exactly so (an archive's internal
+/// `_` column, or a field of an index created with explicit mappings).
 ///
-/// Resolution order:
-///   1. exact name the user wrote
-///   2. same name with a leading `_` added (when user wrote `value`, try `_value`)
-///   3. same name with a leading `_` stripped (when user wrote `_value`, try `value`)
-///
-/// Returns `Err` only when none of the three variants exist in the schema.
+/// Up to v2.19.2 any name was also tried with a `_` added, so a JSON field
+/// named like an archive's internal column minus the underscore (`ts`,
+/// `sequence`, `compression`, …) resolved to that column: a range on a JSON
+/// `ts` compared against archived records' Kafka timestamps and matched
+/// nothing. Archive schemas name every non-record field with a `_`, so an
+/// exact match never captures a JSON field.
 fn resolve_field(
     schema: &tantivy::schema::Schema,
     field_name: &str,
 ) -> std::result::Result<tantivy::schema::Field, ()> {
-    if let Ok(f) = schema.get_field(field_name) {
-        return Ok(f);
-    }
-    if !field_name.starts_with('_') {
-        let prefixed = format!("_{}", field_name);
-        if let Ok(f) = schema.get_field(&prefixed) {
-            return Ok(f);
-        }
-    } else if let Some(stripped) = field_name.strip_prefix('_') {
-        if let Ok(f) = schema.get_field(stripped) {
-            return Ok(f);
+    for (name, spellings) in RECORD_FIELDS {
+        if field_name == *name || spellings.contains(&field_name) {
+            return spellings.iter().find_map(|s| schema.get_field(s).ok()).ok_or(());
         }
     }
-    Err(())
+    schema.get_field(field_name).map_err(|_| ())
 }
 
 /// What a field name in a query refers to in one particular index.
@@ -1693,15 +1959,28 @@ pub(crate) fn build_tantivy_query(
 
             let field = match resolve_target(schema, field_name)? {
                 FieldTarget::Schema(field) => field,
-                // Tantivy 0.24 runs a range over a JSON path only when the JSON
-                // field is a fast (columnar) field, which would add a column
-                // per JSON path per document to every hot and archived index.
-                // Refused here rather than failing inside the search.
-                FieldTarget::JsonPath(_, path) => {
-                    return Err(Error::InvalidInput(format!(
-                        "Range queries on JSON fields ({}) are not supported",
-                        path
-                    )));
+                // Tantivy runs a range over a JSON path only when the JSON
+                // field is fast (columnar). Indexes written since it is
+                // (json_index::json_field_options) answer; older archives are
+                // refused here, so that source contributes nothing rather
+                // than failing inside the search.
+                FieldTarget::JsonPath(json, path) => {
+                    if !schema.get_field_entry(json).field_type().is_fast() {
+                        return Err(Error::InvalidInput(format!(
+                            "Range queries on JSON fields ({}) need an index written with JSON columns",
+                            path
+                        )));
+                    }
+                    let (lower, upper) = range_bounds(range_clause, |v| match v {
+                        serde_json::Value::Number(n) => json_number_term(json, &path, n),
+                        serde_json::Value::String(s) => {
+                            let mut term = Term::from_field_json_path(json, &path, true);
+                            term.append_type_and_str(s);
+                            Ok(term)
+                        }
+                        other => Err(Error::InvalidInput(format!("Range bound must be a number or string, got {}", other))),
+                    })?;
+                    return Ok(Box::new(RangeQuery::new(lower, upper)));
                 }
                 FieldTarget::LegacyFullText(_) => {
                     return Err(Error::InvalidInput(format!(
@@ -1726,6 +2005,23 @@ pub(crate) fn build_tantivy_query(
                         v.as_u64()
                             .map(|u| Term::from_field_u64(field, u))
                             .ok_or_else(|| Error::InvalidInput("Range bound must be a non-negative integer".to_string()))
+                    })?;
+                    Ok(Box::new(RangeQuery::new(lower, upper)))
+                }
+                FieldType::F64(_) => {
+                    let (lower, upper) = range_bounds(range_clause, |v| {
+                        v.as_f64()
+                            .map(|f| Term::from_field_f64(field, f))
+                            .ok_or_else(|| Error::InvalidInput("Range bound must be a number".to_string()))
+                    })?;
+                    Ok(Box::new(RangeQuery::new(lower, upper)))
+                }
+                // The record timestamp (`timestamp` -> `_ts`): epoch millis.
+                FieldType::Date(_) => {
+                    let (lower, upper) = range_bounds(range_clause, |v| {
+                        v.as_i64()
+                            .map(|ms| Term::from_field_date(field, tantivy::DateTime::from_timestamp_millis(ms)))
+                            .ok_or_else(|| Error::InvalidInput("Range bound must be epoch milliseconds".to_string()))
                     })?;
                     Ok(Box::new(RangeQuery::new(lower, upper)))
                 }
@@ -2313,6 +2609,30 @@ mod hot_merge_tests {
         assert!(resolve_field(&hot, "_value").is_ok(), "_value → value");
         assert!(resolve_field(&hot, "_key").is_ok(), "_key → key");
         assert!(resolve_field(&hot, "value").is_ok(), "value exact");
+
+        // An index created with explicit mappings: its own fields by name.
+        let mapped = {
+            let mut b = Schema::builder();
+            b.add_text_field("content", TEXT | STORED);
+            b.build()
+        };
+        assert!(resolve_field(&mapped, "content").is_ok(), "a mapped field by its exact name");
+
+        // An archive's internal columns: reachable by their record name or
+        // their exact name, never by a JSON field's name minus the `_`.
+        let archive = {
+            let mut b = Schema::builder();
+            b.add_date_field("_ts", tantivy::schema::INDEXED | tantivy::schema::FAST);
+            b.add_i64_field("_sequence", STORED);
+            b.add_i64_field("_offset", tantivy::schema::INDEXED);
+            b.build()
+        };
+        assert_eq!(resolve_field(&archive, "timestamp"), archive.get_field("_ts").map_err(|_| ()));
+        assert_eq!(resolve_field(&archive, "_ts"), archive.get_field("_ts").map_err(|_| ()));
+        assert_eq!(resolve_field(&archive, "offset"), archive.get_field("_offset").map_err(|_| ()));
+        assert!(resolve_field(&archive, "ts").is_err(), "a JSON `ts` is not the record timestamp");
+        assert!(resolve_field(&archive, "sequence").is_err(), "a JSON `sequence` is not an internal column");
+        assert!(resolve_field(&archive, "_sequence").is_ok(), "exact internal name");
     }
 
     /// Issue #2 regression: extract_simple_query_text must NOT flatten bool.
@@ -2488,13 +2808,30 @@ mod json_field_tests {
         assert_eq!(hits(&idx, serde_json::json!({"term": {"ok": false}})), vec![1]);
     }
 
-    /// Tantivy 0.24 cannot range over a JSON path without a fast field; the
-    /// query is refused up front instead of failing inside the search.
+    /// The JSON field is fast, so ranges over JSON paths answer (up to v2.19.2
+    /// they were refused: no JSON columns). Integers and floats compare as
+    /// numbers, whichever the bound is.
     #[test]
-    fn ranges_on_json_fields_are_refused() {
+    fn ranges_on_json_fields_answer() {
         let idx = index(false);
-        let dsl: QueryDsl =
-            serde_json::from_value(serde_json::json!({"range": {"n": {"gte": 3}}})).unwrap();
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"n": {"gte": 3}}})), vec![0, 1]);
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"n": {"gt": 3}}})), vec![1]);
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"n": {"gte": 2, "lt": 5}}})), vec![0, 3]);
+        assert_eq!(hits(&idx, serde_json::json!({"range": {"n": {"lte": 2.5}}})), vec![3]);
+    }
+
+    /// An archive written before the JSON field was fast cannot range over
+    /// it: refused up front, so that source contributes nothing.
+    #[test]
+    fn ranges_on_json_fields_without_columns_are_refused() {
+        let mut b = Schema::builder();
+        b.add_i64_field("offset", INDEXED | STORED);
+        let old = chronik_storage::json_index::json_field_options();
+        let old = tantivy::schema::JsonObjectOptions::default()
+            .set_indexing_options(old.get_text_indexing_options().unwrap().clone());
+        b.add_json_field(chronik_storage::json_index::JSON_FIELD, old);
+        let idx = tantivy::Index::create_in_ram(b.build());
+        let dsl: QueryDsl = serde_json::from_value(serde_json::json!({"range": {"n": {"gte": 3}}})).unwrap();
         assert!(build_tantivy_query(&dsl, &idx.schema(), Some(&idx)).is_err());
     }
 
@@ -2585,7 +2922,7 @@ mod archived_hit_tests {
             original_v1_wire_format: None,
             original_v2_wire_format: None,
         };
-        let mut writer = TantivySegmentWriter::new("orders".to_string(), 2, 100).unwrap();
+        let mut writer = TantivySegmentWriter::new_in_ram("orders".to_string(), 2, 100).unwrap();
         writer.write_batch(&canonical).unwrap();
         writer.commit().unwrap().0
     }
@@ -2622,6 +2959,34 @@ mod search_limit_tests {
 
     fn request(body: serde_json::Value) -> SearchRequest {
         serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn record_time_ranges_bound_which_archives_are_searched() {
+        let window = |body: serde_json::Value| required_time_window(request(body).query.as_ref());
+        assert_eq!(window(serde_json::json!({})), (i64::MIN, i64::MAX));
+        assert_eq!(window(serde_json::json!({"query": {"range": {"timestamp": {"gte": 100, "lt": 200}}}})), (100, 199));
+        // Inside bool must/filter, combined; should/must_not do not bound.
+        assert_eq!(
+            window(serde_json::json!({"query": {"bool": {
+                "filter": [{"range": {"timestamp": {"gt": 100}}}, {"term": {"level": "ERROR"}}],
+                "must": [{"range": {"_ts": {"lte": 500}}}],
+                "should": [{"range": {"timestamp": {"gte": 400}}}]
+            }}})),
+            (101, 500)
+        );
+        // A JSON field is not the record timestamp.
+        assert_eq!(window(serde_json::json!({"query": {"range": {"ts": {"gte": 100}}}})), (i64::MIN, i64::MAX));
+
+        let seg = |min, max| chronik_storage::segment_index::SegmentMetadata {
+            segment_id: String::new(), topic: "t".into(), partition: 0, min_offset: 0, max_offset: 9,
+            record_count: 10, min_timestamp: min, max_timestamp: max, object_store_path: String::new(),
+            size_bytes: 0, created_at: 0, compression: String::new(),
+        };
+        assert!(segment_in_window(&seg(100, 199), (150, 300)));
+        assert!(!segment_in_window(&seg(100, 199), (200, 300)));
+        assert!(!segment_in_window(&seg(100, 199), (0, 99)));
+        assert!(segment_in_window(&seg(0, 0), (200, 300)), "unknown timestamps are searched");
     }
 
     #[test]
@@ -2679,14 +3044,21 @@ mod unranked_stop_tests {
     #[test]
     fn stops_only_when_nothing_unsearched_can_rank_higher() {
         let hits: Vec<Hit> = [100, 90, 80, 70].into_iter().map(at).collect();
+        // The best a segment of partition 0 can hold: its newest second and
+        // highest offset.
+        let seg = |max_ms: i64, max_offset: i64| RankBound { second: max_ms.div_euclid(1000), topic: "t".into(), partition: 0, offset: max_offset };
         // Not a full window yet.
-        assert!(!can_stop_unranked(&hits[..2], 3, Some(&10_000)));
-        // The 3rd newest is 80; the next segment's newest is older: done.
-        assert!(can_stop_unranked(&hits, 3, Some(&79_999)));
-        // A tie at 80 could still win the tie-break: keep going.
-        assert!(!can_stop_unranked(&hits, 3, Some(&80_000)));
+        assert!(!can_stop_unranked(&hits[..2], 3, Some(&seg(10_000, 10))));
+        // The 3rd best is (80 s, offset 80); the next segment's newest is older: done.
+        assert!(can_stop_unranked(&hits, 3, Some(&seg(79_999, 1_000))));
+        // Same second: the offset breaks the tie. Lower offsets cannot win...
+        assert!(can_stop_unranked(&hits, 3, Some(&seg(80_000, 79))));
+        // ...higher ones can: keep going.
+        assert!(!can_stop_unranked(&hits, 3, Some(&seg(80_999, 81))));
+        // A lower partition wins a tie in the second.
+        assert!(!can_stop_unranked(&hits, 3, Some(&RankBound { partition: -1, ..seg(80_000, 0) })));
         // A newer record could be in the next segment.
-        assert!(!can_stop_unranked(&hits, 3, Some(&95_000)));
+        assert!(!can_stop_unranked(&hits, 3, Some(&seg(95_000, 0))));
         // Nothing left.
         assert!(can_stop_unranked(&hits, 3, None));
     }
@@ -2771,7 +3143,7 @@ mod legacy_index_tests {
                     original_v1_wire_format: None,
                     original_v2_wire_format: None,
                 };
-                let mut w = TantivySegmentWriter::new("orders".to_string(), p, 0).unwrap();
+                let mut w = TantivySegmentWriter::new_in_ram("orders".to_string(), p, 0).unwrap();
                 w.write_batch(&batch).unwrap();
                 w.commit().unwrap().0
             })

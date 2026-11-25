@@ -2370,6 +2370,17 @@ impl GroupCommitWal {
             })
     }
 
+    /// How many truncations the partition has seen since boot (0 when it has
+    /// no queue yet). A truncation bumps it before it touches any file, so a
+    /// reader that sampled it under the partition's archive lock and finds it
+    /// unchanged later knows no truncation ran in between.
+    pub fn truncation_epoch(&self, topic: &str, partition: i32) -> u64 {
+        self.partition_queues
+            .get(&(topic.to_string(), partition))
+            .map(|q| q.truncation_epoch.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
     /// Seal a partition's active segment (when it holds data) and start a new
     /// one. Returns the id of the segment now active, or `None` when nothing
     /// was written to the partition since boot (every segment on disk is then

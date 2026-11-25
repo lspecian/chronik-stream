@@ -767,9 +767,27 @@ impl IntegratedKafkaServerBuilder {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(15_000_000);
 
+        // Records no archive covers yet are kept past `max_docs` (the hot index
+        // is the only place they can be searched) up to this memory bound.
+        let hard_max_docs = std::env::var("CHRONIK_HOT_TEXT_HARD_MAX_DOCS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| HotTextConfig::default_hard_max(max_docs))
+            .max(max_docs);
+
         let idx = Arc::new(HotTextIndex::new(HotTextConfig {
             writer_heap_bytes: heap_bytes,
             max_docs_per_partition: max_docs,
+            hard_max_docs_per_partition: hard_max_docs,
+            burst_writer_heap_bytes: std::env::var("CHRONIK_HOT_TEXT_BURST_WRITER_HEAP_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(HotTextConfig::default().burst_writer_heap_bytes),
+            max_burst_writers: std::env::var("CHRONIK_HOT_TEXT_MAX_BURST_WRITERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(HotTextConfig::default().max_burst_writers),
+            ..HotTextConfig::default()
         }));
 
         // Background commit timer — in-memory visibility flip, no disk writes.
@@ -777,8 +795,8 @@ impl IntegratedKafkaServerBuilder {
             .start_commit_timer(std::time::Duration::from_millis(commit_interval_ms));
 
         info!(
-            "✅ HotTextIndex enabled — commit_interval={}ms, max_docs/partition={}, heap={}B",
-            commit_interval_ms, max_docs, heap_bytes
+            "✅ HotTextIndex enabled — commit_interval={}ms, max_docs/partition={} (unarchived kept up to {}), heap={}B",
+            commit_interval_ms, max_docs, hard_max_docs, heap_bytes
         );
         Some(idx)
     }
@@ -979,6 +997,18 @@ impl IntegratedKafkaServerBuilder {
             .unwrap_or(100_000);
 
         let start = std::time::Instant::now();
+        // What the archive covers decides what must be reloaded: every record
+        // after it is searchable nowhere else. The catalogue loads in the
+        // background; wait for it rather than take "no archive" for the truth
+        // (which would reload up to the hard cap on every partition).
+        let segment_index = self.wal_indexer.as_ref().map(|ix| ix.segment_index().clone());
+        let catalogue_known = match &segment_index {
+            Some(ix) => ix.wait_loaded(std::time::Duration::from_secs(60)).await,
+            None => false,
+        };
+        if !catalogue_known {
+            warn!("warm-up: archive catalogue not loaded; reloading the newest {} records per partition only", max_docs);
+        }
         let topics = match metadata_store.list_topics().await {
             Ok(t) => t,
             Err(e) => {
@@ -1011,10 +1041,25 @@ impl IntegratedKafkaServerBuilder {
                     }
                 };
 
-                // Approximate: read the trailing `max_docs` offset range.
-                let start_offset = (max_offset + 1).saturating_sub(max_docs as i64).max(0);
+                // The newest `max_docs`, and everything no archive covers yet
+                // (bounded by the hard cap, as at runtime).
+                let archived_through = match (&segment_index, catalogue_known) {
+                    (Some(ix), true) => ix
+                        .get_segments_for_partition(&topic_meta.name, partition)
+                        .await
+                        .ok()
+                        .and_then(|segs| segs.iter().map(|s| s.max_offset).max()),
+                    _ => None,
+                };
+                let start_offset = hot_warm_up_start(
+                    max_offset,
+                    max_docs,
+                    hot_idx.hard_max_docs(),
+                    catalogue_known.then_some(archived_through),
+                );
+                let limit = (max_offset + 1 - start_offset).max(0) as usize;
                 let records = match wal_manager
-                    .read_from(&topic_meta.name, partition, start_offset, max_docs)
+                    .read_from(&topic_meta.name, partition, start_offset, limit)
                     .await
                 {
                     Ok(r) => r,
@@ -1075,12 +1120,8 @@ impl IntegratedKafkaServerBuilder {
                     }
                 }
 
-                // Trim to the last `max_docs` messages — docs are offset-ordered
-                // because read_from returns batches in offset order.
-                if docs.len() > max_docs {
-                    let excess = docs.len() - max_docs;
-                    docs.drain(0..excess);
-                }
+                // A batch straddling the start brings records before it.
+                docs.retain(|d| d.offset >= start_offset);
 
                 if docs.is_empty() {
                     continue;
@@ -1095,6 +1136,11 @@ impl IntegratedKafkaServerBuilder {
                         "warm-up: hot add_batch failed: {}", e
                     );
                     continue;
+                }
+                // After the add: a reloaded record below the watermark would
+                // otherwise read as a stale watermark and erase it.
+                if let Some(archived) = archived_through {
+                    hot_idx.note_archived(&topic_meta.name, partition, archived);
                 }
                 if let Err(e) = hot_idx.commit(&topic_meta.name, partition).await {
                     warn!(
@@ -1697,9 +1743,26 @@ impl IntegratedKafkaServerBuilder {
             crate::columnar_catchup::spawn(metadata_store.clone(), wal_indexer.clone(), fetch_handler);
         }
 
+        // Topic retention over the archive (retention.ms / retention.bytes),
+        // and archive cleanup below a DeleteRecords' log start.
+        if let Some(produce) = self.produce_handler_base.clone() {
+            let hot = crate::retention::HotIndexes { text: self.hot_text_index.clone(), vector: self.hot_vector_index.clone() };
+            crate::retention::spawn(metadata_store.clone(), wal_indexer.clone(), produce.clone(), hot);
+            // Every acknowledged record searchable: a gauge and a warning per gap.
+            crate::search_coverage::spawn(crate::search_coverage::Coverage {
+                metadata_store: metadata_store.clone(),
+                wal_indexer: wal_indexer.clone(),
+                produce,
+                hot: self.hot_text_index.clone(),
+                node_id: self.config.node_id as i32,
+            });
+        }
+
         // Merge runs of small archives into larger ones, in the background
         // (CHRONIK_ARCHIVE_MERGE=false turns it off).
         chronik_storage::archive_merge::spawn(wal_indexer.object_store(), wal_indexer.segment_index().clone());
+        // Rebuild archives found damaged (checksums), and scrub the local ones.
+        chronik_storage::archive_health::spawn(wal_indexer.clone());
 
         self.wal_indexer = Some(wal_indexer);
 
@@ -2166,10 +2229,53 @@ impl IntegratedKafkaServerBuilder {
     }
 }
 
+/// First offset the boot warm-up reloads into the hot text index for a
+/// partition whose log ends at `max_offset`.
+///
+/// `archived`: `Some(highest archived offset, if any)` once the archive
+/// catalogue is loaded, `None` when it could not be read. Known: the newest
+/// `max_docs` records and every record after the archive (the hot index is the
+/// only place those can be searched), the latter bounded by `hard_max_docs` as
+/// at runtime. Unknown: the newest `max_docs` only, rather than the hard cap on
+/// every partition.
+fn hot_warm_up_start(max_offset: i64, max_docs: usize, hard_max_docs: usize, archived: Option<Option<i64>>) -> i64 {
+    let end = max_offset + 1;
+    let window_start = end.saturating_sub(max_docs as i64);
+    let start = match archived {
+        Some(archived_through) => {
+            let unarchived_start = archived_through.map_or(0, |a| a + 1);
+            let hard_start = end.saturating_sub(hard_max_docs as i64);
+            window_start.min(unarchived_start).max(hard_start)
+        }
+        None => window_start,
+    };
+    start.max(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn hot_warm_up_reloads_everything_after_the_archive() {
+        // Log ends at 99,999; soft cap 2,000; hard cap 50,000.
+        let start = |archived| hot_warm_up_start(99_999, 2_000, 50_000, archived);
+        // Archive covers through 79,999: reload the 20,000 after it.
+        assert_eq!(start(Some(Some(79_999))), 80_000);
+        // Archive covers nearly everything: still the newest 2,000.
+        assert_eq!(start(Some(Some(99_500))), 98_000);
+        // Archive covers through 9,999: everything after it would be 90,000
+        // records; the hard cap bounds it to the newest 50,000.
+        assert_eq!(start(Some(Some(9_999))), 50_000);
+        // No archive at all: bounded by the hard cap.
+        assert_eq!(start(Some(None)), 50_000);
+        // Catalogue unknown: the newest 2,000 only.
+        assert_eq!(start(None), 98_000);
+        // Short log.
+        assert_eq!(hot_warm_up_start(499, 2_000, 50_000, Some(None)), 0);
+        assert_eq!(hot_warm_up_start(499, 2_000, 50_000, None), 0);
+    }
 
     #[tokio::test]
     async fn test_builder_init_directories() {

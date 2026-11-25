@@ -239,6 +239,9 @@ mod tests {
             aggregations: None,
             highlight: None,
             timeout: None,
+            track_total_hits: None,
+            _chronik_partitions: None,
+            _chronik_partial: false,
         };
 
         let key1 = QueryCache::generate_key(Some("index1"), &request);
@@ -279,6 +282,7 @@ mod tests {
             },
             aggregations: None,
             _segments: None,
+            _chronik_partial: None,
         };
         
         cache.put("key1".to_string(), response.clone());

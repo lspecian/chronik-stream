@@ -95,6 +95,19 @@ impl TopicConfig {
         true
     }
 
+    /// `searchable.throttle.enabled=true`: produce to a partition waits while
+    /// its hot index is close to its hard cap, so a burst that outruns
+    /// archiving slows down instead of leaving records unsearchable until
+    /// archived. Off by default (bursts then go at full speed and the
+    /// excess is searchable once archived).
+    ///
+    /// Only consulted when `is_searchable()` is already true.
+    pub fn is_searchable_throttle_enabled(&self) -> bool {
+        self.config
+            .get("searchable.throttle.enabled")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    }
+
     /// Create a searchable topic config
     pub fn with_searchable(mut self, searchable: bool) -> Self {
         self.config.insert("searchable".to_string(), searchable.to_string());
