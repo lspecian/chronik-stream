@@ -248,6 +248,120 @@ enum SequenceCheck {
 /// earlier batch of the same producer is known to be in progress.
 type InFlightSequences = Arc<DashMap<(i64, String, i32), Vec<i32>>>;
 
+/// Sequenced batches whose sequence is recorded (phase 2 of the produce path)
+/// and whose request has not finished, keyed like [`InFlightSequences`], each
+/// entry `(base sequence, last sequence)`.
+///
+/// A producer whose request timed out resends it, often on a new connection,
+/// while the original is still being written. The sequence is recorded before
+/// the write, so the resend is a "duplicate" of records that may not be in
+/// the log yet. Clients treat DUPLICATE_SEQUENCE_NUMBER as success; answering
+/// it at once acknowledged records that were not written, let alone
+/// replicated. Measured on Thunderbird right after a roll: an `acks=all`
+/// smoke test was acknowledged and closed, and ListOffsets reported 178 of
+/// its 3,000 records. A duplicate therefore waits here until its original's
+/// request is over: written (then it is answered as a duplicate, once
+/// replicated for `acks=all`), or failed before reaching the log (then the
+/// sequence was rolled back, see [`CommittingGuard`], and it is written).
+type CommittingSequences = Arc<DashMap<(i64, String, i32), Vec<(i32, i32)>>>;
+
+/// One batch in [`CommittingSequences`], from the moment its sequence is
+/// recorded until its request ends. If the batch never reached the WAL queue
+/// the sequence goes back to what it was (when nothing advanced it since), so
+/// the producer's resend is written instead of answered as a duplicate of
+/// records that do not exist. Once queued its place in the log is fixed and
+/// nothing is undone.
+struct CommittingGuard {
+    map: CommittingSequences,
+    producers: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
+    key: (i64, String, i32),
+    base: i32,
+    last: i32,
+    previous: Option<i32>,
+    enqueued: bool,
+}
+
+impl CommittingGuard {
+    fn register(
+        map: &CommittingSequences,
+        producers: &Arc<RwLock<HashMap<i64, ProducerInfo>>>,
+        key: (i64, String, i32),
+        advance: SequenceAdvance,
+    ) -> Self {
+        map.entry(key.clone()).or_default().push((advance.base, advance.last));
+        Self {
+            map: Arc::clone(map),
+            producers: Arc::clone(producers),
+            key,
+            base: advance.base,
+            last: advance.last,
+            previous: advance.previous,
+            enqueued: false,
+        }
+    }
+
+    fn unregister(map: &CommittingSequences, key: &(i64, String, i32), base: i32) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut e) = map.entry(key.clone()) {
+            if let Some(i) = e.get().iter().position(|(b, _)| *b == base) {
+                e.get_mut().swap_remove(i);
+            }
+            if e.get().is_empty() {
+                e.remove();
+            }
+        }
+    }
+
+    /// Undo the recorded sequence if it is still this batch's.
+    fn roll_back(producers: &mut HashMap<i64, ProducerInfo>, key: &(i64, String, i32), last: i32, previous: Option<i32>) {
+        let Some(info) = producers.get_mut(&key.0) else { return };
+        let k = (key.1.clone(), key.2);
+        if info.sequence_numbers.get(&k) == Some(&last) {
+            match previous {
+                Some(p) => info.sequence_numbers.insert(k, p),
+                None => info.sequence_numbers.remove(&k),
+            };
+        }
+    }
+}
+
+impl Drop for CommittingGuard {
+    fn drop(&mut self) {
+        if self.enqueued {
+            Self::unregister(&self.map, &self.key, self.base);
+            return;
+        }
+        // Roll back BEFORE unregistering: a waiting duplicate that wakes must
+        // see the sequence it may now take.
+        if let Ok(mut producers) = self.producers.try_write() {
+            Self::roll_back(&mut producers, &self.key, self.last, self.previous);
+            drop(producers);
+            Self::unregister(&self.map, &self.key, self.base);
+            return;
+        }
+        let (map, producers, key, base, last, previous) =
+            (Arc::clone(&self.map), Arc::clone(&self.producers), self.key.clone(), self.base, self.last, self.previous);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    Self::roll_back(&mut *producers.write().await, &key, last, previous);
+                    Self::unregister(&map, &key, base);
+                });
+            }
+            // No runtime (shutdown): nobody is waiting any more.
+            Err(_) => Self::unregister(&map, &key, base),
+        }
+    }
+}
+
+/// What phase 2 of the sequence check recorded: the batch's sequences and the
+/// value they replaced.
+#[derive(Debug, Clone, Copy)]
+struct SequenceAdvance {
+    base: i32,
+    last: i32,
+    previous: Option<i32>,
+}
+
 /// Records of a throttled topic admitted into the hot index's budget
 /// (`ProduceHandler::wait_for_search_headroom`); released when the batch is
 /// done, by which time its records are counted as queued (or were not written).
@@ -492,6 +606,8 @@ pub struct ProduceHandler {
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
     /// See [`InFlightSequences`].
     in_flight_sequences: InFlightSequences,
+    /// See [`CommittingSequences`].
+    committing_sequences: CommittingSequences,
     metrics: Arc<ProduceMetrics>,
     running: Arc<AtomicBool>,
     /// P3 OPTIMIZATION (v2.2.7): Lock-free memory tracking with AtomicU64
@@ -1415,6 +1531,7 @@ impl ProduceHandler {
             archived_hwm_cache: Arc::new(DashMap::new()),
             producer_info: Arc::new(RwLock::new(HashMap::new())),
             in_flight_sequences: Arc::new(DashMap::new()),
+            committing_sequences: Arc::new(DashMap::new()),
             metrics: Arc::new(ProduceMetrics::default()),
             running: Arc::new(AtomicBool::new(true)),
             memory_used_bytes,
@@ -2177,12 +2294,20 @@ impl ProduceHandler {
                         ).await {
                             Ok(response) => response,
                             Err(e) => {
-                                error!(
-                                    "Failed to produce to {}-{}: {}",
-                                    topic_name, partition_data.index, e
-                                );
-
-                                metrics.produce_errors.fetch_add(1, Ordering::Relaxed);
+                                // A retried batch this partition already
+                                // appended is answered DUPLICATE_SEQUENCE_NUMBER,
+                                // which idempotent clients treat as success: not
+                                // a failure (counted in duplicate_records and
+                                // logged where it is detected).
+                                if matches!(e, Error::DuplicateSequenceNumber(_)) {
+                                    debug!("Duplicate batch for {}-{}: {}", topic_name, partition_data.index, e);
+                                } else {
+                                    error!(
+                                        "Failed to produce to {}-{}: {}",
+                                        topic_name, partition_data.index, e
+                                    );
+                                    metrics.produce_errors.fetch_add(1, Ordering::Relaxed);
+                                }
 
                                 let error_code = produce_error_code(&e);
 
@@ -2540,7 +2665,9 @@ impl ProduceHandler {
                         .answer_duplicate_once_replicated(topic, partition, msg, acks_all_quorum)
                         .await;
                 }
-                other => other?,
+                other => {
+                    other?;
+                }
             }
         }
 
@@ -2582,22 +2709,56 @@ impl ProduceHandler {
         // of order, which idempotence promises cannot happen. Advancing here
         // closes that, and cannot deadlock — N+1 waited in phase 1 holding
         // nothing, and N advances while holding this lock.
-        if sequenced {
+        let advance = if sequenced {
             match self
                 .validate_producer_sequence(
                     &temp_batch, topic, partition, transactional_id, SequenceCheck::AdvanceNow,
                 )
                 .await
             {
-                Err(Error::DuplicateSequenceNumber(msg)) if acks == -1 => {
-                    // Never wait for replication holding the append lock: every
-                    // other write to this partition would queue behind it.
+                Err(Error::DuplicateSequenceNumber(_)) => {
+                    // Another request carrying this batch (a resend) passed phase 1
+                    // alongside this one and recorded it first. Never wait holding
+                    // the append lock: every other write to this partition would
+                    // queue behind it. Wait for that request as phase 1 does.
                     drop(append_guard);
-                    return self
-                        .answer_duplicate_once_replicated(topic, partition, msg, acks_all_quorum)
-                        .await;
+                    return match self
+                        .validate_producer_sequence(
+                            &temp_batch, topic, partition, transactional_id, SequenceCheck::WaitForTurn,
+                        )
+                        .await
+                    {
+                        Err(Error::DuplicateSequenceNumber(msg)) if acks == -1 => {
+                            self.answer_duplicate_once_replicated(topic, partition, msg, acks_all_quorum).await
+                        }
+                        Err(e) => Err(e),
+                        // The other attempt failed before the log and released the
+                        // sequence; this one gave up its place. Retriable.
+                        Ok(_) => Err(Error::Internal(format!(
+                            "sequence {} of {}-{} released by a failed attempt; resend",
+                            temp_batch.header.base_sequence, topic, partition
+                        ))),
+                    };
                 }
                 other => other?,
+            }
+        } else {
+            None
+        };
+        // Until the batch is in the WAL queue, a failure rolls its sequence back
+        // (see `CommittingGuard`); resends of it wait for this request to end.
+        let mut committing = advance.map(|a| {
+            CommittingGuard::register(
+                &self.committing_sequences,
+                &self.producer_info,
+                (temp_batch.header.producer_id, topic.to_string(), partition),
+                a,
+            )
+        });
+        #[cfg(test)]
+        {
+            if sequenced {
+                tests::after_sequence_recorded(temp_batch.header.producer_id, temp_batch.header.base_sequence).await?;
             }
         }
 
@@ -2870,6 +3031,9 @@ impl ProduceHandler {
                                            topic, partition, e);
                                     return Err(Error::Internal(format!("WAL write failed: {}", e)));
                                 }
+                                if let Some(c) = committing.as_mut() {
+                                    c.enqueued = true;
+                                }
                                 // In the queue, so its place in the log is fixed:
                                 // let the next request reserve and enqueue.
                                 drop(append_guard);
@@ -2924,7 +3088,12 @@ impl ProduceHandler {
                                     records.len() as i32,
                                     acks
                                 ).await {
-                                    Ok(commit) => commit,
+                                    Ok(commit) => {
+                                        if let Some(c) = committing.as_mut() {
+                                            c.enqueued = true;
+                                        }
+                                        commit
+                                    }
                                     Err(e) => {
                                         error!("WAL WRITE FAILED (sync path): topic={} partition={} acks={} error={}",
                                                topic, partition, acks, e);
@@ -2956,6 +3125,10 @@ impl ProduceHandler {
         } else {
             error!("❌ WAL_MGR_NONE: wal_manager is None! topic={} partition={} - WAL WRITES SKIPPED!",
                    topic, partition);
+        }
+        // Past the WAL block the batch is in the log (or there is no WAL).
+        if let Some(c) = committing.as_mut() {
+            c.enqueued = true;
         }
 
         // RP-4: nothing is pushed here. Followers fetch this record from the
@@ -3537,6 +3710,18 @@ impl ProduceHandler {
             .unwrap_or(false)
     }
 
+    /// Whether a batch of this producer covering any of `batch`'s sequences
+    /// has recorded them and its request is still under way.
+    fn original_still_committing(&self, batch: &KafkaRecordBatch, topic: &str, partition: i32) -> bool {
+        let first = batch.header.base_sequence;
+        let last = first + batch.records.len().max(1) as i32 - 1;
+        let key = (batch.header.producer_id, topic.to_string(), partition);
+        self.committing_sequences
+            .get(&key)
+            .map(|batches| batches.iter().any(|(b, l)| *b <= last && *l >= first))
+            .unwrap_or(false)
+    }
+
     async fn validate_producer_sequence(
         &self,
         batch: &KafkaRecordBatch,
@@ -3544,9 +3729,9 @@ impl ProduceHandler {
         partition: i32,
         transactional_id: Option<&str>,
         mode: SequenceCheck,
-    ) -> Result<()> {
+    ) -> Result<Option<SequenceAdvance>> {
         if !self.config.enable_idempotence {
-            return Ok(());
+            return Ok(None);
         }
         
         // Bounded wait for the expected sequence.
@@ -3614,6 +3799,25 @@ impl ProduceHandler {
                     .unwrap_or(0);
 
                 if batch.header.base_sequence < expected_sequence {
+                    // A duplicate of a batch whose request is still under way
+                    // (see `CommittingSequences`): wait for it to end. It
+                    // either wrote the records, or failed before the log and
+                    // rolled the sequence back, so this batch is next.
+                    if mode == SequenceCheck::WaitForTurn {
+                        if self.original_still_committing(batch, topic, partition) {
+                            if Instant::now() >= hard_deadline {
+                                // Not a duplicate answer: that is success to the
+                                // client, and the original may still fail.
+                                return Err(Error::Internal(format!(
+                                    "original of sequence {} for {}-{} still in progress",
+                                    batch.header.base_sequence, topic, partition
+                                )));
+                            }
+                            drop(producers);
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            continue;
+                        }
+                    }
                     // Duplicate (already applied).
                     warn!(
                         "Duplicate sequence number detected: producer={}, topic={}, partition={}, expected={}, received={}",
@@ -3625,13 +3829,13 @@ impl ProduceHandler {
                     if mode == SequenceCheck::WaitForTurn {
                         // Our turn — but only record it under the append lock,
                         // together with the offsets, so the two orders agree.
-                        return Ok(());
+                        return Ok(None);
                     }
                     // In order — advance the tracked sequence atomically (same lock).
                     let last_sequence = batch.header.base_sequence + batch.records.len() as i32 - 1;
-                    producer_info.sequence_numbers.insert(key, last_sequence);
+                    let previous = producer_info.sequence_numbers.insert(key, last_sequence);
                     producer_info.last_activity = Instant::now();
-                    return Ok(());
+                    return Ok(Some(SequenceAdvance { base: batch.header.base_sequence, last: last_sequence, previous }));
                 }
                 // base_sequence > expected_sequence: an earlier batch is still in
                 // flight. Release the lock (end of scope) and wait for it.
@@ -4287,6 +4491,7 @@ impl Clone for ProduceHandler {
             archived_hwm_cache: Arc::clone(&self.archived_hwm_cache),
             producer_info: Arc::clone(&self.producer_info),
             in_flight_sequences: Arc::clone(&self.in_flight_sequences),
+            committing_sequences: Arc::clone(&self.committing_sequences),
             metrics: Arc::clone(&self.metrics),
             running: Arc::clone(&self.running),
             memory_used_bytes: Arc::clone(&self.memory_used_bytes),
@@ -4730,6 +4935,109 @@ pub(crate) mod tests {
         if hit {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// `(producer_id, base_sequence)` to hold for 800 ms, or fail, right after
+    /// its sequence is recorded and before it reaches the WAL queue: a slow
+    /// first write (new partition, busy disk) and a failure before the log.
+    static PAUSE_AFTER_RECORDED: std::sync::Mutex<Option<(i64, i32)>> = std::sync::Mutex::new(None);
+    static FAIL_AFTER_RECORDED: std::sync::Mutex<Option<(i64, i32)>> = std::sync::Mutex::new(None);
+
+    pub(super) async fn after_sequence_recorded(producer_id: i64, base_sequence: i32) -> Result<()> {
+        let fail = {
+            let mut f = FAIL_AFTER_RECORDED.lock().unwrap();
+            let hit = *f == Some((producer_id, base_sequence));
+            if hit {
+                *f = None;
+            }
+            hit
+        };
+        if fail {
+            return Err(Error::Internal("injected failure before the WAL".into()));
+        }
+        let hit = *PAUSE_AFTER_RECORDED.lock().unwrap() == Some((producer_id, base_sequence));
+        if hit {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+        Ok(())
+    }
+
+    /// A resend that arrives while its original is still being written is
+    /// answered only once the original is in the log.
+    ///
+    /// Thunderbird, right after a roll: the first write to a new partition
+    /// stalled, the producer timed out and resent on another connection, and
+    /// the resend was answered DUPLICATE_SEQUENCE_NUMBER (success to clients)
+    /// two seconds before the original reached the WAL. The `acks=all` smoke
+    /// producer closed believing 3,000 records written; ListOffsets said 178.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_resend_waits_for_its_original_to_be_written() {
+        let (handler, _temp) = create_test_handler().await;
+        let handler = Arc::new(handler);
+        let produce = |records: Vec<u8>| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        };
+        let pid = 6161;
+        *PAUSE_AFTER_RECORDED.lock().unwrap() = Some((pid, 0));
+        let batch = create_test_record_batch(pid, 0, vec![("a", "1"), ("b", "2"), ("c", "3")]);
+        let h = Arc::clone(&handler);
+        let req = produce(batch.clone());
+        let original = tokio::spawn(async move { h.handle_produce(req, 1).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let resend = handler.handle_produce(produce(batch), 2).await.unwrap();
+        let original_done = original.is_finished();
+        let hwm = handler
+            .partition_states
+            .get(&("test-topic".to_string(), 0))
+            .map(|s| s.high_watermark.load(Ordering::SeqCst))
+            .unwrap_or(0);
+        let original = original.await.unwrap().unwrap();
+        *PAUSE_AFTER_RECORDED.lock().unwrap() = None;
+
+        assert_eq!(original.topics[0].partitions[0].error_code, 0);
+        assert_eq!(resend.topics[0].partitions[0].error_code, ErrorCode::DuplicateSequenceNumber.code());
+        assert!(
+            original_done && hwm >= 3,
+            "the resend was acknowledged before its original was written (original done: {}, high watermark {})",
+            original_done, hwm
+        );
+    }
+
+    /// A batch that recorded its sequence and then failed before the log gives
+    /// the sequence back, so the producer's resend is written. Answering it
+    /// as a duplicate would acknowledge records that exist nowhere.
+    #[tokio::test]
+    async fn a_resend_after_a_failure_before_the_log_is_written() {
+        let (handler, _temp) = create_test_handler().await;
+        let produce = |records: Vec<u8>| ProduceRequest {
+            transactional_id: None,
+            acks: 1,
+            timeout_ms: 30000,
+            topics: vec![ProduceRequestTopic {
+                name: "test-topic".to_string(),
+                partitions: vec![ProduceRequestPartition { index: 0, records }],
+            }],
+        };
+        let pid = 7171;
+        let batch = create_test_record_batch(pid, 0, vec![("a", "1"), ("b", "2")]);
+        *FAIL_AFTER_RECORDED.lock().unwrap() = Some((pid, 0));
+        let failed = handler.handle_produce(produce(batch.clone()), 1).await.unwrap();
+        assert_ne!(failed.topics[0].partitions[0].error_code, 0, "the injected failure did not happen");
+        // The rollback may run on a spawned task when the lock was contended.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let resend = handler.handle_produce(produce(batch), 2).await.unwrap();
+        let p = &resend.topics[0].partitions[0];
+        assert_eq!(
+            (p.error_code, p.base_offset),
+            (0, 0),
+            "the resend of a batch that never reached the log was not written"
+        );
     }
 
     /// `(producer_id, base_sequence)` to hold just before its sequence check,
