@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.2] - 2026-11-26
+
+### Fixed
+
+- **Search ranked older copies of a record above newer ones.** Every
+  archive scored with its own statistics, so the same text scored
+  differently per archive and "newest first among equal scores" never held
+  across archives: on 10M records `timeout` returned records a million
+  offsets old. Every index of a search now scores with the topic's summed
+  statistics (as Elasticsearch's `dfs_query_then_fetch`). Scores change
+  slightly.
+- **`sort` was accepted and ignored.** It is now honoured for `_score`,
+  `_doc`, record fields (`offset`, `timestamp`, `partition`) and JSON paths,
+  with `sort` values on every hit, across partitions, nodes, the hot index and
+  archives. Timestamps sort by the second.
+- **Bool `filter` clauses were scored like `must`.** They now restrict hits
+  without adding to scores, as in Elasticsearch.
+- `_segments.searched` could report a huge number on narrow time windows.
+
+### Performance
+
+- Search at 10M records: 61,425 query rounds per minute (was 18,377;
+  OpenSearch 14,250 on the same machine), p50 match 0.55 ms, term 0.44 ms,
+  bool 0.44 ms, match_all 0.26 ms.
+- Archives are written highest offset first (Tantivy index sorting); merges
+  keep the order. Ranked searches stop reading ties once nothing later can
+  place, so merged archives are the fastest instead of the slowest. Archives
+  written by earlier versions keep working; a plain `POST /admin/reindex`
+  rewrites them (per node).
+- Built against a Tantivy fork (0.27.0 plus upstream PR #3236, which fixes
+  pruning on fields without fieldnorms); see `docs/TANTIVY_FORK.md`.
+
 ## [2.20.1] - 2026-11-25
 
 ### Fixed
