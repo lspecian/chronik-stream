@@ -43,8 +43,9 @@ VOLUME ["/data"]
 EXPOSE 9092 6092 13092
 
 # Health check
+# The base image has no nc; bash's /dev/tcp needs no package.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD nc -z localhost 9092 || exit 1
+    CMD ["bash", "-c", "</dev/tcp/127.0.0.1/9092"]
 
 # Run the server (v2.2.0+ CLI: `start` auto-detects single-node vs cluster mode).
 # IMPORTANT: set CHRONIK_ADVERTISE (or pass --advertise) when running so Kafka

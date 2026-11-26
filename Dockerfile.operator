@@ -42,8 +42,10 @@ USER operator
 
 EXPOSE 8080
 
+# The base image has neither wget nor curl; bash's /dev/tcp needs no package.
+# /healthz always answers 200, so an accepted connection is the same signal.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://localhost:8080/healthz || exit 1
+    CMD ["bash", "-c", "</dev/tcp/127.0.0.1/8080"]
 
 ENTRYPOINT ["chronik-operator"]
 CMD ["start"]
