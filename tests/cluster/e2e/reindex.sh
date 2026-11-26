@@ -18,6 +18,13 @@
 # Needs: KAFKA_HOME, kcat, jq.
 set -u
 BIN=${1:?binary under test}; PREV=${2:?previous binary (archives without JSON columns)}; LABEL=${3:?label}
+# JSON columns arrived in v2.20.0. A newer "previous" binary leaves a reindex nothing
+# to upgrade, and the "before" assertions would fail for that reason alone: refuse it.
+prev_ver=$("$PREV" version 2>/dev/null | sed -n "s/^Chronik Server v//p" | head -1)
+if [ -z "$prev_ver" ] || [ "$(printf "%s\n" "$prev_ver" 2.20.0 | sort -V | head -1)" != "$prev_ver" ] || [ "$prev_ver" = 2.20.0 ]; then
+  echo "WRONG BASELINE: the previous binary is v${prev_ver:-unknown}; this check needs one that archives without JSON columns (before v2.20.0)"
+  exit 2
+fi
 K="${KAFKA_HOME:?set KAFKA_HOME to a Kafka distribution}/bin"
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO"

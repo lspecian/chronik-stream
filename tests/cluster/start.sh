@@ -6,6 +6,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Nodes run from the repo root: data_dir in the node configs is relative to it.
+cd "$PROJECT_ROOT"
 # Normally the release build from this tree. `CHRONIK_BIN` points it at another
 # binary instead, which is how a fix gets compared against the released artifact
 # that still has the bug: a pre/post run needs both, and overwriting

@@ -4,7 +4,7 @@
 
 enabled = true
 node_id = 1
-data_dir = "/home/ubuntu/Development/chronik-stream/tests/cluster/data/node1"
+data_dir = "tests/cluster/data/node1"  # relative to the repo root; the launchers run nodes from there
 replication_factor = 3
 min_insync_replicas = 2
 

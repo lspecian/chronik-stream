@@ -17,6 +17,13 @@
 # Needs: kcat.
 set -u
 BIN=${1:?binary under test}; PREV=${2:?previous binary (writes plain segments)}; LABEL=${3:?label}
+# A newer "previous" binary writes compressed segments already, and every "before"
+# assertion would fail for that reason alone: refuse it rather than report a FAIL.
+prev_ver=$("$PREV" version 2>/dev/null | sed -n "s/^Chronik Server v//p" | head -1)
+if [ -z "$prev_ver" ] || [ "$(printf "%s\n" "$prev_ver" 2.19.2 | sort -V | tail -1)" != 2.19.2 ]; then
+  echo "WRONG BASELINE: the previous binary is v${prev_ver:-unknown}; this check needs one that writes plain raw segments (v2.19.2 or earlier)"
+  exit 2
+fi
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$REPO"
 D=tests/cluster/data/rawz-$LABEL; LOG=tests/cluster/logs/rawz-$LABEL
