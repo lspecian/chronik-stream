@@ -320,7 +320,6 @@ impl EmbeddingModelConfig {
                 }
             }
             EmbeddingProvider::Local => {
-                #[cfg(not(feature = "local-models"))]
                 return Err(anyhow!(
                     "Local provider requires 'local-models' feature. Rebuild with --features local-models"
                 ));

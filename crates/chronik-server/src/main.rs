@@ -34,8 +34,6 @@ mod fetch_handler;
 #[cfg(feature = "search")]
 mod legacy_index_retirement;
 mod fetch;  // Phase 2.2: Extracted fetch modules
-mod offset_storage;
-mod coordinator_manager;
 mod wal_integration;
 mod metadata_dr;
 mod replication;  // Phase 2.3: Extracted replication modules (frame_reader, record_processor)
@@ -1228,10 +1226,9 @@ async fn main() -> Result<()> {
     // priority, so index rebuilds after a restart cannot take the whole CPU
     // budget from request handling.
     chronik_storage::background::init_global_pool();
-    info!("Build features: search={}, backup={}, dynamic-config={}",
+    info!("Build features: search={}, backup={}",
         cfg!(feature = "search"),
-        cfg!(feature = "backup"),
-        cfg!(feature = "dynamic-config")
+        cfg!(feature = "backup")
     );
 
     // Show deprecation warnings for old environment variables.
@@ -1263,8 +1260,6 @@ async fn main() -> Result<()> {
             out.push_str("  - Search: enabled\n");
             #[cfg(feature = "backup")]
             out.push_str("  - Backup: enabled\n");
-            #[cfg(feature = "dynamic-config")]
-            out.push_str("  - Dynamic Config: enabled\n");
             // `println!` panics when the reader has gone (`version | head -1`),
             // and the release build aborts on panic: a core dump for a pipe
             // that closed early. A reader that stopped reading is not an error.

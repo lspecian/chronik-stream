@@ -12,11 +12,6 @@ pub mod wal_metadata_store;
 // v2.2.7 Phase 5: Deleted metalog_store.rs (old WAL-based metadata, replaced by Raft)
 // Deleted metrics.rs (consolidated into chronik-monitoring::UnifiedMetrics)
 
-// Raft-replicated metadata store (requires raft feature)
-#[cfg(feature = "raft")]
-pub mod raft_meta_log;
-#[cfg(feature = "raft")]
-pub mod raft_state_machine;
 
 pub use traits::*;
 pub use transaction::{TransactionMetadata, TransactionState};
@@ -29,9 +24,3 @@ pub use wal_metadata_store::{WalMetadataStore, WalAppendFn, EventBusPublishFn, T
 // Kept METADATA_TOPIC constant for backward compatibility
 pub const METADATA_TOPIC: &str = "__chronik_metadata";
 // Removed WalMetadataMetrics, MetricsReport, global_metrics exports (use chronik-monitoring::UnifiedMetrics instead)
-
-// Raft metadata replication (only when raft feature is enabled)
-#[cfg(feature = "raft")]
-pub use raft_meta_log::{RaftMetaLog, RaftReplicaManager, METADATA_TOPIC as RAFT_METADATA_TOPIC, METADATA_PARTITION};
-#[cfg(feature = "raft")]
-pub use raft_state_machine::MetadataStateMachine;

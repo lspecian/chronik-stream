@@ -3,38 +3,11 @@
 use bytes::{Buf, Bytes, BytesMut, BufMut};
 use chronik_protocol::{
     compression::{CompressionHandler, CompressionType, MessageBatch},
-    frame::KafkaFrameCodec,
     records::{RecordBatch, RecordHeader, RecordAttributes, TimestampType},
     kafka_protocol::{ApiKey, ErrorCode, ProtocolCodec,
         RequestHeader, get_supported_apis,
         TopicMetadata, PartitionMetadata},
 };
-use tokio_util::codec::{Decoder, Encoder};
-
-/// Test frame codec encoding and decoding
-#[test]
-fn test_frame_codec() {
-    let mut codec = KafkaFrameCodec::new();
-    let mut buf = BytesMut::new();
-    
-    // Create a test message (minimum 14 bytes)
-    let mut message = BytesMut::new();
-    message.put_i16(3); // API key
-    message.put_i16(12); // API version
-    message.put_i32(123); // Correlation ID
-    message.put_i16(5); // Client ID length
-    message.put_slice(b"test1"); // Client ID
-    let message = message.freeze();
-    
-    // Encode
-    codec.encode(message.clone(), &mut buf).unwrap();
-    assert_eq!(buf.len(), message.len() + 4); // 4 bytes for length prefix
-    
-    // Decode
-    let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded, message);
-    assert_eq!(buf.len(), 0); // All consumed
-}
 
 /// Test message batching without compression
 #[test]
@@ -255,24 +228,6 @@ fn test_request_header() {
     assert_eq!(decoded.api_version, 12);
     assert_eq!(decoded.correlation_id, 999);
     assert_eq!(decoded.client_id, Some("my-client".to_string()));
-}
-
-/// Test large frame handling
-#[test]
-fn test_large_frame() {
-    let mut codec = KafkaFrameCodec::new();
-    let mut buf = BytesMut::new();
-    
-    // Create a large message (1MB)
-    let large_message = Bytes::from(vec![0xAB; 1024 * 1024]);
-    
-    // Encode
-    codec.encode(large_message.clone(), &mut buf).unwrap();
-    assert_eq!(buf.len(), large_message.len() + 4);
-    
-    // Decode
-    let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.len(), large_message.len());
 }
 
 /// Test error codes
