@@ -43,7 +43,6 @@ This document describes the design for adding optional per-topic columnar storag
          │               │  ──────────────────────────────────────  │
          │               │  /_search/*     → SearchHandler          │
          │               │  /_sql          → SqlQueryHandler        │
-         │               │  /_arrow/*      → ArrowFlightHandler     │
          │               │  /admin/*       → AdminHandler           │
          │               │  /schemas/*     → SchemaRegistryHandler  │
          │               │  /metrics       → PrometheusHandler      │
@@ -185,7 +184,7 @@ BEFORE (v2.2.x):
 
 AFTER (v2.3.0):
   Port 9092  - Kafka Protocol (binary) - unchanged
-  Port 6092  - Unified API (REST + SQL + Arrow Flight) - same port, expanded capabilities
+  Port 6092  - Unified API (REST + SQL) - same port, expanded capabilities
 ```
 
 ### Unified Router Structure
@@ -199,9 +198,6 @@ pub struct UnifiedApi {
 
     // SQL query engine (DataFusion)
     query_engine: Arc<QueryEngine>,
-
-    // Arrow Flight for high-performance data transfer
-    flight_service: Arc<FlightService>,
 
     // Admin operations
     admin_api: Arc<AdminApi>,
@@ -238,10 +234,6 @@ impl UnifiedApi {
             .route("/_sql/explain", post(sql_explain))
             .route("/_sql/tables", get(list_tables))
             .route("/_sql/describe/:table", get(describe_table))
-
-            // Arrow Flight endpoint (high-performance data transfer)
-            .route("/_arrow/query", post(arrow_query))
-            .route("/_arrow/stream/:query_id", get(arrow_stream))
 
             // Admin API
             .nest("/admin", admin_routes())
@@ -360,7 +352,6 @@ crates/chronik-columnar/
 │   ├── converter.rs         # CanonicalRecord <-> Arrow
 │   ├── partitioner.rs       # Time-based partitioning
 │   ├── query_engine.rs      # DataFusion integration
-│   ├── flight.rs            # Arrow Flight service
 │   └── compaction.rs        # Parquet file compaction
 ```
 
@@ -384,8 +375,6 @@ datafusion-common = "44"
 datafusion-expr = "44"
 datafusion-sql = "44"
 
-# Arrow Flight for streaming
-arrow-flight = { version = "54", features = ["flight-sql-experimental"] }
 tonic = { workspace = true }
 
 # Internal dependencies
@@ -900,7 +889,6 @@ unified_api_port = 6092  # Unified API port (same as Search API for backward com
 # Enable/disable API sections
 search_enabled = true
 sql_enabled = true
-arrow_flight_enabled = true
 admin_enabled = true
 schema_registry_enabled = true
 
@@ -986,30 +974,6 @@ curl -X POST http://localhost:6092/_sql \
 }
 ```
 
-### Arrow Flight (High-Performance)
-
-```python
-# Python client using pyarrow
-import pyarrow.flight as flight
-
-# Connect to Chronik
-client = flight.connect("grpc://localhost:6092")
-
-# Execute query and get Arrow stream
-info = client.get_flight_info(
-    flight.FlightDescriptor.for_command(
-        b'SELECT * FROM orders WHERE partition = 0 LIMIT 1000'
-    )
-)
-
-# Read results as Arrow tables (zero-copy)
-reader = client.do_get(info.endpoints[0].ticket)
-table = reader.read_all()
-
-# Convert to pandas
-df = table.to_pandas()
-```
-
 ### Combined Search + SQL
 
 ```bash
@@ -1080,8 +1044,7 @@ curl -X POST http://localhost:6092/_sql \
 2. Migrate Search API endpoints
 3. Migrate Admin API endpoints
 4. Add SQL endpoints
-5. Add Arrow Flight endpoint
-6. Single port configuration
+5. Single port configuration
 
 **Deliverables:**
 - All APIs on single port 6092 (backward compatible)
@@ -1195,6 +1158,5 @@ This design provides:
 4. **Non-breaking changes** - existing Kafka protocol and WAL unchanged
 5. **Gradual adoption** - topics opt-in to columnar storage individually
 6. **Full SQL support** via DataFusion with predicate pushdown
-7. **High-performance data transfer** via Arrow Flight
 
 The implementation leverages existing patterns (WalIndexer, SegmentIndex, Axum routers) while adding new capabilities without disrupting current functionality.

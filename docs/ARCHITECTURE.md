@@ -21,7 +21,6 @@ chronik-stream/
 ├── chronik-config/          # Configuration management
 ├── chronik-monitoring/      # Prometheus metrics, tracing
 ├── chronik-query/           # Query processing
-├── chronik-backup/          # Backup functionality
 └── chronik-bench/           # Performance benchmarks
 ```
 
@@ -305,6 +304,6 @@ Tested with:
 ## See Also
 
 - [RUNNING_A_CLUSTER.md](RUNNING_A_CLUSTER.md) - Cluster deployment guide
-- [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md) - Backup and recovery
+- [DISASTER_RECOVERY.md](DISASTER_RECOVERY.md) - Disaster recovery: metadata images (`metadata_dr`) and the object-store archive (`CHRONIK_DR_RESTORE`)
 - [SEARCHABLE_TOPICS.md](SEARCHABLE_TOPICS.md) - Full-text search feature
 - [wal/](wal/) - WAL implementation details

@@ -27,9 +27,9 @@ is marked done that has not been proven end-to-end against a real client.
 | SASL PLAIN | "✅ Working" | validated credentials, **never enforced** | ✅ **ENFORCED (Phase 0)** |
 | SASL SCRAM-256/512 | "✅ Working" | **advertised, accepted ANY password** | ✅ **no longer advertised or accepted** |
 | ACLs | — | 645-line authorizer, **zero call sites** | **0% — dead code** (principal now available) |
-| Encryption at rest (WAL/segments/index/Parquet) | `wal-encryption` feature exists | **no implementation** | **0%** |
+| Encryption at rest (WAL/segments/index/Parquet) | `wal-encryption` feature existed (removed: it pulled in `ring` and did nothing) | **no implementation** | **0%** |
 | Encryption at rest (object store SSE) | `EncryptionConfig` + builder exist | **never applied to PUT** | ✅ **applied (`CHRONIK_S3_SSE`)** |
-| Encryption at rest (backups) | — | AES-256-GCM / ChaCha20-Poly1305, argon2 KDF, wired | **real** |
+| Encryption at rest (backups) | — | AES-256-GCM / ChaCha20-Poly1305 in `chronik-backup`, which the server never called | **removed** (crate deleted; DR images rely on object-store SSE) |
 
 **Bottom line: anyone who can reach :9092 can do anything, and anyone who can reach :6092
 can read every topic over plain HTTP.** TLS on the Kafka port buys encryption in transit and
@@ -141,23 +141,25 @@ implementing SCRAM, because it is advertised.
 | Parquet columnar files | **plaintext** |
 | Metadata WAL (ChronikMetaLog) + DR uploads | **plaintext** |
 | HNSW vector indexes | **plaintext** |
-| Backups (`chronik-backup`) | **encrypted — genuinely implemented** |
+| Backups | none separate: DR is the metadata images above (`metadata_dr`) plus the object-store archive (`CHRONIK_DR_RESTORE`) |
 
 Two dead knobs that look like features:
 
-1. **`wal-encryption` feature.** `chronik-wal/Cargo.toml:14` declares
-   `wal-encryption = ["wal", "dep:ring"]`. There is **no `use ring` anywhere in
-   `chronik-wal/src`**. Enabling the feature pulls in a dependency and changes nothing.
+1. **`wal-encryption` feature** (since removed). `chronik-wal/Cargo.toml` declared
+   `wal-encryption = ["wal", "dep:ring"]`. There was **no `use ring` anywhere in
+   `chronik-wal/src`**. Enabling the feature pulled in a dependency and changed nothing.
 2. **Object-store SSE.** `object_store/config.rs:228-248` defines `EncryptionConfig` and
    `EncryptionType::{Aes256, AwsKms}` with a `with_encryption()` builder. The S3 backend's
    `put_object` chain (`backends/s3.rs:191`) never calls `.server_side_encryption(...)`.
    `s3.rs:423` only *reads back* `response.server_side_encryption` on GET. Configuring
    encryption has no effect on any write.
 
-The only real cryptography in the tree is [`chronik-backup/src/encryption.rs`](../crates/chronik-backup/src/encryption.rs)
-— AES-256-GCM and ChaCha20-Poly1305 with argon2/pbkdf2 key derivation, wired into
-`manager.rs:225`, `backup` is a default feature. Backups can be encrypted; live data cannot.
-Note `MemoryKeyManager` holds keys in process memory — there is no KMS integration.
+There is no application-level encryption of data at rest. The `chronik-backup` crate had
+AES-256-GCM and ChaCha20-Poly1305 with argon2/pbkdf2 key derivation, but nothing in the server
+ever called it, so no backup was ever written, encrypted or not; it has been removed. Disaster
+recovery is `metadata_dr` (catalog and node-local metadata images in the object store) plus the
+object-store archive, restored with `CHRONIK_DR_RESTORE`. At rest these are protected only by
+object-store SSE (`CHRONIK_S3_SSE`).
 
 ---
 
@@ -295,8 +297,8 @@ Phase 3 adds. Only `/memory/v1/*` has tenant + API-key checks
 
 - **Quick win first:** apply SSE on object-store PUTs (see §2.5).
 - **Model:** envelope encryption — per-segment DEK, KEK from a pluggable KMS (AWS KMS /
-  Vault / file-backed for dev). Extend the existing `KeyManager` trait from
-  `chronik-backup` rather than inventing a second one.
+  Vault / file-backed for dev), behind a `KeyManager` trait (the removed `chronik-backup`
+  crate had one; it is in git history if useful as a starting point).
 - **WAL encryption** is the delicate part:
   - Must not disturb the three-CRC architecture — encrypt *after* checksumming, decrypt
     *before* verification, and never touch `compressed_records_wire_bytes` (the preserved
@@ -444,8 +446,8 @@ key holder can query every topic. Doing it properly means resolving the tables a
 touches from the plan, not string-matching the query.
 
 **Phase 5 remainder.** WAL segments, Tier-2 segments, Tantivy indexes, Parquet files and the
-metadata WAL are still written in plaintext on local disk. Only object-store SSE and backups
-are covered. WAL encryption was deliberately not attempted: it sits in the durability core,
+metadata WAL are still written in plaintext on local disk. Only object-store SSE is
+covered. WAL encryption was deliberately not attempted: it sits in the durability core,
 must not disturb the three-CRC architecture or `compressed_records_wire_bytes`, has to decrypt
 during `WalManager::recover()` including across a key rotation, and conflicts with the io_uring
 zero-copy write path. It needs its own focused work with crash-recovery testing, not an
@@ -593,8 +595,8 @@ client (`apache/kafka:3.7.0`): AdminClient created a topic at RF=3 with
 - **Phase 2 multi-listener** — `PLAINTEXT://` and `SASL_SSL://` side by side, and
   a separate inter-broker listener. `CHRONIK_SASL_ENABLED=optional` covers the
   staged-rollout need.
-- **Phase 5 WAL/segment/index encryption at rest.** Object-store SSE and backups
-  are covered; local files are not.
+- **Phase 5 WAL/segment/index encryption at rest.** Object-store SSE is covered;
+  local files are not.
 - **Re-authentication (KIP-368)** and **inter-broker authentication**.
 - **Transactional-id ACLs.**
 

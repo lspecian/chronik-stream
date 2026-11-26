@@ -1212,10 +1212,7 @@ async fn main() -> Result<()> {
     // priority, so index rebuilds after a restart cannot take the whole CPU
     // budget from request handling.
     chronik_storage::background::init_global_pool();
-    info!("Build features: search={}, backup={}",
-        cfg!(feature = "search"),
-        cfg!(feature = "backup")
-    );
+    info!("Build features: search={}", cfg!(feature = "search"));
 
     // Show deprecation warnings for old environment variables.
     //
@@ -1244,8 +1241,6 @@ async fn main() -> Result<()> {
             let mut out = format!("Chronik Server v{}\nBuild features:\n", env!("CARGO_PKG_VERSION"));
             #[cfg(feature = "search")]
             out.push_str("  - Search: enabled\n");
-            #[cfg(feature = "backup")]
-            out.push_str("  - Backup: enabled\n");
             // `println!` panics when the reader has gone (`version | head -1`),
             // and the release build aborts on panic: a core dump for a pipe
             // that closed early. A reader that stopped reading is not an error.
