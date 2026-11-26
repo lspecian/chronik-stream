@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.4] - 2026-11-26
+
+### Performance
+
+- **Searches reading many archives reopened most of them every time.** At
+  most 256 archives were kept open, a limit from when every archive was
+  unpacked into a directory of files; a search across all topics of a node
+  holding more (Thunderbird nodes: 900 to 1,600) reopened most of them on
+  every search, at ~0.65 ms each. The default is now 4,096
+  (`CHRONIK_SEARCH_CACHE_OPEN_SEGMENTS`): an archive is one file opened in
+  place, and 1,800 open took no more memory or file descriptors than 256.
+  Locally, a search across all topics of 1,800 archives went from 72 ms to
+  25 ms.
+
 ## [2.20.3] - 2026-11-26
 
 ### Fixed
