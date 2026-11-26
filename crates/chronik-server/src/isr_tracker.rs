@@ -150,16 +150,6 @@ impl IsrTracker {
         self.node_last_seen_ms.insert(node_id, now_ms);
     }
 
-    /// Whether `node_id` has been heard from within the liveness bound.
-    ///
-    /// Unknown nodes count as alive: at startup nothing has been heard from
-    /// anyone, and the caller (`is_unknown_for_all`) handles that case
-    /// separately. Treating unknown as dead here would wrongly empty ISR before
-    /// the first heartbeat.
-    pub fn is_node_alive(&self, node_id: u64) -> bool {
-        self.node_is_alive(node_id)
-    }
-
     fn node_is_alive(&self, node_id: u64) -> bool {
         let Some(last) = self.node_last_seen_ms.get(&node_id) else {
             return true;

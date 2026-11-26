@@ -13,7 +13,6 @@ members = [
     "crates/chronik-server",
     "crates/chronik-wal",
     "crates/chronik-bench",
-    "crates/chronik-raft-bridge",
     "crates/chronik-raft",
     "crates/chronik-columnar",
     "crates/chronik-embeddings",

@@ -2,7 +2,6 @@
 
 pub mod api;
 pub mod handlers;
-pub mod indexer;
 pub mod aggregations;
 pub mod cache;
 pub mod client;
@@ -19,7 +18,6 @@ pub mod topic_aggs;
 pub mod result_cache;
 
 pub use api::SearchApi;
-pub use indexer::{TantivyIndexer, IndexerConfig, SearchResult};
 
 /// Helper function to serve the search API app
 pub async fn serve_app(

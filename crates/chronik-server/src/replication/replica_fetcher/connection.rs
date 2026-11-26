@@ -99,12 +99,6 @@ impl LeaderConnection {
         self
     }
 
-    /// Authenticate every new socket with this secret.
-    pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
-        self.secret = Some(secret.into());
-        self
-    }
-
     pub fn addr(&self) -> &str {
         &self.addr
     }

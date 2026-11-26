@@ -408,15 +408,6 @@ impl QueryRouter {
         }
     }
 
-    /// Check if the partition map has been populated (at least one topic).
-    ///
-    /// Used to avoid repeated RwLock writes under high concurrency — only
-    /// refresh if the map is empty (not yet populated on first query).
-    pub async fn has_partition_map(&self) -> bool {
-        let map = self.partition_map.read().await;
-        !map.replicas.is_empty()
-    }
-
     /// Check if all partitions for ALL known topics are local (no fan-out needed).
     ///
     /// Returns true when every partition of every topic in the partition map
@@ -739,13 +730,6 @@ impl<Resp> FanOut<Resp> {
             .map(|f| format!("node {}: {}", f.node_id, f.reason))
             .collect::<Vec<_>>()
             .join("; ")
-    }
-
-    /// The responses, for a caller that has already decided what an incomplete
-    /// fan-out means for it. Named so that discarding the failures is a visible
-    /// choice at the call site rather than the default.
-    pub fn into_responses_ignoring_failures(self) -> Vec<Resp> {
-        self.responses
     }
 
     /// Split into the responses and the `node N: reason` lines, for a caller

@@ -33,7 +33,6 @@ mod consumer_group;
 mod fetch_handler;
 #[cfg(feature = "search")]
 mod legacy_index_retirement;
-mod fetch;  // Phase 2.2: Extracted fetch modules
 mod wal_integration;
 mod metadata_dr;
 mod replication;  // Phase 2.3: Extracted replication modules (frame_reader, record_processor)
@@ -289,19 +288,6 @@ enum ClusterAction {
         #[arg(short = 'c', long, env = "CHRONIK_CONFIG")]
         config: PathBuf,
     },
-}
-
-/// Parse Kafka address (host:port) from cluster config
-fn parse_kafka_addr(addr: &str) -> Result<(String, i32)> {
-    if let Some(colon_pos) = addr.rfind(':') {
-        let host = addr[..colon_pos].to_string();
-        let port_str = &addr[colon_pos + 1..];
-        let port = port_str.parse::<u16>()
-            .map_err(|e| anyhow::anyhow!("Invalid port in address '{}': {}", addr, e))?;
-        Ok((host, port as i32))
-    } else {
-        Err(anyhow::anyhow!("Address '{}' must be in format 'host:port'", addr))
-    }
 }
 
 /// Parse server-side encryption configuration for the object store.

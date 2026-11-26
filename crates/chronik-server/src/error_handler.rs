@@ -173,21 +173,6 @@ impl ErrorCode {
         self as i16
     }
     
-    /// Get human-readable description
-    pub fn description(&self) -> &'static str {
-        match self {
-            ErrorCode::None => "No error",
-            ErrorCode::UnknownTopicOrPartition => "Topic or partition does not exist",
-            ErrorCode::NotController => "This broker is not the controller",
-            ErrorCode::TopicAlreadyExists => "Topic already exists",
-            ErrorCode::InvalidPartitions => "Invalid number of partitions",
-            ErrorCode::InvalidReplicationFactor => "Invalid replication factor",
-            ErrorCode::CoordinatorNotAvailable => "Coordinator is not available",
-            ErrorCode::UnsupportedVersion => "Unsupported API version",
-            ErrorCode::InvalidRequest => "Invalid request format",
-            _ => "Unknown error",
-        }
-    }
 }
 
 /// Error handler with recovery strategies

@@ -1217,7 +1217,6 @@ chronik-stream/
 │   ├── chronik-config/      # Configuration management
 │   ├── chronik-cli/         # CLI tools
 │   ├── chronik-raft/        # Raft consensus for clustering
-│   ├── chronik-raft-bridge/ # Raft integration bridge
 │   ├── chronik-benchmarks/  # Performance benchmarks
 │   ├── raft/                # Vendored TiKV raft (prost 0.12 compatible)
 │   └── raft-proto/          # Vendored raft-proto (prost codegen)

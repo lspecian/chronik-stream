@@ -116,25 +116,11 @@ pub struct ResponsePipelineMetrics {
 }
 
 impl ResponsePipelineMetrics {
-    pub fn registered(&self) -> u64 {
-        self.registered.load(Ordering::Relaxed)
-    }
-
-    pub fn delivered(&self) -> u64 {
-        self.delivered.load(Ordering::Relaxed)
-    }
 
     pub fn timeouts(&self) -> u64 {
         self.timeouts.load(Ordering::Relaxed)
     }
 
-    pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
-    }
-
-    pub fn pending_count(&self) -> u64 {
-        self.pending_count.load(Ordering::Relaxed)
-    }
 }
 
 /// Partition bucket key: (topic, partition)

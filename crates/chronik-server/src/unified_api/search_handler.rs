@@ -21,28 +21,6 @@ use chronik_search::SearchApi;
 #[cfg(feature = "search")]
 use chronik_storage::WalIndexer;
 
-/// Create a SearchApi instance for the unified API
-///
-/// This function creates a SearchApi configured with the WalIndexer
-/// for accessing WAL-created Tantivy indexes.
-///
-/// # Arguments
-/// * `wal_indexer` - The WAL indexer for accessing disk-based indexes
-/// * `index_base_path` - Full path to tantivy_indexes directory (e.g., "{data_dir}/tantivy_indexes")
-///
-/// # Returns
-/// An Arc-wrapped SearchApi ready for use with Axum
-///
-/// # Errors
-/// Returns an error if the SearchApi cannot be created
-#[cfg(feature = "search")]
-pub fn create_search_api(
-    wal_indexer: Arc<WalIndexer>,
-    index_base_path: &str,
-) -> Result<Arc<SearchApi>, chronik_common::Error> {
-    create_search_api_with_hot(wal_indexer, index_base_path, None)
-}
-
 /// HP-1.3: Variant that accepts an optional hot text index for NRT search.
 /// When provided, `/_search` and `/:index/_search` merge hot hits with
 /// cold results, preferring hot on (_index, _id) dedup.

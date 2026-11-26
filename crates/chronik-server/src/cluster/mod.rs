@@ -23,5 +23,5 @@ pub mod broker_registration;
 pub use config::ClusterInitConfig;
 pub use catalog_setup::{start_cluster_catalog, start_catalog_grpc_server};
 pub use server_setup::create_integrated_server;
-pub use listener_setup::{start_kafka_listener, start_search_api, start_admin_api, log_listener_status};
+pub use listener_setup::{start_kafka_listener, start_admin_api, log_listener_status};
 pub use broker_registration::register_configured_brokers;

@@ -3,7 +3,7 @@
 use chronik_common::Result;
 use chronik_storage::{
     ObjectStoreTrait as ObjectStore, ObjectStoreConfig, ObjectStoreFactory,
-    SegmentWriter, SegmentWriterConfig, SegmentReader, SegmentReaderConfig,
+    SegmentWriterConfig, SegmentReaderConfig,
 };
 use std::sync::Arc;
 use tracing::info;
@@ -58,24 +58,4 @@ impl StorageService {
         Arc::clone(&self.object_store)
     }
     
-    /// Create a new segment writer
-    pub async fn create_segment_writer(
-        &self,
-        _topic: String,
-        _partition: i32,
-        config: SegmentWriterConfig,
-    ) -> Result<SegmentWriter> {
-        SegmentWriter::new(config).await
-    }
-    
-    /// Create a new segment reader
-    pub fn create_segment_reader(
-        &self,
-        config: SegmentReaderConfig,
-    ) -> Result<SegmentReader> {
-        Ok(SegmentReader::new(
-            config,
-            self.object_store(),
-        ))
-    }
 }

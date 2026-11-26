@@ -55,8 +55,6 @@ pub struct WalConfig {
 pub enum CompressionType {
     #[default]
     None,
-    #[cfg(feature = "wal-compression")]
-    Zstd,
     Snappy,
     Lz4,
 }

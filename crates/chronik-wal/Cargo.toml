@@ -10,9 +10,6 @@ repository.workspace = true
 # async-io enabled by default: on Linux it activates io_uring for kernel-level async WAL I/O,
 # on non-Linux it compiles the stub (no-op). crossbeam is cross-platform.
 default = ["async-io"]
-wal = ["dep:memmap2"]
-wal-encryption = ["wal", "dep:ring"]
-wal-compression = ["wal", "dep:zstd"]
 async-io = ["dep:crossbeam"]
 
 [dependencies]
@@ -39,9 +36,6 @@ bincode = { workspace = true }
 libc = "0.2"  # v2.2.7: For I/O priority control (ioprio_set syscall)
 
 # Optional dependencies
-memmap2 = { version = "0.9", optional = true }
-ring = { version = "0.17", optional = true }
-zstd = { version = "0.13", optional = true }
 crossbeam = { version = "0.8", optional = true }
 
 # Local dependencies (MUST be before target-specific sections!)

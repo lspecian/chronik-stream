@@ -73,10 +73,6 @@ impl TableTopicMap {
         self.by_table.get(base).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    /// Whether any topic maps to this table name.
-    pub fn is_topic_table(&self, table: &str) -> bool {
-        !self.topics_for(table).is_empty()
-    }
 }
 
 /// Mirror of the SQL layer's topic→table sanitiser.

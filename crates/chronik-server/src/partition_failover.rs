@@ -353,14 +353,6 @@ impl PartitionFailoverController {
         })
     }
 
-    pub fn failovers_performed(&self) -> u64 {
-        self.failovers_performed.load(Ordering::Relaxed)
-    }
-
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-
     pub fn start(self: &Arc<Self>) {
         let this = Arc::clone(self);
         tokio::spawn(async move { this.run().await });
@@ -530,10 +522,6 @@ impl PartitionFailoverController {
         }
         *last_pass = Some(now);
         true
-    }
-
-    pub fn rebalances_performed(&self) -> u64 {
-        self.rebalances_performed.load(Ordering::Relaxed)
     }
 
     /// Move partitions to their new leaders, in batches of catalog commands.

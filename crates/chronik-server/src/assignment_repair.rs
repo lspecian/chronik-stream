@@ -166,10 +166,6 @@ impl AssignmentRepair {
         });
     }
 
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-
     pub fn repaired(&self) -> u64 {
         self.repaired.load(Ordering::Relaxed)
     }

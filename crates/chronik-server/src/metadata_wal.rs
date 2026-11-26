@@ -201,13 +201,6 @@ impl MetadataWal {
         self.partition
     }
 
-    /// Get reference to underlying GroupCommitWal
-    ///
-    /// Useful for advanced operations like recovery, compaction, etc.
-    pub fn wal(&self) -> &Arc<GroupCommitWal> {
-        &self.wal
-    }
-
     /// Recover metadata WAL state on startup: the events after `after` (the
     /// offset a checkpoint covers, if any), oldest first, and the next offset
     /// to assign — past every record on disk and past the checkpoint, so an

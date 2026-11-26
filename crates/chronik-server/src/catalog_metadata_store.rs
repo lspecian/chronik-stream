@@ -262,10 +262,6 @@ impl CatalogMetadataStore {
         &self.catalog
     }
 
-    pub fn local(&self) -> &Arc<WalMetadataStore> {
-        &self.local
-    }
-
     /// Run a command and fail on a refused one.
     async fn run(&self, cmd: CatalogCommand, subject: &str) -> Result<CatalogResult> {
         match self.catalog.execute(cmd).await? {

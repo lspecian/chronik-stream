@@ -450,10 +450,6 @@ impl ConnectionContext {
         self.peer_addr
     }
 
-    pub fn is_tls(&self) -> bool {
-        self.tls
-    }
-
     /// Whether a Produce request (`request`, header included) is answered.
     /// `acks = 0` is not: a Kafka broker writes nothing back, and a client
     /// reads nothing. A produce another broker forwarded is always answered —

@@ -29,7 +29,6 @@
 //! follower therefore knows its own leadership history without being told, which
 //! is what makes the truncation exchange a single request.
 
-use std::collections::HashMap;
 
 use dashmap::DashMap;
 
@@ -346,13 +345,6 @@ impl LeaderEpochStore {
             .unwrap_or_default()
     }
 
-    /// Every partition with recorded history, for diagnostics.
-    pub fn tracked(&self) -> HashMap<(String, i32), i32> {
-        self.caches
-            .iter()
-            .filter_map(|e| e.value().latest_epoch().map(|epoch| (e.key().clone(), epoch)))
-            .collect()
-    }
 }
 
 /// `epoch start_offset` per line. Anything else is skipped: a checkpoint is a

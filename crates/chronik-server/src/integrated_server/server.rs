@@ -23,12 +23,7 @@ use crate::storage::{StorageConfig as IngestStorageConfig, StorageService};
 use crate::wal_integration::WalProduceHandler;
 
 // Storage components
-use chronik_storage::{
-    ObjectStoreTrait, ObjectStoreConfig, ObjectStoreFactory,
-    SegmentReader, SegmentReaderConfig,
-    SegmentWriter, SegmentWriterConfig,
-    WalIndexer, WalIndexerConfig,
-};
+use chronik_storage::{ObjectStoreConfig, WalIndexer};
 
 // Metadata store
 use chronik_common::metadata::traits::MetadataStore;
@@ -1019,14 +1014,6 @@ impl IntegratedKafkaServer {
         ErrorRecovery::Retry
     }
 
-    /// Flush all partition buffers to ensure data durability before shutdown
-    pub async fn flush_all_partitions(&self) -> Result<()> {
-        info!("Flushing all partition buffers to storage...");
-        self.kafka_handler.flush_all_partitions().await?;
-        info!("All partitions flushed successfully");
-        Ok(())
-    }
-
     /// Get server statistics
     pub async fn get_stats(&self) -> Result<ServerStats> {
         let topics = self.metadata_store.list_topics().await?;
@@ -1043,88 +1030,6 @@ impl IntegratedKafkaServer {
         })
     }
 
-    /// Restore high watermarks from segment metadata on startup
-    ///
-    /// This is critical for recovery after WAL deletion. Without this, the server
-    /// would not know what offsets exist in segments and would report empty partitions.
-    async fn restore_high_watermarks_from_segments(
-        metadata_store: &Arc<dyn MetadataStore>,
-    ) -> Result<()> {
-        use std::collections::HashMap;
-
-        // Get all topics
-        let topics = metadata_store.list_topics().await
-            .map_err(|e| anyhow::anyhow!("Failed to list topics: {}", e))?;
-
-        if topics.is_empty() {
-            info!("No topics found, skipping high watermark restoration");
-            return Ok(());
-        }
-
-        // For each topic, find the maximum offset from segments
-        let mut high_watermarks: HashMap<(String, u32), i64> = HashMap::new();
-
-        for topic in topics {
-            // List all segments for this topic
-            let segments = metadata_store.list_segments(&topic.name, None).await
-                .map_err(|e| anyhow::anyhow!("Failed to list segments for topic {}: {}", topic.name, e))?;
-
-            if segments.is_empty() {
-                continue;
-            }
-
-            // Find maximum end_offset for each partition
-            for segment in segments {
-                let key = (segment.topic.clone(), segment.partition);
-                let current_max = high_watermarks.get(&key).copied().unwrap_or(-1);
-
-                // High watermark should be one past the last offset in the segment
-                let segment_high_watermark = segment.end_offset + 1;
-
-                if segment_high_watermark > current_max {
-                    high_watermarks.insert(key, segment_high_watermark);
-                }
-            }
-        }
-
-        // Update high watermarks in metadata store
-        let mut restored_count = 0;
-        for ((topic, partition), high_watermark) in high_watermarks {
-            // Check if we already have a high watermark set (from WAL recovery)
-            if let Ok(Some((existing_hwm, _))) = metadata_store.get_partition_offset(&topic, partition).await {
-                if existing_hwm >= high_watermark {
-                    // Already have a higher or equal watermark from WAL, don't overwrite
-                    debug!(
-                        topic = %topic,
-                        partition = partition,
-                        existing_hwm = existing_hwm,
-                        segment_hwm = high_watermark,
-                        "Skipping watermark restore (existing is higher)"
-                    );
-                    continue;
-                }
-            }
-
-            // Set the high watermark (log_start_offset = 0 for now)
-            metadata_store.update_partition_offset(&topic, partition, high_watermark, 0).await
-                .map_err(|e| anyhow::anyhow!("Failed to update high watermark for {}:{}: {}", topic, partition, e))?;
-
-            info!(
-                topic = %topic,
-                partition = partition,
-                high_watermark = high_watermark,
-                "Restored high watermark from segments"
-            );
-            restored_count += 1;
-        }
-
-        info!(
-            restored_count = restored_count,
-            "High watermark restoration complete"
-        );
-
-        Ok(())
-    }
 }
 
 /// Server statistics

@@ -424,16 +424,6 @@ impl SchemaRegistry {
         }
     }
 
-    /// Check if the registry is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-
-    /// Get the configured port
-    pub fn port(&self) -> u16 {
-        self.config.port
-    }
-
     /// Check if authentication is required for Schema Registry
     pub fn is_auth_required(&self) -> bool {
         self.config.is_auth_required()
@@ -898,31 +888,6 @@ pub struct GetSubjectVersionResponse {
 pub struct CompatibilityConfig {
     #[serde(rename = "compatibilityLevel")]
     pub compatibility_level: CompatibilityLevel,
-}
-
-/// Error response
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error_code: u32,
-    pub message: String,
-}
-
-impl From<SchemaRegistryError> for ErrorResponse {
-    fn from(err: SchemaRegistryError) -> Self {
-        let (code, message) = match &err {
-            SchemaRegistryError::SchemaNotFound(_) => (40403, err.to_string()),
-            SchemaRegistryError::SubjectNotFound(_) => (40401, err.to_string()),
-            SchemaRegistryError::VersionNotFound(_, _) => (40402, err.to_string()),
-            SchemaRegistryError::InvalidSchema(_) => (42201, err.to_string()),
-            SchemaRegistryError::Incompatible(_) => (409, err.to_string()),
-            SchemaRegistryError::SubjectAlreadyExists(_) => (409, err.to_string()),
-        };
-
-        ErrorResponse {
-            error_code: code,
-            message,
-        }
-    }
 }
 
 #[cfg(test)]

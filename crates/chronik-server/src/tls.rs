@@ -29,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// TLS configuration for Kafka connections
 #[derive(Clone, Debug)]
@@ -237,36 +237,6 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
-/// TLS-wrapped listener that can accept both TLS and plain connections
-pub struct TlsListener {
-    acceptor: Option<TlsAcceptor>,
-}
-
-impl TlsListener {
-    /// Create a new TLS listener
-    pub fn new(tls_config: Option<&TlsConfig>) -> Result<Self> {
-        let acceptor = if let Some(config) = tls_config {
-            Some(create_tls_acceptor(config)?)
-        } else {
-            warn!("TLS not configured - connections will be unencrypted");
-            warn!("Set CHRONIK_TLS_CERT and CHRONIK_TLS_KEY to enable TLS");
-            None
-        };
-
-        Ok(Self { acceptor })
-    }
-
-    /// Check if TLS is enabled
-    pub fn is_tls_enabled(&self) -> bool {
-        self.acceptor.is_some()
-    }
-
-    /// Get the TLS acceptor (if TLS is enabled)
-    pub fn acceptor(&self) -> Option<&TlsAcceptor> {
-        self.acceptor.as_ref()
-    }
-}
-
 /// A stream that can be either plain TCP or TLS-wrapped
 ///
 /// This abstraction allows the server to handle both encrypted and unencrypted
@@ -279,13 +249,6 @@ pub enum MaybeTlsStream {
 }
 
 impl MaybeTlsStream {
-    /// Get the remote peer address
-    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        match self {
-            MaybeTlsStream::Plain(stream) => stream.peer_addr(),
-            MaybeTlsStream::Tls(stream) => stream.get_ref().0.peer_addr(),
-        }
-    }
 
     /// Set TCP_NODELAY option
     pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
@@ -608,10 +571,6 @@ impl TlsConnectionAcceptor {
         self.tls_acceptor.is_some()
     }
 
-    /// Get local address
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
-    }
 }
 
 #[cfg(test)]

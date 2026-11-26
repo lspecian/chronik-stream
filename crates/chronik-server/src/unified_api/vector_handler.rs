@@ -172,63 +172,6 @@ pub struct VectorErrorResponse {
     pub error_type: String,
 }
 
-/// Vector handler for direct usage
-pub struct VectorHandler;
-
-impl VectorHandler {
-    /// Search by text query
-    pub async fn search_by_text(
-        state: &UnifiedApiState,
-        topic: &str,
-        query: &str,
-        k: usize,
-        filters: Option<VectorSearchFilters>,
-    ) -> Result<Vec<VectorSearchResult>, String> {
-        let index_manager = state
-            .vector_index_manager
-            .as_ref()
-            .ok_or("Vector index manager not available")?;
-
-        let provider = state
-            .embedding_provider
-            .as_ref()
-            .ok_or("Embedding provider not configured")?;
-
-        let service = VectorSearchService::new(
-            std::sync::Arc::clone(index_manager),
-            std::sync::Arc::clone(provider),
-        ).with_cache(state.embedding_cache.clone());
-
-        service
-            .search_by_text(topic, query, k, filters)
-            .await
-            .map_err(|e| format!("Search failed: {}", e))
-    }
-
-    /// Search by raw vector (does not require embedding provider)
-    pub async fn search_by_vector(
-        state: &UnifiedApiState,
-        topic: &str,
-        vector: &[f32],
-        k: usize,
-        filters: Option<VectorSearchFilters>,
-    ) -> Result<Vec<VectorSearchResult>, String> {
-        let index_manager = state
-            .vector_index_manager
-            .as_ref()
-            .ok_or("Vector index manager not available")?;
-
-        let service = VectorSearchService::new_index_only(
-            std::sync::Arc::clone(index_manager),
-        );
-
-        service
-            .search_by_vector(topic, vector, k, filters)
-            .await
-            .map_err(|e| format!("Search failed: {}", e))
-    }
-}
-
 /// Convert request filters to VectorSearchFilters
 fn build_filters(
     partitions: Option<Vec<i32>>,

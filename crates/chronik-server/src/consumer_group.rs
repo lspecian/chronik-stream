@@ -9,7 +9,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Mutex, oneshot};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 
 // Phase 2.3: Consumer group refactoring modules
 mod assignment;
@@ -155,15 +155,6 @@ pub enum AssignmentStrategy {
 }
 
 impl AssignmentStrategy {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "range" => Some(AssignmentStrategy::Range),
-            "roundrobin" => Some(AssignmentStrategy::RoundRobin),
-            "sticky" => Some(AssignmentStrategy::Sticky),
-            "cooperative-sticky" => Some(AssignmentStrategy::CooperativeSticky),
-            _ => None,
-        }
-    }
 }
 
 /// One member, as the DescribeGroups API reports it.
@@ -397,88 +388,6 @@ impl ConsumerGroup {
         }
     }
     
-    /// Check if rebalance is needed
-    pub fn needs_rebalance(&self) -> bool {
-        !self.pending_members.is_empty() || 
-        self.state == GroupState::PreparingRebalance ||
-        self.state == GroupState::CompletingRebalance
-    }
-    
-    /// Complete the rebalance with incremental support
-    pub fn complete_rebalance(&mut self, assignments: HashMap<String, HashMap<String, Vec<i32>>>) {
-        if self.assignment_strategy == AssignmentStrategy::CooperativeSticky {
-            // Incremental rebalance: set target assignments
-            for (member_id, assignment) in &assignments {
-                if let Some(member) = self.members.get_mut(member_id) {
-                    member.target_assignment = Some(assignment.clone());
-                }
-            }
-            
-            // Check if all members have synced their assignments
-            let all_synced = self.members.values()
-                .all(|m| m.target_assignment.is_some());
-            
-            if all_synced {
-                // Apply target assignments
-                for member in self.members.values_mut() {
-                    if let Some(target) = member.target_assignment.take() {
-                        member.assignment = target;
-                        member.owned_partitions = member.assignment.clone();
-                    }
-                }
-                
-                self.state = GroupState::Stable;
-                self.pending_members.clear();
-                self.rebalance_start_time = None;
-                info!(
-                    group_id = %self.group_id,
-                    generation = self.generation_id,
-                    "Rebalance completed"
-                );
-            } else {
-                self.state = GroupState::CompletingRebalance;
-            }
-        } else {
-            // Eager rebalance: apply assignments immediately
-            for (member_id, assignment) in assignments {
-                if let Some(member) = self.members.get_mut(&member_id) {
-                    member.assignment = assignment;
-                    member.owned_partitions = member.assignment.clone();
-                }
-            }
-            
-            self.state = GroupState::Stable;
-            self.pending_members.clear();
-            self.rebalance_start_time = None;
-            info!(
-                group_id = %self.group_id,
-                generation = self.generation_id,
-                "Eager rebalance completed"
-            );
-        }
-    }
-    
-    /// Get partition assignments for all members
-    pub fn get_assignments(&self) -> HashMap<String, HashMap<String, Vec<i32>>> {
-        self.members
-            .iter()
-            .map(|(id, member)| (id.clone(), member.assignment.clone()))
-            .collect()
-    }
-    
-    /// Check if group needs persistence
-    pub fn needs_persistence(&self) -> bool {
-        match self.last_persisted {
-            Some(last) => last.elapsed() > Duration::from_secs(5),
-            None => true,
-        }
-    }
-    
-    /// Mark as persisted
-    pub fn mark_persisted(&mut self) {
-        self.last_persisted = Some(Instant::now());
-    }
-
     /// Check if all expected members have joined for this generation
     /// NOTE: This is called from an async context, so we can't access pending_join_futures here
     /// Instead, the caller (join_group) should pass the pending count
@@ -524,25 +433,6 @@ impl ConsumerGroup {
         }
 
         false
-    }
-
-    /// Legacy method for compatibility
-    pub fn all_members_joined(&self) -> bool {
-        // Can't access pending_join_futures from sync context
-        // Default to time-based check only
-        if self.state != GroupState::PreparingRebalance {
-            return false;
-        }
-
-        if self.members.is_empty() {
-            return false;
-        }
-
-        if let Some(start_time) = self.rebalance_start_time {
-            start_time.elapsed() >= Duration::from_secs(3)
-        } else {
-            false
-        }
     }
 
     /// Complete the join phase - send responses to all waiting members
@@ -725,57 +615,6 @@ impl GroupManager {
             return true;
         }
         false
-    }
-    
-    /// Set the partition assignment strategy
-    pub async fn set_assignment_strategy(&self, strategy: AssignmentStrategy) {
-        let mut assignor = self.assignor.lock().await;
-        *assignor = match strategy {
-            AssignmentStrategy::Range => Box::new(RangeAssignor::new()),
-            AssignmentStrategy::RoundRobin => Box::new(RoundRobinAssignor::new()),
-            AssignmentStrategy::Sticky => Box::new(CooperativeStickyAssignor::new()),
-            AssignmentStrategy::CooperativeSticky => Box::new(CooperativeStickyAssignor::new()),
-        };
-    }
-    
-    /// Fetch committed offsets for a consumer group
-    pub async fn fetch_offsets(
-        &self,
-        group_id: String,
-        topics: Vec<String>,
-    ) -> Result<Vec<TopicPartitionOffset>> {
-        let mut offsets = Vec::new();
-        
-        for topic in topics {
-            // Get topic metadata to know partition count
-            if let Some(topic_metadata) = self.metadata_store.get_topic(&topic).await
-                .map_err(|e| Error::Storage(format!("Failed to get topic metadata: {}", e)))? {
-                
-                for partition in 0..topic_metadata.config.partition_count {
-                    if let Some(offset) = self.metadata_store
-                        .get_consumer_offset(&group_id, &topic, partition).await
-                        .map_err(|e| Error::Storage(format!("Failed to get offset: {}", e)))? {
-                        
-                        offsets.push(TopicPartitionOffset {
-                            topic: topic.clone(),
-                            partition: partition as i32,
-                            offset: offset.offset,
-                            metadata: offset.metadata,
-                        });
-                    } else {
-                        // No committed offset, start from beginning
-                        offsets.push(TopicPartitionOffset {
-                            topic: topic.clone(),
-                            partition: partition as i32,
-                            offset: 0,
-                            metadata: None,
-                        });
-                    }
-                }
-            }
-        }
-        
-        Ok(offsets)
     }
     
     /// Every consumer group the broker knows about.
@@ -1709,192 +1548,6 @@ impl GroupManager {
         })
     }
     
-    /// Commit offsets for a consumer group
-    pub async fn commit_offsets(
-        &self,
-        group_id: String,
-        generation_id: i32,
-        member_id: String,
-        member_epoch: Option<i32>,
-        offsets: Vec<TopicPartitionOffset>,
-    ) -> Result<CommitOffsetsResponse> {
-        let groups = self.groups.read().await;
-        let group = groups.get(&group_id)
-            .ok_or_else(|| Error::InvalidInput(format!("Unknown group: {}", group_id)))?;
-        
-        // Validate generation
-        if group.generation_id != generation_id {
-            return Ok(CommitOffsetsResponse {
-                error_code: 27, // ILLEGAL_GENERATION
-                partition_errors: offsets.into_iter()
-                    .map(|o| PartitionError {
-                        topic: o.topic,
-                        partition: o.partition,
-                        error_code: 27,
-                    })
-                    .collect(),
-            });
-        }
-        
-        // Validate member
-        if !group.members.contains_key(&member_id) {
-            return Ok(CommitOffsetsResponse {
-                error_code: 25, // UNKNOWN_MEMBER_ID
-                partition_errors: offsets.into_iter()
-                    .map(|o| PartitionError {
-                        topic: o.topic,
-                        partition: o.partition,
-                        error_code: 25,
-                    })
-                    .collect(),
-            });
-        }
-        
-        // Validate member epoch for incremental rebalance
-        if let (Some(epoch), Some(member)) = (member_epoch, group.members.get(&member_id)) {
-            if member.member_epoch != epoch {
-                return Ok(CommitOffsetsResponse {
-                    error_code: 78, // FENCED_MEMBER_EPOCH
-                    partition_errors: offsets.into_iter()
-                        .map(|o| PartitionError {
-                            topic: o.topic,
-                            partition: o.partition,
-                            error_code: 78,
-                        })
-                        .collect(),
-                });
-            }
-        }
-        
-        // Store offsets in metadata store
-        let mut partition_errors = Vec::new();
-        let timestamp = chrono::Utc::now();
-        
-        for offset in offsets {
-            let consumer_offset = ConsumerOffset {
-                group_id: group_id.clone(),
-                topic: offset.topic.clone(),
-                partition: offset.partition as u32,
-                offset: offset.offset,
-                metadata: offset.metadata,
-                commit_timestamp: timestamp,
-            };
-            
-            match self.metadata_store.commit_offset(consumer_offset).await {
-                Ok(_) => {
-                    partition_errors.push(PartitionError {
-                        topic: offset.topic,
-                        partition: offset.partition,
-                        error_code: 0,
-                    });
-                }
-                Err(e) => {
-                    error!(
-                        group_id = %group_id,
-                        topic = %offset.topic,
-                        partition = offset.partition,
-                        error = %e,
-                        "Failed to commit offset"
-                    );
-                    partition_errors.push(PartitionError {
-                        topic: offset.topic,
-                        partition: offset.partition,
-                        error_code: 5, // COORDINATOR_NOT_AVAILABLE
-                    });
-                }
-            }
-        }
-        
-        Ok(CommitOffsetsResponse {
-            error_code: 0,
-            partition_errors,
-        })
-    }
-    
-    /// Fetch committed offsets for a consumer group (with optional topics filter)
-    pub async fn fetch_offsets_optional(
-        &self,
-        group_id: String,
-        topics: Option<Vec<String>>,
-    ) -> Result<Vec<TopicPartitionOffset>> {
-        // Verify group exists
-        let groups = self.groups.read().await;
-        if !groups.contains_key(&group_id) {
-            // It's ok if group doesn't exist - just return empty offsets
-            return Ok(Vec::new());
-        }
-        drop(groups);
-        
-        // Fetch offsets from metadata store
-        let mut offsets: Vec<TopicPartitionOffset> = Vec::new();
-
-        // Get list of topics to query
-        let topics_to_query: Vec<String> = match topics {
-            Some(t) => t,
-            None => {
-                // No topics specified - get all topics from metadata store
-                match self.metadata_store.list_topics().await {
-                    Ok(all_topics) => all_topics.into_iter().map(|t| t.name).collect(),
-                    Err(e) => {
-                        tracing::warn!("Failed to list topics for offset fetch: {}", e);
-                        return Ok(Vec::new());
-                    }
-                }
-            }
-        };
-
-        // For each topic, get partition count and fetch offsets
-        for topic in topics_to_query {
-            let partition_count = match self.metadata_store.get_topic(&topic).await {
-                Ok(Some(topic_meta)) => topic_meta.config.partition_count,
-                Ok(None) => {
-                    tracing::debug!("Topic {} not found, skipping", topic);
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get topic {}: {}", topic, e);
-                    continue;
-                }
-            };
-
-            // Fetch offset for each partition
-            for partition in 0..partition_count {
-                match self.metadata_store.get_consumer_offset(&group_id, &topic, partition).await {
-                    Ok(Some(offset)) => {
-                        offsets.push(TopicPartitionOffset {
-                            topic: topic.clone(),
-                            partition: partition as i32,
-                            offset: offset.offset,
-                            metadata: offset.metadata,
-                        });
-                    }
-                    Ok(None) => {
-                        // No committed offset for this partition - this is normal
-                        // Return -1 to indicate no offset committed
-                        offsets.push(TopicPartitionOffset {
-                            topic: topic.clone(),
-                            partition: partition as i32,
-                            offset: -1,
-                            metadata: None,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to get offset for {}/{}: {}", topic, partition, e);
-                        // Still include the partition with -1 offset
-                        offsets.push(TopicPartitionOffset {
-                            topic: topic.clone(),
-                            partition: partition as i32,
-                            offset: -1,
-                            metadata: None,
-                        });
-                    }
-                }
-            }
-        }
-
-        Ok(offsets)
-    }
-    
     /// Start background task to check expired members
     pub fn start_expiration_checker(self: Arc<Self>) {
         tokio::spawn(async move {
@@ -2511,38 +2164,12 @@ pub struct HeartbeatResponse {
     pub error_code: i16,
 }
 
-/// Commit offsets response
-#[derive(Debug)]
-pub struct CommitOffsetsResponse {
-    pub error_code: i16,
-    pub partition_errors: Vec<PartitionError>,
-}
-
-/// Partition error for commit response
-#[derive(Debug)]
-pub struct PartitionError {
-    pub topic: String,
-    pub partition: i32,
-    pub error_code: i16,
-}
-
-/// Topic partition offset
-#[derive(Debug)]
-pub struct TopicPartitionOffset {
-    pub topic: String,
-    pub partition: i32,
-    pub offset: i64,
-    pub metadata: Option<String>,
-}
-
 /// Partition assignor trait
 #[async_trait]
 pub trait PartitionAssignor: Send + Sync {
     /// Assign partitions to members
     fn assign(&self, context: &AssignmentContext) -> Result<HashMap<String, HashMap<String, Vec<i32>>>>;
     
-    /// Get the name of this assignor
-    fn name(&self) -> &str;
 }
 
 /// Cooperative sticky assignor for KIP-848
@@ -2683,9 +2310,6 @@ impl PartitionAssignor for CooperativeStickyAssignor {
         Ok(assignments)
     }
     
-    fn name(&self) -> &str {
-        "cooperative-sticky"
-    }
 }
 
 // Phase 2.3: Assignment encoding/decoding moved to consumer_group/assignment.rs module
@@ -2743,151 +2367,6 @@ fn parse_subscription_metadata(bytes: &[u8]) -> Result<Vec<String>> {
     }
     
     Ok(topics)
-}
-
-/// Range assignor - assigns partitions in ranges to consumers
-pub struct RangeAssignor;
-
-impl RangeAssignor {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl PartitionAssignor for RangeAssignor {
-    fn assign(&self, context: &AssignmentContext) -> Result<HashMap<String, HashMap<String, Vec<i32>>>> {
-        let mut assignments: HashMap<String, HashMap<String, Vec<i32>>> = HashMap::new();
-        
-        // Group partitions by topic
-        let mut partitions_by_topic: HashMap<String, Vec<i32>> = HashMap::new();
-        for partition in &context.partitions {
-            partitions_by_topic.entry(partition.topic.clone())
-                .or_insert_with(Vec::new)
-                .push(partition.partition);
-        }
-        
-        // Sort partitions for deterministic assignment
-        for partitions in partitions_by_topic.values_mut() {
-            partitions.sort();
-        }
-        
-        // For each topic, assign partitions in ranges
-        for (topic, partitions) in partitions_by_topic {
-            // Get members subscribed to this topic
-            let mut subscribed_members: Vec<String> = context.subscriptions.iter()
-                .filter(|(_, topics)| topics.contains(&topic))
-                .map(|(member_id, _)| member_id.clone())
-                .collect();
-            
-            if subscribed_members.is_empty() {
-                continue;
-            }
-            
-            // Sort members for deterministic assignment
-            subscribed_members.sort();
-            
-            let partitions_per_member = partitions.len() / subscribed_members.len();
-            let remaining_partitions = partitions.len() % subscribed_members.len();
-            
-            let mut partition_idx = 0;
-            for (member_idx, member_id) in subscribed_members.iter().enumerate() {
-                let partition_count = if member_idx < remaining_partitions {
-                    partitions_per_member + 1
-                } else {
-                    partitions_per_member
-                };
-                
-                if partition_count > 0 {
-                    let member_partitions: Vec<i32> = partitions[partition_idx..partition_idx + partition_count]
-                        .to_vec();
-                    
-                    assignments.entry(member_id.clone())
-                        .or_insert_with(HashMap::new)
-                        .insert(topic.clone(), member_partitions);
-                    
-                    partition_idx += partition_count;
-                }
-            }
-        }
-        
-        Ok(assignments)
-    }
-    
-    fn name(&self) -> &str {
-        "range"
-    }
-}
-
-/// Round-robin assignor - distributes partitions evenly across consumers
-pub struct RoundRobinAssignor;
-
-impl RoundRobinAssignor {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl PartitionAssignor for RoundRobinAssignor {
-    fn assign(&self, context: &AssignmentContext) -> Result<HashMap<String, HashMap<String, Vec<i32>>>> {
-        let mut assignments: HashMap<String, HashMap<String, Vec<i32>>> = HashMap::new();
-        
-        // Collect all partitions that need assignment
-        let mut all_partitions: Vec<(String, i32)> = Vec::new();
-        for partition in &context.partitions {
-            all_partitions.push((partition.topic.clone(), partition.partition));
-        }
-        
-        // Sort for deterministic assignment
-        all_partitions.sort();
-        
-        // Get all members and their subscriptions
-        let mut eligible_members: Vec<String> = context.subscriptions.keys()
-            .cloned()
-            .collect();
-        eligible_members.sort();
-        
-        if eligible_members.is_empty() {
-            return Ok(assignments);
-        }
-        
-        // Round-robin assignment
-        let mut member_idx = 0;
-        for (topic, partition) in all_partitions {
-            // Find next member subscribed to this topic
-            let start_idx = member_idx;
-            loop {
-                let member_id = &eligible_members[member_idx];
-                
-                if let Some(topics) = context.subscriptions.get(member_id) {
-                    if topics.contains(&topic) {
-                        // Assign partition to this member
-                        assignments.entry(member_id.clone())
-                            .or_insert_with(HashMap::new)
-                            .entry(topic.clone())
-                            .or_insert_with(Vec::new)
-                            .push(partition);
-                        break;
-                    }
-                }
-                
-                member_idx = (member_idx + 1) % eligible_members.len();
-                if member_idx == start_idx {
-                    // No eligible member found
-                    break;
-                }
-            }
-            
-            member_idx = (member_idx + 1) % eligible_members.len();
-        }
-        
-        Ok(assignments)
-    }
-    
-    fn name(&self) -> &str {
-        "roundrobin"
-    }
 }
 
 #[cfg(test)]
