@@ -38,12 +38,12 @@ jobs:
             target: x86_64-unknown-linux-musl
             artifact: chronik-server-linux-amd64
             use_cross: true
-            features: "--no-default-features --features search,backup"
+            features: "--no-default-features --features search"
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             artifact: chronik-server-linux-arm64
             use_cross: true
-            features: "--no-default-features --features search,backup"
+            features: "--no-default-features --features search"
           # ── glibc builds that back the Docker image, built NATIVELY ──
           # Dockerfile.binary is based on ubuntu:24.04, so static musl buys it
           # nothing, and these are the builds that keep /memory/v1/* in the

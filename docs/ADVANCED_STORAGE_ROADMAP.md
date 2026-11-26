@@ -105,7 +105,7 @@ For real-time requirements, use Kafka Fetch API directly.
 | 4 | Embedding Integration | In Progress | 9/12 | 2024-12-31 | - |
 | 5 | Vector Search Pipeline | Complete | 18/18 | 2025-12-31 | 2025-12-31 |
 | 6 | Unified API | Complete | 30/30 | 2025-12-31 | 2025-12-31 |
-| 7 | Arrow Flight | In Progress | 8/13 | 2025-12-31 | - |
+| 7 | (dropped) | - | - | - | - |
 | 8 | Testing & Documentation | In Progress | 13/14 | 2025-12-31 | - |
 
 **Total Progress**: 128/135 tasks (95%) - Phase 1, 2, 3, 5 & 6 complete; Phase 4, 7 & 8 in progress
@@ -678,97 +678,9 @@ Session 15 (2025-12-31):
 
 ---
 
-## Phase 7: Arrow Flight (Week 7)
+## Phase 7: (dropped)
 
-**Goal**: High-performance streaming for SQL and vector results.
-
-**Status**: Core types implemented; Full gRPC service blocked on tonic version upgrade (0.9 → 0.12).
-
-### 7.1 Flight Service Setup
-- [x] Create `chronik-columnar/src/flight.rs`
-- [~] Implement `FlightService` with tonic (types ready, gRPC blocked on tonic 0.12)
-- [ ] Mount on unified API port 6092
-- [ ] Health check endpoint
-
-### 7.2 Flight SQL
-- [x] Implement `get_flight_info()` for query metadata (execute_sql method)
-- [x] Implement `do_get()` for streaming RecordBatches (via execute_sql)
-- [x] Support SQL queries via Flight SQL protocol (ticket parsing: sql:query)
-- [x] Query result caching (`QueryCache` with TTL and LRU eviction)
-
-### 7.3 Flight for Vector Results
-- [x] Stream vector search results as Arrow (execute_vector_search + vector_results_to_batch)
-- [x] Include embeddings in response (optional) (`vector_results_to_batch_with_embeddings`)
-- [x] Efficient batch transfer (RecordBatch conversion)
-
-### 7.4 Client Examples
-- [ ] Python client example (pyarrow)
-- [ ] Rust client example
-- [ ] Performance benchmark: Flight vs REST
-
-**Phase 7 Checklist**: 8/13 complete (gRPC blocked on tonic upgrade)
-
-**Notes**:
-```
-Session 17 (2025-12-31):
-- Created flight.rs module with ChronikFlightService struct
-- Implemented FlightServiceConfig with max_batch_rows, query_timeout_secs, enable_flight_sql, enable_vector_streaming
-- Added execute_sql() method for SQL query execution
-- Added execute_vector_search() method for vector search
-- Implemented TicketType enum for ticket parsing (sql: and vector: prefixes)
-- Added TicketParseError for error handling
-- Implemented vector_results_to_batch() to convert VectorSearchResult to RecordBatch
-- Added vector_search_schema() helper function
-- Added 4 unit tests: config_default, parse_sql_ticket, parse_vector_ticket, vector_results_to_batch
-- Re-exported flight types from lib.rs
-- BLOCKED: Full FlightService gRPC trait requires tonic 0.12+ (arrow-flight dependency)
-  - ROOT CAUSE: `raft` crate 0.7.0 (latest, from March 2023) uses `prost 0.11`
-  - CONFLICT: `tonic 0.12+` requires `prost 0.13` - these are fundamentally incompatible
-  - Dependency chain: raft 0.7 → prost 0.11 ⇔ tonic 0.12+ → prost 0.13 (CONFLICT)
-  - Attempted upgrade on 2025-12-31: tonic 0.12, prost 0.13, opentelemetry 0.31, axum 0.8
-  - Result: Compilation failed in chronik-wal's raft_storage_impl.rs (Message trait mismatch)
-  - OPTIONS:
-    1. Wait for raft crate update (unmaintained since March 2023)
-    2. Use alternative Raft implementation (e.g., openraft which uses prost 0.13)
-    3. Remove Raft feature when Arrow Flight is needed (feature flags)
-  - Current: Types and utilities ready; gRPC service blocked until Raft dependency resolved
-- All 94 chronik-columnar tests passing
-
-Session 18 (2025-12-31):
-- Phase 4 Embedding Metrics: Added embedding metrics to UnifiedMetrics in chronik-monitoring
-- Added 8 atomic fields: embedding_latency_sum_ms, embedding_latency_count, embedding_queue_depth,
-  embedding_requests_total, embedding_errors_total, embedding_tokens_total, embedding_messages_total,
-  embedding_vectors_total
-- Added Prometheus format output for all embedding metrics
-- Added MetricsRecorder helper methods:
-  - record_embedding_latency(Duration) - track API latency
-  - update_embedding_queue_depth(usize) / increment/decrement - queue depth gauge
-  - record_embedding_request(success, messages, vectors, tokens) - request stats
-  - record_embedding_error() - error counter
-- Wired metrics into EmbeddingPipeline.process_messages() in chronik-columnar:
-  - Track latency around embed_batch() calls
-  - Increment/decrement queue depth for pending requests
-  - Record success/failure with message and vector counts
-- Added chronik-monitoring dependency to chronik-columnar
-- All 89 chronik-columnar tests passing
-
-Session 19 (2025-12-31):
-- Investigated tonic upgrade (0.9 → 0.12) for Arrow Flight support
-- Attempted upgrade: tonic 0.12, prost 0.13, opentelemetry 0.31, axum 0.8
-- Discovered fundamental prost version conflict:
-  - raft crate 0.7.0 (latest, from March 2023) uses prost 0.11
-  - tonic 0.12+ requires prost 0.13
-  - These are fundamentally incompatible at the Rust trait level
-- Build failures in chronik-wal/src/raft_storage_impl.rs:
-  - `prost::Message::decode` method not found for raft types
-  - raft types implement prost 0.11 Message, we import prost 0.13 Message
-- CONCLUSION: Upgrade blocked until:
-  1. raft crate updates to prost 0.12+ (appears unmaintained)
-  2. Switch to alternative Raft (e.g., openraft which uses prost 0.13)
-  3. Use feature flags to exclude Raft when Arrow Flight needed
-- Reverted all changes to maintain working state
-- Updated documentation with detailed blocker analysis
-```
+_Removed from the plan._
 
 ---
 
@@ -997,7 +909,6 @@ Session 20 (2025-12-31):
 | POST | `/_vector/:topic/search_by_vector` | Vector | No | Search by embedding |
 | POST | `/_vector/:topic/hybrid` | Vector | No | Hybrid text+vector |
 | GET | `/_vector/:topic/stats` | Vector | No | Index statistics |
-| POST | `/_arrow/query` | Flight | No | Arrow Flight query |
 | GET | `/admin/*` | Admin | Yes | Cluster management |
 | GET/POST | `/subjects/*` | Schema | Opt | Schema Registry |
 
@@ -1014,8 +925,6 @@ arrow-schema = "54"
 arrow-array = "54"
 parquet = { version = "54", features = ["snap", "zstd", "lz4", "async"] }
 datafusion = "44"
-arrow-flight = { version = "54", features = ["flight-sql-experimental"] }
-tonic = { workspace = true }
 ```
 
 ### chronik-embeddings
@@ -1056,7 +965,6 @@ local = ["candle-core", "candle-transformers", "tokenizers"]
 | `crates/chronik-columnar/src/udfs.rs` | 3 | [x] |
 | `crates/chronik-columnar/src/topic_query.rs` | 3 | [x] |
 | `crates/chronik-columnar/src/vector_index.rs` | 5 | [x] |
-| `crates/chronik-columnar/src/flight.rs` | 7 | [ ] |
 | `crates/chronik-embeddings/Cargo.toml` | 1 | [x] |
 | `crates/chronik-embeddings/src/lib.rs` | 1 | [x] |
 | `crates/chronik-embeddings/src/config.rs` | 4 | [x] |
@@ -1295,7 +1203,6 @@ local = ["candle-core", "candle-transformers", "tokenizers"]
 | 2024-12-31 | Use port 6092 for unified API | Backward compat with Search API |
 | 2024-12-31 | Arrow/Parquet for columnar | Ecosystem compatibility, reliability |
 | 2024-12-31 | Per-topic opt-in | Gradual adoption, no breaking changes |
-| 2024-12-31 | Include Arrow Flight | High-perf streaming for analytics |
 | 2024-12-31 | OpenAI as primary embedding | Simplest integration, best quality |
 | 2024-12-31 | Store embeddings in Parquet | Single source of truth, efficient |
 | 2024-12-31 | HNSW for vector index | O(log n) search, existing impl |

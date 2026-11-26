@@ -8,7 +8,6 @@ members = [
     "crates/chronik-search",
     "crates/chronik-query",
     "crates/chronik-monitoring",
-    "crates/chronik-backup",
     "crates/chronik-config",
     "crates/chronik-server",
     "crates/chronik-wal",

@@ -27,11 +27,6 @@ datafusion = "55"
 datafusion-common = "55"
 datafusion-expr = "55"
 
-# Arrow Flight for streaming (optional feature)
-arrow-flight = { version = "59", features = ["flight-sql-experimental"], optional = true }
-arrow-ipc = { version = "59", optional = true }
-tonic = { workspace = true, optional = true }
-
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -85,7 +80,3 @@ harness = false
 
 [features]
 default = []
-# Note: Full FlightService gRPC trait requires tonic 0.12+ (arrow-flight dependency)
-# which conflicts with workspace tonic 0.9 (opentelemetry-otlp).
-# The flight feature provides types and utilities; full gRPC service pending workspace upgrade.
-flight = []

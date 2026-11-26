@@ -12,7 +12,6 @@ members = [
     "crates/chronik-auth",
     "crates/chronik-cli",
     "crates/chronik-benchmarks",
-    "crates/chronik-backup",
     "crates/chronik-config",
     "crates/chronik-all-in-one",
     "crates/chronik-server",

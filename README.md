@@ -616,7 +616,6 @@ chronik-stream/
 │   ├── chronik-operator/     # Kubernetes operator (ChronikCluster CRD)
 │   ├── chronik-monitoring/   # Prometheus metrics
 │   ├── chronik-config/       # Configuration management
-│   ├── chronik-backup/       # Backup and disaster recovery
 │   ├── chronik-memory/       # Agent memory (optional, --features memory)
 │   ├── chronik-ontology/     # Ontology layer (optional, --features memory)
 │   ├── chronik-cli/          # `chronik` CLI
@@ -651,7 +650,7 @@ See [docs/ROADMAP_RELEVANCE_ENGINE.md](docs/ROADMAP_RELEVANCE_ENGINE.md) and [do
 | [docs/API_REFERENCE.md](docs/API_REFERENCE.md) | Unified REST API reference |
 | [docs/kafka-client-compatibility.md](docs/kafka-client-compatibility.md) | Kafka client compatibility |
 | [docs/DATASET_VALIDATION_REPORT.md](docs/DATASET_VALIDATION_REPORT.md) | Scale and quality validation |
-| [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) | Backup and recovery |
+| [docs/DISASTER_RECOVERY.md](docs/DISASTER_RECOVERY.md) | Disaster recovery: metadata images and the object-store archive (`CHRONIK_DR_RESTORE`) |
 | [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md) | Admin API security |
 | [docs/TANTIVY_FORK.md](docs/TANTIVY_FORK.md) | Why search builds against a Tantivy fork |
 | [BASELINE_PERFORMANCE.md](BASELINE_PERFORMANCE.md) | Performance benchmarks |

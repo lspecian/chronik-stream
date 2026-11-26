@@ -51,9 +51,6 @@ pub mod hot_vector_batcher;
 pub mod json_schema;
 pub mod projection;
 
-#[cfg(feature = "flight")]
-pub mod flight;
-
 // Re-exports
 pub use config::{ColumnarConfig, CompressionCodec, PartitioningStrategy};
 pub use schema::{kafka_message_schema, KafkaSchemaBuilder};
@@ -76,10 +73,3 @@ pub use json_schema::InferredJsonSchema;
 
 // v2.2.22: Re-export datafusion for unified API
 pub use datafusion;
-
-// v2.2.22: Flight types (when feature enabled)
-#[cfg(feature = "flight")]
-pub use flight::{
-    ChronikFlightService, FlightServiceConfig, TicketType, TicketParseError,
-    vector_results_to_batch, vector_search_schema,
-};

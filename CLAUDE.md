@@ -1213,7 +1213,6 @@ chronik-stream/
 │   ├── chronik-search/      # Tantivy full-text search integration
 │   ├── chronik-query/       # Query processing
 │   ├── chronik-monitoring/  # Prometheus metrics, tracing
-│   ├── chronik-backup/      # Backup functionality
 │   ├── chronik-config/      # Configuration management
 │   ├── chronik-cli/         # CLI tools
 │   ├── chronik-raft/        # Raft consensus for clustering

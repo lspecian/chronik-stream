@@ -36,7 +36,7 @@ chronik-embeddings = { path = "../chronik-embeddings" }
 # librdkafka does not cross-compile against musl without a vendored zlib/OpenSSL
 # and glibc-only FORTIFY_SOURCE stubs.
 #
-# The release musl job therefore builds --no-default-features --features search,backup.
+# The release musl job therefore builds --no-default-features --features search.
 # Remove this dependency once /memory/v1/* is served through the broker's internal
 # produce/fetch handlers instead of a loopback Kafka client.
 chronik-memory = { path = "../chronik-memory", optional = true }
@@ -49,7 +49,6 @@ chronik-query = { path = "../chronik-query" }
 
 # Optional components (feature-gated)
 chronik-search = { path = "../chronik-search", optional = true }
-chronik-backup = { path = "../chronik-backup", optional = true }
 tantivy = { workspace = true, optional = true }  # Used by query_handler for text search
 
 # Raft consensus (v2.2.7 - metadata coordination only, NOT data replication)
@@ -131,13 +130,16 @@ tabled = "0.15"
 # engine must never again be taxed by it. Opt in with --features memory (or build
 # the sidecar worker), and only on glibc targets. See docs/ROADMAP_MEMORY_EMBEDDED.md
 # for the in-process path that would let memory return to default without librdkafka.
-default = ["search", "backup"]
+default = ["search"]
 search = ["dep:chronik-search", "dep:tantivy"]
-backup = ["dep:chronik-backup"]
+# Deprecated, no-op; DR is metadata_dr (catalog and local metadata images in the
+# object store, CHRONIK_DR_RESTORE). Kept for one release so builds passing
+# `--features backup` keep working.
+backup = []
 # Agent Memory (/memory/v1/*). Pulls in librdkafka; incompatible with the static
 # musl target. Off by default; enable explicitly on glibc builds only.
 memory = ["dep:chronik-memory", "dep:chronik-ontology"]
-full = ["search", "backup", "memory"]
+full = ["search", "memory"]
 
 # Minimal build without optional features (Raft is always included)
 minimal = []

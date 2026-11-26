@@ -34,7 +34,7 @@ This document catalogs all TODOs, stubs, and incomplete implementations in the C
 - **Files Fixed**: kafka_handler.rs, produce_handler.rs, fetch_handler.rs, segment_reader.rs, record_filter.rs
 
 ### ✅ Phase 2: Security - COMPLETE (v2.2.18)
-- **Backup Encryption**: Implemented in `chronik-backup/src/encryption.rs`
+- **Backup Encryption**: implemented in `chronik-backup`, later removed with the whole crate (nothing in the server ever called it; DR is `metadata_dr` + the object-store archive, `CHRONIK_DR_RESTORE`)
   - AES-256-GCM: AEAD encryption with authentication tag
   - ChaCha20-Poly1305: Alternative AEAD cipher
   - AES-256-CTR-HMAC-SHA256: Encrypt-then-MAC construction
@@ -270,9 +270,9 @@ Dependencies:
 
 ---
 
-### ~~4. Backup Encryption (chronik-backup/src/encryption.rs)~~ ✅ IMPLEMENTED
+### ~~4. Backup Encryption (chronik-backup, removed)~~
 
-**Status**: ✅ **COMPLETE** - Full encryption support implemented
+**Status**: **REMOVED** — implemented, but the server never called `chronik-backup`; the crate was deleted. DR is `metadata_dr` (metadata images in the object store) plus the object-store archive (`CHRONIK_DR_RESTORE`), protected at rest by object-store SSE.
 
 Implementation:
 - `encrypt()` and `decrypt()` with KeyManager integration
@@ -572,7 +572,7 @@ Many TODOs in the original analysis are in dead code. The actual pending work in
 |------|----------|--------|
 | Segment checksums | P2 | ✅ **COMPLETE** (v2.2.18) |
 | LZ4/Snappy compression | P2 | ✅ **COMPLETE** (v2.2.18) |
-| Backup encryption | P1 | ✅ **COMPLETE** (v2.2.19) |
+| Backup encryption | P1 | removed (crate never called; see §4) |
 | Topic deletion | P3 | ✅ **COMPLETE** (v2.2.18) |
 | Consumer group improvements | P3 | ✅ **COMPLETE** (v2.2.19) |
 | Configuration updates | P3 | ✅ **COMPLETE** (v2.2.19) |
@@ -593,7 +593,7 @@ Many TODOs in the original analysis are in dead code. The actual pending work in
 4. ~~LZ4/Snappy compression (P2, 0.5 days)~~ - Done
 
 ### ~~Phase 2: Security (2-3 days)~~ - ✅ COMPLETE (v2.2.19)
-5. ~~Backup encryption (P1, 2 days)~~ - Done
+5. ~~Backup encryption (P1, 2 days)~~ - Done, later removed (never called)
 
 ### ~~Phase 3: Topic Deletion~~ - ✅ COMPLETE (v2.2.20)
 6. ~~Topic deletion (P3, 2 days)~~ - Done

@@ -20,10 +20,8 @@ COPY crates/chronik-storage/Cargo.toml crates/chronik-storage/Cargo.toml
 COPY crates/chronik-search/Cargo.toml crates/chronik-search/Cargo.toml
 COPY crates/chronik-query/Cargo.toml crates/chronik-query/Cargo.toml
 COPY crates/chronik-monitoring/Cargo.toml crates/chronik-monitoring/Cargo.toml
-COPY crates/chronik-backup/Cargo.toml crates/chronik-backup/Cargo.toml
 COPY crates/chronik-config/Cargo.toml crates/chronik-config/Cargo.toml
 COPY crates/chronik-bench/Cargo.toml crates/chronik-bench/Cargo.toml
-COPY crates/chronik-raft-bridge/Cargo.toml crates/chronik-raft-bridge/Cargo.toml
 COPY crates/chronik-raft/Cargo.toml crates/chronik-raft/Cargo.toml
 COPY crates/chronik-columnar/Cargo.toml crates/chronik-columnar/Cargo.toml
 COPY crates/chronik-embeddings/Cargo.toml crates/chronik-embeddings/Cargo.toml
@@ -36,7 +34,7 @@ COPY crates/raft-proto/Cargo.toml crates/raft-proto/Cargo.toml
 # Create dummy src files for all workspace crates (dependency caching)
 RUN for crate in chronik-operator chronik-common chronik-server chronik-protocol \
     chronik-wal chronik-storage chronik-search chronik-query chronik-monitoring \
-    chronik-backup chronik-config chronik-bench chronik-raft-bridge chronik-raft \
+    chronik-config chronik-bench chronik-raft \
     chronik-columnar chronik-embeddings chronik-auth chronik-cli chronik-perf; do \
     mkdir -p crates/$crate/src && \
     echo "" > crates/$crate/src/lib.rs; \

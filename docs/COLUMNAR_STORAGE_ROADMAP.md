@@ -29,7 +29,7 @@
 | Phase 2: Write Path | Not Started | 0/14 | - | - |
 | Phase 3: Query Engine | Not Started | 0/16 | - | - |
 | Phase 4: Unified API | Not Started | 0/18 | - | - |
-| Phase 5: Arrow Flight | Not Started | 0/10 | - | - |
+| Phase 5: (dropped) | - | - | - | - |
 | Phase 6: Testing & Polish | Not Started | 0/12 | - | - |
 
 **Total Progress**: 0/82 tasks
@@ -201,35 +201,9 @@ Session notes go here...
 
 ---
 
-## Phase 5: Arrow Flight (Week 4-5)
+## Phase 5: (dropped)
 
-**Goal**: High-performance streaming query results via Arrow Flight protocol.
-
-### 5.1 Flight Service Setup
-- [ ] Create `src/flight.rs` in chronik-columnar
-- [ ] Implement `FlightService` struct
-- [ ] Set up gRPC server with tonic
-- [ ] Add Flight service to unified API router
-
-### 5.2 Flight SQL Implementation
-- [ ] Implement `get_flight_info()` for query metadata
-- [ ] Implement `do_get()` for streaming RecordBatches
-- [ ] Implement `do_put()` for data ingestion (optional)
-- [ ] Add query result caching for repeated `do_get()` calls
-
-### 5.3 Integration
-- [ ] Mount Flight service on unified API port (6092)
-- [ ] Add Flight endpoint documentation
-- [ ] Create Python client example
-- [ ] Create Rust client example
-- [ ] Performance benchmark: Flight vs REST JSON
-
-**Phase 5 Checklist**: 0/10 complete
-
-**Notes**:
-```
-Session notes go here...
-```
+_Removed from the plan._
 
 ---
 
@@ -243,12 +217,10 @@ Session notes go here...
 - [ ] Test: SQL query returns correct results
 - [ ] Test: Predicate pushdown reduces scan size
 - [ ] Test: Unified API backward compatibility
-- [ ] Test: Arrow Flight streaming query
 
 ### 6.2 Performance Benchmarks
 - [ ] Benchmark: Parquet write throughput (msgs/sec)
 - [ ] Benchmark: SQL query latency by data size
-- [ ] Benchmark: Arrow Flight vs REST performance
 - [ ] Document benchmark results in `docs/BENCHMARKS.md`
 
 ### 6.3 Documentation
@@ -293,7 +265,6 @@ search_enabled = true          # Enable /_search endpoints
 sql_enabled = true             # Enable /_sql endpoints
 admin_enabled = true           # Enable /admin endpoints
 schema_registry_enabled = true # Enable /schemas endpoints
-arrow_flight_enabled = true    # Enable Arrow Flight on same port
 
 sql_max_rows = 100000          # Max rows per SQL query
 sql_timeout_ms = 30000         # SQL query timeout
@@ -316,7 +287,6 @@ sql_timeout_ms = 30000         # SQL query timeout
 | `crates/chronik-columnar/src/reader.rs` | 3 | [ ] |
 | `crates/chronik-columnar/src/query_engine.rs` | 3 | [ ] |
 | `crates/chronik-columnar/src/udfs.rs` | 3 | [ ] |
-| `crates/chronik-columnar/src/flight.rs` | 5 | [ ] |
 | `crates/chronik-server/src/unified_api/mod.rs` | 4 | [ ] |
 | `crates/chronik-server/src/unified_api/sql_handler.rs` | 4 | [ ] |
 | `crates/chronik-server/src/unified_api/router.rs` | 4 | [ ] |
@@ -410,7 +380,6 @@ sql_timeout_ms = 30000         # SQL query timeout
 | 2024-XX-XX | Use port 6092 for unified API | Backward compatibility with existing Search API clients |
 | 2024-XX-XX | Arrow/Parquet over custom format | Ecosystem compatibility, proven reliability |
 | 2024-XX-XX | Per-topic opt-in | Gradual adoption, no breaking changes |
-| 2024-XX-XX | Include Arrow Flight | High-performance streaming for analytics use cases |
 
 ---
 
