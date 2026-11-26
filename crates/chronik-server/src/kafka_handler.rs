@@ -2626,7 +2626,10 @@ impl KafkaProtocolHandler {
         let mut response_partitions = Vec::new();
 
         for partition in topic.partitions {
-            tracing::info!("ListOffsets: Processing topic {} partition {} with timestamp {}",
+            // Per partition, at debug: a client listing every partition of a
+            // large cluster (5,903 on Thunderbird) logged ~17K INFO lines, and
+            // kubelet rotated the startup log away within a minute.
+            tracing::debug!("ListOffsets: Processing topic {} partition {} with timestamp {}",
                 topic.name, partition.partition_index, partition.timestamp);
 
             let (offset, timestamp_found) = self.resolve_list_offsets_partition_offset(
@@ -2643,7 +2646,7 @@ impl KafkaProtocolHandler {
                 leader_epoch: if api_version >= 4 { 0 } else { -1 },
             };
 
-            tracing::info!("ListOffsets: Response for {}-{}: offset={}, timestamp={}, error_code={}",
+            tracing::debug!("ListOffsets: Response for {}-{}: offset={}, timestamp={}, error_code={}",
                 topic.name, partition.partition_index, offset,
                 if api_version >= 1 { timestamp_found } else { -1 },
                 chronik_protocol::list_offsets_types::error_codes::NONE);
@@ -2690,7 +2693,7 @@ impl KafkaProtocolHandler {
                 // Use the maximum of in-memory and segment high watermarks
                 let high_watermark = in_memory_hw.max(segment_hw);
 
-                tracing::info!("ListOffsets: Returning high watermark {} for {}-{} (in-memory: {}, segments: {})",
+                tracing::debug!("ListOffsets: Returning high watermark {} for {}-{} (in-memory: {}, segments: {})",
                     high_watermark, topic_name, partition_index, in_memory_hw, segment_hw);
 
                 (high_watermark, std::time::SystemTime::now()
@@ -2704,7 +2707,7 @@ impl KafkaProtocolHandler {
                 let earliest = self.produce_handler
                     .get_log_start_offset(topic_name, partition_index)
                     .await;
-                tracing::info!("ListOffsets: Returning earliest offset {} for {}-{}", earliest, topic_name, partition_index);
+                tracing::debug!("ListOffsets: Returning earliest offset {} for {}-{}", earliest, topic_name, partition_index);
                 (earliest, std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -2880,7 +2883,7 @@ impl KafkaProtocolHandler {
         use chronik_protocol::list_offsets_types::ListOffsetsResponse;
         use chronik_protocol::parser::Decoder;
 
-        tracing::info!("ListOffsets request received, API version: {}", header.api_version);
+        tracing::debug!("ListOffsets request received, API version: {}", header.api_version);
 
         let is_flexible = header.api_version >= 6;
         let mut decoder = Decoder::new(&mut buf);

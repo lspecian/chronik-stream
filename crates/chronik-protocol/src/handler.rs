@@ -4482,7 +4482,7 @@ impl ProtocolHandler {
                             0
                         };
                         
-                        tracing::info!("ListOffsets: Returning high watermark {} for {}-{}", 
+                        tracing::debug!("ListOffsets: Returning high watermark {} for {}-{}", 
                             high_watermark, topic.name, partition.partition_index);
                         
                         (high_watermark, std::time::SystemTime::now()
