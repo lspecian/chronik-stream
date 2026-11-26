@@ -1075,7 +1075,7 @@ Key environment variables:
 - `CHRONIK_SEARCH_TIMEOUT_MS` - Time limit for a `/_search` or `/{topic}/_search` when the request sets no `timeout` (default: `10000`). At the limit the node answers with the hits found so far and `timed_out: true`; the merged answer is `timed_out` when any node's was. Keep it under the 30 s a node waits for its peers.
 - `CHRONIK_SEARCH_CONCURRENCY` - Archived segments searched at once per request (default: cores the process may use, at most 8).
 - `CHRONIK_SEARCH_CACHE_BYTES` - Disk budget for unpacked archived segments kept between searches (default: `4GB`; accepts `KB`/`MB`/`GB` or raw bytes). Least recently used are deleted first.
-- `CHRONIK_SEARCH_CACHE_OPEN_SEGMENTS` - Unpacked segments kept open at once (default: `256`).
+- `CHRONIK_SEARCH_CACHE_OPEN_SEGMENTS` - Archived segments kept open at once (default: `4096`; `256` up to v2.20.3, when every search across many archives reopened most of them).
 - `CHRONIK_SEARCH_CACHE_DIR` - Where unpacked segments go (default: `{data_dir}/search-cache`). Emptied at boot.
 - `CHRONIK_SEARCH_MAX_RESULT_WINDOW` - Largest `from + size` a search accepts (default: `10000`, Elasticsearch's `index.max_result_window`). Every source on every node collects that many hits, so deeper pages are refused with 400 `illegal_argument_exception`.
 - `CHRONIK_SEARCH_TERM_FILTERS` - Skip archived segments whose term filter (a Bloom filter of their words, `<archive>.terms`) proves a query cannot match them (default: `true`). `false` opens every archive. Never skips a real hit; skipped counts appear in the response's `_segments`.

@@ -28,7 +28,15 @@ use tracing::{debug, info, warn};
 /// Unpacked segments kept on disk, by default (`CHRONIK_SEARCH_CACHE_BYTES`).
 const DEFAULT_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Segments kept open at once, by default (`CHRONIK_SEARCH_CACHE_OPEN_SEGMENTS`).
-const DEFAULT_MAX_OPEN: usize = 256;
+///
+/// 256 dated from unpacking every archive into a directory of files. A plain
+/// `.tar` is now opened in place (one mapped file, no unpacking), and an open
+/// archive costs little: 1,800 open instead of 256 took no more memory or
+/// file descriptors. Below the number of archives a search reads, every
+/// search reopened most of them: a search across all topics of 1,800 small
+/// archives took 72 ms at 256 and 25 ms with all open; Thunderbird nodes hold
+/// 900 to 1,600. The byte budget still bounds what is copied to disk.
+const DEFAULT_MAX_OPEN: usize = 4096;
 
 type Load = Shared<BoxFuture<'static, std::result::Result<Arc<TantivySegmentReader>, String>>>;
 
