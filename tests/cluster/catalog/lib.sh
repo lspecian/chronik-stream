@@ -9,6 +9,8 @@
 
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# Nodes run from the repo root: data_dir in the node configs is relative to it.
+cd "$ROOT"
 DIR="$ROOT/tests/cluster"
 BIN="${CHRONIK_BIN:-$ROOT/target/release/chronik-server}"
 KAFKA_HOME="${KAFKA_HOME:?set KAFKA_HOME to a Kafka distribution}"

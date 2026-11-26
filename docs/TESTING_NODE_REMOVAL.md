@@ -335,18 +335,18 @@ Complete workflow demonstrating zero-downtime node management:
 
 ## Automated Test Script
 
-A comprehensive test script is available:
+The automated check is part of the pre-release e2e suite (`tests/cluster/e2e/run_all.sh`), and runs alone as:
 
 ```bash
-./tests/test_node_removal.sh
+KAFKA_HOME=/path/to/kafka tests/cluster/e2e/node_removal.sh target/release/chronik-server local
 ```
 
-This script:
-- Starts a 4-node cluster
-- Checks initial status
-- Removes node 4 via CLI
-- Verifies cluster still works
-- Provides detailed pass/fail results
+It:
+- Starts the local 3-node cluster and adds node 4 with `cluster add-node` (node 4 joins with `CHRONIK_CLUSTER_JOIN=true`)
+- Creates a topic placed over all four brokers and produces 20,000 records with acks=all
+- Removes node 4 gracefully with `cluster remove-node`, then requires three voters and every partition on three in-sync replicas, none on node 4
+- Stops node 4 and requires every record to be readable through the remaining brokers
+- Requires the admin API to refuse a removal that would leave two voters
 
 ---
 
