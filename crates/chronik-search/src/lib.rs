@@ -13,6 +13,7 @@ pub mod cold_cache;
 pub mod ranking;
 pub mod corpus_stats;
 pub mod sort;
+pub mod filtered_query;
 pub mod prefilter;
 pub mod legacy_index;
 pub mod topic_aggs;

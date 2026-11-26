@@ -2436,13 +2436,32 @@ pub(crate) fn build_tantivy_query(
                 clauses.push((Occur::MustNot, sub_query));
             }
 
-            // Add filter clauses (similar to must but don't affect scoring)
-            for clause in &bool_query.filter {
-                let sub_query = build_tantivy_query(clause, schema, index)?;
-                clauses.push((Occur::Must, sub_query));
+            // Filter clauses restrict the hits and add nothing to their
+            // scores (crate::filtered_query). Up to v2.20.1 they were added
+            // as `must` clauses, scored like them.
+            let filters = bool_query
+                .filter
+                .iter()
+                .map(|clause| build_tantivy_query(clause, schema, index))
+                .collect::<Result<Vec<_>>>()?;
+            if filters.is_empty() {
+                return Ok(Box::new(BooleanQuery::new(clauses)));
             }
-
-            Ok(Box::new(BooleanQuery::new(clauses)))
+            if bool_query.must.is_empty() {
+                // Without `must`, `should` clauses only score (Elasticsearch's
+                // minimum_should_match is 0 beside a filter), and a filter
+                // alone scores 0: the filters are the required clauses.
+                for f in filters {
+                    clauses.push((Occur::Must, Box::new(tantivy::query::ConstScoreQuery::new(f, 0.0))));
+                }
+                return Ok(Box::new(BooleanQuery::new(clauses)));
+            }
+            let scoring: Box<dyn TantivyQuery> = if clauses.len() == 1 && clauses[0].0 == Occur::Must {
+                clauses.pop().map(|(_, q)| q).expect("one clause")
+            } else {
+                Box::new(BooleanQuery::new(clauses))
+            };
+            Ok(Box::new(crate::filtered_query::FilteredQuery::new(scoring, filters)))
         },
         
         QueryDsl::GeoDistance(geo_query) => {

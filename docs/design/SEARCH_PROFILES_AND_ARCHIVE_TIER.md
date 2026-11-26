@@ -441,3 +441,20 @@ working as before; a plain `POST /admin/reindex` rewrites them.
 
 Still behind: bool (a text match AND a filter term): the intersection seeks
 through postings with a single-level skip list (quickwit-oss/tantivy#3287).
+
+### Bool `filter` clauses: not scored, checked after pruning (2026-11-26)
+
+A bool query's `filter` clauses were added as `must` clauses, so their BM25
+scores were added to every hit's (Elasticsearch filters do not score), and
+the query ran as a plain intersection that stepped through every match of
+both clauses. `filtered_query::FilteredQuery` searches the scoring clauses
+with Tantivy's pruning and checks each filter only for the documents that
+get past it, by seeking the filter's postings to them. With archives highest
+offset first, once the page is full the scoring clause skips whole blocks.
+Without `must`, filters are required clauses scoring 0 beside optional
+`should` clauses, as in Elasticsearch.
+
+10M records, 3 merged archives, 8 VUs, 60 s: bool p50 7.43 -> 0.44 ms
+(OpenSearch 4.56); rounds 36,777 -> 61,425 (OpenSearch 14,250). The bool
+answers keep their records (the 50 newest matches, checked against the same
+query sorted by offset descending); their scores are the text match's alone.

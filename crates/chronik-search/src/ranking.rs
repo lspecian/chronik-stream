@@ -1053,11 +1053,17 @@ mod tests {
             let json_union = parser.parse_query("j.msg:alpha OR j.msg:filler").unwrap();
             let json_and = parser.parse_query("+j.msg:alpha +j.level:error").unwrap();
             let json_filtered = BooleanQuery::new(vec![(Occur::Must, term(body, "alpha")), (Occur::Must, parser.parse_query("j.level:error").unwrap())]);
-            let queries: [(&str, &dyn Query); 9] = [
+            // A bool `filter` (crate::filtered_query): text scored, JSON
+            // filtered; and a JSON match filtered by a term.
+            let filter_json = crate::filtered_query::FilteredQuery::new(term(body, "alpha"), vec![parser.parse_query("j.level:error").unwrap()]);
+            let filter_on_json = crate::filtered_query::FilteredQuery::new(parser.parse_query("j.msg:alpha").unwrap(), vec![term(tag, "red")]);
+            let queries: [(&str, &dyn Query); 11] = [
                 ("json_term", &*json_term),
                 ("json_union", &*json_union),
                 ("json_and", &*json_and),
                 ("json_filtered", &json_filtered),
+                ("filter_json", &filter_json),
+                ("filter_on_json", &filter_on_json),
                 ("bm25", &text),
                 ("constant", &equal_scores),
                 ("union", &union),
