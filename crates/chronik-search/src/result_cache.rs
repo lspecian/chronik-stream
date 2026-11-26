@@ -85,11 +85,41 @@ impl ResultCache {
         }
     }
 
+    /// A set of archives as one cache entry: their merged partial. Merging
+    /// 48 archives' partials of an 8K-bucket date_histogram cost more than
+    /// the cached partials saved; a set's identity is every member's, so an
+    /// archive added, replaced or removed makes a new entry.
+    fn set_key(archives: &[SegmentMetadata], request: &Arc<str>) -> Key {
+        let mut ids: Vec<(&str, i64, u64)> =
+            archives.iter().map(|a| (a.object_store_path.as_str(), a.created_at, a.size_bytes)).collect();
+        ids.sort_unstable();
+        let mut set = String::from("set:");
+        for (path, created_at, size) in ids {
+            use std::fmt::Write;
+            let _ = write!(set, "{path}|{created_at}|{size};");
+        }
+        Key { archive: set, created_at: 0, size_bytes: 0, request: request.clone() }
+    }
+
+    /// The merged partial of exactly these archives, if cached.
+    pub fn get_merged(&self, archives: &[SegmentMetadata], request: &Arc<str>) -> Option<Arc<Partial>> {
+        self.get_key(Self::set_key(archives, request))
+    }
+
+    /// Records the merged partial of exactly these archives (all of them
+    /// answered: a partial merge must not stand in for the set).
+    pub fn put_merged(&self, archives: &[SegmentMetadata], request: &Arc<str>, partial: Arc<Partial>) {
+        self.put_key(Self::set_key(archives, request), request, partial)
+    }
+
     pub fn get(&self, archive: &SegmentMetadata, request: &Arc<str>) -> Option<Arc<Partial>> {
+        self.get_key(Self::key(archive, request))
+    }
+
+    fn get_key(&self, key: Key) -> Option<Arc<Partial>> {
         if self.budget == 0 {
             return None;
         }
-        let key = Self::key(archive, request);
         let mut s = self.state.lock().unwrap();
         s.clock += 1;
         let now = s.clock;
@@ -106,13 +136,17 @@ impl ResultCache {
     }
 
     pub fn put(&self, archive: &SegmentMetadata, request: &Arc<str>, partial: Arc<Partial>) {
+        self.put_key(Self::key(archive, request), request, partial)
+    }
+
+    fn put_key(&self, key: Key, request: &Arc<str>, partial: Arc<Partial>) {
         let bytes = ENTRY_OVERHEAD
+            + key.archive.len() as u64
             + request.len() as u64
             + partial.aggs.as_ref().and_then(|a| bincode::serialized_size(a).ok()).unwrap_or(0);
         if self.budget == 0 || bytes > self.budget / 4 {
             return; // one result may not take over the cache
         }
-        let key = Self::key(archive, request);
         let mut s = self.state.lock().unwrap();
         s.clock += 1;
         let now = s.clock;
@@ -184,7 +218,7 @@ mod tests {
 
     #[test]
     fn the_least_recently_used_go_first_and_the_budget_holds() {
-        let per = ENTRY_OVERHEAD + 1;
+        let per = ENTRY_OVERHEAD + 2; // the request ("q") and the archive name, one byte each
         let cache = ResultCache::new(per * 4);
         let req = Arc::<str>::from("q");
         for i in 0..4 {
@@ -197,6 +231,20 @@ mod tests {
         let (entries, bytes, _, _) = cache.stats();
         assert_eq!(entries, 4);
         assert!(bytes <= per * 4);
+    }
+
+    #[test]
+    fn a_merged_set_is_reused_only_for_exactly_the_same_archives() {
+        let cache = ResultCache::new(1 << 20);
+        let req = Arc::<str>::from("q");
+        let (a, b, c) = (archive("a.tar", 1), archive("b.tar", 1), archive("c.tar", 1));
+        cache.put_merged(&[a.clone(), b.clone()], &req, partial(9));
+        assert_eq!(cache.get_merged(&[b.clone(), a.clone()], &req).unwrap().count, 9, "any order");
+        assert!(cache.get_merged(&[a.clone(), b.clone(), c], &req).is_none(), "an archive added");
+        assert!(cache.get_merged(&[a.clone()], &req).is_none(), "an archive removed");
+        assert!(cache.get_merged(&[a.clone(), archive("b.tar", 2)], &req).is_none(), "an archive rewritten");
+        assert!(cache.get_merged(&[a.clone(), b.clone()], &Arc::from("q2")).is_none(), "another request");
+        assert!(cache.get(&a, &req).is_none(), "not an entry for one archive");
     }
 
     #[test]

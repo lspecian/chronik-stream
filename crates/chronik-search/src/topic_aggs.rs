@@ -26,7 +26,9 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tantivy::aggregation::agg_req::Aggregations;
+use tantivy::aggregation::agg_result::{AggregationResult, AggregationResults, BucketEntries, BucketEntry, BucketResult};
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
+use tantivy::aggregation::Key;
 use tantivy::aggregation::{AggregationLimitsGuard, DistributedAggregationCollector};
 use tantivy::collector::Count;
 use tantivy::query::Query;
@@ -83,6 +85,45 @@ impl Partial {
     }
 }
 
+/// Merges many partials pairwise by size, as merge sort does, so each is
+/// merged about log2(n) times rather than once for every partial after it.
+/// Tantivy rebuilds a histogram's whole bucket list on each merge: folding 49
+/// sources one by one into a growing total moved ~200K buckets for one
+/// 8K-bucket date_histogram over 10M records, most of the query's CPU.
+#[derive(Default)]
+pub struct Merger {
+    /// Partials by level (how many merges each holds, as a power of two),
+    /// strictly decreasing from the bottom.
+    stack: Vec<(u32, Partial)>,
+}
+
+impl Merger {
+    pub fn push(&mut self, mut part: Partial) -> Result<()> {
+        let mut level = 0;
+        while self.stack.last().is_some_and(|(l, _)| *l == level) {
+            let (_, mut below) = self.stack.pop().expect("checked");
+            below.merge(part)?;
+            part = below;
+            level += 1;
+        }
+        self.stack.push((level, part));
+        Ok(())
+    }
+
+    /// Everything pushed, merged; smallest first.
+    pub fn finish(self) -> Result<Partial> {
+        let mut parts = self.stack.into_iter().rev().map(|(_, p)| p);
+        let Some(mut total) = parts.next() else {
+            return Ok(Partial::default());
+        };
+        for mut larger in parts {
+            larger.merge(total)?;
+            total = larger;
+        }
+        Ok(total)
+    }
+}
+
 /// A request's aggregations, translated, ready to run against any source.
 #[derive(Debug, Clone)]
 pub struct TopicAggs {
@@ -113,8 +154,12 @@ impl TopicAggs {
         serde_json::from_value(req).map_err(|e| Error::InvalidInput(format!("aggregations: {e}")))
     }
 
-    /// Final, Elasticsearch-shaped results from merged partials.
-    pub fn finalize(&self, partial: Option<IntermediateAggregationResults>) -> Result<Value> {
+    /// Final, Elasticsearch-shaped results from merged partials, as JSON.
+    ///
+    /// Written straight from Tantivy's result: building a `serde_json::Value`
+    /// tree first (a map per bucket), editing it and dropping it was ~40% of
+    /// the CPU of an 8K-bucket date_histogram.
+    pub fn finalize(&self, partial: Option<IntermediateAggregationResults>) -> Result<Box<serde_json::value::RawValue>> {
         // The request only shapes the result here (names, sizes, intervals);
         // its fields were resolved per source when the partials were made.
         let mut req = self.request.clone();
@@ -125,9 +170,9 @@ impl TopicAggs {
         let result = partial
             .into_final_result(req, AggregationLimitsGuard::default())
             .map_err(|e| Error::InvalidInput(format!("aggregations: {e}")))?;
-        let mut out = serde_json::to_value(&result).map_err(|e| Error::Internal(format!("aggregations: {e}")))?;
-        format_date_histograms(&mut out, &self.request, "", &self.date_histograms);
-        Ok(out)
+        let mut result = result;
+        format_date_histograms(&mut result, "", &self.date_histograms);
+        serde_json::value::to_raw_value(&result).map_err(|e| Error::Internal(format!("aggregations: {e}")))
     }
 }
 
@@ -231,7 +276,7 @@ fn translate(aggs: &Value, prefix: &str, dates: &mut HashSet<String>) -> Result<
 }
 
 /// The schema field (or JSON path) a user field name means in `schema`.
-fn resolve_agg_field(schema: &Schema, name: &str) -> String {
+pub(crate) fn resolve_agg_field(schema: &Schema, name: &str) -> String {
     let name = name.strip_suffix(".keyword").unwrap_or(name);
     if name.starts_with(chronik_storage::json_index::JSON_FIELD) {
         return name.to_string();
@@ -271,27 +316,53 @@ fn rewrite_fields(aggs: &mut Value, schema: &Schema) {
 
 /// Integer keys and `key_as_string` (RFC 3339, milliseconds) on the buckets of
 /// date_histograms, at any depth.
-fn format_date_histograms(result: &mut Value, request: &Value, prefix: &str, dates: &HashSet<String>) {
-    let (Value::Object(results), Value::Object(requests)) = (result, request) else { return };
-    for (name, req) in requests {
-        let Some(res) = results.get_mut(name) else { continue };
+fn format_date_histograms(results: &mut AggregationResults, prefix: &str, dates: &HashSet<String>) {
+    for (name, result) in results.0.iter_mut() {
+        let AggregationResult::BucketResult(buckets) = result else { continue };
         let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}>{name}") };
-        let sub = req.get("aggs");
-        let Some(buckets) = res.get_mut("buckets").and_then(Value::as_array_mut) else { continue };
-        for bucket in buckets {
-            if dates.contains(&path) {
-                if let Some(ms) = bucket.get("key").and_then(Value::as_f64) {
-                    let ms = ms as i64;
-                    bucket["key"] = Value::from(ms);
-                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
-                        bucket["key_as_string"] =
-                            Value::String(dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let is_date = dates.contains(&path);
+        match buckets {
+            BucketResult::Histogram { buckets } => {
+                let mut format = |b: &mut BucketEntry| {
+                    if is_date {
+                        let ms = match b.key {
+                            Key::F64(v) => Some(v as i64),
+                            Key::I64(v) => Some(v),
+                            Key::U64(v) => Some(v as i64),
+                            Key::Str(_) => None,
+                        };
+                        if let Some(ms) = ms {
+                            b.key = Key::I64(ms);
+                            b.key_as_string = chrono::DateTime::from_timestamp_millis(ms)
+                                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                        }
                     }
+                    format_date_histograms(&mut b.sub_aggregation, &path, dates);
+                };
+                match buckets {
+                    BucketEntries::Vec(v) => v.iter_mut().for_each(&mut format),
+                    BucketEntries::HashMap(m) => m.values_mut().for_each(&mut format),
                 }
             }
-            if let Some(sub) = sub {
-                format_date_histograms(bucket, sub, &path, dates);
+            BucketResult::Range { buckets } => {
+                let mut sub = |b: &mut tantivy::aggregation::agg_result::RangeBucketEntry| {
+                    format_date_histograms(&mut b.sub_aggregation, &path, dates)
+                };
+                match buckets {
+                    BucketEntries::Vec(v) => v.iter_mut().for_each(&mut sub),
+                    BucketEntries::HashMap(m) => m.values_mut().for_each(&mut sub),
+                }
             }
+            BucketResult::Terms { buckets, .. } => {
+                buckets.iter_mut().for_each(|b| format_date_histograms(&mut b.sub_aggregation, &path, dates))
+            }
+            BucketResult::MultiTerms { buckets, .. } => {
+                buckets.iter_mut().for_each(|b| format_date_histograms(&mut b.sub_aggregation, &path, dates))
+            }
+            BucketResult::Composite { buckets, .. } => {
+                buckets.iter_mut().for_each(|b| format_date_histograms(&mut b.sub_aggregation, &path, dates))
+            }
+            BucketResult::Filter(f) => format_date_histograms(&mut f.sub_aggregations, &path, dates),
         }
     }
 }
@@ -386,7 +457,7 @@ mod tests {
         let b: Partial = serde_json::from_str(&serde_json::to_string(&partial(45, 90)).unwrap()).unwrap();
         a.merge(b).unwrap();
         assert_eq!(a.count, 90);
-        let out = aggs.finalize(a.aggs).unwrap();
+        let out: Value = serde_json::from_str(aggs.finalize(a.aggs).unwrap().get()).unwrap();
         let levels: Vec<(String, u64)> = out["l"]["buckets"].as_array().unwrap().iter()
             .map(|b| (b["key"].as_str().unwrap().to_string(), b["doc_count"].as_u64().unwrap())).collect();
         assert_eq!(levels.len(), 3, "{out}");
@@ -395,6 +466,22 @@ mod tests {
         assert_eq!(out["m"]["buckets"][0]["key_as_string"], "2026-01-01T00:00:00.000Z");
         assert_eq!(out["s"]["count"], 90);
         assert_eq!(out["c"]["value"].as_f64().map(|v| v.round()), Some(3.0));
+
+        // Many sources merged by size give what folding them in order gives.
+        for n in [1usize, 2, 3, 7, 8, 9, 17] {
+            let ranges: Vec<(i64, i64)> = (0..n as i64).map(|i| (i * 90 / n as i64, (i + 1) * 90 / n as i64)).collect();
+            let mut folded = Partial::default();
+            let mut merger = Merger::default();
+            for &(lo, hi) in &ranges {
+                folded.merge(partial(lo, hi)).unwrap();
+                merger.push(partial(lo, hi)).unwrap();
+            }
+            let merged = merger.finish().unwrap();
+            assert_eq!(merged.count, 90, "n={n}");
+            let json = |p: Option<IntermediateAggregationResults>| -> Value { serde_json::from_str(aggs.finalize(p).unwrap().get()).unwrap() };
+            assert_eq!(json(merged.aggs), json(folded.aggs), "n={n}");
+        }
+        assert_eq!(Merger::default().finish().unwrap().count, 0);
     }
 
     #[test]

@@ -32,6 +32,8 @@ use tantivy::{
     Index, IndexReader, IndexWriter, ReloadPolicy, Term,
 };
 use tokio::sync::RwLock;
+use crate::corpus_stats::CorpusStats;
+use crate::sort::SortSpec;
 use tracing::{debug, trace, warn};
 
 /// Minimum heap a Tantivy writer accepts.
@@ -79,6 +81,8 @@ pub struct HotHit {
     pub score: f32,
     pub key: Option<String>,
     pub value: String,
+    /// Values of the request's sort keys (crate::sort), when it has any.
+    pub sort: Option<Vec<serde_json::Value>>,
 }
 
 /// Hot hits in [`crate::ranking::hit_order`]'s order (one topic, so: score,
@@ -90,6 +94,16 @@ fn hot_hit_order(a: &HotHit, b: &HotHit) -> std::cmp::Ordering {
         .then(b.timestamp.div_euclid(1000).cmp(&a.timestamp.div_euclid(1000)))
         .then(a.partition.cmp(&b.partition))
         .then(b.offset.cmp(&a.offset))
+}
+
+/// [`hot_hit_order`], or by the request's sort values first when it has a sort.
+fn hot_order(a: &HotHit, b: &HotHit, sort: Option<&SortSpec>) -> std::cmp::Ordering {
+    match sort {
+        Some(spec) => spec
+            .compare(a.sort.as_deref().unwrap_or_default(), b.sort.as_deref().unwrap_or_default())
+            .then_with(|| hot_hit_order(a, b)),
+        None => hot_hit_order(a, b),
+    }
 }
 
 /// Configuration for the hot text index.
@@ -218,9 +232,11 @@ impl HotPartitionIndex {
     ) -> Result<Self> {
         let mut schema_builder = Schema::builder();
         let topic_field = schema_builder.add_text_field("topic", STRING | STORED);
+        // Fast: `sort` by partition reads it (crate::sort). The index lives in
+        // memory and is rebuilt at boot, so the schema can change freely.
         let partition_field = schema_builder.add_i64_field(
             "partition",
-            NumericOptions::default().set_indexed().set_stored(),
+            NumericOptions::default().set_indexed().set_stored().set_fast(),
         );
         let offset_field = schema_builder.add_i64_field(
             "offset",
@@ -385,7 +401,13 @@ impl HotPartitionIndex {
         Ok(true)
     }
 
-    fn search(&self, query_str: &str, top_k: usize) -> Result<Vec<HotHit>> {
+    fn search(
+        &self,
+        query_str: &str,
+        top_k: usize,
+        stats: Option<&CorpusStats>,
+        sort: Option<&SortSpec>,
+    ) -> Result<Vec<HotHit>> {
         if query_str.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -415,17 +437,7 @@ impl HotPartitionIndex {
         let query = parser
             .parse_query(sanitized)
             .map_err(|e| anyhow!("parse hot query `{}`: {}", sanitized, e))?;
-        let top_docs = crate::ranking::top_docs(&searcher, &query, top_k)
-            .map_err(|e| anyhow!("hot search: {}", e))?;
-
-        let mut hits = Vec::with_capacity(top_docs.len());
-        for (score, doc_addr) in top_docs {
-            let doc: tantivy::TantivyDocument = searcher
-                .doc(doc_addr)
-                .map_err(|e| anyhow!("hot doc fetch: {}", e))?;
-            hits.push(self.doc_to_hit(&doc, score)?);
-        }
-        Ok(hits)
+        self.top_hits(&searcher, &query, top_k, stats, sort)
     }
 
     /// Issue #2: Execute a caller-built Tantivy query against this
@@ -435,16 +447,43 @@ impl HotPartitionIndex {
         &self,
         query: &dyn tantivy::query::Query,
         top_k: usize,
+        stats: Option<&CorpusStats>,
+        sort: Option<&SortSpec>,
     ) -> Result<Vec<HotHit>> {
         let searcher = self.reader.searcher();
-        let top_docs = crate::ranking::top_docs(&searcher, query, top_k)
-            .map_err(|e| anyhow!("hot structured search: {}", e))?;
-        let mut hits = Vec::with_capacity(top_docs.len());
-        for (score, doc_addr) in top_docs {
+        self.top_hits(&searcher, query, top_k, stats, sort)
+    }
+
+    /// The top `top_k` hits of `query`: by `sort` when given (each hit with
+    /// its sort values), else in rank order.
+    fn top_hits(
+        &self,
+        searcher: &tantivy::Searcher,
+        query: &dyn tantivy::query::Query,
+        top_k: usize,
+        stats: Option<&CorpusStats>,
+        sort: Option<&SortSpec>,
+    ) -> Result<Vec<HotHit>> {
+        let docs: Vec<(Option<Vec<serde_json::Value>>, f32, tantivy::DocAddress)> = match sort {
+            Some(spec) => crate::sort::top_sorted(searcher, query, spec, top_k, stats)
+                .map_err(|e| anyhow!("hot sorted search: {}", e))?
+                .into_iter()
+                .map(|(values, score, addr)| (Some(values), score, addr))
+                .collect(),
+            None => crate::ranking::top_docs_with(searcher, query, top_k, stats)
+                .map_err(|e| anyhow!("hot search: {}", e))?
+                .into_iter()
+                .map(|(score, addr)| (None, score, addr))
+                .collect(),
+        };
+        let mut hits = Vec::with_capacity(docs.len());
+        for (values, score, doc_addr) in docs {
             let doc: tantivy::TantivyDocument = searcher
                 .doc(doc_addr)
                 .map_err(|e| anyhow!("hot doc fetch: {}", e))?;
-            hits.push(self.doc_to_hit(&doc, score)?);
+            let mut hit = self.doc_to_hit(&doc, score)?;
+            hit.sort = values;
+            hits.push(hit);
         }
         Ok(hits)
     }
@@ -469,6 +508,7 @@ impl HotPartitionIndex {
             score,
             key: get_text(self.key_field),
             value: get_text(self.value_field).unwrap_or_default(),
+            sort: None,
         })
     }
 
@@ -1003,6 +1043,17 @@ impl HotTextIndex {
         Ok(())
     }
 
+    /// A searcher on each partition of `topic`, for the statistics of a
+    /// search over the topic (crate::corpus_stats).
+    pub async fn searchers(&self, topic: &str) -> Vec<tantivy::Searcher> {
+        let parts: Vec<_> = self.partitions.iter().filter(|e| e.key().0 == topic).map(|e| e.value().clone()).collect();
+        let mut out = Vec::with_capacity(parts.len());
+        for part in parts {
+            out.push(part.read().await.reader.searcher());
+        }
+        out
+    }
+
     /// Search a single (topic, partition).
     pub async fn search_partition(
         &self,
@@ -1011,6 +1062,18 @@ impl HotTextIndex {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<HotHit>> {
+        self.search_partition_with(topic, partition, query, top_k, None, None).await
+    }
+
+    async fn search_partition_with(
+        &self,
+        topic: &str,
+        partition: i32,
+        query: &str,
+        top_k: usize,
+        stats: Option<&CorpusStats>,
+        sort: Option<&SortSpec>,
+    ) -> Result<Vec<HotHit>> {
         let Some(entry) = self.partitions.get(&(topic.to_string(), partition)) else {
             return Ok(Vec::new());
         };
@@ -1018,7 +1081,7 @@ impl HotTextIndex {
         drop(entry);
         let guard = part.read().await;
         let start = std::time::Instant::now();
-        let result = guard.search(query, top_k);
+        let result = guard.search(query, top_k, stats, sort);
         chronik_monitoring::MetricsRecorder::record_hot_text_search(start.elapsed());
         result
     }
@@ -1026,6 +1089,18 @@ impl HotTextIndex {
     /// Search all partitions of a topic, merged by score, dedup by offset,
     /// top_k returned.
     pub async fn search_topic(&self, topic: &str, query: &str, top_k: usize) -> Result<Vec<HotHit>> {
+        self.search_topic_with(topic, query, top_k, None, None).await
+    }
+
+    /// [`Self::search_topic`] scored with `stats` instead of each partition's own.
+    pub async fn search_topic_with(
+        &self,
+        topic: &str,
+        query: &str,
+        top_k: usize,
+        stats: Option<&CorpusStats>,
+        sort: Option<&SortSpec>,
+    ) -> Result<Vec<HotHit>> {
         let keys: Vec<(String, i32)> = self
             .partitions
             .iter()
@@ -1035,7 +1110,7 @@ impl HotTextIndex {
 
         let mut all = Vec::new();
         for (t, p) in keys {
-            let mut hits = self.search_partition(&t, p, query, top_k).await?;
+            let mut hits = self.search_partition_with(&t, p, query, top_k, stats, sort).await?;
             all.append(&mut hits);
         }
         // dedup by (partition, offset); keep highest score on tie
@@ -1046,7 +1121,7 @@ impl HotTextIndex {
                 .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
         });
         all.dedup_by(|a, b| a.partition == b.partition && a.offset == b.offset);
-        all.sort_by(hot_hit_order);
+        all.sort_by(|a, b| hot_order(a, b, sort));
         all.truncate(top_k);
         Ok(all)
     }
@@ -1097,6 +1172,22 @@ impl HotTextIndex {
             &tantivy::Index,
         ) -> Result<Box<dyn tantivy::query::Query>>,
     {
+        self.search_topic_structured_with(topic, build_query, top_k, None, None).await
+    }
+
+    /// [`Self::search_topic_structured`] scored with `stats` instead of each
+    /// partition's own.
+    pub async fn search_topic_structured_with<F>(
+        &self,
+        topic: &str,
+        build_query: F,
+        top_k: usize,
+        stats: Option<&CorpusStats>,
+        sort: Option<&SortSpec>,
+    ) -> Result<Vec<HotHit>>
+    where
+        F: Fn(&tantivy::schema::Schema, &tantivy::Index) -> Result<Box<dyn tantivy::query::Query>>,
+    {
         let keys: Vec<(String, i32)> = self
             .partitions
             .iter()
@@ -1122,7 +1213,7 @@ impl HotTextIndex {
                 }
             };
             let start = std::time::Instant::now();
-            match guard.search_with_query(query.as_ref(), top_k) {
+            match guard.search_with_query(query.as_ref(), top_k, stats, sort) {
                 Ok(mut hits) => all.append(&mut hits),
                 Err(e) => trace!(topic = %t, partition = p, "hot structured search: {}", e),
             }
@@ -1137,7 +1228,7 @@ impl HotTextIndex {
                 .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
         });
         all.dedup_by(|a, b| a.partition == b.partition && a.offset == b.offset);
-        all.sort_by(hot_hit_order);
+        all.sort_by(|a, b| hot_order(a, b, sort));
         all.truncate(top_k);
         Ok(all)
     }

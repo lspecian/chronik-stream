@@ -346,3 +346,115 @@ growing after archiving caught up (trimming only marks deletions; merging
 10M docs does not keep up), memory doubled and queries ran 6x slower. It
 needs reclaim once the archive covers a partition (rebuild rather than
 merge) and faster hot ingestion (it lagged 25 s) before it can be a default.
+
+### Query latency at 10M (2026-11-25, branch perf/search-query-latency)
+
+Same corpus, machine and day; 10M records, one partition, 48 archives
+(unmerged), 8 query clients for 60 s, `AGGS=1`:
+
+| | Chronik before | Chronik after | OpenSearch 2.19.1 |
+|---|---|---|---|
+| Query rounds | 7.3K | **18.4K** | 14.3K |
+| match_text p50 | 9.9 ms | 4.2 ms | **0.96 ms** |
+| term p50 | 17.0 ms | **6.9 ms** | 18.0 ms |
+| bool text + filter p50 | 12.0 ms | 7.1 ms | **4.6 ms** |
+| match_all p50 | 1.5 ms | 1.25 ms | **0.65 ms** |
+| range + terms agg p50 | 0.54 ms | **0.47 ms** | 0.53 ms |
+| date_histogram p50 | 21.6 ms | **4.4 ms** | 6.7 ms |
+| Memory | 3.1 GB | **3.1 GB** | 7.2 GB |
+
+What changed: archives are ranked on their rank columns and only the page's
+documents are read; a floor (the hot index's page, then the best so far)
+lets later archives pass over documents that cannot place; archived rank
+columns are opened once; aggregation partials merge pairwise, the merged
+share of an unchanged archive set is cached, and final aggregations are
+written straight from Tantivy's result. Answers are identical.
+
+Still behind on a single text term: OpenSearch scores it with block-max
+WAND and visits a few blocks. Tantivy's block-max pruning cannot be used on
+Chronik's JSON field: Tantivy keeps no fieldnorms for JSON fields and writes
+zero block maxima, so `for_each_pruning` skips nearly every match (8 of 5,000
+in a minimal index). Using it needs block maxima written for unnormed fields
+(a Tantivy change) and archives rebuilt (`POST /admin/reindex`).
+
+### Scoring with the topic's statistics, and Block-WAND (2026-11-25)
+
+Each Tantivy index used to score with its own BM25 statistics, so the same
+message scored differently in every archive and "newest first among equal
+scores" never held across indexes: on 10M records, `timeout` ranked the newest
+20,136 matches (6.43448) below a million-offset-older archive's (6.44069), and
+`level: ERROR` answered with records 3.5M offsets old. Every index a search
+reads now scores with the summed statistics of all of them (`corpus_stats.rs`;
+Elasticsearch's `dfs_query_then_fetch`), per-segment values cached for good
+(segments never change). Ranked searches prune with Block-WAND again, on the
+Tantivy fork (docs/TANTIVY_FORK.md), and a ranked search with no floor yet
+runs its newest archive alone first so the others start with one.
+
+10M records, 48 archives (merging off), 8 VUs, 60 s, p50:
+
+| | before | Block-WAND | + topic statistics |
+|---|---|---|---|
+| rounds | 18,377 | 20,012 | 24,721 |
+| match_text | 4.24 ms | 3.48 ms | 3.17 ms |
+| term | 6.89 ms | 5.75 ms | 3.20 ms |
+| bool | 7.13 ms | 6.84 ms | 6.34 ms |
+| match_all | 1.25 ms | 1.21 ms | 0.68 ms |
+
+OpenSearch on the same corpus and day: 14,250 rounds; match_text 0.96 ms,
+bool 4.56 ms, match_all 0.65 ms. What remains is per-archive overhead: each of
+48 archives builds a scorer and looks up its terms per query.
+Test: `tests/cluster/e2e/search_scoring_across_archives.sh` (fails on the
+previous binary: the oldest copies ranked first).
+
+### Archives highest offset first (2026-11-25)
+
+Merging the 48 archives of the 10M benchmark into 3 (the production default)
+made searches slower, not faster: match_all 0.68 -> 27 ms, term 3.2 -> 12 ms.
+Equal scores rank newest first, but archives held records oldest first, and
+Tantivy reads matches in document order, so every later tie beat the ones
+held and a 3.3M-record archive was read whole. These 10M records span about
+30 seconds (330K records a second), so even sorting by timestamp left each
+second oldest first.
+
+Archives are now written with Tantivy index sorting on `_offset` descending
+(`tantivy_segment::archive_settings`); merges keep it, and runs of the two
+orders merge separately. A document later in such a segment has a lower
+offset than every earlier one, so it beats an equal-scoring one only with a
+newer second; per block of 1,024 documents, the newest second from there to
+the end bounds that. Once nothing later can place, ties stop being read (the
+collector's threshold becomes strict, so Block-WAND skips them) and match_all
+stops walking. The merged archives here have 18 late-stamped records in 3.7M
+(concurrent producers); they cost only their blocks. Older archives keep
+working as before; a plain `POST /admin/reindex` rewrites them.
+
+10M records, 3 merged archives, 8 VUs, 60 s, p50 (answers identical):
+
+| | merged, oldest first | merged, highest offset first | OpenSearch |
+|---|---|---|---|
+| rounds | 6,482 | 36,777 | 14,250 |
+| match_text | 5.31 ms | 0.44 ms | 0.96 ms |
+| term | 10.13 ms | 0.42 ms | 17.96 ms |
+| bool | 12.90 ms | 7.43 ms | 4.56 ms |
+| match_all | 35.67 ms | 0.26 ms | 0.65 ms |
+| range + terms agg | 0.34 ms | 0.17 ms | 0.53 ms |
+| date_histogram | 4.06 ms | 3.33 ms | 6.70 ms |
+
+Still behind: bool (a text match AND a filter term): the intersection seeks
+through postings with a single-level skip list (quickwit-oss/tantivy#3287).
+
+### Bool `filter` clauses: not scored, checked after pruning (2026-11-26)
+
+A bool query's `filter` clauses were added as `must` clauses, so their BM25
+scores were added to every hit's (Elasticsearch filters do not score), and
+the query ran as a plain intersection that stepped through every match of
+both clauses. `filtered_query::FilteredQuery` searches the scoring clauses
+with Tantivy's pruning and checks each filter only for the documents that
+get past it, by seeking the filter's postings to them. With archives highest
+offset first, once the page is full the scoring clause skips whole blocks.
+Without `must`, filters are required clauses scoring 0 beside optional
+`should` clauses, as in Elasticsearch.
+
+10M records, 3 merged archives, 8 VUs, 60 s: bool p50 7.43 -> 0.44 ms
+(OpenSearch 4.56); rounds 36,777 -> 61,425 (OpenSearch 14,250). The bool
+answers keep their records (the 50 newest matches, checked against the same
+query sorted by offset descending); their scores are the text match's alone.

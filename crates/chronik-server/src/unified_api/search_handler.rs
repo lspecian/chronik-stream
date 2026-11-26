@@ -129,36 +129,6 @@ struct SearchFanoutState {
     metadata_store: Arc<dyn chronik_common::metadata::MetadataStore>,
 }
 
-/// Run a local search handler and read its `SearchResponse` back. A non-200
-/// answer (e.g. "no such index") is returned as it was, for the caller to
-/// serve when no peer has anything either — re-running the search to rebuild
-/// it cost another full search, time limit included.
-#[cfg(feature = "search")]
-async fn local_search_response(
-    response: axum::response::Response,
-) -> Result<chronik_search::api::SearchResponse, axum::response::Response> {
-    use axum::response::IntoResponse;
-
-    let (parts, body) = response.into_parts();
-    let status = parts.status;
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(e) => {
-            return Err((
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not read the local search response: {e}"),
-            )
-                .into_response())
-        }
-    };
-    if status == axum::http::StatusCode::OK {
-        if let Ok(parsed) = serde_json::from_slice(&body_bytes) {
-            return Ok(parsed);
-        }
-    }
-    Err(axum::response::Response::from_parts(parts, axum::body::Body::from(body_bytes)))
-}
-
 #[cfg(feature = "search")]
 fn empty_search_response() -> chronik_search::api::SearchResponse {
     chronik_search::api::SearchResponse {
@@ -226,11 +196,12 @@ async fn search_everywhere<F>(
     what: &'static str,
 ) -> axum::response::Response
 where
-    F: std::future::Future<Output = axum::response::Response>,
+    F: std::future::Future<Output = chronik_search::handlers::SearchResult>,
 {
     use axum::response::IntoResponse;
 
     let (from, size) = (request.from, request.size);
+    let sort = chronik_search::sort::SortSpec::of(request.sort.as_deref());
     let shard = shard_request(&request);
     let peers = state.query_router.all_peers();
     let (local, fan_out) = tokio::join!(local_search_response_of(local), async {
@@ -250,7 +221,7 @@ where
         // The local search answered the whole window: page it here too.
         return match local {
             Ok(resp) => {
-                let mut merged = super::query_router::merge_search_responses(resp, Vec::new(), from, size);
+                let mut merged = super::query_router::merge_search_responses(resp, Vec::new(), from, size, sort.as_ref());
                 finish_counts(&request, &mut merged, 0);
                 axum::Json(merged).into_response()
             }
@@ -270,7 +241,7 @@ where
     match local {
         Ok(local_resp) => {
             let mut merged =
-                super::query_router::merge_search_responses(local_resp, fan_out.responses, from, size);
+                super::query_router::merge_search_responses(local_resp, fan_out.responses, from, size, sort.as_ref());
             // Hits are ranked, so a partial answer is still worth serving — but
             // `_shards.failed` has to say so, or a search that missed a node is
             // indistinguishable from one where that node held no match (issue #57).
@@ -285,6 +256,7 @@ where
                 fan_out.responses,
                 from,
                 size,
+                sort.as_ref(),
             );
             // The local search failed, so this answer is short by this node
             // too — count it with the peers that did not reply.
@@ -300,9 +272,10 @@ async fn local_search_response_of<F>(
     local: F,
 ) -> Result<chronik_search::api::SearchResponse, axum::response::Response>
 where
-    F: std::future::Future<Output = axum::response::Response>,
+    F: std::future::Future<Output = chronik_search::handlers::SearchResult>,
 {
-    local_search_response(local.await).await
+    use axum::response::IntoResponse;
+    local.await.map(|axum::Json(resp)| resp).map_err(IntoResponse::into_response)
 }
 
 /// Fan-out-aware search across all indices.
@@ -320,13 +293,11 @@ async fn search_all_fanout(
     let forwarded = super::query_router::is_forwarded_request(&headers);
     let local_request = if forwarded { request.clone() } else { shard_request(&request) };
     let local = async move {
-        chronik_search::handlers::search_all(axum::extract::State(api), axum::Json(local_request))
-            .await
-            .into_response()
+        chronik_search::handlers::search_all(axum::extract::State(api), axum::Json(local_request)).await
     };
     // A forwarded request is a peer's share of a fan-out: answer locally only.
     if forwarded {
-        return local.await;
+        return local.await.into_response();
     }
     search_everywhere(state, "/_search".to_string(), request, local, "_search").await
 }
@@ -377,10 +348,9 @@ async fn search_index_fanout(
             axum::Json(local_request),
         )
         .await
-        .into_response()
     };
     if forwarded {
-        return local.await;
+        return local.await.into_response();
     }
     search_everywhere(state, format!("/{}/_search", index), request, local, "index _search").await
 }

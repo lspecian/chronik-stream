@@ -346,6 +346,9 @@ impl State {
         while self.bytes > budget {
             let Some(victim) = self.lru(keep, Pick::OnDisk) else { break };
             let e = self.entries.remove(&victim).expect("lru returns a present key");
+            if let Some(reader) = &e.reader {
+                closed(reader);
+            }
             self.bytes = self.bytes.saturating_sub(e.bytes);
             self.evictions += 1;
             let Some(dir) = e.dir else { continue };
@@ -362,6 +365,9 @@ impl State {
         }
         while self.entries.values().filter(|e| e.reader.is_some()).count() > max_open {
             let Some(victim) = self.lru(keep, Pick::Open) else { break };
+            if let Some(reader) = self.entries.get(&victim).and_then(|e| e.reader.as_ref()) {
+                closed(reader);
+            }
             // An archive opened in place has nothing else cached: forget it.
             if self.entries.get(&victim).is_some_and(|e| e.dir.is_none()) {
                 self.entries.remove(&victim);
@@ -386,6 +392,12 @@ impl State {
             .min_by_key(|(_, e)| e.last_used)
             .map(|(k, _)| k.clone())
     }
+}
+
+/// An archive the cache no longer holds open: what else was kept for its
+/// segments goes with it.
+fn closed(reader: &TantivySegmentReader) {
+    crate::ranking::forget_segments(reader.searcher().segment_readers().iter().map(|s| s.segment_id()));
 }
 
 /// Which entries an eviction may choose from.
