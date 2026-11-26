@@ -66,3 +66,8 @@ data*
 *.segment
 *.db
 *.idx
+# Local cluster test data and logs (tens of GB after an e2e run), and extra
+# target directories
+tests/cluster/data/
+tests/cluster/logs/
+target-*/

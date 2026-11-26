@@ -1,79 +1,51 @@
-# Multi-stage build for chronik-operator
-# For CI/CD releases, prefer Dockerfile.operator.binary (pre-built binary, faster)
-# This file is for local development builds.
+# syntax=docker/dockerfile:1
+#
+# chronik-operator built from source (local development).
+# Releases use Dockerfile.operator.binary, which packages a binary built by CI;
+# the runtime stage below matches it.
+#
+#   docker build -f Dockerfile.operator -t chronik-operator:dev .
+#
+# The whole workspace is copied rather than a list of crates: Cargo needs every
+# member's manifest to resolve the workspace, and a hand-kept list went stale
+# whenever a crate was added or removed. Rebuilds stay fast through BuildKit
+# cache mounts for the registry and target directory.
 
-# Stage 1: Build the operator binary
-FROM rust:1.82-bookworm AS builder
+# Stage 1: build. Rust stable, as CI uses. The operator depends only on
+# chronik-scram and pure-Rust crates, so no system libraries are needed.
+FROM rust:1-bookworm AS builder
 
 WORKDIR /build
+COPY . .
 
-# Copy workspace root files
-COPY Cargo.toml Cargo.lock ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked -p chronik-operator --bin chronik-operator && \
+    cp target/release/chronik-operator /chronik-operator
 
-# Copy ALL workspace crate Cargo.toml files (required by workspace resolver)
-COPY crates/chronik-operator/Cargo.toml crates/chronik-operator/Cargo.toml
-COPY crates/chronik-common/Cargo.toml crates/chronik-common/Cargo.toml
-COPY crates/chronik-server/Cargo.toml crates/chronik-server/Cargo.toml
-COPY crates/chronik-protocol/Cargo.toml crates/chronik-protocol/Cargo.toml
-COPY crates/chronik-wal/Cargo.toml crates/chronik-wal/Cargo.toml
-COPY crates/chronik-storage/Cargo.toml crates/chronik-storage/Cargo.toml
-COPY crates/chronik-search/Cargo.toml crates/chronik-search/Cargo.toml
-COPY crates/chronik-query/Cargo.toml crates/chronik-query/Cargo.toml
-COPY crates/chronik-monitoring/Cargo.toml crates/chronik-monitoring/Cargo.toml
-COPY crates/chronik-config/Cargo.toml crates/chronik-config/Cargo.toml
-COPY crates/chronik-bench/Cargo.toml crates/chronik-bench/Cargo.toml
-COPY crates/chronik-raft/Cargo.toml crates/chronik-raft/Cargo.toml
-COPY crates/chronik-columnar/Cargo.toml crates/chronik-columnar/Cargo.toml
-COPY crates/chronik-embeddings/Cargo.toml crates/chronik-embeddings/Cargo.toml
-COPY crates/chronik-auth/Cargo.toml crates/chronik-auth/Cargo.toml
-COPY crates/chronik-cli/Cargo.toml crates/chronik-cli/Cargo.toml
-COPY crates/chronik-perf/Cargo.toml crates/chronik-perf/Cargo.toml
-COPY crates/raft/Cargo.toml crates/raft/Cargo.toml
-COPY crates/raft-proto/Cargo.toml crates/raft-proto/Cargo.toml
-
-# Create dummy src files for all workspace crates (dependency caching)
-RUN for crate in chronik-operator chronik-common chronik-server chronik-protocol \
-    chronik-wal chronik-storage chronik-search chronik-query chronik-monitoring \
-    chronik-config chronik-bench chronik-raft \
-    chronik-columnar chronik-embeddings chronik-auth chronik-cli chronik-perf; do \
-    mkdir -p crates/$crate/src && \
-    echo "" > crates/$crate/src/lib.rs; \
-    done && \
-    echo "fn main() {}" > crates/chronik-operator/src/main.rs && \
-    echo "fn main() {}" > crates/chronik-server/src/main.rs && \
-    echo "fn main() {}" > crates/chronik-bench/src/main.rs && \
-    echo "fn main() {}" > crates/chronik-perf/src/main.rs && \
-    mkdir -p crates/raft/src && echo "" > crates/raft/src/lib.rs && \
-    mkdir -p crates/raft-proto/src && echo "" > crates/raft-proto/src/lib.rs
-
-# Pre-build dependencies (cached layer)
-RUN cargo build --release --bin chronik-operator 2>/dev/null || true
-
-# Copy actual operator source code (invalidates cache only when operator changes)
-COPY crates/chronik-operator/ crates/chronik-operator/
-
-# Rebuild with real source
-RUN touch crates/chronik-operator/src/main.rs && \
-    cargo build --release --bin chronik-operator
-
-# Stage 2: Minimal runtime image
-FROM debian:bookworm-slim
+# Stage 2: runtime, the same as Dockerfile.operator.binary. Built on Debian
+# bookworm (glibc 2.36), the binary runs on Ubuntu 24.04 (glibc 2.39).
+FROM ubuntu:24.04
 
 RUN apt-get update && \
+    apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -u 1000 operator
+RUN useradd -m -u 1002 -g operator operator
 
-COPY --from=builder /build/target/release/chronik-operator /usr/local/bin/chronik-operator
+COPY --from=builder /chronik-operator /usr/local/bin/chronik-operator
 RUN chmod +x /usr/local/bin/chronik-operator
 
 USER operator
 
 EXPOSE 8080
 
+# The base image has neither wget nor curl; bash's /dev/tcp needs no package.
+# /healthz always answers 200, so an accepted connection is the same signal.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://localhost:8080/healthz || exit 1
+    CMD ["bash", "-c", "</dev/tcp/127.0.0.1/8080"]
 
 ENTRYPOINT ["chronik-operator"]
 CMD ["start"]
