@@ -406,6 +406,9 @@ mod tests {
         let json = sb.add_json_field(chronik_storage::json_index::JSON_FIELD, chronik_storage::json_index::json_field_options());
         let index = tantivy::Index::create_in_ram(sb.build());
         let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        // Each commit must stay its own segment: a background merge finishing first
+        // would leave one and the multi-segment case untested (CI caught it so).
+        w.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
         let mut rows: Vec<(i64, i64, Option<i64>, String)> = Vec::new(); // offset, second, status, level
         for o in 0..1_200i64 {
             let second = 1_000 + (o * 7919) % 97;

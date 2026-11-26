@@ -823,6 +823,9 @@ mod tests {
             let off = sb.add_i64_field(off_name, INDEXED | STORED | FAST);
             let index = new_index(sb.build(), sorted);
             let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            // Each commit must stay its own segment: a background merge finishing first
+            // would leave one and the multi-segment case untested (CI caught it so).
+            w.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
             // 8 commits = 8 segments; ms timestamps mostly rising with offset,
             // every 7th record from the past, several per second.
             let mut o = 0i64;
@@ -905,6 +908,9 @@ mod tests {
             let body = sb.add_text_field("body", TEXT);
             let index = new_index(sb.build(), true);
             let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            // Each commit must stay its own segment: a background merge finishing first
+            // would leave one and the multi-segment case untested (CI caught it so).
+            w.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
             let doc = |o: i64, ms: i64| {
                 let mut d = tantivy::TantivyDocument::new();
                 d.add_date(ts, tantivy::DateTime::from_timestamp_millis(ms));
@@ -986,6 +992,9 @@ mod tests {
         for (sorted, burst) in [(false, false), (true, false), (true, true)] {
             let index = new_index(schema.clone(), sorted);
             let mut w: tantivy::IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+            // Each commit must stay its own segment: a background merge finishing first
+            // would leave one and the multi-segment case untested (CI caught it so).
+            w.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
             let mut o = 0i64;
             for _ in 0..6 {
                 for _ in 0..3_000 {
