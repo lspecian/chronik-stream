@@ -570,7 +570,7 @@ On each reconcile:
   3. Ensure ConfigMap with env overrides
   4. Ensure Pod (create/recreate if spec changed — image, resources, env)
      - Command: ["chronik-server", "start", "--data-dir", "/data"]
-     - Env: CHRONIK_ADVERTISED_ADDR, RUST_LOG, profiles, user env
+     - Env: CHRONIK_ADVERTISE, RUST_LOG, profiles, user env
      - Liveness: TCP on kafka port (initialDelay 15s, period 10s)
      - Readiness: TCP on kafka port (initialDelay 10s, period 5s)
      - Volumes: PVC at /data

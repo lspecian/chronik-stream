@@ -71,7 +71,7 @@ The Docker image supports single-node and cluster modes:
 docker run chronik-server:latest
 
 # With advertised address (required for Docker networking)
-docker run -e CHRONIK_ADVERTISED_ADDR=hostname:9092 chronik-server:latest
+docker run -e CHRONIK_ADVERTISE=hostname:9092 chronik-server:latest
 
 # Cluster mode (with config file)
 docker run -v ./cluster.toml:/config.toml chronik-server:latest chronik-server start --config /config.toml

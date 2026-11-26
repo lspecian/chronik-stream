@@ -251,7 +251,7 @@ FetchHandler
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CHRONIK_ADVERTISED_ADDR` | (required) | Address advertised to clients |
+| `CHRONIK_ADVERTISE` | (required) | Address advertised to clients |
 | `CHRONIK_DATA_DIR` | `./data` | Data directory |
 | `CHRONIK_WAL_PROFILE` | auto | `low`/`medium`/`high`/`ultra` |
 | `CHRONIK_DEFAULT_SEARCHABLE` | `false` | Enable search for new topics |

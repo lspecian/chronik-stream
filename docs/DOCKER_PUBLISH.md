@@ -14,7 +14,7 @@ docker buildx inspect --bootstrap
 # Build and push multi-arch image to GitHub Container Registry
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  --tag ghcr.io/lspecian/chronik-stream:v0.5.0 \
+  --tag ghcr.io/lspecian/chronik-stream:0.5.0 \
   --tag ghcr.io/lspecian/chronik-stream:latest \
   --push \
   .
@@ -81,13 +81,13 @@ echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
 
 2. **Tag the image:**
 ```bash
-docker tag chronik-server:latest ghcr.io/lspecian/chronik-stream:v0.5.0
+docker tag chronik-server:latest ghcr.io/lspecian/chronik-stream:0.5.0
 docker tag chronik-server:latest ghcr.io/lspecian/chronik-stream:latest
 ```
 
 3. **Push to registry:**
 ```bash
-docker push ghcr.io/lspecian/chronik-stream:v0.5.0
+docker push ghcr.io/lspecian/chronik-stream:0.5.0
 docker push ghcr.io/lspecian/chronik-stream:latest
 ```
 
@@ -100,13 +100,13 @@ docker login
 
 2. **Tag for Docker Hub:**
 ```bash
-docker tag chronik-server:latest yourusername/chronik-stream:v0.5.0
+docker tag chronik-server:latest yourusername/chronik-stream:0.5.0
 docker tag chronik-server:latest yourusername/chronik-stream:latest
 ```
 
 3. **Push to Docker Hub:**
 ```bash
-docker push yourusername/chronik-stream:v0.5.0
+docker push yourusername/chronik-stream:0.5.0
 docker push yourusername/chronik-stream:latest
 ```
 
@@ -129,10 +129,10 @@ git push origin v0.5.0
 
 ```bash
 # Pull and test the published image
-docker pull ghcr.io/lspecian/chronik-stream:v0.5.0
+docker pull ghcr.io/lspecian/chronik-stream:0.5.0
 
 # Verify multi-arch support
-docker manifest inspect ghcr.io/lspecian/chronik-stream:v0.5.0
+docker manifest inspect ghcr.io/lspecian/chronik-stream:0.5.0
 
 # Should show both architectures:
 # - linux/amd64
@@ -195,7 +195,7 @@ docker scout cves chronik-server:latest
 
 4. **Sign images with cosign (optional):**
 ```bash
-cosign sign ghcr.io/lspecian/chronik-stream:v0.5.0
+cosign sign ghcr.io/lspecian/chronik-stream:0.5.0
 ```
 
 ## Release Checklist

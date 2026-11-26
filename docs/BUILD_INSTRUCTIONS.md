@@ -60,7 +60,7 @@ cross build --release --bin chronik-server --target aarch64-apple-darwin
 docker buildx create --use
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  -t ghcr.io/lspecian/chronik-stream:v0.7.0 \
+  -t ghcr.io/lspecian/chronik-stream:0.7.0 \
   -t ghcr.io/lspecian/chronik-stream:latest \
   --push .
 ```
