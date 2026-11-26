@@ -65,12 +65,12 @@ printf '\n[[peers]]\nid = 4\nkafka = "localhost:9095"\nwal = "localhost:9294"\nr
 
 out=$(CHRONIK_ADMIN_API_KEY=$KEY "$CHRONIK_BIN" cluster add-node 4 --kafka localhost:9095 --wal localhost:9294 \
   --raft localhost:5004 --config "$DIR/node1.toml" 2>&1); rc=$?
-echo "$out" | sed 's/^/  add-node: /' | grep -vE '^\s*add-node: \s*$' | head -4
+echo "$out" | grep -E '✓|✗|rror' | sed 's/^/  add-node: /' | head -4
 [ $rc = 0 ] && echo "$out" | grep -q '✓' || fail "cluster add-node 4 failed (rc=$rc)"
 
 env $(node_env) CHRONIK_ADMIN_API_KEY=$KEY CHRONIK_CLUSTER_JOIN=true RUST_LOG=info \
   "$CHRONIK_BIN" start --config "$OUT/node4.toml" >> "$N4_LOG" 2>&1 &
-N4_PID=$!
+N4_PID=$!; disown "$N4_PID"  # killed by this script; no job notice
 wait_port 9095 || fail "node 4 did not start"
 wait_eq 60 "voters after add-node" 1,2,3,4 voters 1
 echo "  voters after add: $(voters 1)"
