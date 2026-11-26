@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.3] - 2026-11-26
+
+### Fixed
+
+- **Searches across all topics were slower in 2.20.2.** A `/_search`
+  without an index took 1.6 s on a node with 5,903 partitions of ~2,000
+  topics: finding each topic's hot partitions walked every partition, once
+  per topic (twice since 2.20.2), and the archives opened for the topic
+  statistics were opened again by the search. With 1,200 topics: 2.20.1
+  99 ms, 2.20.2 145 ms, 2.20.3 72 ms. Searches on one topic were not
+  affected.
+- Two simultaneous first writes to a partition's hot index could each create
+  it, and records added to the one replaced were lost from the hot index
+  (still archived and searchable once archived).
+- ListOffsets logged three INFO lines per partition; listing every
+  partition's end offset on a large cluster rotated the startup log away.
+  Now at debug.
+
 ## [2.20.2] - 2026-11-26
 
 ### Fixed
