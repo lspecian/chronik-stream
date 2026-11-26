@@ -2,12 +2,10 @@
 
 use bytes::{Bytes, BytesMut, BufMut, Buf};
 use chronik_protocol::{
-    frame::KafkaFrameCodec,
     kafka_protocol::{ApiKey, RequestHeader, ProtocolCodec, TopicMetadata, PartitionMetadata, get_supported_apis},
     compression::{CompressionType, MessageBatch},
     records::{RecordBatch, RecordHeader},
 };
-use tokio_util::codec::{Decoder, Encoder};
 
 /// Test basic protocol parsing
 #[test]
@@ -75,25 +73,6 @@ fn test_metadata_request_response() {
     let mut response = buf.freeze();
     let correlation_id = response.get_i32();
     assert_eq!(correlation_id, 456);
-}
-
-/// Test frame codec
-#[test]
-fn test_frame_codec() {
-    let mut codec = KafkaFrameCodec::new();
-    let mut buf = BytesMut::new();
-    
-    // Create a test message
-    let message = Bytes::from(vec![0u8; 100]);
-    
-    // Encode
-    codec.encode(message.clone(), &mut buf).unwrap();
-    assert_eq!(buf.len(), 104); // 4 bytes length + 100 bytes data
-    
-    // Decode
-    let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded, message);
-    assert_eq!(buf.len(), 0); // All consumed
 }
 
 /// Test message batching
@@ -204,24 +183,6 @@ fn test_version_negotiation() {
     let mut buf = BytesMut::new();
     ProtocolCodec::encode_api_versions_response(&mut buf, 789, &versions, 3).unwrap();
     assert!(!buf.is_empty());
-}
-
-/// Test large message handling
-#[test]
-fn test_large_messages() {
-    let mut codec = KafkaFrameCodec::new();
-    let mut buf = BytesMut::new();
-    
-    // Create a large message (10MB)
-    let large_message = Bytes::from(vec![0xAB; 10 * 1024 * 1024]);
-    
-    // Encode
-    codec.encode(large_message.clone(), &mut buf).unwrap();
-    assert_eq!(buf.len(), large_message.len() + 4);
-    
-    // Decode
-    let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.len(), large_message.len());
 }
 
 /// Test batch compression

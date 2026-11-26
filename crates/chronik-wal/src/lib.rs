@@ -8,7 +8,6 @@
 pub mod error;
 pub mod manager;
 pub mod record;
-pub mod segment;
 pub mod config;
 pub mod fsync;
 pub mod buffer_pool;
@@ -19,7 +18,6 @@ pub mod io;
 pub mod checkpoint;
 pub mod rotation;
 pub mod compaction;
-pub mod periodic_flusher;
 pub mod group_commit;
 pub mod io_priority; // I/O priority control for WAL vs Tantivy
 pub mod io_uring_thread; // Dedicated io_uring thread (hybrid tokio + tokio-uring)
@@ -37,12 +35,10 @@ mod tests;
 pub use error::{WalError, Result};
 pub use manager::WalManager;
 pub use record::WalRecord;
-pub use segment::{WalSegment, SealedSegment};
 pub use config::{WalConfig, CompressionType, CheckpointConfig, RecoveryConfig, RotationConfig, FsyncConfig};
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use fsync::{FsyncBatcher, FsyncStats};
 pub use compaction::{WalCompactor, CompactionConfig, CompactionStats};
-pub use periodic_flusher::{PeriodicFlusherConfig, spawn_periodic_flusher};
 pub use group_commit::{GroupCommitWal, GroupCommitConfig, PartitionMetrics};
 pub use truncate::TruncateOutcome;
 

@@ -31,12 +31,6 @@
 //! ```
 
 // Existing modules (production)
-pub mod search;
-pub mod api;
-pub mod index;
-pub mod aggregation;
-pub mod query_executor;
-pub mod translator;
 
 // Phase 9: Unified query orchestration
 pub mod types;
@@ -51,10 +45,6 @@ pub mod features;
 pub mod merge;
 
 // Re-exports (existing)
-pub use search::{SearchEngine, SearchQuery, SearchResult};
-pub use api::{QueryApi, QueryConfig};
-pub use index::{Indexer, IndexSchema};
-pub use aggregation::{AggregationEngine, AggregationQuery, AggregationResult, WindowType, AggregationFunction};
 
 // Re-exports (Phase 9)
 pub use types::{QueryRequest, QueryResponse, QueryMode, SourceSpec, QuerySpec};

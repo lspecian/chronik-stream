@@ -39,4 +39,3 @@ wiremock = "0.6"
 
 [features]
 default = []
-# local-models = ["ort", "tokenizers"]  # Disabled until ort 2.0 stable

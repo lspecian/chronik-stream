@@ -69,10 +69,6 @@ name = "batch_round_trip"
 path = "integration/test_batch_round_trip.rs"
 
 [[test]]
-name = "vector_search"
-path = "integration/vector_search_test.rs"
-
-[[test]]
 name = "admin_api"
 path = "integration/admin_api_test.rs"
 

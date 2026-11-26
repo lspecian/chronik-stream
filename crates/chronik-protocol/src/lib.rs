@@ -13,11 +13,9 @@ pub mod create_topics;  // Phase 2.4 Part 2: Refactored CreateTopics handler
 pub mod describe_configs;  // Phase 2.4 Part 3: Refactored DescribeConfigs handler
 pub mod error_codes;
 pub mod fetch_response;  // Phase 2.4 Part 1: Refactored Fetch response encoding
-pub mod frame;
 pub mod handler;
 pub mod handlers;
 pub mod kafka_protocol;
-pub mod metadata_fix;
 pub mod offset_for_leader_epoch_types;
 pub mod parser;
 pub mod records;
@@ -63,7 +61,6 @@ pub mod scram_credentials_types;
 
 // Re-export main types
 pub use compression::{CompressionHandler, CompressionType, MessageBatch};
-pub use frame::{Frame, KafkaFrameCodec};
 pub use handler::ProtocolHandler;
 pub use kafka_protocol::{
     ApiKey as KafkaApiKey, ApiVersion, ErrorCode, ProtocolCodec,

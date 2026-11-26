@@ -14,14 +14,9 @@ pub mod segment;
 pub mod segment_writer;
 pub mod segment_reader;
 pub mod chronik_segment;
-pub mod chronik_segment_example;
 pub mod background;
 pub mod checksum;
-pub mod segment_checksum;
 pub mod segment_cache;
-pub mod optimized_segment;
-pub mod vector_search;
-pub mod extended_segment;
 pub mod text_analysis;
 pub mod json_index;
 pub mod term_filter;
@@ -50,21 +45,7 @@ pub use segment_writer::{SegmentWriter, SegmentWriterConfig};
 pub use segment_reader::{SegmentReader, SegmentReaderConfig, FetchResult};
 pub use chronik_segment::{ChronikSegment, ChronikSegmentBuilder, SegmentMetadata, CompressionType, BloomFilter};
 pub use checksum::{ChecksumUtils, ChecksumMode, StreamingChecksum};
-pub use segment_checksum::{SegmentChecksumCalculator, SegmentChecksumVerifier, BatchChecksumVerifier};
 pub use segment_cache::{SegmentCache, SegmentCacheConfig, CachedSegmentReader, CacheStats, EvictionPolicy};
-pub use optimized_segment::{
-    OptimizedTansuSegment, OptimizedSegmentHeader, ColumnarBatch, SegmentStats,
-    CompressionType as OptimizedCompressionType
-};
-pub use vector_search::{
-    VectorIndex, VectorIndexData, DistanceMetric, HybridSearchRequest, VectorQuery,
-    FusionMethod, HybridSearchResult, HnswIndex, RealHnswIndex, HnswConfig, HnswStats,
-    VectorIndexFactory, ScoreFusion
-};
-pub use extended_segment::{
-    ExtendedTansuSegment, ExtendedSegmentMetadata, ExtendedSegmentBuilder,
-    VectorFieldConfig, HybridStats, SegmentMigration
-};
 // v2.2.7 Phase 5: Removed WalMetadataAdapter export (deleted file)
 pub use wal_indexer::{
     WalIndexer, WalIndexerConfig, IndexingStats, BackfillStats, EmbedOutcome, TopicPartition as WalIndexerTopicPartition,

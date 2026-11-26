@@ -81,19 +81,9 @@ fn create_external_provider(config: &EmbeddingModelConfig) -> Result<Arc<dyn Emb
 /// Create Local provider from config (requires local-models feature).
 #[allow(unused_variables)]
 fn create_local_provider(config: &EmbeddingModelConfig) -> Result<Arc<dyn EmbeddingProvider>> {
-    #[cfg(feature = "local-models")]
-    {
-        use crate::local::LocalProvider;
-        let provider = LocalProvider::new(&config.model)?;
-        Ok(Arc::new(provider))
-    }
-
-    #[cfg(not(feature = "local-models"))]
-    {
-        Err(anyhow!(
-            "Local provider requires 'local-models' feature. Rebuild with --features local-models"
-        ))
-    }
+    Err(anyhow!(
+        "Local provider requires 'local-models' feature. Rebuild with --features local-models"
+    ))
 }
 
 #[cfg(test)]
@@ -174,7 +164,6 @@ mod tests {
         let result = create_provider(&config);
 
         // Without the feature flag, this should fail
-        #[cfg(not(feature = "local-models"))]
         assert!(result.is_err());
     }
 
