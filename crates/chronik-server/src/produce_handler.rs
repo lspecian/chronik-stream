@@ -58,9 +58,6 @@ const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 /// We flush after each produce for immediate availability, rotation is for segment management
 const MAX_SEGMENT_AGE: Duration = Duration::from_secs(30);
 
-/// Maximum number of records in memory before flush
-const MAX_BUFFER_RECORDS: usize = 10000;
-
 /// Timeout for replication acknowledgments
 const REPLICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -564,15 +561,6 @@ pub struct ProduceMetrics {
     pub topic_creation_concurrent_attempts: AtomicU64,
 }
 
-/// Topic creation statistics
-#[derive(Debug, Clone)]
-pub struct TopicCreationStats {
-    pub topics_created: u64,
-    pub creation_errors: u64,
-    pub invalid_name_attempts: u64,
-    pub concurrent_attempts: u64,
-}
-
 /// A partition's offsets as this node's durable state records them. See
 /// `ProduceHandler::persisted_offsets`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -872,21 +860,6 @@ impl ProduceHandler {
         }
     }
 
-    /// Get reference to metadata store
-    pub fn get_metadata_store(&self) -> &Arc<dyn MetadataStore> {
-        &self.metadata_store
-    }
-
-    /// Get request timeout in milliseconds
-    pub fn get_request_timeout_ms(&self) -> u64 {
-        self.config.request_timeout_ms
-    }
-
-    /// Get reference to Raft cluster (for request forwarding)
-    pub fn get_raft_cluster(&self) -> &Option<Arc<ClusterCatalog>> {
-        &self.raft_cluster
-    }
-
     /// `searchable.throttle.enabled` for `topic` (cached like
     /// `is_topic_searchable`, so a change takes up to a minute).
     async fn is_topic_search_throttled(&self, topic: &str) -> bool {
@@ -1003,77 +976,6 @@ impl ProduceHandler {
                 false  // On error, assume not searchable (safe default)
             }
         }
-    }
-
-    /// Ensure a partition exists with the specified starting offset (for WAL recovery)
-    pub async fn ensure_partition_exists(
-        &self,
-        topic: &str,
-        partition: i32,
-        next_offset: i64,
-    ) -> Result<()> {
-        let key = (topic.to_string(), partition);
-
-        // Check if partition already exists (lock-free with DashMap)
-        if let Some(state_ref) = self.partition_states.get(&key) {
-            let state = state_ref.value();
-            let current_offset = state.next_offset.load(Ordering::SeqCst);
-            if next_offset > current_offset as i64 {
-                state.next_offset.store(next_offset as u64, Ordering::SeqCst);
-                info!(
-                    "Updated partition {}-{} next offset from {} to {}",
-                    topic, partition, current_offset, next_offset
-                );
-            }
-            return Ok(());
-        }
-
-        let state = self.create_partition_state_with_offset(topic, partition, next_offset).await?;
-        let (state, created) = self.install_partition_state(key, Arc::new(state));
-        if created {
-            info!(
-                "Created partition {}-{} with starting offset {}",
-                topic, partition, next_offset
-            );
-        } else {
-            // Someone else created it meanwhile: still honour our offset.
-            state.next_offset.fetch_max(next_offset.max(0) as u64, Ordering::SeqCst);
-        }
-
-        Ok(())
-    }
-
-    /// Apply recovered batch to partition buffers (for WAL recovery)
-    pub async fn apply_recovered_batch(
-        &self,
-        topic: &str,
-        partition: i32,
-        batch_data: Bytes,
-    ) -> Result<()> {
-        let key = (topic.to_string(), partition);
-
-        // Lock-free lookup with DashMap
-        if let Some(state_ref) = self.partition_states.get(&key) {
-            let state = state_ref.value();
-            // Add to pending batches
-            state.pending_batches.push(BufferedBatch {
-                raw_bytes: batch_data.to_vec(),
-                records: Vec::new(), // Will be parsed when needed
-                base_offset: 0, // Will be assigned when written
-            });
-
-            info!(
-                "Applied recovered batch to partition {}-{} buffers",
-                topic, partition
-            );
-        } else {
-            warn!(
-                "Partition {}-{} not found when applying recovered batch",
-                topic, partition
-            );
-        }
-
-        Ok(())
     }
 
     /// Get high watermark for a partition (NEW architecture v1.3.39+)
@@ -1362,46 +1264,6 @@ impl ProduceHandler {
         }
     }
 
-    /// Extract pending batches for WAL writing (v1.3.37)
-    ///
-    /// This method retrieves the batches that were just written to the partition buffer
-    /// so they can be persisted to the WAL. The batches are NOT cleared, as they're still
-    /// needed for serving fetch requests.
-    pub async fn get_pending_batches(&self, topic: &str, partition: i32) -> Result<Vec<Vec<u8>>> {
-        let key = (topic.to_string(), partition);
-
-        // Lock-free lookup with DashMap
-        if let Some(state_ref) = self.partition_states.get(&key) {
-            let state = state_ref.value();
-            // Drain all batches from SegQueue (lock-free operation)
-            let mut batches = Vec::new();
-            while let Some(batch) = state.pending_batches.pop() {
-                batches.push(batch.raw_bytes);
-            }
-            Ok(batches)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    /// Clear pending batches after they've been written to WAL (v1.3.43)
-    pub async fn clear_pending_batches(&self, topic: &str, partition: i32) -> Result<()> {
-        let key = (topic.to_string(), partition);
-
-        // Lock-free lookup with DashMap
-        if let Some(state_ref) = self.partition_states.get(&key) {
-            let state = state_ref.value();
-            // Drain all batches from SegQueue (lock-free)
-            let mut count = 0;
-            while let Some(_) = state.pending_batches.pop() {
-                count += 1;
-            }
-            debug!("Cleared {} pending batches for {}-{} after WAL write", count, topic, partition);
-        }
-
-        Ok(())
-    }
-
     /// Every partition's state, copied out of the map.
     ///
     /// Never iterate `partition_states` across an `.await`: the iterator
@@ -1589,17 +1451,6 @@ impl ProduceHandler {
         handler.wal_manager = Some(wal_manager);
         info!("CRITICAL_DEBUG: wal_manager set to Some - inline WAL writes ENABLED");
         Ok(handler)
-    }
-    
-    /// Start the produce handler with replication support
-    pub async fn start_with_replication(
-        &mut self,
-        replication_sender: mpsc::Sender<ReplicationRequest>,
-    ) {
-        self.replication_sender = Some(replication_sender);
-        
-        // Start background tasks
-        self.start_background_tasks().await;
     }
     
     /// Set the fetch handler for updating buffers
@@ -1802,18 +1653,6 @@ impl ProduceHandler {
         }
     }
 
-    /// Create a new produce handler with fetch handler connected
-    pub async fn new_with_fetch_handler(
-        config: ProduceHandlerConfig,
-        storage: Arc<dyn ObjectStore>,
-        metadata_store: Arc<dyn MetadataStore>,
-        fetch_handler: Arc<FetchHandler>,
-    ) -> Result<Self> {
-        let mut handler = Self::new(config, storage, metadata_store).await?;
-        handler.fetch_handler = Some(fetch_handler);
-        Ok(handler)
-    }
-    
     /// Start background tasks for segment management
     pub async fn start_background_tasks(&self) {
         let handler = self.clone();
@@ -1906,41 +1745,6 @@ impl ProduceHandler {
         });
     }
     
-    /// Check leadership using metadata store (fallback when Raft is not enabled)
-    ///
-    /// # Returns
-    /// (is_leader, leader_hint) where leader_hint is the current leader node ID if known
-    async fn check_metadata_leadership(&self, topic: &str, partition: i32) -> Result<(bool, Option<u64>)> {
-        let assignments = self.metadata_store
-            .get_partition_assignments(topic)
-            .await?;
-
-        // Debug partition assignments and leadership
-        debug!(
-            "Metadata leadership check for {}-{}: node_id={}, assignments={:?}",
-            topic, partition, self.config.node_id, assignments
-        );
-
-        let (is_leader, leader_id) = assignments.iter()
-            .find(|a| a.partition == partition as u32)
-            .map(|a| {
-                let leader = a.is_leader && a.broker_id == self.config.node_id;
-                let leader_node = if a.is_leader {
-                    Some(a.broker_id as u64)
-                } else {
-                    None
-                };
-                debug!(
-                    "Partition {}-{}: assignment broker_id={}, is_leader={}, our_node_id={}, result={}",
-                    topic, partition, a.broker_id, a.is_leader, self.config.node_id, leader
-                );
-                (leader, leader_node)
-            })
-            .unwrap_or((false, None));
-
-        Ok((is_leader, leader_id))
-    }
-
     /// Handle a produce request
     #[instrument(skip(self, request), fields(correlation_id, acks = request.acks))]
     pub async fn handle_produce(
@@ -4139,51 +3943,6 @@ impl ProduceHandler {
         Ok(())
     }
     
-    /// Force flush all partitions (useful for testing)
-    pub async fn flush_all_partitions(&self) -> Result<()> {
-        for ((topic, partition), state) in self.partition_snapshot() {
-            self.flush_partition(&topic, partition, &state).await?;
-        }
-
-        Ok(())
-    }
-    
-    /// Force immediate rotation of a partition's segment
-    async fn force_rotate_partition(
-        &self,
-        topic: &str,
-        partition: i32,
-        state: &Arc<PartitionState>,
-    ) -> Result<()> {
-        // Flush current segment immediately
-        self.flush_partition(topic, partition, state).await?;
-        
-        // Force rotation by creating a new segment writer
-        let segment_path = format!("{}/{}/partition-{}", 
-            self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), 
-            topic, 
-            partition
-        );
-        
-        let new_writer = SegmentWriter::new(
-            self.config.storage_config.segment_writer_config.clone(),
-        ).await?;
-        
-        // Replace writer
-        *state.current_writer.lock().await = new_writer;
-        state.segment_size.store(0, Ordering::SeqCst);
-        state.segment_created.store(
-            Instant::now().duration_since(state.start_time).as_millis() as u64,
-            Ordering::SeqCst
-        );
-        
-        self.metrics.segments_created.fetch_add(1, Ordering::Relaxed);
-        
-        debug!("Force rotated segment for {}-{}", topic, partition);
-        
-        Ok(())
-    }
-    
     /// Check and rotate segments if needed
     async fn check_and_rotate_segments(&self) -> Result<()> {
         for ((topic, partition), state) in self.partition_snapshot() {
@@ -4428,30 +4187,9 @@ impl ProduceHandler {
         ) || name.starts_with("__")  // All topics starting with __ are considered internal
     }
     
-    /// Clean up expired producer sessions
-    async fn cleanup_expired_producers(&self) {
-        let mut producers = self.producer_info.write().await;
-        let now = Instant::now();
-        let expiry = Duration::from_secs(300); // 5 minute expiry
-        
-        producers.retain(|_, info| {
-            now.duration_since(info.last_activity) < expiry
-        });
-    }
-    
     /// Get current metrics
     pub fn metrics(&self) -> &ProduceMetrics {
         &self.metrics
-    }
-    
-    /// Get topic auto-creation statistics
-    pub fn get_topic_creation_stats(&self) -> TopicCreationStats {
-        TopicCreationStats {
-            topics_created: self.metrics.topics_auto_created.load(Ordering::Relaxed),
-            creation_errors: self.metrics.topic_creation_errors.load(Ordering::Relaxed),
-            invalid_name_attempts: self.metrics.topic_creation_invalid_names.load(Ordering::Relaxed),
-            concurrent_attempts: self.metrics.topic_creation_concurrent_attempts.load(Ordering::Relaxed),
-        }
     }
     
     /// Shutdown the handler gracefully

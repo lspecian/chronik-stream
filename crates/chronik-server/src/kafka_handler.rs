@@ -137,11 +137,6 @@ impl KafkaProtocolHandler {
         self.group_manager.set_coordination(coordination);
     }
 
-    /// Get reference to the produce handler for shutdown
-    pub fn get_produce_handler(&self) -> &Arc<ProduceHandler> {
-        &self.produce_handler
-    }
-
     /// The ACL authorizer, so the HTTP surface can enforce the same policy.
     pub fn authorizer(&self) -> &Authorizer {
         &self.authorizer
@@ -150,17 +145,6 @@ impl KafkaProtocolHandler {
     /// Get reference to the WAL produce handler for shutdown
     pub fn get_wal_handler(&self) -> &Arc<WalProduceHandler> {
         &self.wal_handler
-    }
-
-    /// Handle a Kafka protocol request without a connection context.
-    ///
-    /// Equivalent to [`Self::handle_request_with_context`] on a connection where
-    /// authentication is disabled. Retained for in-process callers and tests;
-    /// the server's accept loops always pass a real context so that the
-    /// pre-authentication gate applies.
-    pub async fn handle_request(&self, request_bytes: &[u8]) -> Result<Response> {
-        let ctx = ConnectionContext::internal();
-        self.handle_request_with_context(&ctx, request_bytes, None).await
     }
 
     /// Handle a Kafka protocol request on behalf of a specific connection.
@@ -336,11 +320,6 @@ impl KafkaProtocolHandler {
         }
 
         Ok(())
-    }
-
-    /// Flush all partition buffers to storage
-    pub async fn flush_all_partitions(&self) -> Result<()> {
-        self.produce_handler.flush_all_partitions().await
     }
 
     // ==================== API Request Handlers ====================

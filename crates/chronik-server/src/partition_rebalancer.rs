@@ -310,29 +310,6 @@ impl PartitionRebalancer {
         assignments
     }
 
-    /// Get current rebalancing status
-    ///
-    /// Returns information about the rebalancer state.
-    pub async fn status(&self) -> RebalancerStatus {
-        let current_nodes = self.raft_cluster.voters();
-        let last_count = self.last_member_count.load(Ordering::Relaxed);
-
-        RebalancerStatus {
-            current_node_count: current_nodes.len(),
-            last_known_node_count: last_count,
-            rebalance_interval_secs: self.rebalance_interval.as_secs(),
-            replication_factor: self.replication_factor,
-        }
-    }
-}
-
-/// Rebalancer status information
-#[derive(Debug, Clone)]
-pub struct RebalancerStatus {
-    pub current_node_count: usize,
-    pub last_known_node_count: usize,
-    pub rebalance_interval_secs: u64,
-    pub replication_factor: usize,
 }
 
 #[cfg(test)]

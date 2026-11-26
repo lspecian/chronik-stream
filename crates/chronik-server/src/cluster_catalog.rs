@@ -240,14 +240,6 @@ impl ClusterCatalog {
         self.node_id
     }
 
-    pub fn raft_handle(&self) -> &RaftHandle {
-        &self.handle
-    }
-
-    pub fn directory(&self) -> &PeerDirectory {
-        &self.directory
-    }
-
     // ---- reads -------------------------------------------------------------
 
     /// The applied catalog. Hold the guard briefly; never across an await.
@@ -269,11 +261,6 @@ impl ClusterCatalog {
 
     pub fn leader_id(&self) -> Option<u64> {
         self.handle.status().leader_id
-    }
-
-    /// Voters and learners of the raft group.
-    pub fn conf_state(&self) -> ConfState {
-        self.conf_state.read().clone()
     }
 
     /// True when this node's catalog can be trusted to be complete: it has
@@ -563,10 +550,6 @@ impl ClusterCatalog {
         }
     }
 
-    /// Stop the raft node.
-    pub fn stop(self) {
-        self.driver.stop();
-    }
 }
 
 fn split_host_port(addr: &str) -> Result<(String, i32), String> {

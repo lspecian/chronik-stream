@@ -1,6 +1,6 @@
 //! Integration tests for the search API.
 
-use chronik_search::{SearchApi, IndexerConfig};
+use chronik_search::SearchApi;
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use serde_json::json;

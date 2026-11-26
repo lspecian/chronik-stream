@@ -10,8 +10,8 @@
 //!
 //! # Schema
 //!
-//! Mirrors the cold TantivyIndexer schema (see `indexer.rs`) so hot and cold
-//! hits are directly mergeable:
+//! Plain field names (as `handlers::hits_of_docs` presents archived records,
+//! so hot and cold hits merge directly):
 //! - `topic`      STRING | STORED
 //! - `partition`  i64 indexed | stored
 //! - `offset`     i64 indexed | stored

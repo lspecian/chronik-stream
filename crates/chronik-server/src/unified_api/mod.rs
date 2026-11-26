@@ -57,10 +57,6 @@ use chronik_embeddings::EmbeddingProvider;
 use chronik_embeddings::reranker::RerankerProvider;
 
 pub use sql_handler::{SqlHandler, SqlRequest, SqlResponse};
-pub use vector_handler::{
-    VectorHandler, VectorSearchRequest, VectorSearchResponse,
-    HybridSearchRequest, HybridSearchResponse,
-};
 pub use admin_handler::{create_admin_state, admin_router, create_admin_router_for_unified_api};
 
 /// Unified API configuration
@@ -509,12 +505,6 @@ impl UnifiedApiState {
         self
     }
 
-    /// v2.2.23: Set the hot buffer configuration
-    pub fn with_hot_buffer_config(mut self, config: HotBufferConfig) -> Self {
-        self.hot_buffer_config = config;
-        self
-    }
-
     /// v2.2.23: Set the hot data buffer
     ///
     /// The hot buffer enables sub-second SQL queries by reading recent data
@@ -580,17 +570,6 @@ impl UnifiedApiState {
 /// Create the unified API router
 pub fn create_router(state: UnifiedApiState) -> Router {
     create_router_full(state, None, None)
-}
-
-/// Create the unified API router with optional search API integration
-///
-/// The search router uses its own state (Arc<SearchApi>), so it's passed
-/// as a separate router that gets merged into the unified API.
-pub fn create_router_with_search(
-    state: UnifiedApiState,
-    search_router: Option<Router>,
-) -> Router {
-    create_router_full(state, search_router, None)
 }
 
 /// Create the unified API router with optional search and admin API integration
@@ -743,179 +722,6 @@ pub struct HealthResponse {
     pub vector_enabled: bool,
     pub search_enabled: bool,
     pub admin_enabled: bool,
-}
-
-/// Start the unified API HTTP server
-///
-/// This function spawns a background tokio task that runs the HTTP server
-/// on the configured port (default: 6092).
-///
-/// # Arguments
-/// * `metadata_store` - Metadata store for topic information
-/// * `query_engine` - Optional SQL query engine
-/// * `vector_index_manager` - Optional vector index manager
-/// * `embedding_provider` - Optional embedding provider for text-based vector search
-/// * `config` - Unified API configuration
-///
-/// # Returns
-/// A JoinHandle that can be used to await server shutdown
-pub async fn start_unified_api(
-    metadata_store: Arc<dyn MetadataStore>,
-    query_engine: Option<Arc<ColumnarQueryEngine>>,
-    vector_index_manager: Option<Arc<VectorIndexManager>>,
-    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
-    config: UnifiedApiConfig,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    start_unified_api_with_search(
-        metadata_store,
-        query_engine,
-        vector_index_manager,
-        embedding_provider,
-        None,
-        config,
-    )
-    .await
-}
-
-/// Start the unified API HTTP server with search integration
-///
-/// This function spawns a background tokio task that runs the HTTP server
-/// on the configured port (default: 6092), including the search API endpoints.
-///
-/// # Arguments
-/// * `metadata_store` - Metadata store for topic information
-/// * `query_engine` - Optional SQL query engine
-/// * `vector_index_manager` - Optional vector index manager
-/// * `embedding_provider` - Optional embedding provider for text-based vector search
-/// * `search_router` - Optional search API router (Elasticsearch-compatible endpoints)
-/// * `config` - Unified API configuration
-///
-/// # Returns
-/// A JoinHandle that can be used to await server shutdown
-pub async fn start_unified_api_with_search(
-    metadata_store: Arc<dyn MetadataStore>,
-    query_engine: Option<Arc<ColumnarQueryEngine>>,
-    vector_index_manager: Option<Arc<VectorIndexManager>>,
-    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
-    search_router: Option<Router>,
-    config: UnifiedApiConfig,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    start_unified_api_full(
-        metadata_store,
-        query_engine,
-        vector_index_manager,
-        embedding_provider,
-        search_router,
-        None, // admin_router
-        None, // hot_buffer - v2.2.23
-        config,
-    )
-    .await
-}
-
-/// Start the unified API HTTP server with all integrations
-///
-/// This function spawns a background tokio task that runs the HTTP server
-/// on the configured port (default: 6092), including all API components:
-/// - SQL endpoints
-/// - Vector search endpoints
-/// - Search API (Elasticsearch-compatible)
-/// - Admin API + Schema Registry
-///
-/// # Arguments
-/// * `metadata_store` - Metadata store for topic information
-/// * `query_engine` - Optional SQL query engine
-/// * `vector_index_manager` - Optional vector index manager
-/// * `embedding_provider` - Optional embedding provider for text-based vector search
-/// * `search_router` - Optional search API router (Elasticsearch-compatible endpoints)
-/// * `admin_router` - Optional admin API router (cluster management + Schema Registry)
-/// * `hot_buffer` - Optional hot buffer for sub-second SQL queries on recent data (v2.2.23)
-/// * `config` - Unified API configuration
-///
-/// # Returns
-/// A JoinHandle that can be used to await server shutdown
-pub async fn start_unified_api_full(
-    metadata_store: Arc<dyn MetadataStore>,
-    query_engine: Option<Arc<ColumnarQueryEngine>>,
-    vector_index_manager: Option<Arc<VectorIndexManager>>,
-    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
-    search_router: Option<Router>,
-    admin_router: Option<Router>,
-    hot_buffer: Option<Arc<chronik_columnar::HotDataBuffer>>,
-    config: UnifiedApiConfig,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let port = std::env::var("CHRONIK_UNIFIED_API_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(config.port);
-
-    let bind_addr = std::env::var("CHRONIK_UNIFIED_API_BIND")
-        .unwrap_or_else(|_| config.bind_addr.clone());
-
-    let search_enabled = search_router.is_some();
-    let admin_enabled = admin_router.is_some();
-
-    let config = UnifiedApiConfig {
-        port,
-        bind_addr: bind_addr.clone(),
-        enable_search: search_enabled,
-        enable_admin: admin_enabled,
-        ..config
-    };
-
-    let state = UnifiedApiState::new(metadata_store, config);
-    let state = if let Some(engine) = query_engine {
-        info!("Unified API: SQL query engine enabled");
-        state.with_query_engine(engine)
-    } else {
-        state
-    };
-    let state = if let Some(manager) = vector_index_manager {
-        info!("Unified API: Vector search enabled");
-        state.with_vector_index_manager(manager)
-    } else {
-        state
-    };
-    let state = if let Some(provider) = embedding_provider {
-        info!("Unified API: Embedding provider '{}' enabled", provider.name());
-        state.with_embedding_provider(provider)
-    } else {
-        state
-    };
-    // v2.2.23: Hot buffer for sub-second SQL queries
-    let state = if let Some(hb) = hot_buffer {
-        info!("Unified API: Hot buffer enabled for sub-second SQL latency");
-        state.with_hot_buffer(hb)
-    } else {
-        state
-    };
-
-    if search_enabled {
-        info!("Unified API: Search (Elasticsearch-compatible) enabled");
-    }
-    if admin_enabled {
-        info!("Unified API: Admin API + Schema Registry enabled");
-    }
-
-    let app = create_router_full(state, search_router, admin_router);
-    let addr: std::net::SocketAddr = format!("{}:{}", bind_addr, port).parse()?;
-
-    info!("Starting Unified API HTTP server on {}", addr);
-    info!("  Query endpoints:  /_query, /_query/capabilities, /_query/profiles");
-    info!("  SQL endpoints:    /_sql, /_sql/explain, /_sql/tables");
-    info!("  Vector endpoints: /_vector/:topic/search, /_vector/:topic/stats, /_vector/:topic/hybrid");
-    if search_enabled {
-        info!("  Search endpoints: /_search, /:index/_search, /:index/_doc/:id");
-    }
-    if admin_enabled {
-        info!("  Admin endpoints:  /admin/status, /admin/add-node, /admin/remove-node");
-        info!("  Schema Registry:  /subjects/*, /schemas/ids/*, /config/*");
-    }
-    info!("  Health endpoint:  /health");
-
-    let handle = spawn_api_server(addr, app).await?;
-
-    Ok(handle)
 }
 
 /// Start the unified API HTTP server with a pre-built state.

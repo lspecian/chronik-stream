@@ -37,50 +37,6 @@ pub async fn start_kafka_listener(
     Ok(server_task)
 }
 
-/// Start Search API (if search feature is enabled)
-///
-/// Spawns background task for Tantivy-based full-text search API.
-/// Complexity: < 15 (conditional feature + spawn)
-#[cfg(feature = "search")]
-pub async fn start_search_api(
-    server: Arc<IntegratedKafkaServer>,
-    bind: String,
-    node_id: u64,
-    data_dir: String,
-) -> Result<()> {
-    let search_port = 6000 + (node_id as u16);
-    info!("Starting Search API on port {}", search_port);
-    info!("✓ Search API will be available at http://{}:{}", bind, search_port);
-
-    let wal_indexer = server.get_wal_indexer();
-    let index_base_path = format!("{}/tantivy_indexes", data_dir);
-
-    tokio::spawn(async move {
-        use chronik_search::api::SearchApi;
-
-        let search_api = Arc::new(SearchApi::new_with_wal_indexer(wal_indexer, index_base_path).unwrap());
-        let app = search_api.router();
-        let addr = format!("{}:{}", bind, search_port);
-        info!("Search API listening on http://{}", addr);
-
-        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-        chronik_search::serve_app(listener, app).await.unwrap()
-    });
-
-    Ok(())
-}
-
-#[cfg(not(feature = "search"))]
-pub async fn start_search_api(
-    _server: Arc<IntegratedKafkaServer>,
-    _bind: String,
-    _node_id: u64,
-    _data_dir: String,
-) -> Result<()> {
-    // No-op when search feature is disabled
-    Ok(())
-}
-
 /// Start Admin API HTTP server
 ///
 /// Starts the admin REST API for cluster management operations.

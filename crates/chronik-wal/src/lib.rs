@@ -3,7 +3,7 @@
 //! Provides durability guarantees with zero message loss through
 //! write-ahead logging, checkpointing, and fast recovery.
 
-#![cfg_attr(not(feature = "wal"), allow(dead_code))]
+#![allow(dead_code)]
 
 pub mod error;
 pub mod manager;

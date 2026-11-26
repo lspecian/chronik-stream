@@ -10,7 +10,6 @@ repository.workspace = true
 # Chronik crates
 chronik-common = { path = "../chronik-common" }
 chronik-monitoring = { path = "../chronik-monitoring" }
-chronik-raft-bridge = { path = "../chronik-raft-bridge" }
 
 # Raft consensus (Apache 2.0)
 raft = { workspace = true }

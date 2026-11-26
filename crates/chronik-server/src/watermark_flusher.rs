@@ -84,8 +84,6 @@ pub struct WatermarkFlusherMetrics {
 impl WatermarkFlusherMetrics {
     pub fn notes(&self) -> u64 { self.notes.load(Ordering::Relaxed) }
     pub fn flushes(&self) -> u64 { self.flushes.load(Ordering::Relaxed) }
-    pub fn flush_errors(&self) -> u64 { self.flush_errors.load(Ordering::Relaxed) }
-    pub fn pending_partitions(&self) -> u64 { self.pending_partitions.load(Ordering::Relaxed) }
 }
 
 /// Debounced metadata watermark flusher.

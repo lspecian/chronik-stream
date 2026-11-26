@@ -147,11 +147,6 @@ impl AclStore {
         self.enabled
     }
 
-    /// Whether an operation with no matching ACL is allowed.
-    pub fn allows_if_no_acl(&self) -> bool {
-        self.allow_if_no_acl
-    }
-
     /// Load bootstrap ACLs from `CHRONIK_ACL_BINDINGS`.
     ///
     /// ACLs have a bootstrapping problem: the store starts empty, so enabling

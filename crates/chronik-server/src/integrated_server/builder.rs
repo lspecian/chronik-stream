@@ -1344,29 +1344,6 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
-    /// Helper: Find maximum offset from WAL records (handles V1 and V2 formats)
-    fn find_max_offset_in_records(records: &[chronik_wal::record::WalRecord]) -> i64 {
-        use chronik_wal::record::WalRecord;
-        use chronik_storage::CanonicalRecord;
-
-        let mut max_offset: i64 = -1;
-
-        for record in records {
-            let offset = match record {
-                WalRecord::V1 { offset, .. } => *offset,
-                WalRecord::V2 { canonical_data, .. } => {
-                    bincode::deserialize::<CanonicalRecord>(canonical_data)
-                        .map(|c| c.last_offset())
-                        .unwrap_or(-1)
-                }
-            };
-            if offset > max_offset {
-                max_offset = offset;
-            }
-        }
-        max_offset
-    }
-
     /// Helper: Recover partitions from WAL records
     /// v2.4.1: Uses get_max_offset_for_partition instead of loading all records with usize::MAX.
     /// This reduces memory from ~1.5GB per partition to ~120MB (reads only last segment file,

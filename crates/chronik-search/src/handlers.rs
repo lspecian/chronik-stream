@@ -1708,8 +1708,8 @@ fn hits_of_docs(
             }
         }
 
-        // Generate document ID. Try both naming conventions: the cold
-        // TantivyIndexer uses `offset`, the realtime indexer uses `_offset`.
+        // Generate document ID. Try both naming conventions: plain-style
+        // indexes use `offset`, the realtime indexer used `_offset`.
         // v2.5.4: also fall back to `_id` for REST-created indexes. Stable
         // IDs are required for hot↔cold dedup in `search_index` to work.
         //
@@ -3031,7 +3031,7 @@ mod hot_merge_tests {
         assert!(resolve_field(&rt, "_value").is_ok(), "_value exact");
         assert!(resolve_field(&rt, "bogus").is_err(), "unknown field is Err");
 
-        // Plain-style schema (hot / WAL TantivyIndexer).
+        // Plain-style schema (the hot index).
         let hot = {
             let mut b = Schema::builder();
             b.add_text_field("value", TEXT | STORED);

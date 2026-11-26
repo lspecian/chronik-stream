@@ -421,22 +421,10 @@ impl ReplicaFetcher {
         self
     }
 
-    pub fn batches_applied(&self) -> u64 {
-        self.batches_applied.load(Ordering::Relaxed)
-    }
-
     /// Partitions rebuilt from the leader because their divergence could not be
     /// placed by the leader-epoch exchange.
     pub fn rebuilds(&self) -> u64 {
         self.rebuilds.load(Ordering::Relaxed)
-    }
-
-    pub fn fetch_errors(&self) -> u64 {
-        self.fetch_errors.load(Ordering::Relaxed)
-    }
-
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
     }
 
     /// Start the supervisor. It owns one fetch task per leader and rebuilds

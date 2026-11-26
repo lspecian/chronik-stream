@@ -188,10 +188,6 @@ impl PipelinedConnection {
         }
     }
 
-    /// Get the remote address of this connection
-    pub fn remote_addr(&self) -> &str {
-        &self.remote_addr
-    }
 }
 
 /// Send task: reads requests from queue and writes to TCP stream

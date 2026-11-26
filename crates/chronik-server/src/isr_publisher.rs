@@ -132,10 +132,6 @@ impl IsrPublisher {
         self.published.load(Ordering::Relaxed)
     }
 
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-
     pub fn start(self: &Arc<Self>) {
         let this = Arc::clone(self);
         tokio::spawn(async move { this.run().await });

@@ -1,27 +1,14 @@
-//! Chronik Raft - gRPC transport for Raft consensus
+//! Chronik Raft: the Raft group that replicates the cluster catalog.
 //!
-//! This crate provides production-ready gRPC transport for tikv/raft-rs,
-//! enabling distributed consensus for Chronik Stream.
-//!
-//! ## Architecture
-//!
-//! - **GrpcTransport**: Production gRPC-based message transport
-//! - **InMemoryTransport**: Testing transport without network overhead
-//! - **prost_bridge**: Compatibility bridge for prost 0.11 (raft) and 0.13 (tonic)
+//! - `driver`: the event-driven Raft driver (its own thread; proposals resolve
+//!   with the applied result)
+//! - `log_store`: the durable Raft log (segments, torn-tail cut)
+//! - `net`: the `CatalogRaft` gRPC service (message batches, forwarded
+//!   proposals)
 
-pub mod config;
-pub mod error;
-pub mod prost_bridge;
-pub mod rpc;
 pub mod driver;
 pub mod log_store;
 pub mod net;
-pub mod storage;
-pub mod transport;
 
-pub use config::RaftConfig;
-pub use error::{RaftError, Result};
 pub use driver::{Applied, BootstrapSnapshot, DriverConfig, Outbox, ProposeError, RaftDriver, RaftHandle, RaftStatus, StateMachine};
 pub use log_store::{LogStoreOptions, RaftLogStore};
-pub use storage::{RaftEntry, RaftLogStorage, MemoryLogStorage, RAFT_TOPIC, RAFT_PARTITION};
-pub use transport::{Transport, GrpcTransport, InMemoryTransport, InMemoryRouter};
