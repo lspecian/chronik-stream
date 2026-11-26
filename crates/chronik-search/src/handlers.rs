@@ -696,6 +696,7 @@ async fn search_wal_indices_for_topic(
     Ok(all_hits)
 }
 
+
 /// Per topic, the BM25 statistics of every index a scored search reads: its
 /// hot partitions and each archive it may match (crate::corpus_stats). Empty
 /// for a search that does not rank by relevance (`match_all`, no sort), or
@@ -704,10 +705,22 @@ async fn search_wal_indices_for_topic(
 /// The archives are those the cold search will consider: inside the query's
 /// record-time window and not ruled out by their term filter (an archive a
 /// filter rules out holds none of the required terms, so it would add only
-/// documents and tokens). Opening them is what the cold search does next
-/// anyway, from the same cache. Stops at `deadline`, with the statistics of
-/// what it opened: still one set of numbers for every index.
-type TopicStats = std::collections::HashMap<String, Arc<crate::corpus_stats::CorpusStats>>;
+/// documents and tokens). They are kept open for the cold search
+/// (`opened`): opened here and again there, a search across all topics of a
+/// node with more archives than the cache keeps open (1,558 against 256 on
+/// Thunderbird) unpacked most of them twice. Stops at `deadline`, with the
+/// statistics of what it opened: still one set of numbers for every index.
+#[derive(Default)]
+struct TopicStats {
+    topics: std::collections::HashMap<String, Arc<crate::corpus_stats::CorpusStats>>,
+    opened: std::collections::HashMap<String, Arc<chronik_storage::tantivy_segment::TantivySegmentReader>>,
+}
+
+impl TopicStats {
+    fn get(&self, topic: &str) -> Option<&Arc<crate::corpus_stats::CorpusStats>> {
+        self.topics.get(topic)
+    }
+}
 
 async fn search_stats(
     api: &SearchApi,
@@ -718,12 +731,13 @@ async fn search_stats(
 ) -> TopicStats {
     use futures::stream::{self, StreamExt};
 
+    let mut out = TopicStats::default();
     let mut by_topic: std::collections::HashMap<String, Vec<tantivy::Searcher>> = Default::default();
     // Statistics matter only to relevance scores: none for a search that
     // does not rank, or sorts by other keys only.
     let sorted_without_scores = crate::sort::SortSpec::of(request.sort.as_deref()).is_some_and(|s| !s.scores());
     if is_unranked(request) || request.size == 0 || sorted_without_scores {
-        return TopicStats::new();
+        return out;
     }
     if let Some(hot) = api.hot_text_index.as_ref() {
         for topic in hot_topics {
@@ -751,22 +765,26 @@ async fn search_stats(
                     }
                 }
                 let reader = cache.reader(store, &path).await.ok()?;
-                Some((topic, reader.searcher()))
+                Some((topic, path, reader))
             }
         }))
         .buffer_unordered(cold_search_concurrency());
         loop {
             match tokio::time::timeout_at(deadline, opened.next()).await {
-                Ok(Some(Some((topic, searcher)))) => by_topic.entry(topic).or_default().push(searcher),
+                Ok(Some(Some((topic, path, reader)))) => {
+                    by_topic.entry(topic).or_default().push(reader.searcher());
+                    out.opened.insert(path, reader);
+                }
                 Ok(Some(None)) => {}
                 Ok(None) | Err(_) => break,
             }
         }
     }
-    by_topic
+    out.topics = by_topic
         .into_iter()
         .map(|(topic, sources)| (topic, Arc::new(crate::corpus_stats::CorpusStats::new(sources))))
-        .collect()
+        .collect();
+    out
 }
 
 /// Search a topic's cold Tantivy segments via the WalIndexer's object store.
@@ -860,18 +878,26 @@ async fn search_cold_segments(
     let search_one = |seg: chronik_storage::segment_index::SegmentMetadata| {
         let (cache, store, request, requirement, floor) =
             (cache.clone(), store.clone(), request.clone(), requirement.clone(), floor.clone());
-        let stats = stats.get(&seg.topic).cloned();
+        let stats_of_topic = stats.get(&seg.topic).cloned();
+        // Opened (and past its term filter) for the statistics already.
+        let opened = stats.opened.get(&seg.object_store_path).cloned();
         async move {
-            if let Some(req) = requirement {
-                if let Some(filter) = cache.term_filter(store.as_ref(), &seg.object_store_path).await {
-                    if !req.may_match(&filter) {
-                        return Ok(None);
+            let stats = stats_of_topic;
+            let reader = match opened {
+                Some(reader) => reader,
+                None => {
+                    if let Some(req) = requirement {
+                        if let Some(filter) = cache.term_filter(store.as_ref(), &seg.object_store_path).await {
+                            if !req.may_match(&filter) {
+                                return Ok(None);
+                            }
+                        }
                     }
+                    cache.reader(store, &seg.object_store_path).await.map_err(|e| {
+                        Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
+                    })?
                 }
-            }
-            let reader = cache.reader(store, &seg.object_store_path).await.map_err(|e| {
-                Error::Internal(format!("could not open {}: {}", seg.object_store_path, e))
-            })?;
+            };
             tokio::task::spawn_blocking(move || {
                 let searcher = reader.searcher();
                 if two_phase {

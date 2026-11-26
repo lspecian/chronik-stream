@@ -729,6 +729,11 @@ impl HotPartitionIndex {
 /// Per-(topic, partition) in-memory Tantivy indexes for NRT search.
 pub struct HotTextIndex {
     partitions: DashMap<(String, i32), Arc<RwLock<HotPartitionIndex>>>,
+    /// Each topic's partitions in `partitions`. Finding a topic's partitions
+    /// walked every entry, and a search across all topics did that once per
+    /// topic: on 5,903 partitions of ~2,000 topics most of an all-topic
+    /// search went there.
+    by_topic: DashMap<String, std::collections::BTreeSet<i32>>,
     config: HotTextConfig,
     /// Live writers across all partitions of THIS index — the burst-cap input.
     live_writers: Arc<std::sync::atomic::AtomicUsize>,
@@ -756,6 +761,7 @@ impl HotTextIndex {
     pub fn new(config: HotTextConfig) -> Self {
         Self {
             partitions: DashMap::new(),
+            by_topic: DashMap::new(),
             config,
             live_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             burst_writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -765,6 +771,14 @@ impl HotTextIndex {
             queued: DashMap::new(),
             reserved: DashMap::new(),
         }
+    }
+
+    /// The (topic, partition) keys of `topic`'s partitions.
+    fn topic_keys(&self, topic: &str) -> Vec<(String, i32)> {
+        self.by_topic
+            .get(topic)
+            .map(|parts| parts.iter().map(|p| (topic.to_string(), *p)).collect())
+            .unwrap_or_default()
     }
 
     fn get_or_create(&self, topic: &str, partition: i32) -> Result<Arc<RwLock<HotPartitionIndex>>> {
@@ -778,9 +792,15 @@ impl HotTextIndex {
             Arc::clone(&self.live_writers),
             Arc::clone(&self.burst_writers),
         )?;
-        let arc = Arc::new(RwLock::new(part));
-        self.partitions
-            .insert((topic.to_string(), partition), arc.clone());
+        // One entry per partition even when two callers create it at once:
+        // a second insert replaced the first, and records added to it were
+        // lost.
+        let arc = self
+            .partitions
+            .entry((topic.to_string(), partition))
+            .or_insert_with(|| Arc::new(RwLock::new(part)))
+            .clone();
+        self.by_topic.entry(topic.to_string()).or_default().insert(partition);
         Ok(arc)
     }
 
@@ -844,6 +864,7 @@ impl HotTextIndex {
     /// watermarks included, so a topic recreated under the name starts clean.
     pub fn forget_topic(&self, topic: &str) {
         self.partitions.retain(|(t, _), _| t != topic);
+        self.by_topic.remove(topic);
         self.archived.retain(|(t, _), _| t != topic);
         self.held.retain(|(t, _), _| t != topic);
         self.queued.retain(|(t, _), _| t != topic);
@@ -1007,6 +1028,15 @@ impl HotTextIndex {
         if remove_entry {
             self.partitions.remove(&(topic.to_string(), partition));
             self.held.remove(&(topic.to_string(), partition));
+            // Checked under the topic's entry: a produce re-creating the
+            // partition meanwhile either is seen here, or adds it back to
+            // `by_topic` once this guard is released.
+            if let Some(mut parts) = self.by_topic.get_mut(topic) {
+                if !self.partitions.contains_key(&(topic.to_string(), partition)) {
+                    parts.remove(&partition);
+                }
+            }
+            self.by_topic.remove_if(topic, |_, parts| parts.is_empty());
         }
         Ok(())
     }
@@ -1046,7 +1076,8 @@ impl HotTextIndex {
     /// A searcher on each partition of `topic`, for the statistics of a
     /// search over the topic (crate::corpus_stats).
     pub async fn searchers(&self, topic: &str) -> Vec<tantivy::Searcher> {
-        let parts: Vec<_> = self.partitions.iter().filter(|e| e.key().0 == topic).map(|e| e.value().clone()).collect();
+        let parts: Vec<_> =
+            self.topic_keys(topic).iter().filter_map(|k| self.partitions.get(k).map(|e| e.value().clone())).collect();
         let mut out = Vec::with_capacity(parts.len());
         for part in parts {
             out.push(part.read().await.reader.searcher());
@@ -1101,12 +1132,7 @@ impl HotTextIndex {
         stats: Option<&CorpusStats>,
         sort: Option<&SortSpec>,
     ) -> Result<Vec<HotHit>> {
-        let keys: Vec<(String, i32)> = self
-            .partitions
-            .iter()
-            .filter(|e| e.key().0 == topic)
-            .map(|e| e.key().clone())
-            .collect();
+        let keys = self.topic_keys(topic);
 
         let mut all = Vec::new();
         for (t, p) in keys {
@@ -1144,7 +1170,7 @@ impl HotTextIndex {
         F: FnMut(i32, Option<i64>, &tantivy::Index, &tantivy::Searcher) -> Option<R> + Send,
     {
         let keys: Vec<(String, i32)> =
-            self.partitions.iter().filter(|e| e.key().0 == topic).map(|e| e.key().clone()).collect();
+            self.topic_keys(topic);
         let mut out = Vec::new();
         for (t, p) in keys {
             let Some(entry) = self.partitions.get(&(t.clone(), p)) else { continue };
@@ -1188,12 +1214,7 @@ impl HotTextIndex {
     where
         F: Fn(&tantivy::schema::Schema, &tantivy::Index) -> Result<Box<dyn tantivy::query::Query>>,
     {
-        let keys: Vec<(String, i32)> = self
-            .partitions
-            .iter()
-            .filter(|e| e.key().0 == topic)
-            .map(|e| e.key().clone())
-            .collect();
+        let keys = self.topic_keys(topic);
 
         let mut all = Vec::new();
         for (t, p) in keys {
