@@ -50,7 +50,7 @@ pub async fn create_integrated_server(
         .build()
         .await?;
 
-    info!("â IntegratedKafkaServer initialized successfully (builder pattern)");
+    info!("✓ IntegratedKafkaServer initialized successfully (builder pattern)");
     Ok(Arc::new(server))
 }
 

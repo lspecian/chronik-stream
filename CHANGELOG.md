@@ -3005,7 +3005,9 @@ Single-node, default config, after produce to an auto-created topic:
   - Linearizable follower reads via ReadIndex protocol
   - Clients always see their own writes immediately
   - Exponential backoff wait logic (1ms → 2ms → 5ms → 10ms)
-  - Configurable timeout (`CHRONIK_FETCH_FOLLOWER_MAX_WAIT_MS`)
+  - Configurable timeout (`CHRONIK_FETCH_FOLLOWER_MAX_WAIT_MS`; correction: it never
+    took effect, because the server never ran the code that read it, which
+    was removed after v2.20.4)
   - Graceful degradation on timeout/failure
 
 - **Complete disaster recovery** with metadata backup

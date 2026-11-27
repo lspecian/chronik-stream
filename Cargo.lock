@@ -86,7 +86,7 @@ checksum = "0258346f92c78dbc5b336b9a5b27c64447aa10643bc64e651db2edb145361564"
 dependencies = [
  "anstyle",
  "memchr",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1286,12 +1286,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
 
 [[package]]
-name = "bytecount"
-version = "0.6.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1397,7 +1391,6 @@ dependencies = [
  "clap",
  "csv",
  "hdrhistogram",
- "human_bytes",
  "indicatif",
  "lazy_static",
  "prometheus",
@@ -1406,11 +1399,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1502,11 +1493,9 @@ version = "2.20.4"
 dependencies = [
  "anyhow",
  "async-trait",
- "chronik-common",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
  "wiremock",
@@ -1584,7 +1573,6 @@ version = "2.20.4"
 dependencies = [
  "anyhow",
  "axum",
- "chronik-common",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -1658,7 +1646,6 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
- "rand 0.8.8",
  "rdkafka",
  "serde",
  "serde_json",
@@ -1703,16 +1690,11 @@ version = "2.20.4"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
  "bytes",
- "chronik-common",
  "chronik-embeddings",
- "chronik-storage",
  "chrono",
- "prometheus",
  "serde",
  "serde_json",
- "tantivy",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -1728,18 +1710,12 @@ dependencies = [
 name = "chronik-raft"
 version = "2.20.4"
 dependencies = [
- "anyhow",
  "async-trait",
- "bincode",
  "bytes",
- "chronik-common",
- "chronik-monitoring",
  "crc32fast",
  "criterion",
- "dashmap 5.5.3",
  "futures",
  "prost 0.14.6",
- "prost-types",
  "raft",
  "serde",
  "serde_json",
@@ -1780,7 +1756,6 @@ dependencies = [
  "bytes",
  "chronik-common",
  "chronik-monitoring",
- "chronik-protocol",
  "chronik-storage",
  "chrono",
  "criterion",
@@ -1833,13 +1808,11 @@ dependencies = [
  "clap",
  "crc32c",
  "crc32fast",
- "crossbeam",
  "dashmap 5.5.3",
  "datafusion",
  "futures",
  "hyper-util",
  "mimalloc",
- "murmur2",
  "openssl",
  "parking_lot 0.12.5",
  "prost 0.14.6",
@@ -1849,12 +1822,9 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "serde_yaml",
  "slog",
  "slog-stdlog",
- "socket2 0.5.10",
  "subtle",
- "tabled",
  "tantivy",
  "tempfile",
  "thiserror 1.0.69",
@@ -1888,7 +1858,6 @@ dependencies = [
  "chronik-columnar",
  "chronik-common",
  "chronik-embeddings",
- "chronik-protocol",
  "chronik-wal",
  "chrono",
  "crc32c",
@@ -1904,7 +1873,6 @@ dependencies = [
  "instant-distance",
  "libc",
  "lz4_flex 0.11.7",
- "md5",
  "memmap2",
  "opendal",
  "parking_lot 0.12.5",
@@ -1941,7 +1909,6 @@ dependencies = [
  "chrono",
  "crc32fast",
  "criterion",
- "crossbeam",
  "dashmap 5.5.3",
  "futures",
  "libc",
@@ -2049,7 +2016,7 @@ version = "4.5.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a0b5487afeab2deb2ff4e03a807ad1a03ac532ff5a2cee5d86884440c7f7671"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -2099,7 +2066,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b03b7db8e0b4b2fdad6c551e634134e99ec000e5c8c3b6856c65e8bbaded7a3b"
 dependencies = [
  "unicode-segmentation",
- "unicode-width 0.2.2",
+ "unicode-width",
 ]
 
 [[package]]
@@ -2132,7 +2099,7 @@ dependencies = [
  "encode_unicode",
  "libc",
  "once_cell",
- "unicode-width 0.2.2",
+ "unicode-width",
  "windows-sys 0.59.0",
 ]
 
@@ -2316,19 +2283,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-epoch",
- "crossbeam-queue",
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2352,15 +2306,6 @@ name = "crossbeam-epoch"
 version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-queue"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -4095,12 +4040,6 @@ dependencies = [
 
 [[package]]
 name = "heck"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
-
-[[package]]
-name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
@@ -4218,12 +4157,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "human_bytes"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91f255a4535024abf7640cb288260811fc14794f62b063652ed349f9a6c2348e"
 
 [[package]]
 name = "humantime"
@@ -4489,7 +4422,7 @@ dependencies = [
  "console",
  "number_prefix",
  "portable-atomic",
- "unicode-width 0.2.2",
+ "unicode-width",
  "web-time",
 ]
 
@@ -5140,12 +5073,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "md5"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
-
-[[package]]
 name = "measure_time"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5216,12 +5143,6 @@ name = "multimap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5ce46fe64a9d73be07dcbe690a38ce1b293be448fd8ce1e6c1b8062c9f72c6a"
-
-[[package]]
-name = "murmur2"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb585ade2549a017db2e35978b77c319214fa4b37cede841e27954dd6e8f3ca8"
 
 [[package]]
 name = "murmurhash32"
@@ -5813,17 +5734,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "papergrid"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ad43c07024ef767f9160710b3a6773976194758c7919b17e63b863db0bdf7fb"
-dependencies = [
- "bytecount",
- "fnv",
- "unicode-width 0.1.14",
-]
-
-[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6249,30 +6159,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proc-macro-error"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da25490ff9892aab3fcf7c36f08cfb902dd3e71ca0f9f9517bea02a73a5ce38c"
-dependencies = [
- "proc-macro-error-attr",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
- "version_check",
-]
-
-[[package]]
-name = "proc-macro-error-attr"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1be40180e52ecc98ad80b184934baf3d0d29f979574e439af5a55274b35f869"
-dependencies = [
- "proc-macro2",
- "quote",
- "version_check",
-]
-
-[[package]]
 name = "proc-macro-error-attr2"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6409,7 +6295,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6e4d69d0fa3e7f6f9cf6b53a0e83e4fc99ba3586f65ce166cff30bd13bb4ad2"
 dependencies = [
- "heck 0.5.0",
+ "heck",
  "itertools 0.15.0",
  "log",
  "multimap",
@@ -7829,16 +7715,6 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
@@ -7934,17 +7810,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
-version = "1.0.109"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
-name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
@@ -8004,30 +7869,6 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
-]
-
-[[package]]
-name = "tabled"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c998b0c8b921495196a48aabaf1901ff28be0760136e31604f7967b0792050e"
-dependencies = [
- "papergrid",
- "tabled_derive",
- "unicode-width 0.1.14",
-]
-
-[[package]]
-name = "tabled_derive"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c138f99377e5d653a371cdad263615634cfc8467685dfe8e73e2b8e98f44b17"
-dependencies = [
- "heck 0.4.1",
- "proc-macro-error",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -8833,12 +8674,6 @@ name = "unicode-segmentation"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
-
-[[package]]
-name = "unicode-width"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"

@@ -50,6 +50,8 @@ pub fn background_thread_count(env: Option<&str>, parallelism: usize) -> usize {
 /// priority, which is what it had before this existed.
 pub fn lower_current_thread_priority() {
     #[cfg(target_os = "linux")]
+    // SAFETY: gettid and setpriority take plain integers.
+    #[allow(unsafe_code)]
     unsafe {
         let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
         libc::setpriority(libc::PRIO_PROCESS, tid, BACKGROUND_NICE);
@@ -120,6 +122,8 @@ mod tests {
     #[test]
     fn lowering_priority_affects_only_the_calling_thread() {
         fn nice_of_current_thread() -> i32 {
+            // SAFETY: gettid and getpriority take plain integers.
+            #[allow(unsafe_code)]
             unsafe {
                 let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
                 libc::getpriority(libc::PRIO_PROCESS, tid)

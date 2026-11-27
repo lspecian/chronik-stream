@@ -517,6 +517,8 @@ impl TantivySegmentWriter {
                 const IOPRIO_CLASS_BE: i32 = 2; // Best-effort
                 const IOPRIO_LEVEL_LOW: i32 = 4; // Lower than WAL (which uses 0)
                 let ioprio = (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_LEVEL_LOW;
+                // SAFETY: ioprio_set takes plain integers and touches no memory of ours.
+                #[allow(unsafe_code)]
                 unsafe { syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, ioprio) };
             }
 

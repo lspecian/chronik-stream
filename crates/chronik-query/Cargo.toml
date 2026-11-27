@@ -6,8 +6,6 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-chronik-common = { path = "../chronik-common" }
-chronik-storage = { path = "../chronik-storage" }
 chronik-embeddings = { path = "../chronik-embeddings" }
 
 # Async runtime
@@ -18,7 +16,6 @@ tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 
 # API framework
-axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 
@@ -28,7 +25,6 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 
 # Search
-tantivy = { workspace = true }
 
 # Utils
 uuid = { workspace = true }
@@ -40,9 +36,10 @@ thiserror = { workspace = true }
 
 # Tracing & Metrics
 tracing = { workspace = true }
-prometheus = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tokio-test = "0.4"
 tempfile = { workspace = true }
+[lints]
+workspace = true
