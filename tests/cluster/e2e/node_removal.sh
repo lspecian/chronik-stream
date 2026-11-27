@@ -3,8 +3,10 @@
 #
 #   1. Three nodes; `cluster add-node 4` (CLI) and node 4 starts with
 #      CHRONIK_CLUSTER_JOIN=true, joining instead of founding a cluster.
-#   2. A topic created now is placed over four brokers, so node 4 holds
-#      replicas; 20,000 records are produced with acks=all.
+#   2. A topic whose replicas name node 4: it leads two partitions and follows
+#      in three. 20,000 records are produced with acks=all, and every one is
+#      counted by a distributed /_sql through node 1 — so node 4's followers
+#      replicate from it and the query router asks it for what it leads.
 #   3. `cluster remove-node 4` (CLI, graceful): replicas move off node 4 before
 #      the membership change. Afterwards every partition has three replicas,
 #      none on node 4, all in sync, and the cluster has three voters.
@@ -41,6 +43,11 @@ bad_partitions() {
     | select((.replicas | index(4)) or (.replicas | length) != 3 or (.isr | length) != 3)] | length' 2>/dev/null
 }
 on_node4() { status "$1" | jq -r --arg t $T '[.partitions[] | select(.topic == $t) | select(.replicas | index(4))] | length' 2>/dev/null; }
+sql_count() { # COUNT(*) of the topic through one node's distributed /_sql
+  curl -s -m 20 -X POST "http://localhost:$((6091 + $1))/_sql" -H 'Content-Type: application/json' \
+    -d "{\"query\": \"SELECT COUNT(*) AS n FROM $T\"}" | jq -r '.rows[0].n // empty' 2>/dev/null
+}
+led_by_node4() { status "$1" | jq -r --arg t $T '[.partitions[] | select(.topic == $t) | select(.leader == 4)] | length' 2>/dev/null; }
 end_offsets() { # sum of the topic's end offsets, through one broker
   "$K/kafka-get-offsets.sh" --bootstrap-server "localhost:$1" --topic $T --time -1 2>/dev/null \
     | awk -F: '{ s += $3 } END { print s+0 }'
@@ -76,14 +83,29 @@ wait_eq 60 "voters after add-node" 1,2,3,4 voters 1
 echo "  voters after add: $(voters 1)"
 
 # --- 2. data on four brokers ---------------------------------------------------
-"$K/kafka-topics.sh" --bootstrap-server localhost:9092 --create --topic $T --partitions $P \
-  --replication-factor 3 >/dev/null 2>&1 || fail "topic create failed"
-held=$(on_node4 1); echo "  partitions with a replica on node 4: ${held:-?} of $P"
-[ "${held:-0}" -gt 0 ] || fail "node 4 holds no replica, so its removal would test nothing"
-seq 1 $N | kcat -P -b localhost:9092,localhost:9093,localhost:9094 -t $T -X acks=all -X linger.ms=5 2>"$OUT/produce.err" \
-  || fail "produce failed: $(head -2 "$OUT/produce.err")"
+# Explicit replicas: placement alone gave node 4 leadership in some runs and
+# not others, and only a partition it leads exposed membership taken from the
+# founding config (its followers had no address for it).
+"$K/kafka-topics.sh" --bootstrap-server localhost:9092 --create --topic $T \
+  --replica-assignment 4:1:2,4:2:3,1:4:3,2:3:4,3:1:4,1:2:3,2:3:1,3:1:2 >/dev/null 2>&1 || fail "topic create failed"
+wait_eq 30 "partitions with a replica on node 4" 5 on_node4 1
+wait_eq 30 "partitions led by node 4" 2 led_by_node4 1
+echo "  partitions on node 4: $(on_node4 1) of $P, led by it: $(led_by_node4 1)"
+# Every partition gets its share: with null keys librdkafka's sticky
+# partitioner can put a whole burst on a few partitions, and a run that wrote
+# nothing to node 4's partitions tested nothing (a pre-fix binary passed so).
+for p in $(seq 0 $((P - 1))); do
+  seq $((p * N / P + 1)) $(((p + 1) * N / P)) \
+    | kcat -P -b localhost:9092,localhost:9093,localhost:9094 -t $T -p $p -X acks=all -X linger.ms=5 -X message.timeout.ms=60000 2>>"$OUT/produce.err" \
+    || fail "produce to partition $p failed: $(tail -2 "$OUT/produce.err")"
+done
 before=$(end_offsets 9092); echo "  records before removal: $before"
 [ "$before" = $N ] || fail "end offsets sum to $before, want $N"
+wait_eq 60 "distributed /_sql COUNT(*) through node 1 (node 4 leads 2 partitions)" $N sql_count 1
+echo "  /_sql COUNT(*) through node 1: $(sql_count 1)"
+# Leadership leaving node 4 would let the checks above pass without it serving
+# anything; as the preferred, in-sync leader it keeps both partitions.
+wait_eq 5 "partitions node 4 still leads after the produce" 2 led_by_node4 1
 
 # --- 3. graceful removal through the CLI ---------------------------------------
 out=$(CHRONIK_ADMIN_API_KEY=$KEY "$CHRONIK_BIN" cluster remove-node 4 --config "$DIR/node1.toml" 2>&1); rc=$?
