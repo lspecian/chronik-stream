@@ -980,6 +980,17 @@ impl ProduceHandler {
         0
     }
 
+    /// The log start DeleteRecords or retention stored for a partition, for a
+    /// partition state created at boot or by replication. Starting those at 0
+    /// made the deleted records readable again after a restart, and the
+    /// watermark sync then wrote the 0 back over the stored value.
+    async fn stored_log_start(&self, topic: &str, partition: i32) -> i64 {
+        match self.metadata_store.get_partition_offset(topic, partition as u32).await {
+            Ok(Some((_hw, log_start))) => log_start.max(0),
+            _ => 0,
+        }
+    }
+
     /// Execute a Kafka DeleteRecords for a single partition.
     ///
     /// `requested_offset` is the offset before which records should be deleted;
@@ -1024,6 +1035,12 @@ impl ProduceHandler {
 
         // 1) Advance in-memory low watermark (authoritative for fetch).
         state.log_start_offset.store(new_lso as u64, Ordering::SeqCst);
+
+        // The leader-epoch history below the new start describes records that
+        // no longer exist; without this it grew for the life of the partition.
+        if new_lso > current_lso {
+            self.leader_epochs.truncate_from_start(topic, partition, new_lso);
+        }
 
         // 2) Persist durably so the deletion survives restart. This is monotonic
         //    and independent of the high-watermark update path.
@@ -1175,7 +1192,7 @@ impl ProduceHandler {
             let state = PartitionState {
                 next_offset: AtomicU64::new(high_watermark as u64),
                 high_watermark: AtomicU64::new(high_watermark as u64),
-                log_start_offset: AtomicU64::new(0),
+                log_start_offset: AtomicU64::new(self.stored_log_start(topic, partition).await as u64),
                 current_writer: Arc::new(Mutex::new(segment_writer)),
                 segment_created: AtomicU64::new(0),
                 start_time: Instant::now(),
@@ -1263,7 +1280,7 @@ impl ProduceHandler {
         Ok(PartitionState {
             next_offset: AtomicU64::new(next_offset as u64),
             high_watermark: AtomicU64::new(next_offset as u64),
-            log_start_offset: AtomicU64::new(0),
+            log_start_offset: AtomicU64::new(self.stored_log_start(topic, partition).await as u64),
             current_writer: Arc::new(Mutex::new(writer)),
             segment_created: AtomicU64::new(0),
             start_time: Instant::now(),
@@ -6057,6 +6074,44 @@ pub(crate) mod tests {
             150,
             "the watermark caught up, but the log end must stay where the leader put it"
         );
+    }
+
+    /// A restart rebuilds partition state from WAL recovery (or a follower's
+    /// first replicated batch); both started the log start at 0, so the
+    /// deleted records were readable again and the watermark sync then stored
+    /// the 0 over the deletion.
+    #[tokio::test]
+    async fn the_log_start_survives_a_restart() {
+        let store = Arc::new(InMemoryMetadataStore::new());
+        let before = tempfile::tempdir().unwrap();
+        let handler = handler_with_pipeline(&before, store.clone()).await;
+        handler.update_high_watermark("t", 0, 100).await.unwrap();
+        handler.update_high_watermark("t", 1, 100).await.unwrap();
+        assert_eq!(handler.delete_records("t", 0, 60).await, Ok(60));
+        assert_eq!(handler.delete_records("t", 1, 70).await, Ok(70));
+
+        let after = tempfile::tempdir().unwrap();
+        let restarted = handler_with_pipeline(&after, store).await;
+        restarted.restore_partition_state("t", 0, 100).await.unwrap();
+        restarted.update_high_watermark("t", 1, 100).await.unwrap();
+        assert_eq!(restarted.get_log_start_offset("t", 0).await, 60, "restored by WAL recovery");
+        assert_eq!(restarted.get_log_start_offset("t", 1).await, 70, "created by replication");
+    }
+
+    /// Moving the log start trims the leader-epoch history below it.
+    #[tokio::test]
+    async fn delete_records_trims_the_epoch_history() {
+        let store = Arc::new(InMemoryMetadataStore::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let handler = handler_with_pipeline(&tmp, store).await;
+        handler.update_high_watermark("t", 0, 300).await.unwrap();
+        for (epoch, start) in [(0, 0), (1, 100), (2, 200)] {
+            handler.leader_epochs().observe_append("t", 0, epoch, start);
+        }
+        handler.delete_records("t", 0, 150).await.unwrap();
+        let history: Vec<_> =
+            handler.leader_epochs().snapshot("t", 0).iter().map(|e| (e.epoch, e.start_offset)).collect();
+        assert_eq!(history, vec![(1, 150), (2, 200)]);
     }
 }
 

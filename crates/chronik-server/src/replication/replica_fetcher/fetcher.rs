@@ -1312,6 +1312,29 @@ impl ReplicaFetcher {
         offset
     }
 
+    /// Move this replica's log start up to the leader's, as a Kafka follower
+    /// does from every fetch response. DeleteRecords runs on the leader only,
+    /// so before this a follower kept the deleted records and served them
+    /// again once it led. Never past this replica's own end: the records it
+    /// has yet to fetch arrive from the leader's start anyway.
+    async fn follow_log_start(&self, topic: &str, partition: i32, leader_start: i64) {
+        let Some(handler) = self.produce_handler.as_ref() else { return };
+        if leader_start <= 0 || leader_start <= handler.get_log_start_offset(topic, partition).await {
+            return;
+        }
+        let local_end = handler.get_high_watermark(topic, partition).await.unwrap_or(0);
+        let target = leader_start.min(local_end);
+        if target <= handler.get_log_start_offset(topic, partition).await {
+            return;
+        }
+        if let Err(code) = handler.delete_records(topic, partition, target).await {
+            warn!(
+                "{}-{}: could not follow the leader's log start {} (error {})",
+                topic, partition, leader_start, code
+            );
+        }
+    }
+
     async fn handle_partition_response(
         &self,
         topic: &str,
@@ -1324,6 +1347,8 @@ impl ReplicaFetcher {
                 .handle_partition_error(topic, index, partition.error_code)
                 .await;
         }
+
+        self.follow_log_start(topic, index, partition.log_start_offset).await;
 
         if partition.records.is_empty() {
             return PartitionOutcome::Fine; // caught up
