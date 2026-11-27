@@ -91,7 +91,9 @@ echo "$out" | grep -E '✓|✗|leader|rror' | sed 's/^/  remove-node: /' | head 
 [ $rc = 0 ] && echo "$out" | grep -q '✓' || fail "cluster remove-node 4 failed (rc=$rc)"
 wait_eq 90 "voters after remove-node" 1,2,3 voters 1
 for n in 1 2 3; do
-  wait_eq 60 "node $n: partitions still on node 4 or not fully in sync" 0 bad_partitions $n
+  wait_eq 60 "node $n: partitions still on node 4 or not fully in sync" 0 bad_partitions $n \
+    || status $n | jq -c --arg t $T '.partitions[] | select(.topic == $t)
+         | select((.replicas | index(4)) or (.replicas | length) != 3 or (.isr | length) != 3)' | sed 's/^/    /'
 done
 echo "  voters after removal: $(voters 1); partitions on node 4 or under-replicated: $(bad_partitions 1)"
 
