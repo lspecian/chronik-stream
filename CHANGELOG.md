@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.5] - 2026-11-27
+
 ### Fixed
 
 - **Deleted records came back.** DeleteRecords (and the log start in
@@ -64,6 +66,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partitions fail over as for any stopped node.
   Test: `tests/cluster/e2e/wal_write_failure.sh` (needs passwordless sudo
   for the tmpfs).
+- **A node added to a running cluster never caught up.** `cluster add-node`
+  followed by starting the node with `CHRONIK_CLUSTER_JOIN=true` left it a
+  voter with an empty log, forever: until `CHRONIK_CATALOG_SNAPSHOT_EVERY`
+  (10,000) catalog entries had been applied, the only stored snapshot was
+  the founding one, whose membership predates the new node, and Raft
+  refuses to restore it. The node answered nothing on its Kafka port, every
+  catalog write it made returned "outcome unknown", the catalog still placed
+  replicas on it, and with one of four voters unable to vote, losing any
+  other node stalled the catalog. A node outside a stored snapshot's
+  membership now gets a fresh one.
+- **An added node was a member only in Raft.** The replica fetcher, the
+  query router and assignment repair took membership from the founding
+  config file, which never lists an added node:
+  - partitions it led were never replicated, `acks=all` writes to them
+    timed out, and records acknowledged there existed only on it (removing
+    it left 15,000 of 20,000 records);
+  - `/_sql`, `/_search`, `/_vector` and `/_query` silently left out the
+    partitions it led;
+  - repaired partitions were never placed on it.
+
+  Membership is now the catalog's broker list everywhere. Up to 2.20.4, do
+  not add nodes to a cluster. Test: `tests/cluster/e2e/node_removal.sh`.
+- **Docker reported every container unhealthy.** The images' `HEALTHCHECK`
+  called `wget` / `nc`, which ubuntu:24.04 does not have; they now use
+  bash's `/dev/tcp`. Kubernetes ignores `HEALTHCHECK`, so clusters were
+  unaffected. `Dockerfile.operator` (from-source development image) builds
+  again.
+
+### Changed
+
+- **A failed WAL write or fsync stops the broker (exit code 74)**, for the
+  message and metadata WALs alike; see the full-disk entry above. Restart it
+  once the disk is fixed.
+
+### Removed
+
+- About 25,000 lines of code chronik-server never ran: unused modules and
+  functions, and items only tests used (#118–#120, #126, #129). No behaviour
+  change.
 
 ## [2.20.4] - 2026-11-26
 
