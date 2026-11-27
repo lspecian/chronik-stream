@@ -14,6 +14,7 @@
 //!
 //! This test validates the complete write→flush→fetch lifecycle through the WAL system.
 //! Tests message ordering, offset guarantees, and data consistency using embedded Kafka producers.
+use base64::Engine as _;
 use rdkafka::producer::Producer;
 
 use std::collections::HashMap;
@@ -371,7 +372,7 @@ impl TestMessage {
             "sequence_id": self.sequence_id,
             "timestamp": self.timestamp.to_rfc3339(),
             "content_hash": self.content_hash,
-            "payload": base64::encode(&self.payload),
+            "payload": base64::engine::general_purpose::STANDARD.encode(&self.payload),
         })).unwrap_or_default()
     }
     
@@ -391,7 +392,7 @@ impl TestMessage {
             .ok_or_else(|| anyhow::anyhow!("Missing content_hash"))?;
         
         let payload = json["payload"].as_str()
-            .and_then(|s| base64::decode(s).ok())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
             .ok_or_else(|| anyhow::anyhow!("Invalid payload"))?;
         
         Ok(Self {

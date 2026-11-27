@@ -39,9 +39,9 @@ fn test_single_batch_multiple_records() {
     assert_eq!(bytes_consumed, batch_bytes.len(), "Should consume all bytes");
 
     // Verify record contents
-    for i in 0..20 {
-        assert_eq!(decoded_batch.records[i].offset, i as i64);
-        assert_eq!(decoded_batch.records[i].value, format!("value-{}", i).as_bytes());
+    for (i, record) in decoded_batch.records.iter().enumerate() {
+        assert_eq!(record.offset, i as i64);
+        assert_eq!(record.value, format!("value-{}", i).as_bytes());
     }
 }
 
@@ -101,9 +101,9 @@ fn test_multiple_batches_concatenated() {
     assert_eq!(all_records.len(), 20, "Should have all 20 records");
 
     // Verify record contents
-    for i in 0..20 {
-        assert_eq!(all_records[i].offset, i as i64);
-        assert_eq!(all_records[i].value, format!("deck-data-{}", i).as_bytes());
+    for (i, record) in all_records.iter().enumerate() {
+        assert_eq!(record.offset, i as i64);
+        assert_eq!(record.value, format!("deck-data-{}", i).as_bytes());
     }
 }
 

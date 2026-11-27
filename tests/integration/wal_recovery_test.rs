@@ -6,6 +6,7 @@
 #[path = "common.rs"]
 mod common;
 
+use base64::Engine as _;
 use rdkafka::producer::Producer;
 
 use std::collections::HashSet;
@@ -34,7 +35,6 @@ const INITIAL_MESSAGE_COUNT: usize = 500;
 const RECOVERY_MESSAGE_COUNT: usize = 300;
 const MESSAGE_SIZE: usize = 150;
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const CRASH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Server process manager for crash testing
 struct TestServer {
@@ -245,6 +245,8 @@ impl Drop for TestServer {
     }
 }
 
+// Read only through Debug, for the test log.
+#[allow(dead_code)]
 #[derive(Debug)]
 struct WalInspectionResult {
     segment_files: usize,
@@ -529,7 +531,7 @@ impl TestMessage {
             "sequence_id": self.sequence_id,
             "timestamp": self.timestamp.to_rfc3339(),
             "content_hash": self.content_hash,
-            "payload": base64::encode(&self.payload),
+            "payload": base64::engine::general_purpose::STANDARD.encode(&self.payload),
         })).unwrap_or_default()
     }
     
@@ -549,7 +551,7 @@ impl TestMessage {
             .ok_or_else(|| anyhow!("Missing content_hash"))?;
         
         let payload = json["payload"].as_str()
-            .and_then(|s| base64::decode(s).ok())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
             .ok_or_else(|| anyhow!("Invalid payload"))?;
         
         Ok(Self {
