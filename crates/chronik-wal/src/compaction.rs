@@ -219,15 +219,12 @@ impl WalCompactor {
     /// Get partitions that need compaction
     async fn get_partitions_for_compaction(&self, wal_manager: Arc<RwLock<WalManager>>) -> Result<Vec<TopicPartition>> {
         let manager = wal_manager.read().await;
-        let mut candidates = Vec::new();
-
-        // Get all partitions from WAL manager
-        // Note: This would need to be implemented in WalManager
-        // For now, we'll implement a simple approach for metadata topic
-        candidates.push(TopicPartition {
+        // Only the metadata topic for now: WalManager does not list its
+        // partitions.
+        let candidates = vec![TopicPartition {
             topic: "__meta".to_string(),
             partition: 0,
-        });
+        }];
 
         // Filter based on compaction criteria
         let mut partitions_to_compact = Vec::new();
@@ -485,7 +482,7 @@ impl WalCompactor {
     async fn create_temp_compacted_segment(&self, partition: &TopicPartition, records: &[WalRecord]) -> Result<PathBuf> {
         let temp_dir = self.base_path.join("tmp");
         tokio::fs::create_dir_all(&temp_dir).await
-            .map_err(|e| WalError::Io(e))?;
+            .map_err(WalError::Io)?;
 
         let temp_file = temp_dir.join(format!("compact_{}_{}.wal", partition.topic, partition.partition));
 
@@ -500,13 +497,13 @@ impl WalCompactor {
         }
 
         tokio::fs::write(&temp_file, data).await
-            .map_err(|e| WalError::Io(e))?;
+            .map_err(WalError::Io)?;
 
         Ok(temp_file)
     }
 
     /// Replace partition data with compacted version
-    async fn replace_partition_data(&self, manager: &mut WalManager, partition: &TopicPartition, temp_path: &Path) -> Result<()> {
+    async fn replace_partition_data(&self, _manager: &mut WalManager, _partition: &TopicPartition, temp_path: &Path) -> Result<()> {
         // This is a placeholder - in a real implementation, you'd need to:
         // 1. Stop writes to the partition
         // 2. Replace the segment files atomically

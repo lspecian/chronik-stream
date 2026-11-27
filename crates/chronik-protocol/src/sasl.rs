@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use bytes::{Bytes, BytesMut, BufMut};
 use subtle::ConstantTimeEq;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 
 use crate::scram::{self, ScramCredential, ScramExchange};
 
@@ -155,6 +155,13 @@ const ENABLED_MECHANISMS: &[SaslMechanism] = &[
     SaslMechanism::ScramSha256,
     SaslMechanism::Plain,
 ];
+
+impl Default for SaslAuthenticator {
+    /// Same as [`SaslAuthenticator::new`]: users from `CHRONIK_SASL_USERS`.
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SaslAuthenticator {
     /// Create a new SASL authenticator, taking users from the environment.
@@ -481,8 +488,8 @@ pub fn encode_sasl_handshake_response(response: &SaslHandshakeResponse) -> Bytes
 /// carrying no lifetime was eight bytes short: librdkafka rejected it with
 /// `Protocol read buffer underflow for SaslAuthenticate v1 ... expected 8 bytes
 /// > 0 remaining bytes`. That is exactly the intermediate step of a SCRAM
-/// exchange, which has no session lifetime to report yet — so SCRAM could not
-/// complete against any real client.
+/// > exchange, which has no session lifetime to report yet — so SCRAM could not
+/// > complete against any real client.
 ///
 /// v2+ is flexible (compact strings/bytes plus tagged fields).
 pub fn encode_sasl_authenticate_response(
@@ -614,7 +621,7 @@ mod tests {
         assert_eq!(response.error_code, 0);
 
         // Authenticate with valid credentials
-        let auth_bytes = format!("\0admin\0admin123").into_bytes();
+        let auth_bytes = "\0admin\0admin123".to_string().into_bytes();
         let response = auth.handle_authenticate(&auth_bytes).unwrap();
         assert_eq!(response.error_code, 0);
         assert!(auth.is_authenticated());
@@ -629,7 +636,7 @@ mod tests {
         auth.handle_handshake(1, &["PLAIN".to_string()]).unwrap();
 
         // Authenticate with invalid credentials
-        let auth_bytes = format!("\0admin\0wrong").into_bytes();
+        let auth_bytes = "\0admin\0wrong".to_string().into_bytes();
         let result = auth.handle_authenticate(&auth_bytes);
         assert!(result.is_err());
         assert!(!auth.is_authenticated());
@@ -726,7 +733,7 @@ mod tests {
         auth.handle_handshake(1, &["PLAIN".to_string()]).unwrap();
 
         // Authenticate with custom user
-        let auth_bytes = format!("\0myuser\0mypass").into_bytes();
+        let auth_bytes = "\0myuser\0mypass".to_string().into_bytes();
         let response = auth.handle_authenticate(&auth_bytes).unwrap();
         assert_eq!(response.error_code, 0);
         assert!(auth.is_authenticated());
@@ -741,7 +748,7 @@ mod tests {
         auth.handle_handshake(1, &["PLAIN".to_string()]).unwrap();
 
         // But authentication should fail (no users configured)
-        let auth_bytes = format!("\0admin\0admin123").into_bytes();
+        let auth_bytes = "\0admin\0admin123".to_string().into_bytes();
         let result = auth.handle_authenticate(&auth_bytes);
         assert!(result.is_err());
         assert!(!auth.is_authenticated());

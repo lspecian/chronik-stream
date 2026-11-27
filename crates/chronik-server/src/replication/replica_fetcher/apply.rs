@@ -527,7 +527,7 @@ pub(crate) mod tests {
         b.extend_from_slice(&(-1i16).to_be_bytes()); // producer_epoch
         b.extend_from_slice(&(-1i32).to_be_bytes()); // base_sequence
         b.extend_from_slice(&record_count.to_be_bytes());
-        b.extend(std::iter::repeat(0u8).take(body_padding));
+        b.extend(std::iter::repeat_n(0u8, body_padding));
         assert_eq!(b.len(), MIN_BATCH_HEADER + body_padding);
         b
     }

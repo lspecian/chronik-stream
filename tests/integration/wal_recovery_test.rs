@@ -6,13 +6,13 @@
 #[path = "common.rs"]
 mod common;
 
+use base64::Engine as _;
 use rdkafka::producer::Producer;
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{Result, Context, anyhow};
 use chrono::Utc;
@@ -35,7 +35,6 @@ const INITIAL_MESSAGE_COUNT: usize = 500;
 const RECOVERY_MESSAGE_COUNT: usize = 300;
 const MESSAGE_SIZE: usize = 150;
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const CRASH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Server process manager for crash testing
 struct TestServer {
@@ -246,6 +245,8 @@ impl Drop for TestServer {
     }
 }
 
+// Read only through Debug, for the test log.
+#[allow(dead_code)]
 #[derive(Debug)]
 struct WalInspectionResult {
     segment_files: usize,
@@ -325,7 +326,7 @@ async fn run_crash_recovery_test(server: &mut TestServer) -> Result<RecoveryTest
     
     // Phase 4: Simulate ungraceful shutdown
     info!("Phase 4: Simulating ungraceful server crash");
-    let crash_start = Instant::now();
+    let _crash_start = Instant::now();
     server.crash().context("Failed to crash server")?;
     
     // Wait a moment to ensure crash is complete
@@ -367,7 +368,7 @@ async fn run_crash_recovery_test(server: &mut TestServer) -> Result<RecoveryTest
 /// Write test messages to the server
 async fn write_test_messages(port: u16, count: usize, id_offset: usize) -> Result<Vec<TestMessage>> {
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", &format!("localhost:{}", port))
+        .set("bootstrap.servers", format!("localhost:{}", port))
         .set("message.timeout.ms", "10000")
         .set("queue.buffering.max.messages", "100000")
         .set("batch.num.messages", "1000")
@@ -423,7 +424,7 @@ async fn write_test_messages(port: u16, count: usize, id_offset: usize) -> Resul
 /// Read and validate messages match expected set
 async fn read_and_validate_messages(port: u16, expected: &[TestMessage]) -> Result<Vec<TestMessage>> {
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &format!("localhost:{}", port))
+        .set("bootstrap.servers", format!("localhost:{}", port))
         .set("group.id", "wal-recovery-validator")
         .set("auto.offset.reset", "earliest")
         .set("enable.auto.commit", "false")
@@ -530,7 +531,7 @@ impl TestMessage {
             "sequence_id": self.sequence_id,
             "timestamp": self.timestamp.to_rfc3339(),
             "content_hash": self.content_hash,
-            "payload": base64::encode(&self.payload),
+            "payload": base64::engine::general_purpose::STANDARD.encode(&self.payload),
         })).unwrap_or_default()
     }
     
@@ -550,7 +551,7 @@ impl TestMessage {
             .ok_or_else(|| anyhow!("Missing content_hash"))?;
         
         let payload = json["payload"].as_str()
-            .and_then(|s| base64::decode(s).ok())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
             .ok_or_else(|| anyhow!("Invalid payload"))?;
         
         Ok(Self {

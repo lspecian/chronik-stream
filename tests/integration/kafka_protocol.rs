@@ -13,7 +13,6 @@ use rdkafka::{
     admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
     consumer::{Consumer, StreamConsumer},
     producer::{FutureProducer, FutureRecord},
-    metadata::Metadata,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -300,7 +299,7 @@ async fn test_kafka_consumer_groups() -> Result<()> {
             match timeout(Duration::from_millis(100), consumer.recv()).await {
                 Ok(Ok(message)) => {
                     let partition = message.partition();
-                    assert!(partition >= 0 && partition < 4);
+                    assert!((0..4).contains(&partition));
                     consumer_counts[i] += 1;
                     total_consumed += 1;
                 }

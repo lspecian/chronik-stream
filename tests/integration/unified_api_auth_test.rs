@@ -318,7 +318,7 @@ fn sql_env() -> Vec<(&'static str, &'static str)> {
 async fn seed_topics(cluster: &TestCluster) -> Result<()> {
     use rdkafka::producer::{FutureProducer, FutureRecord};
     let producer: FutureProducer = rdkafka::config::ClientConfig::new()
-        .set("bootstrap.servers", &cluster.bootstrap_servers())
+        .set("bootstrap.servers", cluster.bootstrap_servers())
         .set("message.timeout.ms", "8000")
         .create()?;
     for topic in ["sqlallowed", "sqldenied"] {

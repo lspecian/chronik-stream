@@ -8,9 +8,7 @@ use chronik_wal::WalManager;
 use chronik_common::Result;
 use chronik_protocol::{ProduceRequest, ProduceResponse};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{info, instrument};
-use bytes::{Bytes, BytesMut, BufMut};
+use tracing::{error, info, instrument};
 
 /// WAL-integrated produce handler wrapper
 /// v1.3.47+: Uses Arc<WalManager> directly for lock-free concurrent access
@@ -82,8 +80,10 @@ impl WalProduceHandler {
         // Shutdown the WAL manager (flushes pending commits and seals active segments)
         self.wal_manager.shutdown().await;
 
-        // Also shutdown the inner ProduceHandler
-        self.inner_handler.shutdown().await;
+        // Also shutdown the inner ProduceHandler (flushes buffered partitions)
+        if let Err(e) = self.inner_handler.shutdown().await {
+            error!("ProduceHandler shutdown failed: {}", e);
+        }
 
         info!("WAL produce handler shutdown complete");
     }
@@ -100,7 +100,7 @@ impl WalProduceHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[tokio::test]
     async fn test_wal_integration() {

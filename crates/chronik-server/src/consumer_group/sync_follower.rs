@@ -29,7 +29,7 @@ impl FollowerSync {
     ///
     /// Complexity: < 25 (spawns background task with assignment computation)
     pub fn spawn_fallback_task(
-        group: &ConsumerGroup,
+        _group: &ConsumerGroup,
         groups_clone: Arc<RwLock<std::collections::HashMap<String, ConsumerGroup>>>,
         metadata_store_clone: Arc<dyn chronik_common::metadata::MetadataStore>,
         assignor_clone: Arc<tokio::sync::Mutex<Box<dyn super::PartitionAssignor>>>,
@@ -134,14 +134,10 @@ impl FollowerSync {
         for (mid, assignment) in &computed_assignments {
             if let Some(tx) = pending_sync.remove(mid) {
                 let member_assignment = encode_assignment(assignment);
-                let member_epoch = group.members.get(mid)
-                    .map(|m| m.member_epoch)
-                    .unwrap_or(0);
 
                 let response = SyncGroupResponse {
                     error_code: 0,
                     assignment: member_assignment,
-                    member_epoch,
                 };
 
                 let _ = tx.send(response);

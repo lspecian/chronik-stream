@@ -339,7 +339,7 @@ impl RecordBatch {
         let stored_crc = data.get_u32_le();
 
         // Save position after CRC to calculate CRC over remaining data
-        let crc_verify_start = data.remaining();
+        let _crc_verify_start = data.remaining();
 
         let attributes = RecordAttributes::from_byte(data.get_i16() as i8);
         let last_offset_delta = data.get_i32();

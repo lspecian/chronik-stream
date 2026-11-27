@@ -5,7 +5,6 @@
 //! came from Tantivy (text), HNSW (vector), DataFusion (SQL), or WAL (fetch).
 
 use crate::types::{QueryMode, RankedResult};
-use serde::Serialize;
 use std::collections::HashMap;
 
 /// A normalized query result from any backend.

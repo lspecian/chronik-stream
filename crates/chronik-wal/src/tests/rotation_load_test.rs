@@ -191,11 +191,12 @@ async fn collect_segment_info(data_dir: &std::path::Path, topic: &str, partition
     }
     
     let mut segments = Vec::new();
+    let segment_name = regex::Regex::new(r"wal_(\d+)_(\d+)").unwrap();
     let mut dir_entries = tokio::fs::read_dir(&partition_dir).await?;
     
     while let Some(entry) = dir_entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "log") {
+        if path.extension().is_some_and(|ext| ext == "log") {
             if let Some(file_name) = path.file_stem().and_then(|n| n.to_str()) {
                 // Filename format is wal_{partition}_{segment_id}.log — see
                 // GroupCommitWal::segment_path in group_commit.rs. Capture group 1
@@ -204,9 +205,7 @@ async fn collect_segment_info(data_dir: &std::path::Path, topic: &str, partition
                 // makes the sort below a no-op and leaves the caller looking at
                 // raw readdir order — the callers' "skip the first and last
                 // segment" logic then skips arbitrary entries.
-                if let Some(caps) = regex::Regex::new(r"wal_(\d+)_(\d+)")
-                    .unwrap()
-                    .captures(file_name) {
+                if let Some(caps) = segment_name.captures(file_name) {
                     let _partition: u64 = caps[1].parse().unwrap_or(0);
                     let id: u64 = caps[2].parse().unwrap_or(0);
 
@@ -221,7 +220,7 @@ async fn collect_segment_info(data_dir: &std::path::Path, topic: &str, partition
     }
     
     // Sort by segment ID
-    segments.sort_by(|a, b| a.0.cmp(&b.0));
+    segments.sort_by_key(|a| a.0);
     Ok(segments)
 }
 
@@ -233,7 +232,7 @@ async fn test_rotation_load_single_partition() {
     
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, SEGMENT_SIZE_KB);
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     let mut metrics = PerformanceMetrics::new();
     metrics.start_timer();
@@ -365,7 +364,7 @@ async fn test_rotation_load_multiple_partitions() {
                 }
                 
                 {
-                    let mut mgr = manager_clone.lock().await;
+                    let mgr = manager_clone.lock().await;
                     mgr.append("multi-test-topic".to_string(), partition, batch_records).await
                         .expect("Batch append should succeed");
                 }
@@ -456,7 +455,7 @@ async fn test_rotation_under_memory_pressure() {
     
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, SEGMENT_SIZE_KB);
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     let mut metrics = PerformanceMetrics::new();
     metrics.start_timer();
@@ -565,16 +564,15 @@ async fn test_rotation_data_integrity() {
     
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, SEGMENT_SIZE_KB);
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     println!("Starting data integrity test with checksums and verification...");
     
     // Track all written records for later verification
     let mut written_records = Vec::with_capacity(MESSAGE_COUNT as usize);
-    let mut current_offset = 0i64;
-    
     // Write messages with predictable content
     for i in 0..MESSAGE_COUNT {
+        let current_offset = i as i64;
         let key = format!("integrity-key-{:08}", i);
         let value = format!("INTEGRITY_TEST_VALUE_{:08}_{}", i, "A".repeat(MESSAGE_SIZE - 50));
         
@@ -592,8 +590,6 @@ async fn test_rotation_data_integrity() {
         
         manager.append("integrity-test-topic".to_string(), 0, vec![record]).await
             .expect("Append should succeed");
-        
-        current_offset += 1;
         
         if i % 1000 == 0 {
             println!("Written {} messages", i);
@@ -636,7 +632,7 @@ async fn test_rotation_performance_benchmarks() {
     
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, SEGMENT_SIZE_KB);
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     println!("Starting performance benchmark test...");
     
@@ -726,7 +722,7 @@ async fn test_rotation_performance_benchmarks() {
 async fn test_rotation_edge_cases() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, 128); // Very small 128KB segments
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     println!("Testing rotation edge cases...");
     

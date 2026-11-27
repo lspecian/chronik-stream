@@ -246,6 +246,7 @@ where
 }
 
 #[cfg(feature = "search")]
+#[allow(clippy::result_large_err)] // axum error response, built once per failed request
 async fn local_search_response_of<F>(
     local: F,
 ) -> Result<chronik_search::api::SearchResponse, axum::response::Response>
@@ -333,11 +334,3 @@ async fn search_index_fanout(
     search_everywhere(state, format!("/{}/_search", index), request, local, "index _search").await
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_module_compiles() {
-        // Basic compile test
-        assert!(true);
-    }
-}

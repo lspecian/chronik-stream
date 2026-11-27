@@ -1,27 +1,27 @@
-/// Async pipelined connection for leader forwarding
-///
-/// This module implements Kafka-style async request pipelining, allowing
-/// multiple requests to be in-flight simultaneously on a single TCP connection.
-/// Responses are matched back to requests via correlation IDs.
-///
-/// Key differences from synchronous forwarding:
-/// - Synchronous: Send → WAIT → Receive (1 request at a time, 50ms each = 20 req/s)
-/// - Pipelined: Send, Send, Send... | Receive, Receive, Receive... (100+ req/s)
-///
-/// Architecture:
-/// ```
-/// Client Call                Send Task              Receive Task
-///     │                          │                       │
-///     ├─ send_request() ────────→│                       │
-///     │                          ├─ write_all() ────────→│
-///     │                          │                       │
-///     ├─ send_request() ────────→│                       │
-///     │                          ├─ write_all() ────────→│
-///     │                          │                       │
-///     │                          │                   ┌───┴─ read_response()
-///     │                          │                   │
-///     │← response ───────────────┴───────────────────┘
-/// ```
+//! Async pipelined connection for leader forwarding
+//!
+//! This module implements Kafka-style async request pipelining, allowing
+//! multiple requests to be in-flight simultaneously on a single TCP connection.
+//! Responses are matched back to requests via correlation IDs.
+//!
+//! Key differences from synchronous forwarding:
+//! - Synchronous: Send → WAIT → Receive (1 request at a time, 50ms each = 20 req/s)
+//! - Pipelined: Send, Send, Send... | Receive, Receive, Receive... (100+ req/s)
+//!
+//! Architecture:
+//! ```
+//! Client Call                Send Task              Receive Task
+//!     │                          │                       │
+//!     ├─ send_request() ────────→│                       │
+//!     │                          ├─ write_all() ────────→│
+//!     │                          │                       │
+//!     ├─ send_request() ────────→│                       │
+//!     │                          ├─ write_all() ────────→│
+//!     │                          │                       │
+//!     │                          │                   ┌───┴─ read_response()
+//!     │                          │                   │
+//!     │← response ───────────────┴───────────────────┘
+//! ```
 
 use crate::replication::replica_fetcher::connection::LeaderStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -259,7 +259,7 @@ async fn receive_task(
 
             // Notify all pending requests of failure
             let mut pending = pending_responses.lock().await;
-            for (correlation_id, tx) in pending.drain() {
+            for (_correlation_id, tx) in pending.drain() {
                 let _ = tx.send(Err(Error::Internal("Connection closed".into())));
             }
 

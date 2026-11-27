@@ -191,6 +191,7 @@ impl SaslConfig {
 
     /// A configuration with authentication disabled — the default, and what
     /// tests and internal callers use when they are not exercising auth.
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
             mode: SaslMode::Disabled,
@@ -201,6 +202,7 @@ impl SaslConfig {
     }
 
     /// Build a configuration requiring authentication (for tests).
+    #[cfg(test)]
     pub fn enabled_with_users(users: Vec<(String, String)>) -> Self {
         Self {
             mode: SaslMode::Required,
@@ -211,6 +213,7 @@ impl SaslConfig {
     }
 
     /// Build a configuration offering but not requiring authentication.
+    #[cfg(test)]
     pub fn optional_with_users(users: Vec<(String, String)>) -> Self {
         Self {
             mode: SaslMode::Optional,
@@ -220,23 +223,9 @@ impl SaslConfig {
         }
     }
 
+    #[cfg(test)]
     pub fn mode(&self) -> SaslMode {
         self.mode
-    }
-
-    /// Install the broker user from an explicit secret (tests; production reads
-    /// the environment in `from_env`).
-    #[cfg(test)]
-    pub fn with_inter_broker_secret(mut self, secret: &str) -> Self {
-        self.inter_broker = Some(SaslUser::from_scram_credential(
-            chronik_protocol::scram::ScramCredential::derive(
-                secret,
-                chronik_protocol::sasl::SaslMechanism::ScramSha512,
-                chronik_protocol::scram::DEFAULT_ITERATIONS,
-            )
-            .unwrap(),
-        ));
-        self
     }
 
     /// Whether authentication is offered at all (required or optional).
@@ -434,6 +423,7 @@ impl ConnectionContext {
 
     /// A context for internal callers and tests that do not authenticate
     /// (in-process request handling, unit tests).
+    #[cfg(test)]
     pub fn internal() -> Self {
         Self::new(
             SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -483,10 +473,12 @@ impl ConnectionContext {
         Arc::new(self.produce_order.issue(partitions))
     }
 
+    #[cfg(test)]
     pub async fn auth_state(&self) -> AuthState {
         self.inner.lock().await.auth.clone()
     }
 
+    #[cfg(test)]
     pub async fn is_authenticated(&self) -> bool {
         self.inner.lock().await.auth.is_authenticated()
     }

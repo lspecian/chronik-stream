@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
-use chronik_monitoring::{init_monitoring, TracingConfig};
+use chronik_monitoring::init_monitoring;
 
 // mimalloc instead of the system allocator: search requests allocate many
 // short-lived buffers (column reads, aggregation buckets, JSON), and glibc
@@ -84,9 +84,8 @@ use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, Integrate
 use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy};
 use chronik_wal::config::{WalConfig, CompressionType};
 use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials, EncryptionConfig, EncryptionType};
-use chronik_config::{ClusterConfig, NodeConfig};
+use chronik_config::ClusterConfig;
 use chronik_columnar::ColumnarQueryEngine;
-use serde_json;
 
 /// Default Kafka listen port, used when neither `--kafka-port` nor a cluster
 /// config file says otherwise.
@@ -573,7 +572,7 @@ fn parse_advertise_addr(advertise: Option<&str>, bind: &str, default_port: u16) 
 ///
 /// Returns None with a log message if provider cannot be created (e.g., missing API key).
 fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::EmbeddingProvider>> {
-    use chronik_embeddings::{VectorSearchConfig, EmbeddingModelConfig};
+    use chronik_embeddings::EmbeddingModelConfig;
     use chronik_embeddings::config::EmbeddingProvider as ProviderType;
 
     // Check if embedding is explicitly disabled
@@ -611,7 +610,7 @@ fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::Embeddi
     let endpoint = std::env::var("CHRONIK_EMBEDDING_ENDPOINT").ok();
 
     let model_config = EmbeddingModelConfig {
-        provider: provider_enum.clone(),
+        provider: provider_enum,
         model,
         dimensions,
         endpoint,
@@ -1457,10 +1456,12 @@ async fn run_cluster_mode(
     let columnar_query_engine = Arc::new(ColumnarQueryEngine::new());
     info!("✓ Columnar Query Engine initialized for SQL queries");
 
-    let mut unified_api_config = unified_api::UnifiedApiConfig::default();
-    // Use node-specific port to avoid conflicts in cluster mode (6091 + node_id)
-    unified_api_config.port = 6091 + init_config.node_id as u16;
-    unified_api_config.bind_addr = bind.clone();
+    let unified_api_config = unified_api::UnifiedApiConfig {
+        // Node-specific port to avoid conflicts in cluster mode (6091 + node_id)
+        port: 6091 + init_config.node_id as u16,
+        bind_addr: bind.clone(),
+        ..Default::default()
+    };
     // v2.2.23: Create hot buffer for sub-second SQL queries on recent data
     let hot_buffer = if std::env::var("CHRONIK_HOT_BUFFER_ENABLED")
         .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -1516,7 +1517,7 @@ async fn run_cluster_mode(
     // HP-2.6/2.8: Build the micro-batcher once we have an embedder, populate
     // the shared slot, wire the hot vector index into WalIndexer for
     // eviction, and expose it to the unified API for query-time merge.
-    if let (Some(ref provider), Some(hot_vec_idx), Some(slot)) = (
+    if let (Some(provider), Some(hot_vec_idx), Some(slot)) = (
         embedder.as_ref(),
         server.get_hot_vector_index(),
         server.get_hot_vector_batcher_slot(),
@@ -1682,7 +1683,6 @@ async fn run_single_node_mode(
         auto_create_topics: true,
         num_partitions: 3,  // Default to 3 partitions for better parallelism (configurable via --num-partitions)
         replication_factor: 1,
-        enable_wal_indexing: true,
         wal_indexing_interval_secs: 30,
         object_store_config,
         enable_metadata_dr: true,
@@ -1747,9 +1747,11 @@ async fn run_single_node_mode(
     {
         let wal_indexer = server.get_wal_indexer();
         let vector_index_manager = wal_indexer.vector_index_manager().clone();
-        let mut unified_config = unified_api::UnifiedApiConfig::default();
-        unified_config.port = 6092;
-        unified_config.bind_addr = bind.clone();
+        let unified_config = unified_api::UnifiedApiConfig {
+            port: 6092,
+            bind_addr: bind.clone(),
+            ..Default::default()
+        };
 
         // v2.2.23: Create ColumnarQueryEngine for SQL queries in single-node mode
         let columnar_query_engine = Arc::new(ColumnarQueryEngine::new());
@@ -1816,7 +1818,7 @@ async fn run_single_node_mode(
             wal_indexer.set_cold_flush_listener(adapter).await;
         }
         // HP-2.x: Hot vector batcher + cold-flush adapter + unified state wiring.
-        if let (Some(ref provider), Some(hot_vec_idx), Some(slot)) = (
+        if let (Some(provider), Some(hot_vec_idx), Some(slot)) = (
             embedder.as_ref(),
             server.get_hot_vector_index(),
             server.get_hot_vector_batcher_slot(),
@@ -2370,7 +2372,7 @@ async fn handle_compaction_command(cli: &Cli, action: CompactAction) -> Result<(
     use chronik_wal::manager::WalManager;
 
     match action {
-        CompactAction::Now { partition, strategy, dry_run } => {
+        CompactAction::Now { partition: _, strategy, dry_run } => {
             info!("Running manual WAL compaction");
 
             // Parse strategy
@@ -2401,8 +2403,10 @@ async fn handle_compaction_command(cli: &Cli, action: CompactAction) -> Result<(
             };
 
             // Create compaction config
-            let mut compact_config = CompactionConfig::default();
-            compact_config.strategy = compact_strategy;
+            let compact_config = CompactionConfig {
+                strategy: compact_strategy,
+                ..Default::default()
+            };
 
             // Create compactor
             let compactor = WalCompactor::new(wal_config.clone(), compact_config);

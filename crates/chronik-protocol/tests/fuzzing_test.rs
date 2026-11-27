@@ -71,7 +71,7 @@ proptest! {
                 }
             }
             Ok(())
-        });
+        })?;
     }
 
     /// Test string encoding edge cases
@@ -121,22 +121,14 @@ proptest! {
             
             match handler.handle_request(&request).await {
                 Ok(response) => {
-                    // Check header
+                    // The correlation id travels in the header; the frame
+                    // writer puts it on the wire ahead of the body.
                     prop_assert_eq!(response.header.correlation_id, correlation_id);
-                    
-                    // Check body
-                    let body_id = i32::from_be_bytes([
-                        response.body[0],
-                        response.body[1],
-                        response.body[2],
-                        response.body[3],
-                    ]);
-                    prop_assert_eq!(body_id, correlation_id);
                 }
                 Err(_) => prop_assert!(false, "ApiVersions request should succeed"),
             }
             Ok(())
-        });
+        })?;
     }
 
     /// Test varint encoding with random values
@@ -171,7 +163,7 @@ proptest! {
             encoder.write_i32(len);
 
             // For non-negative lengths, write that many dummy items
-            if len >= 0 && len < 100 {
+            if (0..100).contains(&len) {
                 // Limit to reasonable size
                 for _ in 0..len {
                     encoder.write_i16(0); // Dummy item
@@ -232,7 +224,7 @@ proptest! {
             // Should handle any valid combination
             prop_assert!(result.is_ok() || result.is_err());
             Ok(())
-        });
+        })?;
     }
 
     /// Test large request handling
@@ -259,7 +251,7 @@ proptest! {
             // Should handle gracefully
             prop_assert!(result.is_ok() || result.is_err());
             Ok(())
-        });
+        })?;
     }
 
     /// Test edge case values
@@ -339,7 +331,7 @@ mod tests {
     fn test_proptest_setup() {
         // Verify proptest is working
         proptest!(|(x: i32)| {
-            prop_assert_eq!(x + 0, x);
+            prop_assert_eq!(x, x);
         });
     }
     
@@ -349,7 +341,7 @@ mod tests {
         let handler = ProtocolHandler::new();
         
         // Test cases that have caused issues in the past
-        let test_cases = vec![
+        let test_cases: Vec<Vec<u8>> = vec![
             // Empty request
             vec![],
             // Just API key

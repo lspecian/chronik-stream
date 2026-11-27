@@ -34,7 +34,7 @@ use rdkafka::{
 };
 use serde_json::json;
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 #[tokio::test]
 #[ignore = "produce->search pipeline returns 0 hits; see module docs"]
@@ -110,7 +110,7 @@ async fn test_produce_to_search() -> Result<()> {
     
     // Test 1: Match all query
     let response = client
-        .post(&format!("{}/test-search/_search", search_endpoint))
+        .post(format!("{}/test-search/_search", search_endpoint))
         .json(&json!({
             "query": {
                 "match_all": {}
@@ -127,7 +127,7 @@ async fn test_produce_to_search() -> Result<()> {
     
     // Test 2: Term query
     let response = client
-        .post(&format!("{}/test-search/_search", search_endpoint))
+        .post(format!("{}/test-search/_search", search_endpoint))
         .json(&json!({
             "query": {
                 "term": {
@@ -144,7 +144,7 @@ async fn test_produce_to_search() -> Result<()> {
     
     // Test 3: Full-text search
     let response = client
-        .post(&format!("{}/test-search/_search", search_endpoint))
+        .post(format!("{}/test-search/_search", search_endpoint))
         .json(&json!({
             "query": {
                 "match": {
@@ -214,7 +214,7 @@ async fn test_streaming_updates() -> Result<()> {
     
     // Verify initial state
     let response = client
-        .post(&format!("{}/test-streaming/_search", search_endpoint))
+        .post(format!("{}/test-streaming/_search", search_endpoint))
         .json(&json!({
             "query": {
                 "term": { "id": "stream1" }
@@ -254,7 +254,7 @@ async fn test_streaming_updates() -> Result<()> {
     
     // Verify final state (should have latest value)
     let response = client
-        .post(&format!("{}/test-streaming/_search", search_endpoint))
+        .post(format!("{}/test-streaming/_search", search_endpoint))
         .json(&json!({
             "query": {
                 "term": { "id": "stream1" }
@@ -332,7 +332,7 @@ async fn test_multi_partition_ordering() -> Result<()> {
     // Verify each user's messages are in order
     for user in &users {
         let response = client
-            .post(&format!("{}/test-partitions/_search", search_endpoint))
+            .post(format!("{}/test-partitions/_search", search_endpoint))
             .json(&json!({
                 "query": {
                     "term": { "user_id": user }
@@ -424,7 +424,7 @@ async fn test_large_document_handling() -> Result<()> {
     
     // Verify all documents are searchable
     let response = client
-        .post(&format!("{}/test-large-docs/_search", search_endpoint))
+        .post(format!("{}/test-large-docs/_search", search_endpoint))
         .json(&json!({
             "query": { "match_all": {} },
             "sort": [{ "size_bytes": { "order": "asc" } }]

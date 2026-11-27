@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::collections::HashSet;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
-use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, ApiKey, write_response_header, ResponseHeader}, error_codes};
-use chronik_storage::{SegmentReader, ObjectStoreTrait};
+use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, ApiKey, write_response_header, ResponseHeader}};
+use chronik_storage::ObjectStoreTrait;
 use crate::produce_handler::ProduceHandler;
 use crate::consumer_group::GroupManager;
 use crate::fetch_handler::FetchHandler;
@@ -17,9 +17,9 @@ use crate::connection::ConnectionContext;
 use crate::acl::AclStore;
 use crate::authorizer::{Authorizer, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_GROUP_AUTHORIZATION_FAILED};
 use chronik_protocol::describe_acls_types::{AclOperation, ResourceType};
-use bytes::{Bytes, BytesMut, BufMut, Buf};
+use bytes::{Bytes, BytesMut};
 use tokio::sync::RwLock;
-use tracing::{debug, error, instrument};
+use tracing::{debug, instrument};
 
 /// What the ACL admin APIs answer with authorization off. Kafka answers
 /// `SECURITY_DISABLED` too; reporting success would claim a rule exists that
@@ -35,8 +35,6 @@ pub struct KafkaProtocolHandler {
     produce_handler: Arc<ProduceHandler>,
     /// WAL handler for durability (MANDATORY - no longer optional)
     wal_handler: Arc<WalProduceHandler>,
-    /// Segment reader for fetch operations
-    segment_reader: Arc<SegmentReader>,
     /// Metadata store
     metadata_store: Arc<dyn MetadataStore>,
     /// Consumer group manager
@@ -51,8 +49,6 @@ pub struct KafkaProtocolHandler {
     port: i32,
     /// Expected topics tracker for v0 metadata compatibility
     expected_topics: Arc<RwLock<HashSet<String>>>,
-    /// Default number of partitions for auto-created topics
-    default_num_partitions: u32,
     /// ACL authorization (Security Phase 3). Disabled unless CHRONIK_ACL_ENABLED.
     authorizer: Authorizer,
 }
@@ -60,11 +56,11 @@ pub struct KafkaProtocolHandler {
 impl KafkaProtocolHandler {
     /// Create a new Kafka protocol handler with WAL (MANDATORY)
     /// WAL is now required for all Chronik Stream instances - no optional paths
+    #[allow(clippy::too_many_arguments)] // the handler's components, wired once at startup
     pub async fn new(
         produce_handler: Arc<ProduceHandler>,
-        segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
-        object_store: Arc<dyn ObjectStoreTrait>,
+        _object_store: Arc<dyn ObjectStoreTrait>,
         fetch_handler: Arc<FetchHandler>,
         wal_handler: Arc<WalProduceHandler>,  // WAL is MANDATORY, not optional
         node_id: i32,
@@ -119,7 +115,6 @@ impl KafkaProtocolHandler {
             }),
             produce_handler,
             wal_handler,
-            segment_reader,
             metadata_store,
             group_manager,
             fetch_handler,
@@ -127,7 +122,6 @@ impl KafkaProtocolHandler {
             host: host.clone(),
             port,
             expected_topics: Arc::new(RwLock::new(HashSet::new())),
-            default_num_partitions,
             authorizer: Authorizer::new(acl_store),
         })
     }
@@ -956,7 +950,7 @@ impl KafkaProtocolHandler {
             encode_delete_acls_response, parse_delete_acls_request, DeleteAclsResponse,
             FilterResult, MatchingAcl,
         };
-        use chronik_protocol::describe_acls_types::PatternType;
+        
         use crate::acl::AclFilter;
 
         let mut decoder = chronik_protocol::parser::Decoder::new(&mut buf);
@@ -1277,7 +1271,7 @@ impl KafkaProtocolHandler {
     /// the generic error path produced a v7 body librdkafka could not parse
     /// ("Protocol read buffer underflow for OffsetFetch v7 ... expected 4 bytes
     /// > 1 remaining bytes") and then **segfaulted the client**. A malformed
-    /// denial is worse than no denial.
+    /// > denial is worse than no denial.
     ///
     /// `topics: None` in the request means "all topics for this group". There is
     /// nothing to enumerate in that case, so the response is an empty topics
@@ -2429,7 +2423,7 @@ impl KafkaProtocolHandler {
         is_flexible: bool,
         api_version: i16,
     ) -> Result<Vec<chronik_protocol::list_offsets_types::ListOffsetsRequestTopic>> {
-        use chronik_protocol::list_offsets_types::ListOffsetsRequestTopic;
+        
 
         // Parse topics count
         let topics_count = if is_flexible {
@@ -2440,7 +2434,7 @@ impl KafkaProtocolHandler {
         };
 
         // Safety check
-        if topics_count < 0 || topics_count > 10000 {
+        if !(0..=10000).contains(&topics_count) {
             return Err(Error::Protocol(format!("Invalid topics count: {}", topics_count)));
         }
 
@@ -2498,7 +2492,7 @@ impl KafkaProtocolHandler {
         is_flexible: bool,
         api_version: i16,
     ) -> Result<Vec<chronik_protocol::list_offsets_types::ListOffsetsRequestPartition>> {
-        use chronik_protocol::list_offsets_types::ListOffsetsRequestPartition;
+        
 
         // Parse partitions count
         let partitions_count = if is_flexible {
@@ -2509,7 +2503,7 @@ impl KafkaProtocolHandler {
         };
 
         // Safety check
-        if partitions_count < 0 || partitions_count > 10000 {
+        if !(0..=10000).contains(&partitions_count) {
             return Err(Error::Protocol(format!("Invalid partitions count: {}", partitions_count)));
         }
 
@@ -2583,7 +2577,7 @@ impl KafkaProtocolHandler {
         topics: Vec<chronik_protocol::list_offsets_types::ListOffsetsRequestTopic>,
         api_version: i16,
     ) -> Result<Vec<chronik_protocol::list_offsets_types::ListOffsetsResponseTopic>> {
-        use chronik_protocol::list_offsets_types::ListOffsetsResponseTopic;
+        
 
         let mut response_topics = Vec::new();
         for topic in topics {
@@ -2924,7 +2918,7 @@ impl KafkaProtocolHandler {
         // Delegate to the connection's authenticator: it decides whether the
         // mechanism is enabled and moves the connection into the right state.
         let enabled_mechanisms = ctx.enabled_mechanisms().await;
-        let response = match ctx.sasl_handshake(header.api_version, &[mechanism.clone()]).await {
+        let response = match ctx.sasl_handshake(header.api_version, std::slice::from_ref(&mechanism)).await {
             Ok(mut resp) => {
                 resp.enabled_mechanisms = enabled_mechanisms;
                 resp

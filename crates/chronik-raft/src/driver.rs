@@ -148,6 +148,9 @@ pub struct RaftStatus {
 
 type Reply = oneshot::Sender<Result<Applied, ProposeError>>;
 
+// `Step(Message)` dominates the size; boxing it would add an allocation to
+// every Raft message for an enum that only lives in a channel.
+#[allow(clippy::large_enum_variant)]
 enum Event {
     Propose { data: Vec<u8>, reply: Reply },
     ConfChange { cc: ConfChangeV2, reply: Reply },
@@ -303,7 +306,7 @@ impl RaftDriver {
             meta.mut_conf_state().voters = initial_voters.to_vec();
             store
                 .apply_snapshot(snap)?
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bootstrap snapshot: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("bootstrap snapshot: {}", e)))?;
         }
         // Rebuild the state machine from the snapshot; raft re-delivers every
         // committed entry after it.
@@ -328,7 +331,7 @@ impl RaftDriver {
         raft_config.validate().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let logger = slog::Logger::root(slog::Drain::fuse(slog_stdlog::StdLog), slog::o!("raft_id" => config.id));
         let node = RawNode::new(&raft_config, store.clone(), &logger)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("raft: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("raft: {}", e)))?;
 
         let (tx, rx) = mpsc::channel();
         let (status_tx, status_rx) = watch::channel(RaftStatus { id: config.id, applied: snap_index, ..Default::default() });
@@ -585,7 +588,7 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
             self.outbox.send(ready.take_messages());
         }
 
-        if !raft::is_empty_snap(ready.snapshot()) {
+        if !ready.snapshot().is_empty() {
             let snap = ready.snapshot().clone();
             let index = snap.get_metadata().index;
             match self.store.apply_snapshot(snap.clone())? {
@@ -606,7 +609,7 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
 
         self.store.append(ready.entries())?;
         if let Some(hs) = ready.hs() {
-            self.store.set_hardstate(hs.clone())?;
+            self.store.set_hardstate(*hs)?;
         }
         if !ready.persisted_messages().is_empty() {
             self.outbox.send(ready.take_persisted_messages());
@@ -1152,8 +1155,7 @@ mod tests {
         let mut single = raft::eraftpb::ConfChangeSingle::default();
         single.set_change_type(raft::eraftpb::ConfChangeType::AddNode);
         single.node_id = 4;
-        let mut cc = ConfChangeV2::default();
-        cc.changes = vec![single];
+        let cc = ConfChangeV2 { changes: vec![single], ..Default::default() };
         c.h(leader).propose_conf_change(cc).await.unwrap();
         c.join(4);
         let last = c.create_on_leader("after").await.index;

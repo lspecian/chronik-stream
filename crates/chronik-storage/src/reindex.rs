@@ -119,7 +119,7 @@ pub async fn rebuild(indexer: &WalIndexer, entry: &SegmentMetadata, force: bool,
     let suffix = format!("r{}", chrono::Utc::now().timestamp_millis());
     let rebuilt = indexer.build_unregistered_archive(&entry.topic, entry.partition, batches, &suffix).await?;
     let new_path = rebuilt.object_store_path.clone();
-    if !indexer.segment_index().replace_segments(&[entry.segment_id.clone()], rebuilt).await? {
+    if !indexer.segment_index().replace_segments(std::slice::from_ref(&entry.segment_id), rebuilt).await? {
         let _ = store.delete(&new_path).await;
         let _ = store.delete(&crate::term_filter::term_filter_key(&new_path)).await;
         return Ok(Outcome::Raced);

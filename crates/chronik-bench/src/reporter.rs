@@ -1,4 +1,4 @@
-/// Result reporting and formatting
+//! Result reporting and formatting
 
 use anyhow::Result;
 use chrono::Utc;
@@ -159,7 +159,7 @@ impl Reporter for CsvReporter {
         let mut writer = Writer::from_writer(file);
 
         // Write header
-        writer.write_record(&[
+        writer.write_record([
             "timestamp",
             "mode",
             "duration_secs",
@@ -224,14 +224,11 @@ impl Reporter for CsvReporter {
 fn format_number(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::new();
-    let mut count = 0;
-
-    for c in s.chars().rev() {
+    for (count, c) in s.chars().rev().enumerate() {
         if count > 0 && count % 3 == 0 {
             result.push(',');
         }
         result.push(c);
-        count += 1;
     }
 
     result.chars().rev().collect()

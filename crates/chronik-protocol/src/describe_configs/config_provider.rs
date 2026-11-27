@@ -138,6 +138,7 @@ impl ConfigProvider {
     /// Build ConfigEntry for topic
     ///
     /// Complexity: < 15
+    #[allow(clippy::too_many_arguments)] // one argument per ConfigEntry field
     fn build_topic_config_entry(
         name: &str,
         default_value: Option<&str>,
@@ -229,19 +230,19 @@ mod tests {
     #[test]
     fn test_should_include_config_no_filter() {
         // No filter = include all
-        assert_eq!(ConfigProvider::should_include_config("retention.ms", &None), true);
+        assert!(ConfigProvider::should_include_config("retention.ms", &None));
     }
 
     #[test]
     fn test_should_include_config_with_filter_match() {
         let keys = Some(vec!["retention.ms".to_string(), "segment.bytes".to_string()]);
-        assert_eq!(ConfigProvider::should_include_config("retention.ms", &keys), true);
+        assert!(ConfigProvider::should_include_config("retention.ms", &keys));
     }
 
     #[test]
     fn test_should_include_config_with_filter_no_match() {
         let keys = Some(vec!["retention.ms".to_string()]);
-        assert_eq!(ConfigProvider::should_include_config("segment.bytes", &keys), false);
+        assert!(!ConfigProvider::should_include_config("segment.bytes", &keys));
     }
 
     #[tokio::test]
@@ -279,8 +280,7 @@ mod tests {
     /// What the topic holds is what DescribeConfigs reports.
     #[tokio::test]
     async fn topic_overrides_are_reported_as_topic_config() {
-        let mut config = TopicConfig::default();
-        config.retention_ms = Some(777_777);
+        let mut config = TopicConfig { retention_ms: Some(777_777), ..Default::default() };
         config.config.insert("cleanup.policy".into(), "compact".into());
         config.config.insert("columnar.enabled".into(), "true".into());
         let configs = ConfigProvider::get_topic_configs(&topic(config), &None, true, false, 3).await.unwrap();

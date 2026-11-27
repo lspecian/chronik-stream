@@ -167,6 +167,7 @@ impl AssignmentRepair {
         });
     }
 
+    #[cfg(test)]
     pub fn repaired(&self) -> u64 {
         self.repaired.load(Ordering::Relaxed)
     }

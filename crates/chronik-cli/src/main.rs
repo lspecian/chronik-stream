@@ -156,7 +156,7 @@ async fn run_ontology(action: OntologyAction) -> Result<()> {
                     continue;
                 }
                 let fact = parse_fact_line(line)
-                    .map_err(|e| anyhow::anyhow!("facts line {}: {}", i + 1, e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!("facts line {}: {}", i + 1, e))?;
                 records.push(fact_record(&namespace, &tenant, &fact, records.len() as i64));
             }
             let n = publish_records(&brokers, &records).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;

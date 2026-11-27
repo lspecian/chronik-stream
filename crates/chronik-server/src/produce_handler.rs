@@ -8,7 +8,7 @@
 //! - Provides compression support
 //! - Ensures high-throughput message ingestion
 
-use crate::storage::{StorageConfig, StorageService};
+use crate::storage::StorageConfig;
 use crate::fetch_handler::FetchHandler;
 use crate::cluster_catalog::ClusterCatalog;
 use chronik_common::{Result, Error};
@@ -18,33 +18,30 @@ use chronik_protocol::{
     kafka_protocol::ErrorCode,
 };
 use chronik_storage::kafka_records::{
-    KafkaRecordBatch, CompressionType, TimestampType, RecordHeader as KafkaRecordHeader,
+    KafkaRecordBatch, TimestampType,
 };
 use chronik_search::hot_text_index::{HotTextIndex, HotDoc};
 use chronik_columnar::hot_vector_batcher::{MicroBatcherHandle, PendingEmbed};
-use serde_json::Map as JsonMap;
 use chronik_storage::{
-    RecordBatch, Record, SegmentWriter,
+    SegmentWriter,
     object_store::storage::ObjectStore,
 };
-use chronik_common::metadata::traits::{MetadataStore, PartitionAssignment};
+use chronik_common::metadata::traits::MetadataStore;
 use chronik_wal::WalManager;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Mutex, mpsc, oneshot};  // v2.2.10: oneshot for ResponsePipeline
+use tokio::sync::{RwLock, Mutex, oneshot};  // v2.2.10: oneshot for ResponsePipeline
 use tokio::time::timeout;
-use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn, trace, instrument};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use dashmap::DashMap;
-use crossbeam::queue::SegQueue;
 
 
 /// v2.2.9: Async pipelined connection for leader forwarding (eliminates 168x slowdown)
-use crate::pipelined_connection::{PipelinedConnection, PipelinedConnectionPool};
+use crate::pipelined_connection::PipelinedConnectionPool;
 
 /// `client_id` on produce requests one broker forwards to the partition leader
 /// for a client. The receiving broker uses it to refuse to forward the write a
@@ -70,16 +67,6 @@ pub struct ProduceHandlerConfig {
     pub storage_config: StorageConfig,
     /// Enable idempotent producer support
     pub enable_idempotence: bool,
-    /// Enable transactional producer support
-    pub enable_transactions: bool,
-    /// Maximum in-flight requests per connection
-    pub max_in_flight_requests: usize,
-    /// Batch size for buffering
-    pub batch_size: usize,
-    /// Linger time for batching
-    pub linger_ms: u64,
-    /// Compression type
-    pub compression_type: CompressionType,
     /// Request timeout
     pub request_timeout_ms: u64,
     /// Buffer memory limit
@@ -99,7 +86,7 @@ pub struct ProduceHandlerConfig {
     /// perfectly durable without it. Kafka waits for the in-sync set and fails
     /// only when it falls below `min.insync.replicas`.
     pub min_insync_replicas: usize,
-    /// Flush profile for pending_batches management
+    /// Flush profile (sizes `buffer_memory`; reported in logs and metrics)
     pub flush_profile: ProduceFlushProfile,
 }
 
@@ -113,11 +100,6 @@ impl Default for ProduceHandlerConfig {
             node_id: 0,
             storage_config: StorageConfig::default(),
             enable_idempotence: true,
-            enable_transactions: true,
-            max_in_flight_requests: 5,
-            batch_size: 16384,
-            linger_ms: profile.linger_ms(),
-            compression_type: CompressionType::Gzip,
             request_timeout_ms: 120000,  // 120 seconds (increased from 30s to handle slow topic auto-creation)
             buffer_memory: profile.buffer_memory(),
             auto_create_topics_enable: true,
@@ -131,13 +113,15 @@ impl Default for ProduceHandlerConfig {
 
 /// ProduceHandler flush performance profiles
 ///
-/// Controls when buffered messages in `pending_batches` become visible to consumers.
-/// Similar to WAL profiles, but optimizes the in-memory flush layer.
+/// Selected with `CHRONIK_PRODUCE_PROFILE`; sets the produce buffer memory limit
+/// (`buffer_memory`). Similar to WAL profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ProduceFlushProfile {
     /// Low-latency profile: Minimal buffering, instant visibility
     /// Use case: Real-time analytics, instant messaging, live dashboards
     /// Performance: 37K msg/s, 6.84ms p99 latency (with LOW WAL profile)
+    #[default]
     LowLatency,
 
     /// Balanced profile: Good balance of throughput and latency
@@ -156,11 +140,6 @@ pub enum ProduceFlushProfile {
     Extreme,
 }
 
-impl Default for ProduceFlushProfile {
-    fn default() -> Self {
-        Self::LowLatency
-    }
-}
 
 impl ProduceFlushProfile {
     /// Auto-select profile based on environment variable or default to LowLatency
@@ -443,33 +422,10 @@ impl Drop for InFlightGuard {
 /// Producer information for idempotence tracking
 #[derive(Debug, Clone)]
 struct ProducerInfo {
-    producer_id: i64,
     producer_epoch: i16,
     sequence_numbers: HashMap<(String, i32), i32>,
     transactional_id: Option<String>,
-    transaction_state: TransactionState,
     last_activity: Instant,
-}
-
-/// Transaction state
-#[derive(Debug, Clone, PartialEq)]
-enum TransactionState {
-    None,
-    InTransaction,
-    PrepareCommit,
-    PrepareAbort,
-    CompleteCommit,
-    CompleteAbort,
-}
-
-/// Batch of records with original wire format preserved
-struct BufferedBatch {
-    /// Original wire-format bytes from Produce request (with correct CRC)
-    raw_bytes: Vec<u8>,
-    /// Parsed records for indexing
-    records: Vec<ProduceRecord>,
-    /// Base offset for this batch
-    base_offset: i64,
 }
 
 /// Partition state for tracking offsets and segments
@@ -488,11 +444,6 @@ pub(crate) struct PartitionState {
     start_time: Instant,
     /// Current segment size
     segment_size: AtomicU64,
-    /// PERFORMANCE (v2.2.7 - P3): Use lock-free SegQueue instead of Mutex<Vec> for pending batches
-    /// This eliminates mutex contention on every batch write (5-10% throughput gain)
-    pending_batches: Arc<SegQueue<BufferedBatch>>,
-    /// Last flush time
-    last_flush: Arc<Mutex<Instant>>,
     /// Held from offset reservation until the batch is in the WAL queue, so
     /// the log holds batches in offset order. See `produce_to_partition`.
     append_lock: Mutex<()>,
@@ -534,12 +485,6 @@ struct ProduceRecord {
     timestamp: i64,
     key: Option<Vec<u8>>,
     value: Vec<u8>,
-    headers: HashMap<String, Vec<u8>>,
-    producer_id: i64,
-    producer_epoch: i16,
-    sequence: i32,
-    is_transactional: bool,
-    is_control: bool,
 }
 
 /// Produce handler metrics
@@ -550,10 +495,6 @@ pub struct ProduceMetrics {
     pub produce_errors: AtomicU64,
     pub duplicate_records: AtomicU64,
     pub segments_created: AtomicU64,
-    pub indexing_lag_ms: AtomicU64,
-    pub compression_ratio: AtomicU64,
-    pub storage_write_errors: AtomicU64,
-    pub storage_write_retries: AtomicU64,
     // Topic auto-creation metrics
     pub topics_auto_created: AtomicU64,
     pub topic_creation_errors: AtomicU64,
@@ -579,6 +520,9 @@ impl PersistedOffsets {
 }
 
 /// Enhanced produce request handler
+/// An in-flight topic creation other requests for the same topic wait on.
+type PendingTopicCreation = Arc<Mutex<Option<chronik_common::metadata::TopicMetadata>>>;
+
 pub struct ProduceHandler {
     config: ProduceHandlerConfig,
     storage: Arc<dyn ObjectStore>,
@@ -602,7 +546,6 @@ pub struct ProduceHandler {
     /// Replaces Semaphore for ~15-25% throughput gain at high concurrency
     memory_used_bytes: Arc<AtomicU64>,
     memory_limit_bytes: u64,
-    replication_sender: Option<mpsc::Sender<ReplicationRequest>>,
     fetch_handler: Option<Arc<FetchHandler>>,
 
     /// Shared with `FetchHandler`: the wake-up handles a parked long poll
@@ -615,7 +558,7 @@ pub struct ProduceHandler {
     /// exactly what happened on the first attempt at this (RP-9).
     append_notify: Arc<dashmap::DashMap<(String, i32), Arc<tokio::sync::Notify>>>,
     /// Track in-flight topic creation requests to prevent duplicates
-    topic_creation_cache: Arc<RwLock<HashMap<String, Arc<Mutex<Option<chronik_common::metadata::TopicMetadata>>>>>>,
+    topic_creation_cache: Arc<RwLock<HashMap<String, PendingTopicCreation>>>,
     /// WAL manager for inline durability writes (v1.3.47+)
     /// Uses Arc<WalManager> directly - no RwLock needed since WalManager uses DashMap internally
     wal_manager: Option<Arc<WalManager>>,
@@ -685,17 +628,6 @@ pub struct ProduceHandler {
     /// (default 100ms). Watermarks are monotonic so intermediate values are
     /// safe to drop.
     watermark_flusher: crate::watermark_flusher::WatermarkFlusher,
-}
-
-/// Replication request for ISR management
-#[derive(Debug)]
-struct ReplicationRequest {
-    topic: String,
-    partition: i32,
-    offset: i64,
-    data: Bytes,
-    acks_required: i16,
-    response_sender: mpsc::Sender<Result<()>>,
 }
 
 /// RAII guard for the in-flight produce-memory reservation taken in
@@ -1248,8 +1180,6 @@ impl ProduceHandler {
                 segment_created: AtomicU64::new(0),
                 start_time: Instant::now(),
                 segment_size: AtomicU64::new(0),
-                pending_batches: Arc::new(SegQueue::new()),
-                last_flush: Arc::new(Mutex::new(Instant::now())),
                 append_lock: Mutex::new(()),
             };
 
@@ -1282,40 +1212,6 @@ impl ProduceHandler {
             .iter()
             .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
             .collect()
-    }
-
-    /// Clear all partition buffers (used before WAL recovery to prevent duplicates - v1.3.52+)
-    ///
-    /// This is called during server startup BEFORE WAL recovery to ensure we start with
-    /// a clean slate. Without this, WAL replay would add recovered data on top of any
-    /// existing in-memory state, causing duplicate messages.
-    pub async fn clear_all_buffers(&self) -> Result<()> {
-        let mut total_cleared = 0;
-
-        // PERFORMANCE (v2.2.7 - P2 Fix): Collect keys first to avoid holding DashMap iterator
-        // The DashMap iterator can conflict with insert() operations during WAL recovery,
-        // causing the cluster to hang at "Replaying WAL to restore high watermarks".
-        // By collecting keys first, we release the iterator before operating on partitions.
-        let keys: Vec<_> = self.partition_states.iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        // Now iterate over keys without holding DashMap iterator
-        for key in keys {
-            if let Some(state) = self.partition_states.get(&key) {
-                let mut count = 0;
-                while let Some(_) = state.pending_batches.pop() {
-                    count += 1;
-                }
-                total_cleared += count;
-                if count > 0 {
-                    debug!("Cleared {} pending batches for {}-{}", count, key.0, key.1);
-                }
-            }
-        }
-
-        info!("Cleared all partition buffers before WAL recovery: {} total batches", total_cleared);
-        Ok(())
     }
 
     /// Restore partition state from WAL recovery (v1.3.48)
@@ -1372,8 +1268,6 @@ impl ProduceHandler {
             segment_created: AtomicU64::new(0),
             start_time: Instant::now(),
             segment_size: AtomicU64::new(0),
-            pending_batches: Arc::new(SegQueue::new()),
-            last_flush: Arc::new(Mutex::new(Instant::now())),
             append_lock: Mutex::new(()),
         })
     }
@@ -1418,7 +1312,6 @@ impl ProduceHandler {
             running: Arc::new(AtomicBool::new(true)),
             memory_used_bytes,
             memory_limit_bytes,
-            replication_sender: None,
             fetch_handler: None,
             append_notify: Arc::new(dashmap::DashMap::new()),
             topic_creation_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -1465,6 +1358,7 @@ impl ProduceHandler {
         self.append_notify = notify;
     }
 
+    #[cfg(test)]
     pub fn set_fetch_handler(&mut self, fetch_handler: Arc<FetchHandler>) {
         self.fetch_handler = Some(fetch_handler);
     }
@@ -1557,7 +1451,7 @@ impl ProduceHandler {
 
         info!("Starting ProduceHandler metadata event listener for < 10ms watermark replication");
 
-        let handler = Arc::clone(&self);
+        let _handler = Arc::clone(&self);
         tokio::spawn(async move {
             let mut rx = event_bus.subscribe();
 
@@ -1583,15 +1477,8 @@ impl ProduceHandler {
                                 );
                                 // Leadership is read from the metadata store per request; nothing is cached here.
                             }
-                            MetadataEvent::LeaderChanged { topic, partition, new_leader } => {
-                                debug!(
-                                    "Received LeaderChanged event: {}-{} → new leader {}",
-                                    topic, partition, new_leader
-                                );
-                                // Leadership is read from the metadata store per request, so there is nothing to invalidate.
-                            }
                             _ => {
-                                // Other events (TopicCreated, TopicDeleted, ISRUpdated) logged but not acted upon
+                                // Other events (TopicCreated, TopicDeleted, ...) logged but not acted upon
                                 debug!("Received metadata event: {:?}", event);
                             }
                         }
@@ -1627,9 +1514,9 @@ impl ProduceHandler {
         self.response_pipeline = Some(pipeline);
     }
 
-    /// Update high watermark from WAL callback (v2.2.11)
-    /// CRITICAL BUG FIX #8: Updates in-memory high watermark to make messages visible to consumers
-    /// Called from GroupCommitWal callback after successful fsync
+    /// Raise the in-memory high watermark directly, outside the replication
+    /// path (tests: a watermark raised by another path).
+    #[cfg(test)]
     pub fn update_high_watermark_from_wal(&self, topic: &str, partition: i32, new_watermark: i64) {
         if let Some(state) = self.partition_states.get(&(topic.to_string(), partition)) {
             state.raise_watermark(new_watermark.max(0) as u64);
@@ -1778,7 +1665,6 @@ impl ProduceHandler {
         ticket: Option<Arc<crate::produce_order::ProduceTicket>>,
     ) -> Result<ProduceResponse> {
         let start_time = Instant::now();
-        let mut response_topics = Vec::new();
         let acks = request.acks;
         let timeout_ms = request.timeout_ms as u64;
 
@@ -1813,10 +1699,10 @@ impl ProduceHandler {
             self.process_produce_request(request, acks, forwarded, ticket),
         ).await;
         
-        match result {
+        let response_topics = match result {
             Ok(Ok(topics)) => {
-                response_topics = topics;
                 MetricsRecorder::record_produce(true, total_bytes, total_partitions);
+                topics
             }
             Ok(Err(e)) => {
                 error!("Produce request processing failed: {}", e);
@@ -1872,7 +1758,7 @@ impl ProduceHandler {
                     topics: timeout_topics,
                 });
             }
-        }
+        };
         
         let duration = start_time.elapsed();
         debug!("Produce request completed in {:?}", duration);
@@ -2175,7 +2061,7 @@ impl ProduceHandler {
         records_data: &[u8],
         acks: i16,
     ) -> Result<ProduceResponsePartition> {
-        use bytes::{Bytes, BytesMut, BufMut};
+        use bytes::{BytesMut, BufMut};
         use chronik_protocol::parser::{Encoder, Decoder};
 
         // Get leader's Kafka address from metadata store
@@ -2345,7 +2231,7 @@ impl ProduceHandler {
     ) -> Result<ProduceResponsePartition> {
         use std::time::Instant;
         let start_time = Instant::now();
-        let mut last_checkpoint = start_time;
+        let _last_checkpoint = start_time;
 
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         debug!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
@@ -2429,7 +2315,7 @@ impl ProduceHandler {
         //
         // Solution: Get record count first, then atomically reserve the offset range.
         // This ensures each request gets a unique, non-overlapping offset range.
-        use chronik_storage::canonical_record::CanonicalRecord;
+        
 
         // Parse incoming base_offset from records_data
         let incoming_base_offset = if records_data.len() >= 8 {
@@ -2673,7 +2559,7 @@ impl ProduceHandler {
 
         // Assign offsets and prepare records
         let mut records = Vec::with_capacity(kafka_batch.records.len());
-        let mut current_offset = base_offset;
+        let current_offset = base_offset;
         let mut total_bytes = 0u64;
         
         for (i, kafka_record) in kafka_batch.records.iter().enumerate() {
@@ -2683,14 +2569,6 @@ impl ProduceHandler {
                 timestamp,
                 key: kafka_record.key.as_ref().map(|k| k.to_vec()),
                 value: kafka_record.value.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
-                headers: kafka_record.headers.iter()
-                    .map(|h| (h.key.clone(), h.value.as_ref().map(|v| v.to_vec()).unwrap_or_default()))
-                    .collect(),
-                producer_id: kafka_batch.header.producer_id,
-                producer_epoch: kafka_batch.header.producer_epoch,
-                sequence: kafka_batch.header.base_sequence + i as i32,
-                is_transactional: (kafka_batch.header.attributes & 0x10) != 0,
-                is_control: (kafka_batch.header.attributes & 0x20) != 0,
             };
 
             // Trace-level logging only (removed from hot path for performance)
@@ -3138,12 +3016,6 @@ impl ProduceHandler {
             -1 => {
                 // v2.2.7 Phase 4: acks=-1 with IsrAckTracker
                 // Wait for replication to ISR quorum (leader + majority of followers)
-                // NOTE: We do NOT call flush_partition_if_needed() here because:
-                // 1. WAL write already completed synchronously (durability guaranteed)
-                // 2. Flushing with linger logic (100 batches / 500ms) kills throughput
-                // 3. Background task handles actual segment writes
-                // 4. Client just needs ISR quorum ACK (immediate in standalone)
-
                 if let Some(ref tracker) = self.isr_ack_tracker {
                     // Register this produce request for ISR quorum tracking
                     // v2.2.9 Phase 2: Option 4 - Get ISR from metadata_store (WAL-only, no Raft)
@@ -3300,20 +3172,6 @@ impl ProduceHandler {
             } else {
                 tracing::trace!("PRODUCE→BUFFER: Successfully stored raw batch for {}-{}", topic, partition);
             }
-        }
-
-        // PERFORMANCE FIX (v2.2.10): Flush for acks=1 to trigger group commit batching
-        // acks=-1 already flushed at line 1523, so only flush for acks=0 and acks=1
-        // Without this flush, batches accumulate in pending_batches but don't trigger
-        // group commit batching properly, resulting in small batch sizes (1-7 writes)
-        // instead of hundreds, causing 50-60% throughput loss.
-        //
-        // Flush strategy:
-        // - acks=0: Fire-and-forget, flush triggers group commit batching
-        // - acks=1: Flush triggers group commit batching (100ms window accumulates writes)
-        // - acks=-1: Already flushed at line 1523 before ISR quorum wait
-        if acks != -1 {
-            self.flush_partition_if_needed(topic, partition, &partition_state).await?;
         }
 
         // v2.2.0: WAL replication hook already called earlier (after WAL write, before buffering)
@@ -3477,7 +3335,7 @@ impl ProduceHandler {
         }
         
         // Create segment writer
-        let segment_path = format!("{}/{}/partition-{}", self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), topic, partition);
+        let _segment_path = format!("{}/{}/partition-{}", self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), topic, partition);
         let writer = Arc::new(Mutex::new(
             SegmentWriter::new(
                 self.config.storage_config.segment_writer_config.clone(),
@@ -3503,8 +3361,6 @@ impl ProduceHandler {
             segment_created: AtomicU64::new(0),
             start_time: now,
             segment_size: AtomicU64::new(0),
-            pending_batches: Arc::new(SegQueue::new()),
-            last_flush: Arc::new(Mutex::new(Instant::now())),
             append_lock: Mutex::new(()),
         });
 
@@ -3587,11 +3443,9 @@ impl ProduceHandler {
 
                 let producer_info = producers.entry(batch.header.producer_id).or_insert_with(|| {
                     ProducerInfo {
-                        producer_id: batch.header.producer_id,
                         producer_epoch: batch.header.producer_epoch,
                         sequence_numbers: HashMap::new(),
                         transactional_id: transactional_id.map(String::from),
-                        transaction_state: TransactionState::None,
                         last_activity: Instant::now(),
                     }
                 });
@@ -3627,8 +3481,8 @@ impl ProduceHandler {
                     // (see `CommittingSequences`): wait for it to end. It
                     // either wrote the records, or failed before the log and
                     // rolled the sequence back, so this batch is next.
-                    if mode == SequenceCheck::WaitForTurn {
-                        if self.original_still_committing(batch, topic, partition) {
+                    if mode == SequenceCheck::WaitForTurn
+                        && self.original_still_committing(batch, topic, partition) {
                             if Instant::now() >= hard_deadline {
                                 // Not a duplicate answer: that is success to the
                                 // client, and the original may still fail.
@@ -3641,7 +3495,6 @@ impl ProduceHandler {
                             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                             continue;
                         }
-                    }
                     // Duplicate (already applied).
                     warn!(
                         "Duplicate sequence number detected: producer={}, topic={}, partition={}, expected={}, received={}",
@@ -3818,131 +3671,6 @@ impl ProduceHandler {
     }
 
     
-    /// Flush partition if needed based on size or time
-    ///
-    /// v1.3.56+: Uses ProduceFlushProfile for configurable flush behavior:
-    /// - LowLatency: 1 batch / 10ms (real-time)
-    /// - Balanced: 10 batches / 100ms (default)
-    /// - HighThroughput: 100 batches / 500ms (bulk)
-    async fn flush_partition_if_needed(
-        &self,
-        topic: &str,
-        partition: i32,
-        state: &Arc<PartitionState>,
-    ) -> Result<()> {
-        let should_flush = {
-            // Note: SegQueue doesn't have a len() method, we need to drain to count
-            // This is called infrequently so the drain is acceptable
-            let mut pending_count = 0;
-            let mut temp_batches = Vec::new();
-            while let Some(batch) = state.pending_batches.pop() {
-                pending_count += 1;
-                temp_batches.push(batch);
-            }
-            // Push back
-            for batch in temp_batches {
-                state.pending_batches.push(batch);
-            }
-            let last_flush = state.last_flush.lock().await;
-
-            // Use profile settings for flush thresholds
-            let min_batches = if cfg!(debug_assertions) {
-                1  // Always flush immediately in debug
-            } else {
-                self.config.flush_profile.min_batches()
-            };
-
-            let linger_time = if cfg!(debug_assertions) {
-                Duration::from_millis(10)  // Fast flush in debug
-            } else {
-                Duration::from_millis(self.config.flush_profile.linger_ms())
-            };
-
-            pending_count >= min_batches ||
-            state.segment_size.load(Ordering::Relaxed) >= MAX_SEGMENT_SIZE ||
-            last_flush.elapsed() >= linger_time
-        };
-
-        if should_flush {
-            self.flush_partition(topic, partition, state).await?;
-        }
-
-        Ok(())
-    }
-    
-    /// Flush pending records to storage (v1.3.66 - PROPER UNDERSTANDING)
-    ///
-    /// POST-REFACTOR (v1.3.39+): This is intentionally a NO-OP because data persistence happens via:
-    /// 1. Inline WAL writes (handled during handle_produce at line ~1208) - MANDATORY, acks-based
-    /// 2. Background indexing (WalIndexer → Tantivy → Object Store)
-    ///
-    /// pending_batches is for in-memory serving to consumers, NOT for durability.
-    /// Durability is guaranteed by inline WAL writes that happen BEFORE this method.
-    ///
-    /// The data flow is:
-    /// - Producer sends batch
-    /// - handle_produce() writes to WAL inline (line ~1208, with acks parameter)
-    /// - handle_produce() buffers to pending_batches for fast consumer reads
-    /// - Consumer reads from pending_batches (fast path) or WAL (slower path)
-    /// - WalIndexer periodically indexes WAL to Tantivy
-    ///
-    /// During shutdown:
-    /// - Inline WAL writes have already persisted all data
-    /// - pending_batches can be safely discarded (data is in WAL)
-    /// - No additional flush needed
-    async fn flush_partition(
-        &self,
-        topic: &str,
-        partition: i32,
-        state: &Arc<PartitionState>,
-    ) -> Result<()> {
-        // ARCHITECTURAL NOTE (v1.3.64):
-        // Data flow: Produce → WAL (GroupCommitWal V2) → WalIndexer → S3 raw segments
-        //
-        // The inline WAL writes (in WalProduceHandler) have ALREADY persisted all data.
-        // pending_batches are only for in-memory serving (Phase 1 buffer fetch).
-        //
-        // WalIndexer runs periodically (every 30s) to:
-        // 1. Read sealed WAL segments
-        // 2. Upload bincode Vec<CanonicalRecord> to S3 as raw segments
-        // 3. Create Tantivy indexes for searchability
-        //
-        // Therefore, flush_partition() should simply clear pending_batches since:
-        // - Data is already durable (in WAL)
-        // - Segment creation is WalIndexer's responsibility
-        // - No need to write to SegmentWriter (wrong format anyway)
-
-        // Take all pending batches (discard them, data is in WAL)
-        let batches = {
-            let mut batches = Vec::new();
-            while let Some(batch) = state.pending_batches.pop() {
-                batches.push(batch);
-            }
-            batches
-        };
-
-        if batches.is_empty() {
-            trace!("No pending batches to flush for {}-{}", topic, partition);
-            return Ok(());
-        }
-
-        // Record flush metrics (v2.1.0)
-        MetricsRecorder::record_produce_flush(batches.len() as u64);
-
-        info!(
-            "Flushed {} batches from memory for {}-{} (data already in WAL, WalIndexer will upload to S3)",
-            batches.len(), topic, partition
-        );
-
-        // Update last flush time
-        {
-            let mut last_flush = state.last_flush.lock().await;
-            *last_flush = Instant::now();
-        }
-
-        Ok(())
-    }
-    
     /// Check and rotate segments if needed
     async fn check_and_rotate_segments(&self) -> Result<()> {
         for ((topic, partition), state) in self.partition_snapshot() {
@@ -3963,11 +3691,8 @@ impl ProduceHandler {
                 || (seg_size > 0 && segment_age >= MAX_SEGMENT_AGE);
 
             if should_rotate {
-                // Flush current segment
-                self.flush_partition(topic, *partition, state).await?;
-                
                 // Create new segment writer
-                let segment_path = format!("{}/{}/partition-{}", 
+                let _segment_path = format!("{}/{}/partition-{}", 
                     self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), topic, partition);
                     
                 let new_writer = SegmentWriter::new(
@@ -4188,6 +3913,7 @@ impl ProduceHandler {
     }
     
     /// Get current metrics
+    #[cfg(test)]
     pub fn metrics(&self) -> &ProduceMetrics {
         &self.metrics
     }
@@ -4195,13 +3921,6 @@ impl ProduceHandler {
     /// Shutdown the handler gracefully
     pub async fn shutdown(&self) -> Result<()> {
         self.running.store(false, Ordering::SeqCst);
-
-        // Flush all partitions
-        for ((topic, partition), state) in self.partition_snapshot() {
-            if let Err(e) = self.flush_partition(&topic, partition, &state).await {
-                error!("Error flushing partition {}-{} during shutdown: {}", topic, partition, e);
-            }
-        }
 
         info!("Produce handler shutdown complete");
         Ok(())
@@ -4249,7 +3968,6 @@ impl Clone for ProduceHandler {
             running: Arc::clone(&self.running),
             memory_used_bytes: Arc::clone(&self.memory_used_bytes),
             memory_limit_bytes: self.memory_limit_bytes,
-            replication_sender: self.replication_sender.clone(),
             fetch_handler: self.fetch_handler.clone(),
             append_notify: Arc::clone(&self.append_notify),
             topic_creation_cache: Arc::clone(&self.topic_creation_cache),
@@ -4273,11 +3991,12 @@ impl Clone for ProduceHandler {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use chronik_storage::kafka_records::CompressionType;
     use chronik_common::metadata::{InMemoryMetadataStore, TopicConfig};
     use chronik_storage::object_store::backends::local::LocalBackend;
     use chronik_protocol::types::{ProduceRequestTopic, ProduceRequestPartition};
     use tempfile::TempDir;
-    use bytes::BufMut;
+    
 
     // Regression: the in-flight produce-memory reservation must be released on
     // EVERY exit path. Before the MemoryReservation guard, the 17 `?`
@@ -4375,7 +4094,7 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
+        let _pd_endpoints = ["localhost:2379".to_string()];
         let temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
@@ -5054,9 +4773,9 @@ pub(crate) mod tests {
         let response = handler.handle_produce(request, 1).await.unwrap();
         
         assert_eq!(response.topics[0].partitions.len(), 3);
-        for i in 0..3 {
-            assert_eq!(response.topics[0].partitions[i].error_code, 0);
-            assert_eq!(response.topics[0].partitions[i].base_offset, 0);
+        for partition in &response.topics[0].partitions {
+            assert_eq!(partition.error_code, 0);
+            assert_eq!(partition.base_offset, 0);
         }
         
         assert_eq!(handler.metrics.records_produced.load(Ordering::Relaxed), 3);
@@ -5100,8 +4819,7 @@ pub(crate) mod tests {
     
     #[tokio::test]
     async fn test_compression() {
-        let (mut handler, _temp) = create_test_handler().await;
-        handler.config.compression_type = CompressionType::Gzip;
+        let (handler, _temp) = create_test_handler().await;
         
         // Create larger payload to see compression benefits
         let mut large_value = String::new();
@@ -5269,8 +4987,8 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
-        let temp_dir = TempDir::new().unwrap();
+        let _pd_endpoints = ["localhost:2379".to_string()];
+        let _temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
@@ -5336,8 +5054,8 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
-        let temp_dir = TempDir::new().unwrap();
+        let _pd_endpoints = ["localhost:2379".to_string()];
+        let _temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
@@ -5393,8 +5111,8 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
-        let temp_dir = TempDir::new().unwrap();
+        let _pd_endpoints = ["localhost:2379".to_string()];
+        let _temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
@@ -5568,8 +5286,8 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
-        let temp_dir = TempDir::new().unwrap();
+        let _pd_endpoints = ["localhost:2379".to_string()];
+        let _temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
@@ -5676,22 +5394,26 @@ pub(crate) mod tests {
 
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
 
-        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
-        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
-            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        let object_store_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+            },
+            ..Default::default()
         };
         let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
             Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(object_store_config).await.unwrap());
 
-        let mut handler = ProduceHandler::new(
+        let handler = ProduceHandler::new(
             produce_config,
             object_store,
             metadata_store.clone(),
         ).await.unwrap();
 
         // Create topic
-        let mut topic_config = TopicConfig::default();
-        topic_config.partition_count = 1;
+        let topic_config = TopicConfig {
+            partition_count: 1,
+            ..Default::default()
+        };
         metadata_store.create_topic("test-topic", topic_config).await.unwrap();
 
         // Produce a message with acks=0
@@ -5730,22 +5452,26 @@ pub(crate) mod tests {
 
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
 
-        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
-        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
-            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        let object_store_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+            },
+            ..Default::default()
         };
         let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
             Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(object_store_config).await.unwrap());
 
-        let mut handler = ProduceHandler::new(
+        let handler = ProduceHandler::new(
             produce_config,
             object_store,
             metadata_store.clone(),
         ).await.unwrap();
         
         // Create topic
-        let mut topic_config = TopicConfig::default();
-        topic_config.partition_count = 1;
+        let topic_config = TopicConfig {
+            partition_count: 1,
+            ..Default::default()
+        };
         metadata_store.create_topic("test-topic", topic_config).await.unwrap();
         
         // Produce multiple messages with acks=1
@@ -5784,21 +5510,17 @@ pub(crate) mod tests {
 
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
 
-        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
-        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
-            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        let object_store_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+            },
+            ..Default::default()
         };
         let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
             Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(object_store_config).await.unwrap());
 
         // Create FetchHandler
-        let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-            chronik_storage::SegmentReaderConfig::default(),
-            object_store.clone()
-        ));
-
         let fetch_handler = Arc::new(crate::fetch_handler::FetchHandler::new(
-            segment_reader,
             metadata_store.clone(),
             object_store.clone(),
         ));
@@ -5813,8 +5535,10 @@ pub(crate) mod tests {
         handler.set_fetch_handler(fetch_handler.clone());
         
         // Create topic
-        let mut topic_config = TopicConfig::default();
-        topic_config.partition_count = 1;
+        let topic_config = TopicConfig {
+            partition_count: 1,
+            ..Default::default()
+        };
         metadata_store.create_topic("test-topic", topic_config).await.unwrap();
         
         // Produce messages
@@ -5871,9 +5595,11 @@ pub(crate) mod tests {
         };
         let wal_manager = Arc::new(chronik_wal::WalManager::new(wal_config).await.unwrap());
 
-        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
-        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
-            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        let object_store_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+            },
+            ..Default::default()
         };
         let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> = Arc::from(
             chronik_storage::object_store::ObjectStoreFactory::create(object_store_config)
@@ -5938,8 +5664,10 @@ pub(crate) mod tests {
         let ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
         handler.set_isr_ack_tracker(ack_tracker.clone());
 
-        let mut topic_config = TopicConfig::default();
-        topic_config.partition_count = 1;
+        let topic_config = TopicConfig {
+            partition_count: 1,
+            ..Default::default()
+        };
         metadata_store.create_topic("quorum-topic", topic_config).await.unwrap();
         metadata_store
             .assign_partition(PartitionAssignment {
@@ -6013,8 +5741,10 @@ pub(crate) mod tests {
         let ack_tracker = crate::isr_ack_tracker::IsrAckTracker::new();
         handler.set_isr_ack_tracker(ack_tracker.clone());
 
-        let mut topic_config = TopicConfig::default();
-        topic_config.partition_count = 1;
+        let topic_config = TopicConfig {
+            partition_count: 1,
+            ..Default::default()
+        };
         metadata_store.create_topic(topic, topic_config).await.unwrap();
         metadata_store
             .assign_partition(PartitionAssignment {
@@ -6181,8 +5911,10 @@ pub(crate) mod tests {
 
         let (handler, _temp) = create_test_handler().await;
 
-        let mut topic_config = TopicConfig::default();
-        topic_config.partition_count = 1;
+        let topic_config = TopicConfig {
+            partition_count: 1,
+            ..Default::default()
+        };
         let _ = handler.metadata_store.create_topic("epoch-topic", topic_config).await;
 
         // Leadership starts elsewhere and moves HERE, so the current epoch is 1

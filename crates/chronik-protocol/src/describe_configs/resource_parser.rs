@@ -50,9 +50,9 @@ impl ResourceParser {
     /// Complexity: < 5
     fn parse_resource_name(decoder: &mut Decoder, use_compact: bool) -> Result<String> {
         let name = if use_compact {
-            decoder.read_compact_string()?.unwrap_or_else(|| String::new())
+            decoder.read_compact_string()?.unwrap_or_else(String::new)
         } else {
-            decoder.read_string()?.unwrap_or_else(|| String::new())
+            decoder.read_string()?.unwrap_or_else(String::new)
         };
         Ok(name)
     }

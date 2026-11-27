@@ -593,6 +593,7 @@ const REBUILD_PENDING_RATIO_PERCENT: usize = 10;
 const REBUILD_FIRST_BUILD_MIN: usize = 100;
 
 impl PartitionIndex {
+    #[cfg(test)]
     fn new(config: HnswIndexConfig) -> Self {
         Self::with_model_id(config, "default".to_string())
     }
@@ -707,7 +708,8 @@ impl PartitionIndex {
     ///
     /// The same three steps the manager runs with the lock released between
     /// them — see [`PartitionIndex::prepare_build`]. Used where nothing else
-    /// can observe the index (tests, a freshly loaded index not yet shared).
+    /// can observe the index; only tests do.
+    #[cfg(test)]
     fn build(&mut self) -> Result<()> {
         if let Some(job) = self.prepare_build() {
             let output = job.run();
@@ -748,7 +750,7 @@ impl PartitionIndex {
 
         Some(BuildJob {
             instance: self.instance,
-            metric: self.config.metric.clone(),
+            metric: self.config.metric,
             build_dims: self.config.effective_search_dims(),
             dimensions: self.config.dimensions,
             ef_construction: self.config.ef_construction,
@@ -2142,7 +2144,7 @@ impl EmbeddingPipeline {
     ) -> Self {
         let provider_max = provider.max_batch_size();
         let effective_batch_size = batch_size.max(1).min(provider_max);
-        let effective_concurrency = concurrency.max(1).min(32);
+        let effective_concurrency = concurrency.clamp(1, 32);
         // VO-1: Report pipeline config to metrics
         MetricsRecorder::update_embedding_pipeline_config(effective_batch_size, effective_concurrency);
         Self {

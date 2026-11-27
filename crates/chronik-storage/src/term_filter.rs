@@ -47,7 +47,7 @@ impl TermFilter {
         let ln2 = std::f64::consts::LN_2;
         let bits = (-(n * FALSE_POSITIVE_RATE.ln()) / (ln2 * ln2)).ceil().max(64.0);
         let hashes = ((bits / n) * ln2).round().clamp(1.0, 16.0) as u32;
-        let words = ((bits as u64 + 63) / 64) as usize;
+        let words = (bits as u64).div_ceil(64) as usize;
         Self { hashes, words: vec![0; words] }
     }
 
@@ -145,8 +145,8 @@ impl TermFilter {
             return None;
         }
         let words = body[12..]
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
+            .as_chunks::<8>().0.iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
         Some(Self { hashes, words })
     }

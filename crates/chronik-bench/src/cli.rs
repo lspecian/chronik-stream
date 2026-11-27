@@ -1,4 +1,4 @@
-/// CLI argument parsing using clap
+//! CLI argument parsing using clap
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -175,7 +175,7 @@ pub enum CompressionType {
 }
 
 impl CompressionType {
-    pub fn to_rdkafka_str(&self) -> &'static str {
+    pub fn to_rdkafka_str(self) -> &'static str {
         match self {
             CompressionType::None => "none",
             CompressionType::Gzip => "gzip",

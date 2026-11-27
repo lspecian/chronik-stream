@@ -625,6 +625,29 @@ impl QueryResult {
     }
 }
 
+/// `schema` (a sample segment's) with every projected column present at its
+/// configured type: replaced where the sample has it under another type,
+/// appended where it does not.
+fn with_projected_columns(
+    schema: datafusion::arrow::datatypes::SchemaRef,
+    projected: &[crate::projection::ColumnSpec],
+) -> datafusion::arrow::datatypes::SchemaRef {
+    use datafusion::arrow::datatypes::{Field, Schema};
+    if projected.is_empty() {
+        return schema;
+    }
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    for spec in projected {
+        let field = Arc::new(Field::new(&spec.name, spec.ty.sql_arrow_type(), true));
+        match fields.iter_mut().find(|f| f.name() == &spec.name) {
+            Some(existing) if existing.data_type() == field.data_type() => {}
+            Some(existing) => *existing = field,
+            None => fields.push(field),
+        }
+    }
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,27 +984,4 @@ mod tests {
 
         writer.write_to_file(&[batch], path).unwrap();
     }
-}
-
-/// `schema` (a sample segment's) with every projected column present at its
-/// configured type: replaced where the sample has it under another type,
-/// appended where it does not.
-fn with_projected_columns(
-    schema: datafusion::arrow::datatypes::SchemaRef,
-    projected: &[crate::projection::ColumnSpec],
-) -> datafusion::arrow::datatypes::SchemaRef {
-    use datafusion::arrow::datatypes::{Field, Schema};
-    if projected.is_empty() {
-        return schema;
-    }
-    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-    for spec in projected {
-        let field = Arc::new(Field::new(&spec.name, spec.ty.sql_arrow_type(), true));
-        match fields.iter_mut().find(|f| f.name() == &spec.name) {
-            Some(existing) if existing.data_type() == field.data_type() => {}
-            Some(existing) => *existing = field,
-            None => fields.push(field),
-        }
-    }
-    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }

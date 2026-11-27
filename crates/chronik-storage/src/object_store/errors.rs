@@ -128,15 +128,15 @@ pub enum ObjectStoreError {
 impl ObjectStoreError {
     /// Check if error is retryable
     pub fn is_retryable(&self) -> bool {
-        match self {
-            ObjectStoreError::NetworkError { .. } => true,
-            ObjectStoreError::ServiceUnavailable { .. } => true,
-            ObjectStoreError::RateLimited { .. } => true,
-            ObjectStoreError::Timeout { .. } => true,
-            ObjectStoreError::InternalError { .. } => true,
-            ObjectStoreError::Io(_) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            ObjectStoreError::NetworkError { .. }
+                | ObjectStoreError::ServiceUnavailable { .. }
+                | ObjectStoreError::RateLimited { .. }
+                | ObjectStoreError::Timeout { .. }
+                | ObjectStoreError::InternalError { .. }
+                | ObjectStoreError::Io(_)
+        )
     }
 
     /// Check if error is permanent (not retryable)

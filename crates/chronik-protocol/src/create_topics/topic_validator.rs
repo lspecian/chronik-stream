@@ -177,12 +177,11 @@ impl TopicValidator {
                         }
                     }
                 }
-                "searchable" => {
-                    if !Self::is_valid_bool(value) {
+                "searchable"
+                    if !Self::is_valid_bool(value) => {
                         error!("Invalid searchable value: {} (expected 'true' or 'false')", value);
                         return Err(error_codes::INVALID_CONFIG);
                     }
-                }
                 _ => {} // Other configs validated at runtime
             }
         }
@@ -230,13 +229,13 @@ impl TopicValidator {
                     }
                 }
                 "columnar.row_group_size" => {
-                    if value.parse::<usize>().map(|v| v > 0).unwrap_or(false) == false {
+                    if !value.parse::<usize>().map(|v| v > 0).unwrap_or(false) {
                         error!("Invalid columnar.row_group_size value: {} (expected positive integer)", value);
                         return Err(error_codes::INVALID_CONFIG);
                     }
                 }
                 "columnar.page_size" => {
-                    if value.parse::<usize>().map(|v| v > 0).unwrap_or(false) == false {
+                    if !value.parse::<usize>().map(|v| v > 0).unwrap_or(false) {
                         error!("Invalid columnar.page_size value: {} (expected positive integer)", value);
                         return Err(error_codes::INVALID_CONFIG);
                     }
@@ -374,7 +373,7 @@ impl TopicValidator {
                     }
                 }
                 "vector.index.m" | "vector.index.ef_construction" | "vector.index.ef_search" => {
-                    if value.parse::<usize>().map(|v| v > 0).unwrap_or(false) == false {
+                    if !value.parse::<usize>().map(|v| v > 0).unwrap_or(false) {
                         error!("Invalid {} value: {} (expected positive integer)", key, value);
                         return Err(error_codes::INVALID_CONFIG);
                     }
@@ -386,7 +385,7 @@ impl TopicValidator {
                     }
                 }
                 "vector.hnsw.m" | "vector.hnsw.ef_construction" | "vector.hnsw.ef_search" => {
-                    if value.parse::<usize>().map(|v| v > 0).unwrap_or(false) == false {
+                    if !value.parse::<usize>().map(|v| v > 0).unwrap_or(false) {
                         error!("Invalid {} value: {} (expected positive integer)", key, value);
                         return Err(error_codes::INVALID_CONFIG);
                     }

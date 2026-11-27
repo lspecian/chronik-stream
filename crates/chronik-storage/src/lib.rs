@@ -16,7 +16,6 @@ pub mod segment_reader;
 pub mod chronik_segment;
 pub mod background;
 pub mod checksum;
-pub mod segment_cache;
 pub mod text_analysis;
 pub mod json_index;
 pub mod term_filter;
@@ -45,7 +44,6 @@ pub use segment_writer::{SegmentWriter, SegmentWriterConfig};
 pub use segment_reader::{SegmentReader, SegmentReaderConfig, FetchResult};
 pub use chronik_segment::{ChronikSegment, ChronikSegmentBuilder, SegmentMetadata, CompressionType, BloomFilter};
 pub use checksum::{ChecksumUtils, ChecksumMode, StreamingChecksum};
-pub use segment_cache::{SegmentCache, SegmentCacheConfig, CachedSegmentReader, CacheStats, EvictionPolicy};
 // v2.2.7 Phase 5: Removed WalMetadataAdapter export (deleted file)
 pub use wal_indexer::{
     WalIndexer, WalIndexerConfig, IndexingStats, BackfillStats, EmbedOutcome, TopicPartition as WalIndexerTopicPartition,

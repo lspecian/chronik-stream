@@ -654,7 +654,7 @@ impl Response {
                 }
 
                 // Write throttle_time_ms at the END for v1-v8
-                if api_version >= 1 && api_version < 9 {
+                if (1..9).contains(&api_version) {
                     encoder.write_i32(resp.throttle_time_ms);
                 }
 

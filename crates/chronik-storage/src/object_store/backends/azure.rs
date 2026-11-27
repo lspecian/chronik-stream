@@ -152,7 +152,7 @@ impl ObjectStore for AzureBackend {
             },
         })?;
         
-        Ok(data.into())
+        Ok(data)
     }
 
     async fn delete(&self, key: &str) -> ObjectStoreResult<()> {
@@ -218,7 +218,7 @@ impl ObjectStore for AzureBackend {
             
             results.push(ObjectMetadata {
                 key: entry.path().to_string(),
-                size: metadata.content_length() as u64,
+                size: metadata.content_length(),
                 last_modified: metadata.last_modified()
                     .map(|t| t.into_inner().as_millisecond() as u64)
                     .unwrap_or(0),

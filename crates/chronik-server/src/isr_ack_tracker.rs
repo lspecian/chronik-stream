@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// How long an `acks=all` wait may sit before it is failed and released.
 /// Matches Kafka's default `request.timeout.ms`.
@@ -263,6 +263,7 @@ impl IsrAckTracker {
     }
 
     /// Number of `acks=all` requests currently waiting.
+    #[cfg(test)]
     pub fn pending_count(&self) -> usize {
         self.partitions
             .iter()
@@ -278,44 +279,30 @@ impl IsrAckTracker {
             .filter(|&offset| offset != i64::MIN)
     }
 
+    #[cfg(test)]
     pub fn stats(&self) -> IsrAckStats {
         let mut pending_requests = 0;
-        let mut oldest_age_ms = 0u64;
         let mut tracked_replicas = 0;
 
         for partition in self.partitions.iter() {
             tracked_replicas += partition.node_offsets.len();
             for entries in partition.waiters.values() {
                 pending_requests += entries.len();
-                for entry in entries {
-                    let age_ms = entry.registered_at.elapsed().as_millis() as u64;
-                    if age_ms > oldest_age_ms {
-                        oldest_age_ms = age_ms;
-                    }
-                }
             }
         }
 
-        IsrAckStats {
-            pending_requests,
-            tracked_replicas,
-            waiting_for_quorum: pending_requests,
-            oldest_request_age_ms: oldest_age_ms,
-        }
+        IsrAckStats { pending_requests, tracked_replicas }
     }
 }
 
-/// Statistics for monitoring.
+/// Statistics for tests.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct IsrAckStats {
     /// `acks=all` requests still waiting.
     pub pending_requests: usize,
     /// How many (partition, replica) positions are being tracked.
     pub tracked_replicas: usize,
-    /// Same as `pending_requests`; a registered wait is by definition unsatisfied.
-    pub waiting_for_quorum: usize,
-    /// Age of the oldest outstanding wait.
-    pub oldest_request_age_ms: u64,
 }
 
 impl Default for IsrAckTracker {

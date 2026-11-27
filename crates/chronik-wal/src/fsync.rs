@@ -326,7 +326,7 @@ impl FsyncBatcher {
             match write_result {
                 Ok(()) => {
                     // Record successful metrics
-                    if let Ok(metrics) = std::panic::catch_unwind(|| Metrics::get()) {
+                    if let Ok(metrics) = std::panic::catch_unwind(Metrics::get) {
                         metrics.wal_batch_flushes_total
                             .with_label_values(&[&topic, &partition.to_string()])
                             .inc();

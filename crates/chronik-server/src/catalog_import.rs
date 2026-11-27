@@ -261,18 +261,19 @@ mod tests {
         catalog.set_import_pending(false);
         assert!(catalog.is_caught_up());
 
-        let state = catalog.read();
-        let mut names: Vec<&str> = state.topics().map(|t| t.name.as_str()).collect();
-        names.sort();
-        assert_eq!(names, vec!["only-a", "only-b", "orders"]);
-        // The higher epoch won, and the assignment that came with it.
-        let o = state.assignment("orders", 0).unwrap();
-        assert_eq!(o.leader_epoch, epoch_b);
         let b_assign = b.get_partition_assignments("orders").await.unwrap();
-        assert_eq!(o.leader_id, b_assign.iter().find(|x| x.partition == 0).unwrap().leader_id);
-        assert_eq!(state.topic("only-b").unwrap().config.partition_count, 3);
-        assert_eq!(state.assignments_for("only-b").len(), 3);
-        drop(state);
+        {
+            let state = catalog.read();
+            let mut names: Vec<&str> = state.topics().map(|t| t.name.as_str()).collect();
+            names.sort();
+            assert_eq!(names, vec!["only-a", "only-b", "orders"]);
+            // The higher epoch won, and the assignment that came with it.
+            let o = state.assignment("orders", 0).unwrap();
+            assert_eq!(o.leader_epoch, epoch_b);
+            assert_eq!(o.leader_id, b_assign.iter().find(|x| x.partition == 0).unwrap().leader_id);
+            assert_eq!(state.topic("only-b").unwrap().config.partition_count, 3);
+            assert_eq!(state.assignments_for("only-b").len(), 3);
+        }
 
         // Idempotent.
         let again = import(&catalog, read_legacy(&a).await).await.unwrap();

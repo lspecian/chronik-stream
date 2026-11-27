@@ -266,7 +266,7 @@ impl AclStore {
             for entry in entries {
                 if filter.matches(entry) {
                     let key = (entry.resource_type, entry.resource_name.clone(), entry.pattern_type);
-                    results.entry(key).or_insert_with(Vec::new).push(AclEntry {
+                    results.entry(key).or_default().push(AclEntry {
                         principal: entry.principal.clone(),
                         host: entry.host.clone(),
                         operation: entry.operation,
@@ -382,15 +382,14 @@ impl AclStore {
             }
 
             for entry in entries {
-                if entry.pattern_type == PatternType::Prefixed && resource_name.starts_with(rn) {
-                    if self.entry_matches(entry, principal, host, operation) {
+                if entry.pattern_type == PatternType::Prefixed && resource_name.starts_with(rn)
+                    && self.entry_matches(entry, principal, host, operation) {
                         return if entry.permission_type == AclPermissionType::Allow {
                             AuthorizationResult::Allowed
                         } else {
                             AuthorizationResult::Denied
                         };
                     }
-                }
             }
         }
 
@@ -574,30 +573,15 @@ pub enum AclError {
     /// The rule could not be written to the metadata log, so it was not applied.
     #[error("ACL storage error: {0}")]
     StorageError(String),
-
-    #[error("Invalid resource type")]
-    InvalidResourceType,
-
-    #[error("Invalid pattern type")]
-    InvalidPatternType,
-
-    #[error("Invalid operation")]
-    InvalidOperation,
-
-    #[error("Invalid permission type")]
-    InvalidPermissionType,
-
-    #[error("ACL not found")]
-    NotFound,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use tokio::sync::Mutex;
 
     // Serialize ACL tests that mutate CHRONIK_ACL_ENABLED env var
-    static ACL_ENV_MUTEX: Mutex<()> = Mutex::new(());
+    static ACL_ENV_MUTEX: Mutex<()> = Mutex::const_new(());
 
     fn create_test_binding(principal: &str, operation: AclOperation) -> AclBinding {
         AclBinding {
@@ -613,7 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_acl_store_disabled_by_default() {
-        let _lock = ACL_ENV_MUTEX.lock().unwrap();
+        let _lock = ACL_ENV_MUTEX.lock().await;
         std::env::remove_var("CHRONIK_ACL_ENABLED");
         let store = AclStore::new();
         assert!(!store.is_enabled());
@@ -634,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_acl_create_and_describe() {
-        let _lock = ACL_ENV_MUTEX.lock().unwrap();
+        let _lock = ACL_ENV_MUTEX.lock().await;
         std::env::set_var("CHRONIK_ACL_ENABLED", "true");
         let store = AclStore::new();
 
@@ -688,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorization_deny_takes_precedence() {
-        let _lock = ACL_ENV_MUTEX.lock().unwrap();
+        let _lock = ACL_ENV_MUTEX.lock().await;
         std::env::set_var("CHRONIK_ACL_ENABLED", "true");
         std::env::set_var("CHRONIK_ACL_ALLOW_IF_NO_ACL", "false");
         let store = AclStore::new();
@@ -1029,7 +1013,7 @@ impl AclStore {
         for binding in persisted.chain(bootstrap) {
             let entries = index
                 .entry((binding.resource_type, binding.resource_name.clone()))
-                .or_insert_with(Vec::new);
+                .or_default();
             if !entries.iter().any(|e| e == &binding) {
                 entries.push(binding);
             }

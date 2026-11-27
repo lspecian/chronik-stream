@@ -3,7 +3,7 @@
 use crate::api::{
     SearchApi, SearchRequest, SearchResponse, IndexDocumentRequest, IndexDocumentResponse,
     GetDocumentResponse, DeleteDocumentResponse, CatIndexInfo, ErrorResponse, ErrorInfo,
-    ShardInfo, HitsInfo, TotalHits, Hit, IndexMapping, FieldMapping, QueryDsl, BoolQuery,
+    ShardInfo, HitsInfo, TotalHits, Hit, IndexMapping, FieldMapping, QueryDsl,
     HighlightConfig,
 };
 use axum::{
@@ -302,7 +302,7 @@ pub async fn search_all(
         let index_name = entry.key().clone();
         let state = entry.value();
 
-        match search_in_index(&index_name, &state, &request).await {
+        match search_in_index(&index_name, state, &request).await {
             Ok(mut hits) => all_hits.append(&mut hits),
             Err(e) => {
                 error!("Error searching in-memory index {}: {}", index_name, e);
@@ -462,13 +462,13 @@ pub async fn search_index(
         have_any_cold_source = true;
         let hits = search_in_index(&index, &state, &request)
             .await
-            .map_err(|e| search_error(e))?;
+            .map_err(search_error)?;
         cold_hits.extend(hits);
 
         if let Some(aggs) = request.aggs.as_ref().or(request.aggregations.as_ref()) {
             let query = match &request.query {
                 Some(query_dsl) => build_tantivy_query(query_dsl, &state.schema, Some(&state.index))
-                    .map_err(|e| search_error(e))?,
+                    .map_err(search_error)?,
                 None => Box::new(AllQuery),
             };
             let agg_executor = crate::aggregations::AggregationExecutor::new(
@@ -533,7 +533,7 @@ pub async fn search_index(
     };
     // Every index scores with the topic's statistics, so equal texts score
     // equally in the hot index and every archive (crate::corpus_stats).
-    let stats = search_stats(&api, segments.as_deref().unwrap_or_default(), &[index.clone()], &request, deadline).await;
+    let stats = search_stats(&api, segments.as_deref().unwrap_or_default(), std::slice::from_ref(&index), &request, deadline).await;
     let hot_hits = match api.hot_text_index {
         Some(_) => Some(search_hot_topic(&api, &index, &request, stats.get(&index).map(|s| &**s)).await),
         None => None,
@@ -1067,7 +1067,7 @@ async fn count_and_aggregate(
 
     let allowed: Option<std::collections::HashSet<i32>> =
         request._chronik_partitions.as_ref().map(|p| p.iter().copied().collect());
-    let counts = |p: i32| allowed.as_ref().map_or(true, |a| a.contains(&p));
+    let counts = |p: i32| allowed.as_ref().is_none_or(|a| a.contains(&p));
     let mut total = Merger::default();
     let mut complete = true;
 
@@ -1356,7 +1356,8 @@ fn keep_best_candidates(candidates: &mut Vec<Candidate>, window: usize) {
 /// Reads the candidates' documents into hits, archive by archive; an archive
 /// that cannot be read is left out (as a segment that fails its search is).
 fn read_candidates(candidates: Vec<Candidate>) -> Vec<Hit> {
-    let mut by_source: Vec<(Arc<CandidateSource>, Vec<(tantivy::Score, tantivy::DocAddress)>)> = Vec::new();
+    type SourceDocs = (Arc<CandidateSource>, Vec<(tantivy::Score, tantivy::DocAddress)>);
+    let mut by_source: Vec<SourceDocs> = Vec::new();
     for c in candidates {
         match by_source.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &c.source)) {
             Some((_, docs)) => docs.push((c.key.score, c.addr)),
@@ -1916,8 +1917,8 @@ async fn search_in_index(
             .to_string();
         
         // Generate highlights if requested
-        let highlight = if request.highlight.is_some() {
-            generate_highlights(&doc, &query, &state.schema, request.highlight.as_ref().unwrap())?
+        let highlight = if let Some(config) = request.highlight.as_ref() {
+            generate_highlights(&doc, &query, &state.schema, config)?
         } else {
             None
         };
@@ -2491,7 +2492,7 @@ pub(crate) fn build_tantivy_query(
         },
         
         QueryDsl::GeoDistance(geo_query) => {
-            use crate::geo::{GeoQuery, GeoPoint, DistanceType, parse_geo_point, parse_distance_string};
+            use crate::geo::{GeoQuery, DistanceType, parse_geo_point, parse_distance_string};
             
             let center = parse_geo_point(&geo_query.center)?;
             let distance = parse_distance_string(&geo_query.distance)?;
@@ -2529,7 +2530,7 @@ pub(crate) fn build_tantivy_query(
             use crate::geo::{GeoQuery, parse_geo_point};
             
             let points = geo_query.points.iter()
-                .map(|p| parse_geo_point(p))
+                .map(parse_geo_point)
                 .collect::<Result<Vec<_>>>()?;
             
             let query = GeoQuery::Polygon {
@@ -2561,18 +2562,18 @@ pub async fn index_document(
     
     // Convert JSON to Tantivy document
     let tantivy_doc = json_to_tantivy_doc(&document, &state.schema, &state.mapping)
-        .map_err(|e| indexing_error(e))?;
+        .map_err(indexing_error)?;
     
     // Add document to index
     let mut writer = state.writer.write().await;
     writer.add_document(tantivy_doc)
         .map_err(|e| Error::Internal(format!("Failed to index document: {}", e)))
-        .map_err(|e| indexing_error(e))?;
+        .map_err(indexing_error)?;
     
     // Commit immediately for consistency
     writer.commit()
         .map_err(|e| Error::Internal(format!("Failed to commit: {}", e)))
-        .map_err(|e| indexing_error(e))?;
+        .map_err(indexing_error)?;
 
     // The reader uses ReloadPolicy::OnCommitWithDelay, so a commit alone does not
     // make the write visible to the next searcher() until the delayed reload fires.
@@ -2580,7 +2581,7 @@ pub async fn index_document(
     // get/search (Elasticsearch realtime-GET semantics), honoring the commit above.
     state.reader.reload()
         .map_err(|e| Error::Internal(format!("Failed to reload reader: {}", e)))
-        .map_err(|e| indexing_error(e))?;
+        .map_err(indexing_error)?;
 
     let response = IndexDocumentResponse {
         _index: index,
@@ -2614,19 +2615,19 @@ pub async fn get_document(
     let searcher = state.reader.searcher();
     let id_field = state.schema.get_field("_id")
         .map_err(|_| Error::Internal("_id field not found".to_string()))
-        .map_err(|e| search_error(e))?;
+        .map_err(search_error)?;
     
     let term = Term::from_field_text(id_field, &id);
     let query = TermQuery::new(term, Default::default());
     
     let top_docs = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())
         .map_err(|e| Error::Internal(format!("Search failed: {}", e)))
-        .map_err(|e| search_error(e))?;
+        .map_err(search_error)?;
     
     if let Some((_score, doc_address)) = top_docs.first() {
         let doc: tantivy::TantivyDocument = searcher.doc(*doc_address)
             .map_err(|e| Error::Internal(format!("Failed to retrieve document: {}", e)))
-            .map_err(|e| search_error(e))?;
+            .map_err(search_error)?;
         
         // Convert to JSON
         let mut source = serde_json::Map::new();
@@ -2696,7 +2697,7 @@ pub async fn delete_document(
     // Delete document by _id
     let id_field = state.schema.get_field("_id")
         .map_err(|_| Error::Internal("_id field not found".to_string()))
-        .map_err(|e| deletion_error(e))?;
+        .map_err(deletion_error)?;
     
     let term = Term::from_field_text(id_field, &id);
     
@@ -2704,13 +2705,13 @@ pub async fn delete_document(
     writer.delete_term(term);
     writer.commit()
         .map_err(|e| Error::Internal(format!("Failed to commit: {}", e)))
-        .map_err(|e| deletion_error(e))?;
+        .map_err(deletion_error)?;
 
     // Force a reader reload so the deletion is immediately visible to the next
     // get/search (see the note in index_document — OnCommitWithDelay otherwise lags).
     state.reader.reload()
         .map_err(|e| Error::Internal(format!("Failed to reload reader: {}", e)))
-        .map_err(|e| deletion_error(e))?;
+        .map_err(deletion_error)?;
 
     let response = DeleteDocumentResponse {
         _index: index,
@@ -2950,7 +2951,7 @@ fn index_creation_error(error: Error) -> (StatusCode, Json<ErrorResponse>) {
 /// Generate highlights for matching fields
 fn generate_highlights(
     _doc: &tantivy::TantivyDocument,
-    _query: &Box<dyn TantivyQuery>,
+    _query: &dyn TantivyQuery,
     _schema: &tantivy::schema::Schema,
     _config: &HighlightConfig,
 ) -> Result<Option<HashMap<String, Vec<String>>>> {

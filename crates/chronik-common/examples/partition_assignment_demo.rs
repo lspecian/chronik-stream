@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nExample 3: JSON Serialization");
     println!("==============================");
     let mut assignment3 = PartitionAssignment::new();
-    assignment3.add_topic("test", 3, 2, &vec![1, 2, 3])?;
+    assignment3.add_topic("test", 3, 2, &[1, 2, 3])?;
 
     let json = assignment3.to_json()?;
     println!("JSON representation:\n{}", json);
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nExample 4: Leader Failover");
     println!("==========================");
     let mut assignment4 = PartitionAssignment::new();
-    assignment4.add_topic("users", 3, 3, &vec![1, 2, 3])?;
+    assignment4.add_topic("users", 3, 3, &[1, 2, 3])?;
 
     println!("Initial state:");
     for partition in 0..3 {

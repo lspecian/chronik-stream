@@ -214,7 +214,7 @@ async fn run_io_uring_loop(mut cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
                     async move {
                         let result = match file_ref {
                             Some(file) => {
-                                file.sync_all().await.map_err(|e| crate::WalError::Io(e))
+                                file.sync_all().await.map_err(crate::WalError::Io)
                             }
                             None => {
                                 Err(crate::WalError::IoError(format!("File not found for partition: {}", partition_key)))
@@ -253,8 +253,8 @@ async fn run_io_uring_loop(mut cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
             use futures::future::join_all;
 
             // Group by partition, preserving arrival order within each.
-            let mut by_partition: HashMap<String, Vec<(Bytes, tokio::sync::oneshot::Sender<Result<()>>)>> =
-                HashMap::new();
+            type Writes = Vec<(Bytes, tokio::sync::oneshot::Sender<Result<()>>)>;
+            let mut by_partition: HashMap<String, Writes> = HashMap::new();
             for cmd in write_cmds {
                 if let IoUringCommand::Write { partition_key, data, response } = cmd {
                     by_partition.entry(partition_key).or_default().push((data, response));

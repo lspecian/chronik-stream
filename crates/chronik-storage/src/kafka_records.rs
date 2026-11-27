@@ -5,10 +5,9 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use chronik_common::{Result, Error};
-use crc32fast::Hasher as Crc32;
 use std::io::{Cursor, Read, Write};
-use flate2::write::{GzEncoder, ZlibEncoder};
-use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
 use flate2::Compression;
 use snap::raw::Decoder as SnappyDecoder;
 use lz4_flex::decompress_size_prepended as lz4_decompress;
@@ -187,7 +186,7 @@ impl KafkaRecordBatch {
         buf.put_i32(0); // Placeholder for batch length
         
         // Start of data for CRC calculation
-        let crc_start = buf.len();
+        let _crc_start = buf.len();
         
         // Write header fields
         buf.put_i32(self.header.partition_leader_epoch);
@@ -540,7 +539,7 @@ impl KafkaRecordBatch {
     
     /// Decode legacy message set (v0/v1 format) and convert to v2 RecordBatch
     fn decode_legacy_message_set(data: &[u8]) -> Result<(Self, usize)> {
-        use tracing::warn as legacy_warn;
+        
         let mut cursor = Cursor::new(data);
         let mut records = Vec::new();
         let mut base_offset = 0i64;
@@ -695,7 +694,7 @@ impl KafkaRecordBatch {
 
                 // Update offsets and timestamps from nested messages BEFORE extending
                 for record in &nested_batch.records {
-                    let record_offset = base_offset + record.offset_delta as i64;
+                    let _record_offset = base_offset + record.offset_delta as i64;
                     let record_timestamp = base_timestamp + record.timestamp_delta;
                     if record_timestamp > max_timestamp {
                         max_timestamp = record_timestamp;
@@ -823,7 +822,7 @@ impl KafkaRecordBatch {
             let headers_count = decode_varint(&mut cursor)?;
             
             // Sanity check headers count to prevent capacity overflow
-            if headers_count < 0 || headers_count > 1000 {
+            if !(0..=1000).contains(&headers_count) {
                 return Err(Error::Internal(format!(
                     "Invalid headers count: {} at position {}. This might be due to incorrect message format.", 
                     headers_count, cursor.position()
@@ -834,7 +833,7 @@ impl KafkaRecordBatch {
             
             for _ in 0..headers_count {
                 let key_len = decode_varint(&mut cursor)?;
-                if key_len < 0 || key_len > 10000 {
+                if !(0..=10000).contains(&key_len) {
                     return Err(Error::Internal(format!("Invalid header key length: {}", key_len)));
                 }
                 let mut key_buf = vec![0u8; key_len as usize];
@@ -1095,13 +1094,13 @@ mod tests {
         assert_eq!(decoded.records.len(), 10);
         assert_eq!(bytes_consumed, encoded.len());
         
-        for i in 0..10 {
+        for (i, record) in decoded.records.iter().enumerate() {
             assert_eq!(
-                decoded.records[i].key.as_ref().map(|b| b.as_ref()), 
+                record.key.as_ref().map(|b| b.as_ref()), 
                 Some(format!("key{}", i).as_bytes())
             );
             assert_eq!(
-                decoded.records[i].value.as_ref().map(|b| b.as_ref()), 
+                record.value.as_ref().map(|b| b.as_ref()), 
                 Some(format!("value{}", i).as_bytes())
             );
         }

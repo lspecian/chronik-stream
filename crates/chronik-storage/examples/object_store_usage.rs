@@ -1,8 +1,8 @@
 //! Example demonstrating the Object Storage Abstraction Layer usage.
 
 use chronik_storage::object_store::{
-    ObjectStoreFactory, ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials,
-    ObjectStoreTrait, PutOptions, GetOptions, ListOptions, ChronikStorageAdapter, SegmentLocation,
+    ObjectStoreFactory, ObjectStoreConfig, StorageBackend, AuthConfig,
+    PutOptions, ChronikStorageAdapter, SegmentLocation,
     PerformanceConfig,
 };
 // `ObjectStoreConfig::retry` takes the config-file form of the retry policy;
@@ -13,7 +13,6 @@ use chronik_storage::{
     RecordBatch, Record,
 };
 use chronik_common::Bytes;
-use std::collections::HashMap;
 use std::time::Duration;
 
 #[tokio::main]

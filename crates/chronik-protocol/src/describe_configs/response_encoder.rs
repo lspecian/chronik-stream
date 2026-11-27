@@ -7,7 +7,6 @@
 use crate::parser::Encoder;
 use crate::types::{ConfigEntry, DescribeConfigsResult};
 use chronik_common::Result;
-use bytes::BytesMut;
 
 /// Encoder for DescribeConfigs response
 pub struct ResponseEncoder;
@@ -247,6 +246,7 @@ impl ResponseEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
     use crate::types::ConfigSynonym;
     use crate::describe_configs_types::error_codes;
 
@@ -302,7 +302,7 @@ mod tests {
 
         let bytes = buf.freeze();
         // Compact array starts with varint
-        assert!(bytes.len() >= 1);
+        assert!(!bytes.is_empty());
     }
 
     #[test]

@@ -2,9 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, BTreeMap};
 use tantivy::{
-    collector::{Count, TopDocs, DocSetCollector},
     query::{Query, EnableScoring},
-    schema::{Field, FieldType},
     IndexReader, Searcher, DocAddress,
 };
 use tantivy::schema::Schema;
@@ -422,7 +420,8 @@ impl AggregationExecutor {
         let field = self.schema.get_field(&range_agg.field)
             .map_err(|_| anyhow::anyhow!("Field not found: {}", range_agg.field))?;
         
-        let mut range_counts: Vec<(Option<f64>, Option<f64>, Option<String>, u64)> = 
+        type RangeCount = (Option<f64>, Option<f64>, Option<String>, u64);
+        let mut range_counts: Vec<RangeCount> =
             range_agg.ranges.iter().map(|r| (r.from, r.to, r.key.clone(), 0)).collect();
         
         let weight = query.weight(EnableScoring::disabled_from_searcher(searcher))?;

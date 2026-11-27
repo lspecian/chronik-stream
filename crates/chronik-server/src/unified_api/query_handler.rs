@@ -444,16 +444,16 @@ impl BackendAdapter for ServerBackendAdapter {
                     chronik_wal::WalRecord::V2 { base_offset, .. } => *base_offset,
                 };
 
-                let candidate = Candidate::new(
+                
+
+                Candidate::new(
                     topic.to_string(),
                     partition,
                     record_offset,
                     QueryMode::Fetch,
                     1.0,
                     rank,
-                );
-
-                candidate
+                )
             })
             .collect();
 
@@ -874,6 +874,7 @@ fn query_response_json(response: QueryResponse) -> axum::response::Response {
 }
 
 /// Run `request` against this node's backends.
+#[allow(clippy::result_large_err)] // axum error response, built once per failed request
 async fn run_local_query(
     state: &UnifiedApiState,
     request: &QueryRequest,
@@ -894,7 +895,7 @@ async fn run_local_query(
     }
 
     // Plan the query
-    let plan = match QueryPlanner::plan(&request, &capabilities) {
+    let plan = match QueryPlanner::plan(request, &capabilities) {
         Ok(plan) => plan,
         Err(e) => {
             chronik_monitoring::MetricsRecorder::record_query_error("planning");
@@ -921,7 +922,7 @@ async fn run_local_query(
         .with_feature_logger(state.feature_logger.clone());
 
     // Execute
-    match orchestrator.execute(&request, plan).await {
+    match orchestrator.execute(request, plan).await {
         Ok(response) => {
             chronik_monitoring::MetricsRecorder::record_query_latency(
                 std::time::Duration::from_millis(response.stats.latency_ms)

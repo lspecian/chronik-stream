@@ -1,5 +1,9 @@
 //! Common test utilities and helpers for integration tests
 
+// Several test binaries include this module (`mod common;`), each using a
+// subset of it; items another binary needs read as dead in the rest.
+#![allow(dead_code)]
+
 use chronik_common::Result;
 use std::net::{TcpListener, SocketAddr};
 use std::path::PathBuf;
@@ -7,7 +11,7 @@ use std::process::{Child, Command};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Test cluster configuration
 #[derive(Debug, Clone)]
@@ -15,7 +19,6 @@ pub struct TestClusterConfig {
     pub num_servers: usize,
     pub data_dir: Option<PathBuf>,
     pub object_storage: ObjectStorageType,
-    pub enable_tls: bool,
     /// Require SASL authentication (sets `CHRONIK_SASL_ENABLED`).
     pub enable_auth: bool,
     /// `(username, password)` pairs the broker will accept, passed as
@@ -27,7 +30,6 @@ pub struct TestClusterConfig {
     pub acl_bindings: String,
     /// Whether an operation with no matching ACL is allowed.
     pub acl_allow_if_no_acl: bool,
-    pub enable_wal_metadata: bool,
 }
 
 impl Default for TestClusterConfig {
@@ -36,13 +38,11 @@ impl Default for TestClusterConfig {
             num_servers: 1,
             data_dir: None,
             object_storage: ObjectStorageType::Local,
-            enable_tls: false,
             enable_auth: false,
             sasl_users: Vec::new(),
             enable_acls: false,
             acl_bindings: String::new(),
             acl_allow_if_no_acl: true,
-            enable_wal_metadata: true,
         }
     }
 }
@@ -50,16 +50,6 @@ impl Default for TestClusterConfig {
 #[derive(Debug, Clone)]
 pub enum ObjectStorageType {
     Local,
-    S3(S3Config),
-    InMemory,
-}
-
-#[derive(Debug, Clone)]
-pub struct S3Config {
-    pub endpoint: String,
-    pub bucket: String,
-    pub access_key: String,
-    pub secret_key: String,
 }
 
 /// Serializes tests that start their own broker.
@@ -184,13 +174,6 @@ impl TestCluster {
         &self.api_addrs
     }
 
-    /// Admin endpoint for the first server (`/admin/*` on the Unified API).
-    ///
-    /// This used to return `http://<kafka port>`, which never served HTTP.
-    pub fn admin_endpoint(&self) -> String {
-        format!("http://{}", self.api_addrs[0])
-    }
-
     /// Search endpoint for the first server (`/_search`, `/_sql`, `/_vector`).
     pub fn search_endpoint(&self) -> String {
         format!("http://{}", self.api_addrs[0])
@@ -200,7 +183,7 @@ impl TestCluster {
         &mut self,
         id: usize,
         addr: SocketAddr,
-        data_dir: &PathBuf,
+        data_dir: &std::path::Path,
         extra_env: &[(&str, &str)],
     ) -> Result<()> {
         let node_data_dir = data_dir.join(format!("server-{}", id));
@@ -210,7 +193,7 @@ impl TestCluster {
         // (`--bind-addr`, `--wal-metadata`, and no subcommand at all) had not
         // been valid since the CLI was redesigned, so this harness could not
         // launch a server no matter which test called it. WAL metadata is the
-        // default now, so `enable_wal_metadata` needs no flag.
+        // default now.
         let mut cmd = Command::new(server_binary());
         // Broker verbosity is overridable: the hardcoded `chronik=debug` made a
         // full suite run emit tens of MB per invocation, which buries the test
@@ -259,16 +242,6 @@ impl TestCluster {
                 std::fs::create_dir_all(&segments_dir)?;
                 cmd.env("OBJECT_STORE_TYPE", "local")
                     .env("LOCAL_STORAGE_PATH", segments_dir.to_str().unwrap());
-            }
-            ObjectStorageType::S3(s3) => {
-                cmd.env("OBJECT_STORE_TYPE", "s3")
-                    .env("S3_ENDPOINT", &s3.endpoint)
-                    .env("S3_BUCKET", &s3.bucket)
-                    .env("AWS_ACCESS_KEY_ID", &s3.access_key)
-                    .env("AWS_SECRET_ACCESS_KEY", &s3.secret_key);
-            }
-            ObjectStorageType::InMemory => {
-                cmd.env("OBJECT_STORE_TYPE", "memory");
             }
         }
 

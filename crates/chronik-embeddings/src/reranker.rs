@@ -17,7 +17,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Result of re-ranking a single document.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -30,18 +30,15 @@ impl GeoPoint {
 
 /// Distance calculation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum DistanceType {
     /// Great circle distance (accurate)
+    #[default]
     Arc,
     /// Euclidean distance (faster, less accurate)
     Plane,
 }
 
-impl Default for DistanceType {
-    fn default() -> Self {
-        Self::Arc
-    }
-}
 
 /// Bounding box for geo queries
 #[derive(Debug, Clone)]
@@ -71,12 +68,6 @@ pub enum GeoQuery {
         field: String,
         points: Vec<GeoPoint>,
     },
-}
-
-/// Geo field mapping in schema
-pub struct GeoFieldMapping {
-    lat_field: Field,
-    lon_field: Field,
 }
 
 /// Extension trait for Schema to support geo fields
@@ -248,7 +239,6 @@ fn euclidean_distance(p1: &GeoPoint, p2: &GeoPoint) -> f64 {
 
 /// Calculate bounding box for a distance query
 fn calculate_bounding_box(center: &GeoPoint, distance_meters: f64) -> Result<GeoBoundingBox> {
-    const EARTH_RADIUS_M: f64 = 6_371_000.0;
     const METERS_PER_DEGREE_LAT: f64 = 111_319.9;
     
     // Calculate latitude difference

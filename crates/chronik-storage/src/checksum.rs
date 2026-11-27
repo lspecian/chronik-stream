@@ -12,27 +12,30 @@ use tracing::{debug, warn, error};
 
 /// Checksum verification mode
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum ChecksumMode {
     /// Skip checksum verification (fast but unsafe)
     Skip,
     /// Verify checksum and log warning on mismatch
     Warn,
     /// Verify checksum and fail on mismatch (default)
+    #[default]
     Strict,
     /// Try to repair checksum if mismatched
     Repair,
 }
 
-impl Default for ChecksumMode {
-    fn default() -> Self {
-        ChecksumMode::Strict
-    }
-}
 
 /// Checksum calculator for streaming data
 pub struct StreamingChecksum {
     hasher: Hasher,
     bytes_processed: u64,
+}
+
+impl Default for StreamingChecksum {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StreamingChecksum {
@@ -233,25 +236,6 @@ impl ChecksumUtils {
         }
         
         Ok(data)
-    }
-}
-
-/// Parallel checksum calculator for large files
-pub struct ParallelChecksum {
-    chunk_size: usize,
-}
-
-impl ParallelChecksum {
-    /// Create new parallel checksum calculator
-    pub fn new(chunk_size: usize) -> Self {
-        Self { chunk_size }
-    }
-    
-    /// Calculate checksum in parallel (simplified - real implementation would use rayon)
-    pub fn calculate(&self, data: &[u8]) -> u32 {
-        // For now, just use the standard calculation
-        // In a real implementation, we'd split data into chunks and process in parallel
-        ChecksumUtils::calculate_checksum(data)
     }
 }
 

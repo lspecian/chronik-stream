@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 /// Extract bytes from any binary-like Arrow array type at a given index.
 /// Handles BinaryArray, BinaryViewArray, and LargeBinaryArray.
-fn get_binary_value<'a>(arr: &'a dyn Array, idx: usize) -> Option<&'a [u8]> {
+fn get_binary_value(arr: &dyn Array, idx: usize) -> Option<&[u8]> {
     if arr.is_null(idx) {
         return None;
     }

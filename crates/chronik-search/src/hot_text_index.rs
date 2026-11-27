@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use tantivy::{
-    collector::{Count, TopDocs},
+    collector::Count,
     query::{QueryParser, RangeQuery},
     schema::{Field, NumericOptions, Schema, STORED, STRING, TEXT},
     Index, IndexReader, IndexWriter, ReloadPolicy, Term,
@@ -47,7 +47,7 @@ const TANTIVY_MIN_HEAP: usize = 15_000_000;
 /// sequentially). `add_batch` consults this to commit+release eagerly once the
 /// burst cap is exceeded â bursty partitions pay one cheap RAM-only commit per
 /// batch while steady producers stay under the cap and keep their writers.
-
+///
 /// Burst cap on concurrent live hot writers (env: CHRONIK_HOT_TEXT_MAX_LIVE_WRITERS).
 /// 64 writers â 1GB worst-case budget.
 fn hot_writer_burst_cap() -> usize {
@@ -537,7 +537,7 @@ impl HotPartitionIndex {
         let max = self.config.max_burst_writers;
         let reserved = self
             .burst_writers
-            .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+            .try_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
                 (n < max).then_some(n + 1)
             })
             .is_ok();

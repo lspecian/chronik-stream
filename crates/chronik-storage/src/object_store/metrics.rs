@@ -199,7 +199,7 @@ impl MetricsSnapshot {
         let mut ops: Vec<_> = self.operation_counts.iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        ops.sort_by(|a, b| b.1.cmp(&a.1));
+        ops.sort_by_key(|op| std::cmp::Reverse(op.1));
         ops
     }
 }

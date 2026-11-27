@@ -261,7 +261,7 @@ mod tests {
         ResponseEncoder::encode(&mut buf, &response, 5).unwrap();
 
         // v5: compact encoding, should be smaller
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 
     #[test]

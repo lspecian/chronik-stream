@@ -27,7 +27,7 @@ use chronik_protocol::parser::Decoder;
 
 use super::protocol::{
     decode_fetch_response, encode_epoch_request_header, encode_fetch_request, frame_request,
-    FetchRequestSpec, FetchResponseFrame, OFFSET_FOR_LEADER_EPOCH_API_VERSION,
+    FetchRequestSpec, FetchResponseFrame,
 };
 
 /// Ceiling on a response frame, independent of what the leader claims. A
@@ -94,6 +94,7 @@ impl LeaderConnection {
     }
 
     /// Speak TLS to the leader with this client.
+    #[cfg(test)]
     pub fn with_tls(mut self, tls: tokio_rustls::TlsConnector) -> Self {
         self.tls = Some(tls);
         self
@@ -108,6 +109,7 @@ impl LeaderConnection {
     /// says nothing about whether the peer is alive (a TCP write lands in the
     /// local send buffer long after the peer is gone; that mistake cost the
     /// push stack an ISR-eviction bug that unit tests could not see).
+    #[cfg(test)]
     pub fn is_connected(&self) -> bool {
         self.stream.is_some()
     }

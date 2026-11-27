@@ -168,7 +168,8 @@ pub async fn sweep_orphans(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentInde
     let norm = |k: &str| k.trim_start_matches('/').to_string();
     // Per archive directory (one partition): the referenced keys and the
     // offset ranges they cover.
-    let mut dirs: BTreeMap<String, (HashSet<String>, Vec<(i64, i64)>)> = BTreeMap::new();
+    type DirRefs = (HashSet<String>, Vec<(i64, i64)>);
+    let mut dirs: BTreeMap<String, DirRefs> = BTreeMap::new();
     for s in index.get_all_segments().await.unwrap_or_default() {
         if let Some((dir, _)) = s.object_store_path.rsplit_once('/') {
             let entry = dirs.entry(format!("{dir}/")).or_default();
@@ -302,7 +303,7 @@ async fn convert_one(
         let _ = store.put(&term_filter_key(new_key), bytes::Bytes::from(f.to_bytes())).await;
     }
     let replacement = SegmentMetadata { object_store_path: new_key.to_string(), size_bytes, ..seg.clone() };
-    if !index.replace_segments(&[seg.segment_id.clone()], replacement).await? {
+    if !index.replace_segments(std::slice::from_ref(&seg.segment_id), replacement).await? {
         let _ = store.delete(new_key).await;
         let _ = store.delete(&term_filter_key(new_key)).await;
         return Ok(false);

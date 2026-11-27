@@ -81,6 +81,7 @@ pub struct WatermarkFlusherMetrics {
     pub pending_partitions: AtomicU64,
 }
 
+#[cfg(test)]
 impl WatermarkFlusherMetrics {
     pub fn notes(&self) -> u64 { self.notes.load(Ordering::Relaxed) }
     pub fn flushes(&self) -> u64 { self.flushes.load(Ordering::Relaxed) }
@@ -285,13 +286,14 @@ impl WatermarkFlusher {
     }
 
     /// Metrics accessor.
+    #[cfg(test)]
     pub fn metrics(&self) -> Arc<WatermarkFlusherMetrics> {
         self.inner.metrics.clone()
     }
 
     /// Force an immediate drain — used by tests that don't want to wait for
     /// the next tick. Not called on the hot path.
-    #[doc(hidden)]
+    #[cfg(test)]
     pub async fn drain_now_for_test(&self) {
         Self::drain_once(&self.inner).await;
     }

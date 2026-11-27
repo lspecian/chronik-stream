@@ -1,7 +1,7 @@
-/// Integration test for CanonicalRecord CRC validation
-///
-/// This test verifies that the CanonicalRecord encode/decode implementation
-/// correctly preserves CRC checksums, fixing the v1.3.29-v1.3.33 CRC corruption bugs.
+//! Integration test for CanonicalRecord CRC validation
+//!
+//! This test verifies that the CanonicalRecord encode/decode implementation
+//! correctly preserves CRC checksums, fixing the v1.3.29-v1.3.33 CRC corruption bugs.
 
 use chronik_storage::canonical_record::CanonicalRecord;
 use bytes::Bytes;
@@ -59,7 +59,7 @@ fn test_canonical_record_with_java_kafka_batch() {
 /// Create a simple Kafka RecordBatch v2 for testing
 fn create_simple_kafka_batch() -> Bytes {
     use bytes::{BufMut, BytesMut};
-    use std::io::Cursor;
+    
     use crc32fast::Hasher as Crc32;
 
     let mut buf = BytesMut::new();
@@ -83,10 +83,11 @@ fn create_simple_kafka_batch() -> Bytes {
     buf.put_i32(1); // records_count
 
     // Single record (key="test-key", value="test-value")
-    let mut record = Vec::new();
-    record.push(0); // attributes
-    record.push(0); // timestamp_delta (varint 0)
-    record.push(0); // offset_delta (varint 0)
+    let mut record = vec![
+        0, // attributes
+        0, // timestamp_delta (varint 0)
+        0, // offset_delta (varint 0)
+    ];
 
     // Key: "test-key" (8 bytes)
     record.push(16); // key length (varint 8)
@@ -186,11 +187,12 @@ fn test_canonical_with_headers() {
     buf.put_i32(1); // records_count
 
     // Record with headers
-    let mut record = Vec::new();
-    record.push(0); // attributes
-    record.push(0); // timestamp_delta
-    record.push(0); // offset_delta
-    record.push(4); // key length (varint 2)
+    let mut record = vec![
+        0, // attributes
+        0, // timestamp_delta
+        0, // offset_delta
+        4, // key length (varint 2)
+    ];
     record.extend_from_slice(b"k1");
     record.push(4); // value length (varint 2)
     record.extend_from_slice(b"v1");

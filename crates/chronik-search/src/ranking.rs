@@ -41,6 +41,7 @@ pub(crate) struct RankKey {
 /// second), so collectors pass it over before building its key.
 pub(crate) type Floor = (Score, i64);
 
+#[cfg(test)]
 fn below_floor(floor: Option<Floor>, score: Score, second: impl FnOnce() -> i64) -> (bool, Option<i64>) {
     match floor {
         Some((s, _)) if score < s => (true, None),
@@ -102,7 +103,7 @@ impl RankFields {
             },
         ];
         candidates.into_iter().find(|c| {
-            fast(c.timestamp) && fast(c.offset) && c.partition.map_or(true, |p| fast(p))
+            fast(c.timestamp) && fast(c.offset) && c.partition.is_none_or(&fast)
         })
     }
 
@@ -585,7 +586,7 @@ fn newest_of_all(searcher: &Searcher, fields: RankFields, limit: usize, floor: O
     // place; at 1.0 the floor's second bounds which are worth reading.
     let oldest_s = match floor {
         Some((s, _)) if s > 1.0 => return Vec::new(),
-        Some((s, t)) if s == 1.0 => t,
+        Some((1.0, t)) => t,
         _ => i64::MIN,
     };
 
@@ -1158,13 +1159,11 @@ mod tests {
 
     #[test]
     fn score_then_newest_then_position() {
-        let mut v = vec![
-            hit("t", 1.0, 100, 0, 1),
+        let mut v = [hit("t", 1.0, 100, 0, 1),
             hit("t", 2.0, 50, 0, 2),
             hit("t", 1.0, 200, 1, 9),
             hit("t", 1.0, 100, 0, 3),
-            hit("a", 1.0, 100, 2, 0),
-        ];
+            hit("a", 1.0, 100, 2, 0)];
         v.sort_by(hit_order);
         let ids: Vec<_> = v.iter().map(|h| format!("{}/{}", h._index, h._id)).collect();
         assert_eq!(ids, ["t/0-2", "t/1-9", "a/2-0", "t/0-3", "t/0-1"]);

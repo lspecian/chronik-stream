@@ -1425,7 +1425,10 @@ mod tests {
         assert!(CatalogState::from_snapshot(&[42]).is_err());
     }
 
-    fn imported(name: &str, partitions: u32, assignments: Vec<(u32, Vec<u64>, u64, i32, Vec<u64>)>) -> ImportedTopic {
+    /// (partition, replicas, leader, leader epoch, isr)
+    type Assignment = (u32, Vec<u64>, u64, i32, Vec<u64>);
+
+    fn imported(name: &str, partitions: u32, assignments: Vec<Assignment>) -> ImportedTopic {
         ImportedTopic {
             name: name.into(),
             config: config(partitions, 3),

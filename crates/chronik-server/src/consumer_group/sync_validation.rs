@@ -4,7 +4,6 @@
 //! Handles generation ID and member epoch validation.
 
 use crate::consumer_group::{ConsumerGroup, SyncGroupResponse};
-use chronik_common::Result;
 
 /// SyncGroup validator
 ///
@@ -23,7 +22,6 @@ impl SyncValidator {
             return Some(SyncGroupResponse {
                 error_code: 27, // ILLEGAL_GENERATION
                 assignment: vec![],
-                member_epoch: 0,
             });
         }
         None
@@ -42,7 +40,6 @@ impl SyncValidator {
                 return Some(SyncGroupResponse {
                     error_code: 78, // FENCED_MEMBER_EPOCH
                     assignment: vec![],
-                    member_epoch: member.member_epoch,
                 });
             }
         }
@@ -68,7 +65,7 @@ impl SyncValidator {
 mod tests {
     use super::*;
     use crate::consumer_group::ConsumerGroup;
-    use std::collections::{HashMap, HashSet};
+    
 
     #[test]
     fn test_validate_generation_success() {

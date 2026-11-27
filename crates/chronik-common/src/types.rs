@@ -70,14 +70,11 @@ pub struct TopicConfig {
 /// Cleanup policy for topics.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum CleanupPolicy {
+    #[default]
     Delete,
     Compact,
     CompactAndDelete,
 }
 
-impl Default for CleanupPolicy {
-    fn default() -> Self {
-        Self::Delete
-    }
-}

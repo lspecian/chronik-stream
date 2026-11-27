@@ -1,46 +1,46 @@
-/// Async response pipeline for WAL batch commits
-///
-/// This module implements asynchronous response delivery for Kafka produce requests
-/// with acks=1 or acks=-1. It eliminates the 168x performance bottleneck caused by
-/// synchronous blocking on WAL fsync operations.
-///
-/// ## Architecture
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────────────────────┐
-/// │                    ResponsePipeline Flow                        │
-/// ├─────────────────────────────────────────────────────────────────┤
-/// │                                                                 │
-/// │  1. PRODUCE REQUEST (acks=1)                                    │
-/// │     ├─ WAL.append(acks=0) - no blocking!                        │
-/// │     ├─ ResponsePipeline.register(topic, partition, offset, tx)  │
-/// │     └─ Return IMMEDIATELY to request handler                    │
-/// │                                                                 │
-/// │  2. GROUP COMMIT (background worker, every 50ms)                │
-/// │     ├─ fsync batch (topic1-p0: offsets 100-199)                 │
-/// │     ├─ Trigger callback: notify_batch_committed()               │
-/// │     └─ ResponsePipeline receives notification                   │
-/// │                                                                 │
-/// │  3. RESPONSE DELIVERY                                           │
-/// │     ├─ O(1) bucket lookup by (topic, partition)                 │
-/// │     ├─ O(log n) range scan in BTreeMap for offset range         │
-/// │     ├─ Send success response via oneshot channel                │
-/// │     └─ Kafka client receives ProduceResponse                    │
-/// │                                                                 │
-/// │  4. TIMEOUT CLEANUP (background task, every 2s)                 │
-/// │     ├─ Scan buckets for responses older than 30s                │
-/// │     └─ Send timeout errors                                      │
-/// │                                                                 │
-/// └─────────────────────────────────────────────────────────────────┘
-/// ```
-///
-/// ## v2.4.1 Performance Fix
-///
-/// Storage changed from flat `DashMap<ResponseKey, PendingResponse>` to
-/// partition-bucketed `DashMap<(topic, partition), BTreeMap<offset, response>>`.
-/// This changes `notify_batch_committed()` from O(n) over ALL pending entries
-/// to O(1) bucket lookup + O(log n + k) range scan within one partition.
-/// Under bulk load (280+ req/sec), this prevents cascading timeouts.
+//! Async response pipeline for WAL batch commits
+//!
+//! This module implements asynchronous response delivery for Kafka produce requests
+//! with acks=1 or acks=-1. It eliminates the 168x performance bottleneck caused by
+//! synchronous blocking on WAL fsync operations.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    ResponsePipeline Flow                        │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │                                                                 │
+//! │  1. PRODUCE REQUEST (acks=1)                                    │
+//! │     ├─ WAL.append(acks=0) - no blocking!                        │
+//! │     ├─ ResponsePipeline.register(topic, partition, offset, tx)  │
+//! │     └─ Return IMMEDIATELY to request handler                    │
+//! │                                                                 │
+//! │  2. GROUP COMMIT (background worker, every 50ms)                │
+//! │     ├─ fsync batch (topic1-p0: offsets 100-199)                 │
+//! │     ├─ Trigger callback: notify_batch_committed()               │
+//! │     └─ ResponsePipeline receives notification                   │
+//! │                                                                 │
+//! │  3. RESPONSE DELIVERY                                           │
+//! │     ├─ O(1) bucket lookup by (topic, partition)                 │
+//! │     ├─ O(log n) range scan in BTreeMap for offset range         │
+//! │     ├─ Send success response via oneshot channel                │
+//! │     └─ Kafka client receives ProduceResponse                    │
+//! │                                                                 │
+//! │  4. TIMEOUT CLEANUP (background task, every 2s)                 │
+//! │     ├─ Scan buckets for responses older than 30s                │
+//! │     └─ Send timeout errors                                      │
+//! │                                                                 │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## v2.4.1 Performance Fix
+//!
+//! Storage changed from flat `DashMap<ResponseKey, PendingResponse>` to
+//! partition-bucketed `DashMap<(topic, partition), BTreeMap<offset, response>>`.
+//! This changes `notify_batch_committed()` from O(n) over ALL pending entries
+//! to O(1) bucket lookup + O(log n + k) range scan within one partition.
+//! Under bulk load (280+ req/sec), this prevents cascading timeouts.
 
 use dashmap::DashMap;
 use std::collections::BTreeMap;
@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use tracing::{debug, warn, error, info};
+use tracing::{debug, warn};
 
 use chronik_protocol::produce_types::ProduceResponsePartition;
 
@@ -115,8 +115,8 @@ pub struct ResponsePipelineMetrics {
     pub pending_count: AtomicU64,
 }
 
+#[cfg(test)]
 impl ResponsePipelineMetrics {
-
     pub fn timeouts(&self) -> u64 {
         self.timeouts.load(Ordering::Relaxed)
     }
@@ -371,69 +371,14 @@ impl ResponsePipeline {
         }
     }
 
-    /// Notify that a WAL batch commit failed.
-    ///
-    /// Uses O(1) bucket lookup + O(log n) range scan.
-    pub fn notify_batch_failed(
-        &self,
-        topic: &str,
-        partition: i32,
-        min_offset: i64,
-        max_offset: i64,
-        error_message: &str,
-    ) {
-        error!(
-            "WAL batch commit FAILED: topic={} partition={} offsets={}..={} error={}",
-            topic, partition, min_offset, max_offset, error_message
-        );
-
-        let bucket_key = (topic.to_string(), partition);
-
-        let mut bucket = match self.pending.get_mut(&bucket_key) {
-            Some(b) => b,
-            None => return,
-        };
-
-        let offsets_in_range: Vec<i64> = bucket
-            .range(min_offset..=max_offset)
-            .filter(|(_, resp)| resp.last_offset <= max_offset)
-            .map(|(offset, _)| *offset)
-            .collect();
-
-        for offset in offsets_in_range {
-            if let Some(response) = bucket.remove(&offset) {
-                let error_response = ProduceResponsePartition {
-                    index: response.partition,
-                    error_code: 1, // UNKNOWN_SERVER_ERROR
-                    base_offset: -1,
-                    log_append_time: -1,
-                    log_start_offset: -1,
-                    record_errors: Some(vec![]),
-                    error_message: Some(error_message.to_string()),
-                };
-
-                let _ = response.response_tx.send(error_response);
-
-                if self.config.enable_metrics {
-                    self.metrics.pending_count.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        if bucket.is_empty() {
-            drop(bucket);
-            // Only if still empty, checked under the shard lock: a `register`
-            // may have refilled it since `bucket` was dropped.
-            self.pending.remove_if(&bucket_key, |_, b| b.is_empty());
-        }
-    }
-
     /// Get current metrics
+    #[cfg(test)]
     pub fn metrics(&self) -> &ResponsePipelineMetrics {
         &self.metrics
     }
 
     /// Get current pending count
+    #[cfg(test)]
     pub fn pending_count(&self) -> usize {
         self.pending.iter().map(|entry| entry.value().len()).sum()
     }
@@ -549,26 +494,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_response_pipeline_batch_failed() {
-        let pipeline = ResponsePipeline::new();
-
-        let (tx, rx) = oneshot::channel();
-
-        // Register response
-        pipeline.register("test-topic".to_string(), 0, 100, 199, tx);
-
-        // Notify batch failed
-        pipeline.notify_batch_failed("test-topic", 0, 100, 199, "Disk error");
-
-        // Should receive error response
-        let response = rx.await.unwrap();
-        assert_eq!(response.error_code, 1); // UNKNOWN_SERVER_ERROR
-        assert_eq!(response.error_message, Some("Disk error".to_string()));
-
-        assert_eq!(pipeline.pending_count(), 0);
-    }
-
-    #[tokio::test]
     async fn test_response_pipeline_multi_partition() {
         let pipeline = ResponsePipeline::new();
 
@@ -637,7 +562,6 @@ mod tests {
 
         // Should not panic when notifying for non-existent topic
         pipeline.notify_batch_committed("nonexistent", 0, 0, 100);
-        pipeline.notify_batch_failed("nonexistent", 0, 0, 100, "error");
 
         assert_eq!(pipeline.pending_count(), 0);
     }

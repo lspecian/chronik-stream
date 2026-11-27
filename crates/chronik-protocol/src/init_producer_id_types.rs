@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
-use chronik_common::{Result, Error};
+use chronik_common::Result;
 
 /// InitProducerId request
 #[derive(Debug, Clone, Serialize, Deserialize)]

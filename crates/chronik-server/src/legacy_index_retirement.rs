@@ -226,7 +226,7 @@ mod tests {
         b.extend_from_slice(&(body_len as i32).to_be_bytes());
         b.extend_from_slice(&0i32.to_be_bytes());
         b.push(2);
-        b.extend(std::iter::repeat(0u8).take(n as usize));
+        b.extend(std::iter::repeat_n(0u8, n as usize));
         b
     }
 

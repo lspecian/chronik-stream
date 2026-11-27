@@ -36,7 +36,6 @@ pub async fn create_integrated_server(
         auto_create_topics: true,
         num_partitions: 3,  // Default for better parallelism
         replication_factor: init_config.replication_factor,
-        enable_wal_indexing: true,
         wal_indexing_interval_secs: 30,
         object_store_config,
         enable_metadata_dr: true,
@@ -82,7 +81,6 @@ mod tests {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             data_dir: temp_dir.path().to_path_buf(),
-            object_store_config: None,
             replication_factor: 3,
             kafka_bind_addr: "0.0.0.0:9092".to_string(),
             wal_bind_addr: "0.0.0.0:9291".to_string(),
@@ -105,7 +103,6 @@ mod tests {
             auto_create_topics: true,
             num_partitions: 3,
             replication_factor: init_config.replication_factor,
-            enable_wal_indexing: true,
             wal_indexing_interval_secs: 30,
             object_store_config: None,
             enable_metadata_dr: true,

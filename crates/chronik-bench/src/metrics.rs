@@ -114,8 +114,3 @@ pub fn update_throughput_stats(msg_per_sec: f64, mb_per_sec: f64) {
     THROUGHPUT_MB_PER_SEC.set(mb_per_sec);
 }
 
-// Dummy implementations for when prometheus feature is disabled
-#[cfg(not(feature = "prometheus"))]
-pub async fn start_prometheus_exporter(_port: u16) -> anyhow::Result<()> {
-    Ok(())
-}

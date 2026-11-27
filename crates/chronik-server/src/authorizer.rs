@@ -222,78 +222,6 @@ impl Authorizer {
 /// Kafka's name for the cluster resource.
 pub const CLUSTER_RESOURCE_NAME: &str = "kafka-cluster";
 
-/// The operation an API requires on its primary resource.
-///
-/// This mirrors Kafka's `AclOperation` table (see `KafkaApis` upstream). The
-/// non-obvious entries are worth stating explicitly:
-///
-/// - `Fetch` needs **Read** on the topic, not Describe.
-/// - Consumer-group APIs need **Read** on the group; only `DescribeGroups` and
-///   `ListGroups` are Describe.
-/// - `ListOffsets` needs **Describe** on the topic.
-/// - Transactional APIs need **Write** on the TransactionalId.
-/// - `OffsetCommit` needs Read on the group *and* Read on each topic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequiredAccess {
-    /// Operation on named topics.
-    Topic(AclOperation),
-    /// Operation on the named consumer group.
-    Group(AclOperation),
-    /// Operation on the cluster.
-    Cluster(AclOperation),
-    /// Operation on a transactional id.
-    TransactionalId(AclOperation),
-    /// No authorization required (protocol negotiation and authentication).
-    None,
-}
-
-/// Map an API key to the access it requires.
-///
-/// Returned for documentation and for the coarse cluster-level checks that can
-/// be made without parsing a body; per-resource checks happen in the handlers,
-/// which know the names.
-pub fn required_access(api_key: i16) -> RequiredAccess {
-    use AclOperation::*;
-    match api_key {
-        0 => RequiredAccess::Topic(Write),        // Produce
-        1 => RequiredAccess::Topic(Read),         // Fetch
-        2 => RequiredAccess::Topic(Describe),     // ListOffsets
-        3 => RequiredAccess::Topic(Describe),     // Metadata
-        8 => RequiredAccess::Group(Read),         // OffsetCommit
-        9 => RequiredAccess::Group(Describe),     // OffsetFetch
-        10 => RequiredAccess::Group(Describe),    // FindCoordinator
-        11 => RequiredAccess::Group(Read),        // JoinGroup
-        12 => RequiredAccess::Group(Read),        // Heartbeat
-        13 => RequiredAccess::Group(Read),        // LeaveGroup
-        14 => RequiredAccess::Group(Read),        // SyncGroup
-        15 => RequiredAccess::Group(Describe),    // DescribeGroups
-        16 => RequiredAccess::Cluster(Describe),  // ListGroups
-        17 | 18 | 36 => RequiredAccess::None,     // SaslHandshake/ApiVersions/SaslAuthenticate
-        19 => RequiredAccess::Cluster(Create),    // CreateTopics
-        20 => RequiredAccess::Topic(Delete),      // DeleteTopics
-        21 => RequiredAccess::Topic(Delete),      // DeleteRecords
-        22 => RequiredAccess::TransactionalId(Write), // InitProducerId
-        23 => RequiredAccess::Topic(Describe),    // OffsetForLeaderEpoch
-        24 => RequiredAccess::TransactionalId(Write), // AddPartitionsToTxn
-        25 => RequiredAccess::TransactionalId(Write), // AddOffsetsToTxn
-        26 => RequiredAccess::TransactionalId(Write), // EndTxn
-        28 => RequiredAccess::TransactionalId(Write), // TxnOffsetCommit
-        29 | 30 | 31 => RequiredAccess::Cluster(Alter), // Describe/Create/DeleteAcls
-        32 => RequiredAccess::Cluster(DescribeConfigs), // DescribeConfigs
-        33 => RequiredAccess::Cluster(AlterConfigs), // AlterConfigs
-        35 => RequiredAccess::Cluster(Describe),  // DescribeLogDirs
-        37 => RequiredAccess::Topic(Alter),       // CreatePartitions
-        42 => RequiredAccess::Group(Delete),      // DeleteGroups
-        44 => RequiredAccess::Cluster(AlterConfigs), // IncrementalAlterConfigs
-        47 => RequiredAccess::Group(Delete),      // OffsetDelete
-        // Anything unmapped is treated as a cluster operation requiring
-        // ClusterAction. Failing closed on an unknown API is the safe default:
-        // a new API added without an entry here is refused rather than silently
-        // unauthorized.
-        _ => RequiredAccess::Cluster(ClusterAction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,30 +277,6 @@ mod tests {
             .await;
         assert!(allowed.is_empty());
         assert_eq!(denied.len(), 2);
-    }
-
-    /// An API with no entry in the table must fail closed, not open.
-    #[test]
-    fn unmapped_api_requires_cluster_action() {
-        assert_eq!(
-            required_access(9999),
-            RequiredAccess::Cluster(AclOperation::ClusterAction)
-        );
-    }
-
-    /// Regression guards for the entries most often got wrong.
-    #[test]
-    fn operation_table_matches_kafka() {
-        assert_eq!(required_access(0), RequiredAccess::Topic(AclOperation::Write)); // Produce
-        assert_eq!(required_access(1), RequiredAccess::Topic(AclOperation::Read)); // Fetch, not Describe
-        assert_eq!(required_access(11), RequiredAccess::Group(AclOperation::Read)); // JoinGroup
-        assert_eq!(
-            required_access(19),
-            RequiredAccess::Cluster(AclOperation::Create)
-        ); // CreateTopics
-        assert_eq!(required_access(18), RequiredAccess::None); // ApiVersions
-        assert_eq!(required_access(17), RequiredAccess::None); // SaslHandshake
-        assert_eq!(required_access(36), RequiredAccess::None); // SaslAuthenticate
     }
 
     /// With ACLs disabled nothing is checked - the default must stay free.

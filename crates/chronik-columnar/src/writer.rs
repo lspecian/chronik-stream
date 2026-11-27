@@ -253,8 +253,7 @@ mod tests {
 
     #[test]
     fn test_compression_mapping() {
-        let mut config = ColumnarConfig::default();
-        config.compression = CompressionCodec::Snappy;
+        let config = ColumnarConfig { compression: CompressionCodec::Snappy, ..Default::default() };
 
         let schema = kafka_message_schema();
         let writer = ParquetSegmentWriter::new(schema, config);

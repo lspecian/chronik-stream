@@ -214,10 +214,9 @@ impl InferredJsonSchema {
             if entry.is_empty() {
                 continue;
             }
-            let (name_and_type, nullable) = if entry.ends_with('?') {
-                (&entry[..entry.len() - 1], true)
-            } else {
-                (entry, false)
+            let (name_and_type, nullable) = match entry.strip_suffix('?') {
+                Some(stripped) => (stripped, true),
+                None => (entry, false),
             };
 
             let parts: Vec<&str> = name_and_type.splitn(2, ':').collect();

@@ -50,9 +50,9 @@ use tracing::{debug, error, info, warn};
 use crate::isr_tracker::IsrTracker;
 use crate::cluster_catalog::ClusterCatalog;
 use crate::schema_registry::{
-    CompatibilityConfig, CompatibilityLevel, GetSchemaResponse, GetSubjectVersionResponse,
-    RegisterSchemaRequest, RegisterSchemaResponse, SchemaRegistry, SchemaRegistryConfig,
-    SchemaRegistryError, SchemaType, SchemaVersionRef,
+    CompatibilityConfig, GetSchemaResponse, GetSubjectVersionResponse,
+    RegisterSchemaRequest, RegisterSchemaResponse, SchemaRegistry,
+    SchemaRegistryError, SchemaVersionRef,
 };
 use chronik_common::metadata::traits::MetadataStore;
 
@@ -962,6 +962,7 @@ fn admin_error_response(status: StatusCode, reason: &str, hint: &str) -> Respons
 }
 
 /// Authentication middleware for Admin API (X-API-Key header)
+#[allow(clippy::result_large_err)] // axum error response, built once per failed request
 async fn auth_middleware(
     State(state): State<AdminApiState>,
     headers: HeaderMap,
@@ -1003,6 +1004,7 @@ async fn auth_middleware(
 ///
 /// Validates credentials from `Authorization: Basic <base64>` header.
 /// If auth is disabled via config, requests pass through without validation.
+#[allow(clippy::result_large_err)] // axum error response, built once per failed request
 async fn schema_registry_auth_middleware(
     State(state): State<AdminApiState>,
     headers: HeaderMap,

@@ -10,8 +10,8 @@
 //! ```rust
 //! let tracker = IsrTracker::new(10_000, 10_000);
 //!
-//! // Update follower offset after replication
-//! tracker.update_follower_offset(2, "orders", 0, 12345);
+//! // Record a follower fetch (fetch offset, leader log end)
+//! tracker.record_follower_fetch(2, "orders", 0, 12345, 12345);
 //!
 //! // Check if follower is in-sync
 //! if tracker.is_in_sync(2, "orders", 0, 12350) {
@@ -303,13 +303,14 @@ impl IsrTracker {
         now_ms.saturating_sub(since) > self.max_lag_ms
     }
 
-    /// Update follower offset after successful replication
+    /// Update follower offset after successful replication (tests)
     ///
     /// # Arguments
     /// - `node_id`: Follower node ID
     /// - `topic`: Topic name
     /// - `partition`: Partition ID
     /// - `offset`: New acknowledged offset
+    #[cfg(test)]
     pub fn update_follower_offset(
         &self,
         node_id: u64,
@@ -460,30 +461,6 @@ impl IsrTracker {
             // "no interlock", which is what single-node deployments rely on.
             _ => min_live,
         }
-    }
-
-    /// Drop everything known about a node, across all partitions.
-    ///
-    /// Called when the leader loses its connection to a follower. Without this, a
-    /// follower that was caught up when it died stays in ISR indefinitely: it is
-    /// caught up (so the lag bound never fires) and it will never ACK again (so
-    /// nothing else can evict it). Observed live — a node killed for 60s still
-    /// reported `isr=[1,2,3]`.
-    ///
-    /// Kafka does not need this because a follower proves liveness by continuing
-    /// to fetch. In the push model the only equivalent signal is the connection
-    /// itself, refreshed every heartbeat interval. RP-2 makes this unnecessary
-    /// again by moving to fetch.
-    pub fn remove_node(&self, node_id: u64) {
-        self.follower_offsets
-            .retain(|(nid, _), _| *nid != node_id);
-    }
-
-    /// Remove follower state (e.g., when node leaves cluster)
-    #[allow(dead_code)]
-    pub fn remove_follower(&self, node_id: u64, topic: &str, partition: i32) {
-        let key = (node_id, (topic.to_string(), partition));
-        self.follower_offsets.remove(&key);
     }
 
     /// Get follower lag for debugging/monitoring
@@ -881,38 +858,6 @@ mod tests {
             SyncState::InSync,
             "a single missed heartbeat must not eject a healthy replica"
         );
-    }
-
-    /// Explicit eviction still works for a node genuinely removed from the cluster.
-    #[test]
-    fn dead_but_caught_up_follower_is_evicted_on_connection_loss() {
-        let tracker = IsrTracker::new(1000, 10_000);
-        let replicas = vec![1, 2, 3];
-
-        tracker.update_follower_offset(2, "t", 0, 100);
-        tracker.update_follower_offset(3, "t", 0, 100);
-        assert_eq!(tracker.get_isr("t", 0, 100, &replicas), vec![2, 3]);
-
-        tracker.remove_node(3);
-
-        assert_eq!(tracker.get_isr("t", 0, 100, &replicas), vec![2]);
-        assert_eq!(tracker.sync_state(3, "t", 0, 100), SyncState::Unknown);
-    }
-
-    /// Eviction is per node, across every partition it replicated.
-    #[test]
-    fn remove_node_clears_all_partitions() {
-        let tracker = IsrTracker::new(1000, 10_000);
-
-        tracker.update_follower_offset(3, "a", 0, 10);
-        tracker.update_follower_offset(3, "b", 7, 20);
-        tracker.update_follower_offset(2, "a", 0, 10);
-
-        tracker.remove_node(3);
-
-        assert_eq!(tracker.sync_state(3, "a", 0, 10), SyncState::Unknown);
-        assert_eq!(tracker.sync_state(3, "b", 7, 20), SyncState::Unknown);
-        assert_eq!(tracker.sync_state(2, "a", 0, 10), SyncState::InSync, "other nodes untouched");
     }
 
     /// A backwards clock step must not eject healthy replicas.

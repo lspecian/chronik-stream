@@ -511,7 +511,7 @@ impl PartitionFailoverController {
         let Some(interval) = self.rebalance_interval else {
             return false;
         };
-        let elapsed = |t: Option<Instant>| t.map_or(true, |t| now.duration_since(t) >= interval);
+        let elapsed = |t: Option<Instant>| t.is_none_or(|t| now.duration_since(t) >= interval);
 
         if !elapsed(*self.last_leadership_change.lock()) {
             return false;

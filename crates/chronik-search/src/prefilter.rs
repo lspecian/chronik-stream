@@ -70,7 +70,7 @@ impl Requirement {
                 }
                 if !b.should.is_empty() {
                     let options: Vec<Requirement> = b.should.iter().map(Self::of_dsl).collect();
-                    if options.iter().any(|r| *r == Requirement::Unknown) {
+                    if options.contains(&Requirement::Unknown) {
                         return Requirement::Unknown;
                     }
                     return Requirement::Any(options);

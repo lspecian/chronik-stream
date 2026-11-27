@@ -147,6 +147,7 @@ pub struct CanonicalRecord {
     /// **WHEN IT'S NONE:**
     /// - Batches created from Tantivy segments (`from_entries()`)
     /// - Batches we synthesize ourselves (test fixtures, etc.)
+    ///
     /// In these cases, `to_kafka_batch()` will compress normally.
     ///
     /// **SERIALIZATION:**
@@ -462,7 +463,7 @@ impl CanonicalRecord {
 
         let crc = cursor.get_u32_le(); // CRC is little-endian
         let attributes = cursor.get_u16();
-        let last_offset_delta = cursor.get_i32();
+        let _last_offset_delta = cursor.get_i32();
         let base_timestamp = cursor.get_i64();
         let max_timestamp = cursor.get_i64();
         let producer_id = cursor.get_i64();
@@ -813,7 +814,7 @@ impl CanonicalRecord {
     ///
     /// Updated v1 MessageSet with offsets matching self.records[].offset values
     fn update_v1_messageset_offsets(&self, v1_bytes: &[u8]) -> Result<Vec<u8>> {
-        use byteorder::{BigEndian, WriteBytesExt};
+        
 
         let mut updated = v1_bytes.to_vec();
         let mut cursor_pos = 0;
@@ -1226,11 +1227,14 @@ mod tests {
         }
     }
 
+    /// (key, value, headers)
+    type TestRecord = (Option<Vec<u8>>, Option<Vec<u8>>, Vec<(String, Vec<u8>)>);
+
     /// Helper to create a simple uncompressed Kafka RecordBatch v2
     fn create_test_kafka_batch(
         base_offset: i64,
         partition_leader_epoch: i32,
-        records: Vec<(Option<Vec<u8>>, Option<Vec<u8>>, Vec<(String, Vec<u8>)>)>, // (key, value, headers)
+        records: Vec<TestRecord>,
     ) -> Bytes {
         let mut buf = BytesMut::new();
 
@@ -1553,11 +1557,12 @@ mod tests {
         buf.put_i32(1); // records_count
 
         // Simple record
-        let mut record_content = Vec::new();
-        record_content.push(0); // attributes
-        record_content.push(0); // timestamp_delta (varint 0)
-        record_content.push(0); // offset_delta (varint 0)
-        record_content.push(4); // key length (varint 2)
+        let mut record_content = vec![
+            0, // attributes
+            0, // timestamp_delta (varint 0)
+            0, // offset_delta (varint 0)
+            4, // key length (varint 2)
+        ];
         record_content.extend_from_slice(b"k1");
         record_content.push(4); // value length (varint 2)
         record_content.extend_from_slice(b"v1");

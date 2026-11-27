@@ -1,62 +1,17 @@
-/// Metadata Event System for WAL-Based Replication
-///
-/// This module implements an event-based architecture for metadata replication
-/// where RaftMetadataStore emits events that MetadataWalReplicator subscribes to.
-///
-/// Architecture:
-/// ```
-/// RaftMetadataStore → emit(MetadataEvent) → MetadataEventBus → MetadataWalReplicator
-/// ```
-
-use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::debug;
 
-/// Metadata events that trigger WAL replication
+/// Local metadata change notifications (the node's event bus)
 #[derive(Debug, Clone)]
 pub enum MetadataEvent {
     /// Partition assignment changed.
-    ///
-    /// Carries the WHOLE assignment, not a summary of it. This event is not
-    /// only a local notification: the replicator rebuilds a `PartitionAssignment`
-    /// from these fields and ships it to every follower, which applies it
-    /// verbatim. Any field missing here is a field that silently becomes its
-    /// default on every other node in the cluster.
-    ///
-    /// It carried only `replicas` and `leader`, so `leader_epoch` was rebuilt as
-    /// `0` on the wire — every follower's copy of every assignment read epoch 0
-    /// forever, no matter how many times leadership actually changed. That
-    /// disarms leader-epoch truncation cluster-wide: a follower asks about
-    /// epoch 0, and a promoted replica that also believes it is on epoch 0
-    /// answers "that is the current epoch, it ends at my log end", so nothing
-    /// ever truncates.
     PartitionAssigned {
         topic: String,
         partition: i32,
         replicas: Vec<u64>,
         leader: u64,
-        /// Increments on a genuine leader change. Followers need it to tell a
-        /// new assignment from a stale one, and to answer `OffsetForLeaderEpoch`
-        /// correctly if they are promoted.
+        /// Increments on a genuine leader change.
         leader_epoch: i32,
-        /// Which replicas hold the committed records. Failover elects from this,
-        /// and the node that runs failover is usually not the node that measured
-        /// it — so it has to survive the trip.
-        isr: Vec<u64>,
-    },
-
-    /// Partition leader changed
-    LeaderChanged {
-        topic: String,
-        partition: i32,
-        new_leader: u64,
-    },
-
-    /// ISR (In-Sync Replicas) updated
-    ISRUpdated {
-        topic: String,
-        partition: i32,
-        isr: Vec<u64>,
     },
 
     /// High watermark updated
@@ -66,37 +21,17 @@ pub enum MetadataEvent {
         offset: i64,
     },
 
-    /// Topic created
-    TopicCreated {
-        topic: String,
-        num_partitions: i32,
-    },
+    /// Topic created, or its configuration changed
+    TopicCreated,
 
     /// Topic deleted
-    TopicDeleted {
-        topic: String,
-    },
+    TopicDeleted,
 
-    /// Broker registered (v2.2.9)
-    /// CRITICAL FIX: This was missing, causing followers to not receive broker metadata
-    BrokerRegistered {
-        broker_id: i32,
-        host: String,
-        port: i32,
-        rack: Option<String>,
-    },
+    /// A broker registered (one event per registered broker)
+    BrokerRegistered,
 
-    /// An ACL or SCRAM credential change, carried exactly as it was written to
-    /// the metadata log and shipped to followers unchanged.
-    ///
-    /// These had no variant here, so the adapter in the server builder dropped
-    /// them as "non-replication events": a rule or credential created, altered
-    /// or revoked on one broker was never seen by the others. The other
-    /// variants are summaries the replicator re-expands; security records are
-    /// small and must arrive exactly as written, so they travel whole.
-    SecurityChanged {
-        event: chronik_common::metadata::MetadataEvent,
-    },
+    /// An ACL or SCRAM credential changed
+    SecurityChanged,
 }
 
 /// Event bus for metadata changes
@@ -144,6 +79,7 @@ impl MetadataEventBus {
     }
 
     /// Get the number of active subscribers
+    #[cfg(test)]
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }
@@ -192,7 +128,6 @@ mod tests {
             replicas: vec![1, 2, 3],
             leader: 1,
             leader_epoch: 7,
-            isr: vec![1, 3],
         };
 
         let count = bus.publish(event.clone());
@@ -205,20 +140,13 @@ mod tests {
 
         match received {
             MetadataEvent::PartitionAssigned {
-                topic, partition, replicas, leader, leader_epoch, isr,
+                topic, partition, replicas, leader, leader_epoch,
             } => {
                 assert_eq!(topic, "test");
                 assert_eq!(partition, 0);
                 assert_eq!(replicas, vec![1, 2, 3]);
                 assert_eq!(leader, 1);
-                // These two travel to every follower, which applies them
-                // verbatim. Asserting them here is asserting that a leadership
-                // change and an in-sync set survive the trip at all: when
-                // `leader_epoch` was rebuilt as 0 on the way out, every
-                // follower in the cluster read epoch 0 forever and leader-epoch
-                // truncation could not fire anywhere.
                 assert_eq!(leader_epoch, 7, "the leader epoch must survive the bus");
-                assert_eq!(isr, vec![1, 3], "the in-sync set must survive the bus");
             }
             _ => panic!("Wrong event type"),
         }
@@ -232,10 +160,7 @@ mod tests {
 
         assert_eq!(bus.subscriber_count(), 2);
 
-        let event = MetadataEvent::TopicCreated {
-            topic: "test".to_string(),
-            num_partitions: 3,
-        };
+        let event = MetadataEvent::TopicCreated;
 
         let count = bus.publish(event.clone());
         assert_eq!(count, 2, "Should have 2 subscribers");
@@ -251,11 +176,7 @@ mod tests {
             .expect("recv");
 
         match (r1, r2) {
-            (MetadataEvent::TopicCreated { topic: t1, .. },
-             MetadataEvent::TopicCreated { topic: t2, .. }) => {
-                assert_eq!(t1, "test");
-                assert_eq!(t2, "test");
-            }
+            (MetadataEvent::TopicCreated, MetadataEvent::TopicCreated) => {}
             _ => panic!("Wrong event types"),
         }
     }
@@ -275,17 +196,18 @@ mod tests {
         // A catalog far larger than the old 1000 buffer, pushed before any drain.
         const N: usize = 3000;
         for i in 0..N {
-            bus.publish(MetadataEvent::TopicCreated {
-                topic: format!("repro-{}", i),
-                num_partitions: 1,
+            bus.publish(MetadataEvent::HighWatermarkUpdated {
+                topic: "repro".to_string(),
+                partition: 0,
+                offset: i as i64,
             });
         }
 
         // Drain: every event must arrive, in order, with no Lagged gap.
         for i in 0..N {
             match receiver.try_recv() {
-                Ok(MetadataEvent::TopicCreated { topic, .. }) => {
-                    assert_eq!(topic, format!("repro-{}", i), "out-of-order / dropped at {}", i);
+                Ok(MetadataEvent::HighWatermarkUpdated { offset, .. }) => {
+                    assert_eq!(offset, i as i64, "out-of-order / dropped at {}", i);
                 }
                 Ok(other) => panic!("unexpected event: {:?}", other),
                 Err(e) => panic!("event {} dropped/unavailable: {:?} — buffer too small", i, e),
@@ -303,9 +225,10 @@ mod tests {
         let mut receiver = bus.subscribe();
 
         for i in 0..3000 {
-            bus.publish(MetadataEvent::TopicCreated {
-                topic: format!("repro-{}", i),
-                num_partitions: 1,
+            bus.publish(MetadataEvent::HighWatermarkUpdated {
+                topic: "repro".to_string(),
+                partition: 0,
+                offset: i as i64,
             });
         }
 
@@ -323,10 +246,7 @@ mod tests {
     async fn test_no_subscribers() {
         let bus = MetadataEventBus::new(10);
 
-        let event = MetadataEvent::TopicCreated {
-            topic: "test".to_string(),
-            num_partitions: 1,
-        };
+        let event = MetadataEvent::TopicCreated;
 
         // Should not panic with no subscribers
         let count = bus.publish(event);
@@ -339,11 +259,8 @@ mod tests {
         let mut receiver = bus.subscribe();
 
         // Send more events than buffer size
-        for i in 0..5 {
-            bus.publish(MetadataEvent::TopicCreated {
-                topic: format!("test-{}", i),
-                num_partitions: 1,
-            });
+        for _ in 0..5 {
+            bus.publish(MetadataEvent::TopicCreated);
         }
 
         // First recv should return Lagged error

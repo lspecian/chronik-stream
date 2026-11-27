@@ -16,35 +16,7 @@ enum ErrorCode {
     UnknownTopicOrPartition = 3,
     InvalidFetchSize = 4,
     LeaderNotAvailable = 5,
-    NotLeaderForPartition = 6,
-    RequestTimedOut = 7,
-    BrokerNotAvailable = 8,
-    ReplicaNotAvailable = 9,
-    MessageTooLarge = 10,
-    StaleControllerEpoch = 11,
-    OffsetMetadataTooLarge = 12,
-    NetworkException = 13,
-    CoordinatorLoadInProgress = 14,
-    CoordinatorNotAvailable = 15,
-    NotCoordinator = 16,
-    InvalidTopicException = 17,
-    RecordListTooLarge = 18,
-    NotEnoughReplicas = 19,
-    NotEnoughReplicasAfterAppend = 20,
-    InvalidRequiredAcks = 21,
-    IllegalGeneration = 22,
-    InconsistentGroupProtocol = 23,
-    InvalidGroupId = 24,
-    UnknownMemberId = 25,
-    InvalidSessionTimeout = 26,
-    RebalanceInProgress = 27,
-    InvalidCommitOffsetSize = 28,
-    TopicAuthorizationFailed = 29,
-    GroupAuthorizationFailed = 30,
-    ClusterAuthorizationFailed = 31,
-    InvalidTimestamp = 32,
     UnsupportedSaslMechanism = 33,
-    IllegalSaslState = 34,
     UnsupportedVersion = 35,
 }
 
@@ -53,7 +25,7 @@ enum ErrorCode {
 async fn test_malformed_request_handling() {
     let handler = ProtocolHandler::new();
     
-    let malformed_requests = vec![
+    let malformed_requests: [Vec<u8>; 4] = [
         // Empty request
         vec![],
         // Too short for header
@@ -302,7 +274,7 @@ async fn test_sequential_error_handling() {
         let response = result.unwrap();
         assert_eq!(
             response.header.correlation_id,
-            i as i32,
+            i,
             "Correlation ID should be preserved"
         );
     }

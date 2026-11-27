@@ -259,7 +259,7 @@ fn test_api_versions_v0_field_ordering() {
     ProtocolCodec::encode_api_versions_response(&mut buf, 123, &apis, 0).unwrap();
 
     // Skip correlation ID (4 bytes)
-    let mut data = &buf[4..];
+    let data = &buf[4..];
 
     // First should be error_code (2 bytes) for kafka-python compatibility
     let error_code = i16::from_be_bytes([data[0], data[1]]);
@@ -285,7 +285,7 @@ fn test_api_versions_v1_field_ordering() {
     ProtocolCodec::encode_api_versions_response(&mut buf, 456, &apis, 1).unwrap();
 
     // Skip correlation ID (4 bytes)
-    let mut data = &buf[4..];
+    let data = &buf[4..];
 
     // First should be throttle_time_ms (4 bytes) for v1+
     let throttle_time = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);

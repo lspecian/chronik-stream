@@ -510,7 +510,7 @@ impl ObjectStore for LocalBackend {
             .await
             .map_err(|e| ObjectStoreError::Other(format!("Failed to copy data: {}", e)))?;
 
-        writer.flush().await.map_err(|e| ObjectStoreError::Io(e))?;
+        writer.flush().await.map_err(ObjectStoreError::Io)?;
 
         debug!("Streamed {} bytes from: {:?}", bytes_copied, path);
         Ok(bytes_copied)
@@ -535,7 +535,7 @@ impl ObjectStore for LocalBackend {
             .await
             .map_err(|e| ObjectStoreError::Other(format!("Failed to copy data: {}", e)))?;
 
-        file.flush().await.map_err(|e| ObjectStoreError::Io(e))?;
+        file.flush().await.map_err(ObjectStoreError::Io)?;
 
         debug!("Streamed {} bytes to: {:?}", bytes_copied, path);
         Ok(())
