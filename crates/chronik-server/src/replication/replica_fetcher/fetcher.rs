@@ -275,7 +275,7 @@ pub fn plan_assignments(
 
         if !known_peers.contains_key(&leader) {
             warn!(
-                "Cannot replicate {}-{}: leader {} has no address in the cluster config",
+                "Cannot replicate {}-{}: leader {} is neither a configured peer nor a registered broker",
                 topic, partition, leader
             );
             continue;
@@ -295,6 +295,30 @@ pub fn plan_assignments(
     by_leader
 }
 
+/// Where to fetch from each leader: the configured peers, plus brokers the
+/// catalog knows and the config does not name.
+///
+/// The config names the founding nodes only. A node added with `cluster
+/// add-node` is registered in the catalog and leads partitions there, but is in
+/// no founding node's config: resolving leaders from the config alone left its
+/// partitions unreplicated ("leader 4 has no address in the cluster config"),
+/// and `acks=all` writes to them timed out. A configured address wins, because
+/// it may be a dedicated replication address (`replication` in the config).
+pub fn merge_peer_addresses(
+    node_id: u64,
+    configured: &HashMap<u64, String>,
+    brokers: &[chronik_common::metadata::traits::BrokerMetadata],
+) -> HashMap<u64, String> {
+    let mut peers = configured.clone();
+    for broker in brokers {
+        let Ok(id) = u64::try_from(broker.broker_id) else { continue };
+        if id != node_id {
+            peers.entry(id).or_insert_with(|| format!("{}:{}", broker.host, broker.port));
+        }
+    }
+    peers
+}
+
 /// Runs a node's follower-side replication.
 pub struct ReplicaFetcher {
     node_id: u64,
@@ -307,7 +331,8 @@ pub struct ReplicaFetcher {
     /// The same handler in production, narrowed to what reconciliation needs —
     /// and substitutable in tests. See [`FollowerState`].
     follower_state: Option<Arc<dyn FollowerState>>,
-    /// node id → Kafka address, from the cluster config.
+    /// node id → Kafka address, from the cluster config; catalog brokers are
+    /// merged in at each plan (see [`merge_peer_addresses`]).
     peers: HashMap<u64, String>,
     /// Wakes the supervisor the moment assignments change, instead of leaving it
     /// to the next `refresh_interval` tick.
@@ -436,6 +461,17 @@ impl ReplicaFetcher {
         });
     }
 
+    /// Leader addresses for this plan; see [`merge_peer_addresses`].
+    async fn peer_addresses(&self) -> HashMap<u64, String> {
+        match self.metadata_store.list_brokers().await {
+            Ok(brokers) => merge_peer_addresses(self.node_id, &self.peers, &brokers),
+            Err(e) => {
+                debug!("Could not list brokers; using the configured peers: {}", e);
+                self.peers.clone()
+            }
+        }
+    }
+
     async fn run_supervisor(self: Arc<Self>) {
         info!(
             "Follower-pull replication active on node {} ({} peers known)",
@@ -448,9 +484,10 @@ impl ReplicaFetcher {
         let mut events = self.metadata_events.as_ref().map(|bus| bus.subscribe());
 
         while !self.shutdown.load(Ordering::Relaxed) {
+            let peers = self.peer_addresses().await;
             let desired = match self.read_assignments().await {
                 Ok(assignments) => {
-                    let plan = plan_assignments(self.node_id, &assignments, &self.peers);
+                    let plan = plan_assignments(self.node_id, &assignments, &peers);
                     self.warn_if_replicating_nothing(&assignments, &plan);
                     plan
                 }
@@ -471,7 +508,7 @@ impl ReplicaFetcher {
                 }
 
                 for (leader, partitions) in &desired {
-                    let addr = match self.peers.get(leader) {
+                    let addr = match peers.get(leader) {
                         Some(addr) => addr.clone(),
                         None => continue,
                     };
@@ -1547,6 +1584,36 @@ mod tests {
             (2, "node2:9092".to_string()),
             (3, "node3:9092".to_string()),
         ])
+    }
+
+    fn broker(id: i32) -> chronik_common::metadata::traits::BrokerMetadata {
+        chronik_common::metadata::traits::BrokerMetadata {
+            broker_id: id,
+            host: format!("added{id}"),
+            port: 9095,
+            rack: None,
+            status: chronik_common::metadata::traits::BrokerStatus::Online,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A node added with `cluster add-node` is a registered broker but in no
+    /// founding node's config. Its partitions must still be fetched from it;
+    /// a configured address (possibly a replication fabric) wins over the
+    /// broker's, and this node never fetches from itself.
+    #[test]
+    fn a_leader_added_at_runtime_is_fetched_from() {
+        let configured = HashMap::from([(1, "node1:9092".to_string()), (2, "repl2:19092".to_string())]);
+        let peers = merge_peer_addresses(3, &configured, &[broker(1), broker(2), broker(3), broker(4)]);
+        assert_eq!(peers.get(&2).map(String::as_str), Some("repl2:19092"));
+        assert_eq!(peers.get(&4).map(String::as_str), Some("added4:9095"));
+        assert!(!peers.contains_key(&3), "never fetch from yourself");
+
+        let assignments = vec![("t".to_string(), 0, Some(4), vec![4, 3, 1])];
+        assert!(plan_assignments(3, &assignments, &configured).is_empty(), "the old behaviour");
+        let plan = plan_assignments(3, &assignments, &peers);
+        assert_eq!(plan.keys().copied().collect::<Vec<_>>(), vec![4]);
     }
 
     fn followed(n: usize) -> Vec<FollowedPartition> {

@@ -121,6 +121,7 @@ impl LocalLog for crate::produce_handler::ProduceHandler {
 
 pub struct AssignmentRepair {
     node_id: u64,
+    /// The configured nodes; used only until the catalog lists brokers.
     nodes: Vec<u64>,
     replication_factor: usize,
     metadata_store: Arc<dyn MetadataStore>,
@@ -173,6 +174,17 @@ impl AssignmentRepair {
     pub(crate) async fn repair_once(&self) -> chronik_common::Result<()> {
         let is_raft_leader = self.raft_leader.load(Ordering::Relaxed);
         let mut still_missing: HashSet<(String, u32)> = HashSet::new();
+        // Membership is the catalog's broker list: it includes nodes added with
+        // `cluster add-node` and drops removed ones, which the founding config
+        // (the fallback, before any broker is registered) does not.
+        let brokers: Vec<u64> = self
+            .metadata_store
+            .list_brokers()
+            .await?
+            .into_iter()
+            .filter_map(|b| u64::try_from(b.broker_id).ok())
+            .collect();
+        let nodes: &[u64] = if brokers.is_empty() { &self.nodes } else { &brokers };
 
         for topic in self.metadata_store.list_topics().await? {
             if topic.name.starts_with("__") {
@@ -202,7 +214,7 @@ impl AssignmentRepair {
 
                 match plan_repair(
                     self.node_id,
-                    &self.nodes,
+                    nodes,
                     self.replication_factor,
                     is_raft_leader,
                     partition,
@@ -388,5 +400,32 @@ mod tests {
         assert_eq!(leader_of(&store, 0).await.map(|(_, r)| r.is_empty()), Some(false));
         node1.repair_once().await.unwrap();
         assert_eq!(node1.repaired(), 1, "nothing left to repair");
+    }
+
+    /// Membership is the catalog's broker list, not the founding config: node 4
+    /// was added with `cluster add-node` and node 3 removed, so a claim places
+    /// replicas on 1, 2 and 4 — never on the removed node.
+    #[tokio::test]
+    async fn a_claim_places_replicas_on_the_registered_brokers() {
+        use chronik_common::metadata::traits::{BrokerMetadata, BrokerStatus};
+        let store = half_assigned_catalog().await;
+        for id in [1, 2, 4] {
+            store
+                .register_broker(BrokerMetadata {
+                    broker_id: id,
+                    host: format!("node{id}"),
+                    port: 9092,
+                    rack: None,
+                    status: BrokerStatus::Online,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+        let node2 = repair_on(2, store.clone(), &[("t", 1, 142)], false);
+        node2.repair_once().await.unwrap();
+        node2.repair_once().await.unwrap();
+        assert_eq!(leader_of(&store, 1).await, Some((2, vec![2, 4, 1])));
     }
 }

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
+use dashmap::DashMap;
 use reqwest::Client;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -49,6 +50,21 @@ pub fn is_forwarded_request(headers: &HeaderMap) -> bool {
 pub struct PeerNode {
     pub node_id: u64,
     pub url: String,
+}
+
+/// How often the peer list is re-read from the catalog.
+const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A peer's Unified API address: its Kafka host, and a port from, in order,
+/// `CHRONIK_UNIFIED_API_PORT_NODE_<id>`, `CHRONIK_UNIFIED_API_PORT`, or
+/// `6091 + id` (what `main.rs` binds).
+fn peer_node(node_id: u64, host: &str, scheme: &str, env_port: Option<u16>) -> PeerNode {
+    let port = std::env::var(format!("CHRONIK_UNIFIED_API_PORT_NODE_{node_id}"))
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .or(env_port)
+        .unwrap_or(6091 + node_id as u16);
+    PeerNode { node_id, url: format!("{scheme}://{host}:{port}") }
 }
 
 /// Partition-to-node mapping for routing queries to the right nodes.
@@ -178,17 +194,22 @@ impl Default for QueryRouterConfig {
 pub struct QueryRouter {
     /// HTTP client (connection-pooled, reused across requests)
     client: Client,
-    /// All peer nodes in the cluster (excluding self)
-    peers: Vec<PeerNode>,
+    /// All peer nodes in the cluster (excluding self), shared by clones and
+    /// replaced when membership changes (see [`Self::refresh_peers`]).
+    peers: Arc<std::sync::RwLock<Arc<Vec<PeerNode>>>>,
     /// This node's ID
     self_node_id: u64,
+    /// `http` or `https`, and the `CHRONIK_UNIFIED_API_PORT` override: how a
+    /// peer's URL is formed (see [`peer_node`]).
+    scheme: &'static str,
+    env_port: Option<u16>,
     /// Partition-to-node mapping (refreshed from metadata store)
     partition_map: Arc<RwLock<PartitionMap>>,
     /// Configuration
     config: QueryRouterConfig,
     /// Per-peer ARS metrics (EWMA latency + outstanding request count).
     /// Shared via Arc so spawned fan-out tasks can update metrics.
-    peer_metrics: Arc<HashMap<u64, PeerMetrics>>,
+    peer_metrics: Arc<DashMap<u64, PeerMetrics>>,
 }
 
 impl QueryRouter {
@@ -239,20 +260,8 @@ impl QueryRouter {
             .iter()
             .filter(|peer| peer.id != self_node_id)
             .map(|peer| {
-                let host = peer
-                    .kafka
-                    .rsplit_once(':')
-                    .map(|(h, _)| h)
-                    .unwrap_or("localhost");
-                let port = std::env::var(format!("CHRONIK_UNIFIED_API_PORT_NODE_{}", peer.id))
-                    .ok()
-                    .and_then(|v| v.parse::<u16>().ok())
-                    .or(env_port)
-                    .unwrap_or(6091 + peer.id as u16);
-                PeerNode {
-                    node_id: peer.id,
-                    url: format!("{scheme}://{host}:{port}"),
-                }
+                let host = peer.kafka.rsplit_once(':').map(|(h, _)| h).unwrap_or("localhost");
+                peer_node(peer.id, host, scheme, env_port)
             })
             .collect();
 
@@ -272,24 +281,75 @@ impl QueryRouter {
             .build()
             .expect("Failed to create reqwest client for QueryRouter");
 
-        let peer_metrics: HashMap<u64, PeerMetrics> = peers
-            .iter()
-            .map(|p| (p.node_id, PeerMetrics::new()))
-            .collect();
-
-        info!(
-            peer_metrics_count = peer_metrics.len(),
-            "ARS metrics initialized for peers"
-        );
+        let peer_metrics: DashMap<u64, PeerMetrics> =
+            peers.iter().map(|p| (p.node_id, PeerMetrics::new())).collect();
 
         Self {
             client,
-            peers,
+            peers: Arc::new(std::sync::RwLock::new(Arc::new(peers))),
             self_node_id,
+            scheme,
+            env_port,
             partition_map: Arc::new(RwLock::new(PartitionMap::default())),
             config,
             peer_metrics: Arc::new(peer_metrics),
         }
+    }
+
+    /// The peers as of the last refresh.
+    fn peers(&self) -> Arc<Vec<PeerNode>> {
+        self.peers.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Take the peer list from the catalog's brokers.
+    ///
+    /// The cluster config names the founding nodes only: a node added with
+    /// `cluster add-node` is a registered broker but in no other node's config,
+    /// and a removed node is unregistered but may still be in it. A router fixed
+    /// at the config never asked an added node for the partitions it leads, so
+    /// every distributed query silently lacked them. An empty broker list (the
+    /// catalog not loaded yet) keeps the current peers.
+    pub async fn refresh_peers(&self, metadata_store: &dyn MetadataStore) {
+        let brokers = match metadata_store.list_brokers().await {
+            Ok(brokers) if !brokers.is_empty() => brokers,
+            Ok(_) => return,
+            Err(e) => {
+                debug!(error = %e, "Could not list brokers; keeping the current query peers");
+                return;
+            }
+        };
+        let mut peers: Vec<PeerNode> = brokers
+            .iter()
+            .filter(|b| b.broker_id >= 0 && b.broker_id as u64 != self.self_node_id)
+            .map(|b| peer_node(b.broker_id as u64, &b.host, self.scheme, self.env_port))
+            .collect();
+        peers.sort_by_key(|p| p.node_id);
+        let current = self.peers();
+        let same = current.len() == peers.len()
+            && current.iter().zip(&peers).all(|(a, b)| a.node_id == b.node_id && a.url == b.url);
+        if same {
+            return;
+        }
+        info!(
+            peers = ?peers.iter().map(|p| &p.url).collect::<Vec<_>>(),
+            "Query peers changed (cluster membership)"
+        );
+        for peer in &peers {
+            self.peer_metrics.entry(peer.node_id).or_insert_with(PeerMetrics::new);
+        }
+        *self.peers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(peers);
+    }
+
+    /// Keep the peer list in step with cluster membership.
+    pub fn start_peer_refresh(self: &Arc<Self>, metadata_store: Arc<dyn MetadataStore>) {
+        let router = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PEER_REFRESH_INTERVAL);
+            loop {
+                tick.tick().await;
+                router.refresh_peers(metadata_store.as_ref()).await;
+            }
+        });
     }
 
     /// Refresh the partition map from the metadata store.
@@ -328,13 +388,14 @@ impl QueryRouter {
     /// fan-out while ensuring all partitions are covered.
     ///
     /// Falls back to all peers if partition map is empty.
-    pub async fn nodes_for_topic(&self, topic: &str) -> Vec<&PeerNode> {
+    pub async fn nodes_for_topic(&self, topic: &str) -> Vec<PeerNode> {
+        let peers = self.peers();
         let map = self.partition_map.read().await;
 
         if let Some(replicas) = map.replicas.get(topic) {
             if replicas.is_empty() {
                 // Partition map exists but empty — fall through to all peers
-                return self.peers.iter().collect();
+                return peers.to_vec();
             }
 
             let mut selected_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -375,19 +436,15 @@ impl QueryRouter {
                 debug!(
                     topic = topic,
                     selected_peers = ?selected_ids,
-                    total_peers = self.peers.len(),
+                    total_peers = peers.len(),
                     "ARS selected peers for topic"
                 );
             }
-            return self
-                .peers
-                .iter()
-                .filter(|p| selected_ids.contains(&p.node_id))
-                .collect();
+            return peers.iter().filter(|p| selected_ids.contains(&p.node_id)).cloned().collect();
         }
 
         // Fallback: no partition info for topic — return all peers
-        self.peers.iter().collect()
+        peers.to_vec()
     }
 
     /// Check if all partitions for a topic are local (no fan-out needed).
@@ -521,15 +578,15 @@ impl QueryRouter {
     }
 
     /// Get all peer nodes (for global queries like SQL that need all nodes).
-    pub fn all_peers(&self) -> Vec<&PeerNode> {
-        self.peers.iter().collect()
+    pub fn all_peers(&self) -> Vec<PeerNode> {
+        self.peers().to_vec()
     }
 
     /// Get ARS scores for all peers (for monitoring and debugging).
     ///
     /// Returns (node_id, ars_score, latency_ewma_ms, outstanding) tuples.
     pub fn peer_ars_scores(&self) -> Vec<(u64, f64, f64, u64)> {
-        self.peers
+        self.peers()
             .iter()
             .map(|p| {
                 let (score, latency_ms, outstanding) = self
@@ -567,7 +624,7 @@ impl QueryRouter {
         &self,
         path: &str,
         request_body: &Req,
-        target_nodes: &[&PeerNode],
+        target_nodes: &[PeerNode],
     ) -> FanOut<Resp>
     where
         Req: serde::Serialize + Send + Sync,
@@ -4392,8 +4449,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_peer_url_computation() {
+    #[tokio::test]
+    async fn test_peer_url_computation() {
         // Simulate ClusterConfig peers
         let config = ClusterConfig {
             enabled: true,
@@ -4444,17 +4501,44 @@ mod tests {
         std::env::remove_var("CHRONIK_UNIFIED_API_PORT_NODE_3");
 
         let router = QueryRouter::new(&config);
-        assert_eq!(router.peers.len(), 2); // Excludes self (node 2)
-        assert_eq!(router.peers[0].node_id, 1);
+        assert_eq!(router.all_peers().len(), 2); // Excludes self (node 2)
+        assert_eq!(router.all_peers()[0].node_id, 1);
         // Per-peer port = 6091 + peer.id, matches main.rs's bind logic.
         // Previously this asserted 6092 for every peer — that was the bug
         // that hid a third of the data on every distributed search in
         // multi-port single-host configs (and was wrong in multi-host
         // configs too, just less visibly because hosts differ).
-        assert_eq!(router.peers[0].url, "http://192.0.2.1:6092");
-        assert_eq!(router.peers[1].node_id, 3);
-        assert_eq!(router.peers[1].url, "http://192.0.2.3:6094");
+        assert_eq!(router.all_peers()[0].url, "http://192.0.2.1:6092");
+        assert_eq!(router.all_peers()[1].node_id, 3);
+        assert_eq!(router.all_peers()[1].url, "http://192.0.2.3:6094");
         assert_eq!(router.self_node_id, 2);
+
+        // Membership changes come from the catalog: node 4 added with
+        // `cluster add-node` (in no config here), node 3 removed. A clone
+        // (what the handlers hold) sees the change too.
+        let held = router.clone();
+        let store = chronik_common::metadata::InMemoryMetadataStore::new();
+        for (id, host) in [(1, "192.0.2.1"), (2, "192.0.2.2"), (4, "192.0.2.4")] {
+            store
+                .register_broker(chronik_common::metadata::traits::BrokerMetadata {
+                    broker_id: id,
+                    host: host.to_string(),
+                    port: 9092,
+                    rack: None,
+                    status: chronik_common::metadata::traits::BrokerStatus::Online,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+        router.refresh_peers(&store).await;
+        let urls: Vec<(u64, String)> = held.all_peers().into_iter().map(|p| (p.node_id, p.url)).collect();
+        assert_eq!(
+            urls,
+            vec![(1, "http://192.0.2.1:6092".to_string()), (4, "http://192.0.2.4:6095".to_string())]
+        );
+        assert!(router.peer_metrics.contains_key(&4), "the added peer is scored like the others");
     }
 
     #[test]
@@ -4488,8 +4572,8 @@ mod tests {
             auto_recover: true,
         };
         let router = QueryRouter::new(&config);
-        assert_eq!(router.peers.len(), 1);
-        assert_eq!(router.peers[0].url, "http://remote-host:16099");
+        assert_eq!(router.all_peers().len(), 1);
+        assert_eq!(router.all_peers()[0].url, "http://remote-host:16099");
         std::env::remove_var("CHRONIK_UNIFIED_API_PORT_NODE_99");
     }
 }
@@ -4513,11 +4597,13 @@ mod partition_ownership_tests {
 
         QueryRouter {
             client: Client::new(),
-            peers: Vec::new(),
+            peers: Default::default(),
             self_node_id,
+            scheme: "http",
+            env_port: None,
             partition_map: Arc::new(RwLock::new(map)),
             config: QueryRouterConfig::default(),
-            peer_metrics: Arc::new(HashMap::new()),
+            peer_metrics: Default::default(),
         }
     }
 
