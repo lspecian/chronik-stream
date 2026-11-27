@@ -87,18 +87,24 @@ TRUTH=$("$KAFKA_BIN/kafka-get-offsets.sh" --bootstrap-server "$BOOT" --topic "$T
 echo "ground truth from Kafka: $TRUTH records"
 
 # Let the indexer seal, index and upload. Sealing is on a timer, so this waits
-# for evidence rather than a fixed sleep.
-echo "waiting for an indexing run to complete..."
-indexed=0
+# for evidence rather than a fixed sleep: this topic's upload, or one of the
+# failures checked below. Any indexing run is not enough — a run that archived
+# another topic's segment first ended the wait before this topic was sealed.
+echo "waiting for this topic's index to be archived (or to fail)..."
+this_topic_done() {
+    sed 's/\x1b\[[0-9;]*m//g' "$CLUSTER"/logs/node*.log 2>/dev/null \
+      | grep -E "Uploaded Tantivy index to object store|add index to tar|Failed to create Tantivy index|failed indexing — backing off|quarantining it" \
+      | grep -qE "$TOPIC|add index to tar|Failed to create Tantivy index"
+}
 for _ in $(seq 1 40); do
-    if grep -qE "WAL indexing run complete" "$CLUSTER"/logs/node*.log 2>/dev/null; then
-        indexed=1
+    if this_topic_done; then
         sleep 15   # let any further passes run too
         break
     fi
     sleep 10
 done
-[ "$indexed" = 1 ] || setup_fail "no indexing run completed in ~7 minutes"
+grep -qE "WAL indexing run complete" "$CLUSTER"/logs/node*.log 2>/dev/null \
+    || setup_fail "no indexing run completed in ~7 minutes"
 
 # --- 1. the failure this issue is about -------------------------------------
 tar_errs=$(grep -c "add index to tar" "$CLUSTER"/logs/node*.log 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')

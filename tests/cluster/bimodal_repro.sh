@@ -13,9 +13,12 @@
 #   - a leader election partway through
 #   - follower fetches erroring and backing off
 set -u
-DIR=/home/ubuntu/Development/chronik-stream/tests/cluster
-BIN=/home/ubuntu/Development/chronik-stream/target/release/chronik-server
-BENCH=/home/ubuntu/Development/chronik-stream/target/release/chronik-bench
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Nodes run from the repo root: data_dir in the node configs is relative to it.
+cd "$ROOT"
+DIR="$ROOT/tests/cluster"
+BIN="$ROOT/target/release/chronik-server"
+BENCH="$ROOT/target/release/chronik-bench"
 LOGS=$DIR/logs
 OUT=/tmp/outlier-evidence
 ACKS="${ACKS:-1}"; RUNS="${RUNS:-8}"

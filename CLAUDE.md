@@ -732,8 +732,8 @@ curl -u admin:secret123 http://localhost:6092/subjects
 Comprehensive test suite for node management:
 
 ```bash
-# Automated test script
-./tests/test_node_removal.sh
+# Automated check (also part of tests/cluster/e2e/run_all.sh)
+KAFKA_HOME=/path/to/kafka tests/cluster/e2e/node_removal.sh target/release/chronik-server local
 
 # Manual testing guide
 # See docs/TESTING_NODE_REMOVAL.md for step-by-step instructions

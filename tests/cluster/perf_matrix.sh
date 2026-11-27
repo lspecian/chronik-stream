@@ -21,6 +21,8 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# Nodes run from the repo root: data_dir in the node configs is relative to it.
+cd "$ROOT"
 BIN="$ROOT/target/release/chronik-server"
 BENCH="$ROOT/target/release/chronik-bench"
 DIR="$ROOT/tests/cluster"
