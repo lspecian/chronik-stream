@@ -386,6 +386,8 @@ docker run -e CHRONIK_ADVERTISED_ADDR=chronik-stream chronik-stream
 
 After successful persistence, old WAL segments are truncated.
 
+**A failed WAL write or fsync stops the broker (exit code 74).** The partition is fenced first (every waiting write gets the error, nothing more is written behind the failure), then `halt_on_wal_failure` (`wal_integration.rs`) exits, for the message and metadata WALs alike. Restart once the disk is fixed: each partition writes a new segment, and reading an old one stops at a partial record. `WalWriter::write_all` flushes because tokio's `File::sync_all` swallows the previous write's error. Test: `tests/cluster/e2e/wal_write_failure.sh`.
+
 ### Protocol Version Handling
 - `ApiVersions` (v0-v3) - Negotiate supported versions
 - Version-specific encoding/decoding in `chronik-protocol`
