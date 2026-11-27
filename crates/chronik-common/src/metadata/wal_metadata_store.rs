@@ -1298,18 +1298,14 @@ impl MetadataStore for WalMetadataStore {
             self.write_and_apply(event).await?;
         }
 
-        // Update log_start_offset MONOTONICALLY. The high-watermark hot path calls
-        // this with log_start_offset=0; without the max() guard those calls would
-        // reset a DeleteRecords low watermark back to 0 and resurrect deleted
-        // records. Durable advancement goes through update_log_start_offset().
-        let mut offsets = self.state.partition_offsets.write().await;
-        if let Some((_hwm, lso)) = offsets.get_mut(&key) {
-            if log_start_offset > *lso {
-                *lso = log_start_offset;
-            }
-        } else {
-            // Initialize if missing (shouldn't happen, but be defensive)
-            offsets.insert(key, (high_watermark, log_start_offset));
+        // The log start only moves forward, and only through a durable event.
+        // This used to raise it in memory alone. When the watermark sync ran
+        // between a DeleteRecords (or retention pass) moving the partition's
+        // log start and that call persisting it, the persist then saw the
+        // value already there and wrote nothing; a restart brought the deleted
+        // records back. Smaller values (the hot path passes 0) change nothing.
+        if log_start_offset > 0 {
+            self.update_log_start_offset(topic, partition, log_start_offset).await?;
         }
 
         Ok(())
@@ -1930,8 +1926,39 @@ mod catalog_healing_tests {
         assert!(names.contains(&"survivor".to_string()));
     }
 
+    /// The watermark sync passed a log start that a DeleteRecords had just
+    /// moved, before that DeleteRecords persisted it. The sync raised it in
+    /// memory only; the DeleteRecords then saw it already there and wrote
+    /// nothing, so a restart read 0 and served the deleted records again
+    /// (retention e2e, 1 run in 2).
+    #[tokio::test]
+    async fn a_log_start_seen_first_by_the_watermark_sync_survives_replay() {
+        let appended: Arc<Mutex<Vec<MetadataEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&appended);
+        let wal_append: WalAppendFn = Arc::new(move |bytes: Vec<u8>| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                if let Ok(event) = MetadataEvent::from_bytes(&bytes) {
+                    sink.lock().unwrap().push(event);
+                }
+                Ok(0i64)
+            })
+        });
+        let store = WalMetadataStore::new(1, wal_append);
+        store.update_partition_offset("t", 0, 1500, 0).await.unwrap();
+        // The sync first, then the DeleteRecords' own persist.
+        store.update_partition_offset("t", 0, 1500, 1000).await.unwrap();
+        assert_eq!(store.update_log_start_offset("t", 0, 1000).await.unwrap(), 1000);
 
+        let noop: WalAppendFn = Arc::new(|_b| Box::pin(async { Ok(0i64) }));
+        let recovered = WalMetadataStore::new(1, noop);
+        recovered.replay_events(appended.lock().unwrap().clone()).await.unwrap();
+        assert_eq!(recovered.get_partition_offset("t", 0).await.unwrap(), Some((1500, 1000)));
 
+        // A smaller value (the hot path passes 0) never moves it back.
+        recovered.update_partition_offset("t", 0, 1600, 0).await.unwrap();
+        assert_eq!(recovered.get_partition_offset("t", 0).await.unwrap(), Some((1600, 1000)));
+    }
 }
 
 #[cfg(test)]

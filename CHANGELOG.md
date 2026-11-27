@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     replicated batch started its log start at 0, not at the stored value.
     The deleted records were readable after a restart, and the watermark
     sync then stored the 0 over the deletion for good.
+  - When the watermark sync (every 5 s) ran between a DeleteRecords or
+    retention pass moving the log start and that pass persisting it, the
+    sync raised the stored value in memory only and the persist then wrote
+    nothing. A restart read the old log start (the retention e2e failed 1
+    run in 2). The log start now only moves through a durable write.
 
   On 2.20.4, with 9,000 records and a DeleteRecords to 7,500 on a 3-node
   cluster, the new leader after a failover served all 9,000. After a
