@@ -5,7 +5,6 @@ pub mod canonical_record;
 pub mod tantivy_segment;
 pub mod wal_indexer;
 pub mod segment_index;
-pub mod index;
 pub mod object_store;
 pub mod record_batch;
 pub mod kafka_records;
@@ -33,7 +32,6 @@ pub use tantivy_segment::{
     TantivySegmentWriter, TantivySegmentReader, SegmentMetadata as TantivySegmentMetadata,
     SchemaFields as TantivySchemaFields,
 };
-pub use index::{IndexBuilder, Document, FieldType, FieldValue, SegmentSearcher, SearchHit};
 pub use object_store::{
     ObjectStore as ObjectStoreTrait, ObjectStoreConfig, ObjectStoreFactory, ObjectMetadata,
     StorageBackend as ObjectStoreBackend, ChronikStorageAdapter, SegmentLocation

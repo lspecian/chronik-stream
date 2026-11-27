@@ -48,3 +48,6 @@ tokio-test = "0.4"
 proptest = { workspace = true }
 criterion = "0.5"
 
+
+[lints]
+workspace = true

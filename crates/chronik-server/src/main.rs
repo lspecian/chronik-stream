@@ -5,6 +5,7 @@
 //! - Ingest: Data ingestion node (future: for distributed mode)
 //! - Search: Search node (future: for distributed mode)
 //! - All: All components in one process
+#![warn(missing_docs)]
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

@@ -53,6 +53,8 @@ impl Deref for MappedFile {
         &self.0
     }
 }
+// SAFETY: a memory map does not move when the handle does.
+#[allow(unsafe_code)]
 unsafe impl stable_deref_trait::StableDeref for MappedFile {}
 
 /// `bytes::Bytes` handed to `OwnedBytes`: its buffer does not move either.
@@ -63,6 +65,8 @@ impl Deref for HeapBytes {
         &self.0
     }
 }
+// SAFETY: as above, the heap buffer behind `Bytes` stays put.
+#[allow(unsafe_code)]
 unsafe impl stable_deref_trait::StableDeref for HeapBytes {}
 
 /// The whole of a local file, memory-mapped.
@@ -70,6 +74,7 @@ pub fn map_file(path: &Path) -> io::Result<OwnedBytes> {
     let file = std::fs::File::open(path)?;
     // SAFETY: archives are immutable once written; nothing truncates a file a
     // reader has mapped (a deleted file stays readable while mapped).
+    #[allow(unsafe_code)]
     let map = unsafe { memmap2::Mmap::map(&file)? };
     Ok(OwnedBytes::new(MappedFile(map)))
 }

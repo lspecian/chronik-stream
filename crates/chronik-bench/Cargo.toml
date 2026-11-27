@@ -35,14 +35,11 @@ lazy_static = { version = "1.5", optional = true }
 
 # Utilities
 anyhow = "1.0"
-thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = "0.4"
-human_bytes = "0.4"
 indicatif = "0.17"
 rand = "0.8"
-uuid = { version = "1.0", features = ["v4"] }
 
 [features]
 default = []
@@ -50,3 +47,6 @@ prometheus = ["dep:prometheus", "dep:axum", "dep:lazy_static"]
 
 [dev-dependencies]
 tempfile = "3.12"
+
+[lints]
+workspace = true

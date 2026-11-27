@@ -135,7 +135,8 @@ impl TestServer {
                 use std::os::unix::process::ExitStatusExt;
                 let pid = process.id();
                 
-                // Send SIGKILL
+                // Send SIGKILL. SAFETY: kill takes plain integers.
+                #[allow(unsafe_code)]
                 unsafe {
                     libc::kill(pid as i32, libc::SIGKILL);
                 }

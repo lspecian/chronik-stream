@@ -3,7 +3,7 @@
 //! See `docs/ROADMAP_HOT_PATH.md` (HP-1.1) for the full design.
 //!
 //! The hot path is RAM-only. "writer" and "commit" below refer to Tantivy's
-//! in-memory API (RAMDirectory, buffer visibility flip) â there is no disk I/O.
+//! in-memory API (RAMDirectory, buffer visibility flip) — there is no disk I/O.
 //!
 //! Query path merges hot hits with cold Tantivy hits; eviction is driven by
 //! WalIndexer after it successfully persists offsets to the cold index.
@@ -45,11 +45,11 @@ const TANTIVY_MIN_HEAP: usize = 15_000_000;
 /// (measured: hot text alone added ~11GB at a 2000-topic burst; the idle-release
 /// path cannot keep up because the commit timer walks dirty partitions
 /// sequentially). `add_batch` consults this to commit+release eagerly once the
-/// burst cap is exceeded â bursty partitions pay one cheap RAM-only commit per
+/// burst cap is exceeded — bursty partitions pay one cheap RAM-only commit per
 /// batch while steady producers stay under the cap and keep their writers.
 ///
 /// Burst cap on concurrent live hot writers (env: CHRONIK_HOT_TEXT_MAX_LIVE_WRITERS).
-/// 64 writers â 1GB worst-case budget.
+/// 64 writers ≈ 1GB worst-case budget.
 fn hot_writer_burst_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
@@ -177,7 +177,7 @@ struct HotPartitionIndex {
     /// only needed while writes are pending: it is created on demand by
     /// `ensure_writer` and dropped by the commit timer once the partition goes
     /// idle. The in-RAM `index`/`reader` stay alive, so searchability is
-    /// unaffected â only the mutation machinery is released.
+    /// unaffected — only the mutation machinery is released.
     writer: Option<IndexWriter>,
     /// Uncommitted adds/deletes since the last visibility flip. Lets the
     /// commit timer skip idle partitions instead of churning every writer
@@ -246,7 +246,7 @@ impl HotPartitionIndex {
             "timestamp",
             NumericOptions::default().set_indexed().set_stored().set_fast(),
         );
-        // `key` is STRING â Kafka keys are opaque identifiers, not prose. Indexing
+        // `key` is STRING — Kafka keys are opaque identifiers, not prose. Indexing
         // them through the English analyzer drops stopword-shaped keys (e.g. "A",
         // "the") entirely and mangles everything else by stemming/lowercasing. Keep
         // this consistent with the cold Tantivy schema, where `_key` is also
@@ -322,7 +322,7 @@ impl HotPartitionIndex {
 
     /// Drop the writer, freeing its heap arena and indexing threads. Committed
     /// docs remain searchable through `reader`; the next write recreates the
-    /// writer via `ensure_writer`. Callers must only release a clean writer â
+    /// writer via `ensure_writer`. Callers must only release a clean writer —
     /// dropping one with uncommitted adds would lose them.
     fn release_writer(&mut self) {
         debug_assert!(!self.dirty, "releasing a dirty hot writer would drop pending docs");
@@ -384,7 +384,7 @@ impl HotPartitionIndex {
         Ok(())
     }
 
-    /// Flip in-memory buffer visibility. Tantivy name is `commit` â no disk writes.
+    /// Flip in-memory buffer visibility. Tantivy name is `commit` — no disk writes.
     /// Returns whether there was pending work: a clean partition is a no-op, so
     /// the commit timer does not churn thousands of idle writers every tick.
     fn make_visible(&mut self) -> Result<bool> {
@@ -902,7 +902,7 @@ impl HotTextIndex {
     }
 
     /// Insert a batch of docs into (topic, partition). Does not make them
-    /// visible to readers â call `commit` (or rely on the background timer).
+    /// visible to readers — call `commit` (or rely on the background timer).
     pub async fn add_batch(&self, topic: &str, partition: i32, docs: &[HotDoc]) -> Result<()> {
         if docs.is_empty() {
             return Ok(());
@@ -923,7 +923,7 @@ impl HotTextIndex {
         chronik_monitoring::MetricsRecorder::record_hot_text_add(docs.len() as u64);
         // Burst cap: during bulk topic creation thousands of partitions acquire
         // writers within one commit window and the sequential commit timer cannot
-        // release them fast enough â unbounded writers OOM the node. Once too
+        // release them fast enough — unbounded writers OOM the node. Once too
         // many are live, make this batch visible NOW and release the writer
         // rather than waiting for the idle timer. RAM-only commit, ~ms; steady
         // high-throughput partitions stay under the cap and keep their writers.
@@ -956,7 +956,7 @@ impl HotTextIndex {
     /// releases the writer once the partition goes idle, and reaps the entry
     /// entirely once it is both idle and empty (cold search covers evicted
     /// offsets). The release/reap steps are what keep hot-text memory bounded
-    /// by the ACTIVE partition set instead of every partition ever written â
+    /// by the ACTIVE partition set instead of every partition ever written —
     /// one Tantivy writer per partition held forever OOM-killed nodes at a few
     /// thousand topics.
     pub async fn commit(&self, topic: &str, partition: i32) -> Result<()> {
@@ -1017,7 +1017,7 @@ impl HotTextIndex {
                     trace!(topic, partition, "hot text: releasing idle writer");
                     guard.release_writer();
                 }
-                // Empty + idle + writer released â nothing left worth holding:
+                // Empty + idle + writer released → nothing left worth holding:
                 // reap the whole entry (index + reader). The next produce
                 // recreates it; cold search serves the evicted offsets.
                 guard.doc_count == 0
@@ -1158,7 +1158,7 @@ impl HotTextIndex {
     /// Tantivy Index, so queries can't be shared across partitions).
     ///
     /// Unlike `search_topic` (which routes through QueryParser and a flat
-    /// query string), this path preserves the structure of bool queries â
+    /// query string), this path preserves the structure of bool queries —
     /// `bool.must` actually ANDs its clauses, `bool.should` actually ORs,
     /// etc.
     /// Run `f` on each partition of `topic` with its archived watermark (the
@@ -1317,7 +1317,7 @@ impl HotTextIndex {
     /// partitions on a fixed interval. Returns the JoinHandle so the caller
     /// can abort on shutdown.
     ///
-    /// No disk I/O â this only makes buffered in-memory docs visible to
+    /// No disk I/O — this only makes buffered in-memory docs visible to
     /// in-memory readers (Tantivy `commit` semantics on RAMDirectory).
     pub fn start_commit_timer(
         self: Arc<Self>,
@@ -1341,7 +1341,7 @@ impl HotTextIndex {
 /// HP-1.4: Adapter that owns an `Arc<HotTextIndex>` and implements
 /// `ColdFlushListener`. The indirection exists because `notify_cold_flushed`
 /// takes `&self` but eviction needs an `Arc<Self>` to spawn a detached task.
-/// Register the adapter â not `HotTextIndex` directly â via
+/// Register the adapter — not `HotTextIndex` directly — via
 /// `WalIndexer::set_cold_flush_listener`.
 pub struct HotTextColdFlushAdapter {
     inner: Arc<HotTextIndex>,
@@ -1459,7 +1459,7 @@ mod tests {
     }
 
     /// Regression (per-topic memory OOM, burst): a bulk topic-creation burst
-    /// must not accumulate unbounded live writers â past the burst cap,
+    /// must not accumulate unbounded live writers — past the burst cap,
     /// add_batch commits + releases eagerly. Docs must remain searchable.
     #[tokio::test]
     async fn bulk_burst_caps_live_writers() {
@@ -1485,8 +1485,8 @@ mod tests {
     }
 
     /// Regression (per-topic memory OOM): once a partition is empty (all docs
-    /// evicted after cold flush) and idle, its entire entry â in-RAM index,
-    /// reader, map slot â must be reaped, not held forever.
+    /// evicted after cold flush) and idle, its entire entry — in-RAM index,
+    /// reader, map slot — must be reaped, not held forever.
     #[tokio::test]
     async fn empty_idle_partition_is_reaped() {
         let idx = HotTextIndex::new(HotTextConfig::default());
@@ -1497,7 +1497,7 @@ mod tests {
         idx.evict_up_to("t", 0, 0).await.unwrap();
         assert_eq!(idx.doc_count("t", 0).await, 0);
 
-        // Idle ticks after the eviction commit â entry reaped.
+        // Idle ticks after the eviction commit → entry reaped.
         for _ in 0..=HotTextIndex::WRITER_IDLE_RELEASE_TICKS {
             idx.commit("t", 0).await.unwrap();
         }
@@ -1532,7 +1532,7 @@ mod tests {
         assert_eq!(idx.doc_count("bench", 0).await, 1000);
 
         let hits = idx.search_partition("bench", 0, "fox", 20).await.unwrap();
-        // Every 7th doc (0, 7, 14, ..., 994) â 143 matches; top_k caps at 20.
+        // Every 7th doc (0, 7, 14, ..., 994) — 143 matches; top_k caps at 20.
         assert_eq!(hits.len(), 20);
         for h in &hits {
             assert!(h.offset % 7 == 0, "fox only in multiples-of-7 docs");
@@ -1605,7 +1605,7 @@ mod tests {
         idx.commit("t", 1).await.unwrap();
 
         let hits = idx.search_topic("t", "red", 10).await.unwrap();
-        // Same offset on different partitions â both should appear.
+        // Same offset on different partitions — both should appear.
         assert_eq!(hits.len(), 2);
         let parts: std::collections::HashSet<i32> = hits.iter().map(|h| h.partition).collect();
         assert_eq!(parts, [0, 1].into_iter().collect());
@@ -1852,7 +1852,7 @@ mod tests {
         // Pretend WalIndexer just committed offsets 0..=1 to cold Tantivy.
         adapter.notify_cold_flushed("t".to_string(), 0, 1);
 
-        // Eviction is spawned â wait for it to land.
+        // Eviction is spawned — wait for it to land.
         for _ in 0..50 {
             if idx.doc_count("t", 0).await == 2 {
                 break;
@@ -1900,7 +1900,7 @@ mod tests {
 
     /// Issue #2 regression: `bool.must` ANDs its clauses. Previously the hot
     /// path flattened must clauses into a space-joined OR query, so two
-    /// disjoint must clauses â one matching the only doc, one matching zero â
+    /// disjoint must clauses — one matching the only doc, one matching zero —
     /// returned 1 hit instead of 0.
     #[tokio::test]
     async fn structured_bool_must_ands_its_clauses() {
@@ -1964,10 +1964,10 @@ mod tests {
         assert_eq!(
             and_miss.len(),
             0,
-            "bool.must[value=foo, key=beta] must AND to 0 â the fix for GitHub #2"
+            "bool.must[value=foo, key=beta] must AND to 0 — the fix for GitHub #2"
         );
 
-        // Positive: (value=foo AND key=alpha) â 1 hit.
+        // Positive: (value=foo AND key=alpha) → 1 hit.
         let and_hit: Vec<_> = idx
             .search_topic_structured(
                 "t",

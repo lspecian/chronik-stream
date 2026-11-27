@@ -1,7 +1,7 @@
 //! Dedicated io_uring thread for WAL writes (hybrid tokio + tokio-uring architecture)
 //!
 //! This module runs a separate OS thread with tokio-uring runtime for zero-copy WAL I/O,
-//! while the main application uses regular tokio. Communication happens via crossbeam channels.
+//! while the main application uses regular tokio. Communication happens over a tokio channel (see below).
 //!
 //! Architecture:
 //! - Main thread: Regular tokio runtime (multi-threaded)
@@ -44,6 +44,7 @@ use tracing::{info, warn, error};
 struct BytesBuf(Bytes);
 
 #[cfg(all(target_os = "linux", feature = "async-io"))]
+#[allow(unsafe_code)] // SAFETY: see above; the bytes never move while the handle lives.
 unsafe impl tokio_uring::buf::IoBuf for BytesBuf {
     fn stable_ptr(&self) -> *const u8 {
         self.0.as_ptr()

@@ -56,6 +56,8 @@ pub fn set_io_priority(class: IoPriorityClass, level: IoPriorityLevel) -> io::Re
 
     // Call ioprio_set(IOPRIO_WHO_PROCESS, 0, ioprio)
     // 0 means current thread
+    // SAFETY: ioprio_set takes plain integers and touches no memory of ours.
+    #[allow(unsafe_code)]
     let result = unsafe {
         syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, ioprio)
     };

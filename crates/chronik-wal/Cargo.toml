@@ -8,9 +8,9 @@ repository.workspace = true
 
 [features]
 # async-io enabled by default: on Linux it activates io_uring for kernel-level async WAL I/O,
-# on non-Linux it compiles the stub (no-op). crossbeam is cross-platform.
+# on non-Linux it compiles the stub (no-op).
 default = ["async-io"]
-async-io = ["dep:crossbeam"]
+async-io = []
 
 [dependencies]
 # Workspace dependencies
@@ -36,7 +36,6 @@ bincode = { workspace = true }
 libc = "0.2"  # v2.2.7: For I/O priority control (ioprio_set syscall)
 
 # Optional dependencies
-crossbeam = { version = "0.8", optional = true }
 
 # Local dependencies (MUST be before target-specific sections!)
 chronik-common = { path = "../chronik-common" }
@@ -57,3 +56,6 @@ rand = "0.8"
 regex = "1.10"
 tokio = { workspace = true, features = ["test-util"] }
 
+
+[lints]
+workspace = true

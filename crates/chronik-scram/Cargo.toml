@@ -16,3 +16,6 @@ pbkdf2 = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

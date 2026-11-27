@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 chronik-common = { path = "../chronik-common" }
 chronik-storage = { path = "../chronik-storage" }
-chronik-protocol = { path = "../chronik-protocol" }
 chronik-monitoring = { path = "../chronik-monitoring" }
 
 # Web framework (use workspace axum 0.6.20)
@@ -64,3 +63,5 @@ criterion = { workspace = true }
 # NOTE: the `realtime_indexing_bench` target was removed here because its source
 # (benches/realtime_indexing_bench.rs) was deleted in 920664d — the dangling path
 # made `cargo check/build --all-targets` fail for the whole workspace.
+[lints]
+workspace = true

@@ -6,7 +6,6 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-chronik-common = { path = "../chronik-common" }
 
 # Tracing - use http-proto instead of tonic to avoid tonic version conflicts
 tracing = { workspace = true }
@@ -31,3 +30,5 @@ serde_json = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+[lints]
+workspace = true
