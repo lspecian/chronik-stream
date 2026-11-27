@@ -370,8 +370,18 @@ impl Core {
         Ok(())
     }
 
-    fn snapshot_for(&self, request_index: u64) -> Result<Snapshot, RaftError> {
-        if self.snapshot_metadata().index < request_index || self.snapshot_metadata().index == 0 {
+    /// The stored snapshot, for sending to `to`. Unavailable (the driver then takes
+    /// a new one) when it is older than requested, or when its membership does not
+    /// include `to`: raft refuses to restore a snapshot it is not a member of, so a
+    /// node added after the stored snapshot (with an empty log, it can only start
+    /// from one) would be sent the same refused snapshot forever and never catch up.
+    fn snapshot_for(&self, request_index: u64, to: u64) -> Result<Snapshot, RaftError> {
+        let meta = self.snapshot_metadata();
+        let cs = meta.get_conf_state();
+        let member = [&cs.voters, &cs.learners, &cs.voters_outgoing, &cs.learners_next]
+            .iter()
+            .any(|ids| ids.contains(&to));
+        if meta.index < request_index || meta.index == 0 || !member {
             return Err(RaftError::Store(StorageError::SnapshotTemporarilyUnavailable));
         }
         Ok(self.snapshot.clone())
@@ -535,8 +545,8 @@ impl Storage for RaftLogStore {
         Ok(self.rl().last_index())
     }
 
-    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        let result = self.rl().snapshot_for(request_index);
+    fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
+        let result = self.rl().snapshot_for(request_index, to);
         if result.is_err() {
             self.snapshot_requested.store(true, Ordering::Relaxed);
         }
@@ -933,6 +943,28 @@ mod tests {
         assert!(s.snapshot(3, 2).is_err());
         assert!(s.snapshot_requested());
         assert_eq!(all(&s), vec![entry(3, 2)]);
+    }
+
+    /// A snapshot that does not list the node it would be sent to is refused by
+    /// that node, so it is unavailable for it (and a new one is asked for).
+    #[test]
+    fn a_snapshot_is_not_sent_to_a_node_outside_its_membership() {
+        let dir = TempDir::new().unwrap();
+        let s = open(&dir);
+        s.append(&[entry(1, 1), entry(2, 1), entry(3, 1)]).unwrap();
+        s.set_commit(3).unwrap();
+        let mut cs = ConfState::default();
+        cs.voters = vec![1, 2, 3];
+        s.create_snapshot(2, cs.clone(), b"state@2".to_vec()).unwrap();
+        assert!(s.snapshot(0, 2).is_ok());
+        assert!(!s.snapshot_requested());
+        assert_eq!(s.snapshot(0, 4), Err(RaftError::Store(StorageError::SnapshotTemporarilyUnavailable)));
+        assert!(s.snapshot_requested());
+        // The next snapshot is taken after node 4 joined, as a learner here.
+        cs.learners = vec![4];
+        s.create_snapshot(3, cs, b"state@3".to_vec()).unwrap();
+        assert_eq!(s.snapshot(0, 4).unwrap().get_metadata().index, 3);
+        assert!(!s.snapshot_requested());
     }
 
     /// Small segments: every append rotates. Truncation across segment

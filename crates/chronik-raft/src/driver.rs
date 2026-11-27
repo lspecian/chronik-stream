@@ -889,6 +889,19 @@ mod tests {
             self.drivers.insert(id, d);
         }
 
+        /// Start a node added to the running cluster: an empty store and no
+        /// voters of its own, as `CHRONIK_CLUSTER_JOIN` starts one.
+        fn join(&mut self, id: u64) {
+            self.dirs.insert(id, TempDir::new().unwrap());
+            let sm = Names::default();
+            let d = RaftDriver::start(self.dirs[&id].path(), (self.cfg)(id), &[], sm.clone(), self.router.outbox(id))
+                .unwrap();
+            self.router.register(id, d.handle());
+            self.sms.insert(id, sm);
+            self.drivers.insert(id, d);
+            self.ids.push(id);
+        }
+
         fn stop(&mut self, id: u64) {
             self.router.unregister(id);
             if let Some(d) = self.drivers.remove(&id) {
@@ -1122,6 +1135,31 @@ mod tests {
         assert_eq!(c.sms[&down].set(), c.sms[&leader].set());
         // It never replayed the compacted commands one by one.
         assert!(c.sms[&down].applied_log().len() < 100, "{} replayed", c.sms[&down].applied_log().len());
+    }
+
+    /// A node added to a running cluster has an empty log, so it can only start
+    /// from a snapshot. The stored one here is the founding snapshot (far fewer
+    /// entries than `snapshot_every`), which does not list the new node, and raft
+    /// refuses a snapshot it is not a member of. It must be sent a newer one: it
+    /// was sent the founding one forever, a voter that never caught up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_added_after_the_last_snapshot_catches_up() {
+        let mut c = Cluster::new(&[1, 2, 3], config);
+        for i in 0..10 {
+            c.create_on_leader(&format!("a{}", i)).await;
+        }
+        let leader = c.leader().await;
+        let mut single = raft::eraftpb::ConfChangeSingle::default();
+        single.set_change_type(raft::eraftpb::ConfChangeType::AddNode);
+        single.node_id = 4;
+        let mut cc = ConfChangeV2::default();
+        cc.changes = vec![single];
+        c.h(leader).propose_conf_change(cc).await.unwrap();
+        c.join(4);
+        let last = c.create_on_leader("after").await.index;
+        c.settle(last).await;
+        assert_eq!(c.sms[&4].set().len(), 11);
+        assert_eq!(c.sms[&4].set(), c.sms[&leader].set());
     }
 
     #[tokio::test(flavor = "multi_thread")]
