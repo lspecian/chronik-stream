@@ -10,16 +10,19 @@ use super::traits::{
     TopicConfig, TopicMetadata,
 };
 
+/// A map shared by the store's clones.
+type Shared<K, V> = Arc<RwLock<HashMap<K, V>>>;
+
 /// In-memory implementation of MetadataStore for testing
 pub struct InMemoryMetadataStore {
-    topics: Arc<RwLock<HashMap<String, TopicMetadata>>>,
-    brokers: Arc<RwLock<HashMap<i32, BrokerMetadata>>>,
-    consumer_groups: Arc<RwLock<HashMap<String, ConsumerGroupMetadata>>>,
-    consumer_offsets: Arc<RwLock<HashMap<(String, String, u32), ConsumerOffset>>>,
-    partition_assignments: Arc<RwLock<HashMap<(String, u32), PartitionAssignment>>>,
-    segments: Arc<RwLock<HashMap<(String, String), SegmentMetadata>>>,
-    partition_offsets: Arc<RwLock<HashMap<(String, u32), (i64, i64)>>>,
-    parquet_segments: Arc<RwLock<HashMap<(String, i32, String), ParquetSegmentMetadata>>>,
+    topics: Shared<String, TopicMetadata>,
+    brokers: Shared<i32, BrokerMetadata>,
+    consumer_groups: Shared<String, ConsumerGroupMetadata>,
+    consumer_offsets: Shared<(String, String, u32), ConsumerOffset>,
+    partition_assignments: Shared<(String, u32), PartitionAssignment>,
+    segments: Shared<(String, String), SegmentMetadata>,
+    partition_offsets: Shared<(String, u32), (i64, i64)>,
+    parquet_segments: Shared<(String, i32, String), ParquetSegmentMetadata>,
 }
 
 impl InMemoryMetadataStore {

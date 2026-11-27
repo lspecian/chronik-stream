@@ -1358,7 +1358,7 @@ async fn fan_out_needed(state: &UnifiedApiState, headers: &HeaderMap, sql: &str)
     // Skip the fan-out only when this node LEADS every partition.
     //
     // This used to skip when the node was a *replica* of every partition
-    // (`all_topics_local`), which at RF=node_count is always true — so on a
+    // (a replica-based check), which at RF=node_count is always true — so on a
     // full-replication cluster the query never fanned out and returned only what
     // this node happened to see locally. That is #22: partial results, and
     // different ones depending on which node answered.
@@ -1716,9 +1716,6 @@ pub async fn execute_sql(
 pub struct ExplainRequest {
     /// SQL query to explain
     pub query: String,
-    /// Include physical plan
-    #[serde(default)]
-    pub physical: bool,
 }
 
 /// Explain query response

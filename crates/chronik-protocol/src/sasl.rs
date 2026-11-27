@@ -156,6 +156,13 @@ const ENABLED_MECHANISMS: &[SaslMechanism] = &[
     SaslMechanism::Plain,
 ];
 
+impl Default for SaslAuthenticator {
+    /// Same as [`SaslAuthenticator::new`]: users from `CHRONIK_SASL_USERS`.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SaslAuthenticator {
     /// Create a new SASL authenticator, taking users from the environment.
     ///

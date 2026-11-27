@@ -74,23 +74,6 @@ impl TlsConfig {
                 .unwrap_or(false),
         })
     }
-
-    /// Create TLS config from paths
-    pub fn new(cert_path: impl Into<String>, key_path: impl Into<String>) -> Self {
-        Self {
-            cert_path: cert_path.into(),
-            key_path: key_path.into(),
-            ca_cert_path: None,
-            require_client_cert: false,
-        }
-    }
-
-    /// Enable mutual TLS (mTLS) with client certificate verification
-    pub fn with_client_auth(mut self, ca_cert_path: impl Into<String>) -> Self {
-        self.ca_cert_path = Some(ca_cert_path.into());
-        self.require_client_cert = true;
-        self
-    }
 }
 
 /// Load certificates from a PEM file
@@ -241,6 +224,7 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
 ///
 /// This abstraction allows the server to handle both encrypted and unencrypted
 /// connections uniformly.
+#[allow(clippy::large_enum_variant)] // one per connection; boxing would add a pointer hop to every TLS read and write
 pub enum MaybeTlsStream {
     /// Plain TCP connection (no encryption)
     Plain(TcpStream),
@@ -586,23 +570,6 @@ mod tests {
         let config = TlsConfig::from_env();
         assert!(config.is_none());
     }
-
-    #[test]
-    fn test_tls_config_new() {
-        let config = TlsConfig::new("/path/to/cert.pem", "/path/to/key.pem");
-        assert_eq!(config.cert_path, "/path/to/cert.pem");
-        assert_eq!(config.key_path, "/path/to/key.pem");
-        assert!(!config.require_client_cert);
-    }
-
-    #[test]
-    fn test_tls_config_with_client_auth() {
-        let config = TlsConfig::new("/path/to/cert.pem", "/path/to/key.pem")
-            .with_client_auth("/path/to/ca.pem");
-
-        assert_eq!(config.ca_cert_path, Some("/path/to/ca.pem".to_string()));
-        assert!(config.require_client_cert);
-    }
 }
 
 #[cfg(test)]
@@ -663,7 +630,8 @@ pub(crate) mod test_pki {
     use super::TlsConfig;
 
     pub struct Pki {
-        pub dir: tempfile::TempDir,
+        /// Holds the files below; deleted when the `Pki` is dropped.
+        _dir: tempfile::TempDir,
         pub ca: String,
         pub cert: String,
         pub key: String,
@@ -691,7 +659,7 @@ pub(crate) mod test_pki {
             let ca = write("ca.crt", ca.pem());
             let cert = write("tls.crt", cert.pem());
             let key = write("tls.key", key.serialize_pem());
-            Self { dir, ca, cert, key }
+            Self { _dir: dir, ca, cert, key }
         }
 
         /// The listener config a broker with this PKI runs.

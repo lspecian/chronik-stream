@@ -53,10 +53,12 @@ pub struct LeaderEpochCache {
 }
 
 impl LeaderEpochCache {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self { entries: Vec::new() }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -101,15 +103,6 @@ impl LeaderEpochCache {
         self.entries.retain(|e| e.start_offset < start_offset);
         self.entries.push(EpochEntry { epoch, start_offset });
         true
-    }
-
-    /// The epoch that was in force at `offset`, if known.
-    pub fn epoch_for_offset(&self, offset: i64) -> Option<i32> {
-        self.entries
-            .iter()
-            .rev()
-            .find(|e| e.start_offset <= offset)
-            .map(|e| e.epoch)
     }
 
     /// Answer `OffsetForLeaderEpoch`: where did `requested` end?
@@ -161,30 +154,6 @@ impl LeaderEpochCache {
         let before = self.entries.len();
         self.entries.retain(|e| e.start_offset < end_offset);
         self.entries.len() != before
-    }
-
-    /// Drop history below `start_offset` after retention advanced the log start.
-    ///
-    /// The entry covering `start_offset` is kept and clamped, so the epoch of
-    /// the oldest surviving record is still answerable.
-    pub fn truncate_from_start(&mut self, start_offset: i64) {
-        if start_offset <= 0 || self.entries.is_empty() {
-            return;
-        }
-
-        let covering = self
-            .entries
-            .iter()
-            .rev()
-            .find(|e| e.start_offset <= start_offset)
-            .copied();
-
-        self.entries.retain(|e| e.start_offset > start_offset);
-
-        if let Some(mut entry) = covering {
-            entry.start_offset = start_offset;
-            self.entries.insert(0, entry);
-        }
     }
 }
 
@@ -604,8 +573,8 @@ mod tests {
     /// epoch began (Kafka's rule): from there on every record is newer.
     #[test]
     fn an_epoch_older_than_retained_history_ends_where_the_oldest_began() {
-        let mut c = cache(&[(1, 0), (5, 100), (6, 200)]);
-        c.truncate_from_start(150);
+        // Retention removed everything below 150.
+        let c = cache(&[(5, 150), (6, 200)]);
 
         assert_eq!(c.end_offset_for_epoch(1, 400), (1, 150));
         assert_eq!(c.end_offset_for_epoch(0, 400), (0, 150));
@@ -676,34 +645,6 @@ mod tests {
         assert_eq!(c.latest_epoch(), Some(2));
     }
 
-    /// Retention must not erase the epoch of the oldest surviving record — the
-    /// covering entry is kept and clamped instead of dropped.
-    #[test]
-    fn retention_keeps_the_epoch_covering_the_new_log_start() {
-        let mut c = cache(&[(1, 0), (2, 100), (3, 200)]);
-        c.truncate_from_start(150);
-
-        assert_eq!(
-            c.entries(),
-            &[
-                EpochEntry { epoch: 2, start_offset: 150 },
-                EpochEntry { epoch: 3, start_offset: 200 },
-            ],
-            "epoch 2 still covers offsets 150..199 and must remain answerable"
-        );
-        assert_eq!(c.epoch_for_offset(150), Some(2));
-    }
-
-    #[test]
-    fn offsets_map_back_to_the_epoch_in_force() {
-        let c = cache(&[(1, 0), (4, 100), (7, 250)]);
-
-        assert_eq!(c.epoch_for_offset(0), Some(1));
-        assert_eq!(c.epoch_for_offset(99), Some(1));
-        assert_eq!(c.epoch_for_offset(100), Some(4));
-        assert_eq!(c.epoch_for_offset(300), Some(7));
-    }
-
     #[test]
     fn the_store_keeps_partitions_apart() {
         let store = LeaderEpochStore::new();
@@ -749,6 +690,7 @@ const LEADER_EPOCH_OFFSET: usize = 12;
 const MAGIC_OFFSET: usize = 16;
 /// Where Kafka's CRC-32C input begins: the attributes field, immediately after
 /// the CRC itself.
+#[cfg(test)]
 const ATTRIBUTES_OFFSET: usize = 21;
 /// Smallest v2 header we will touch (through attributes).
 const MIN_BATCH_HEADER: usize = 23;
@@ -808,6 +750,7 @@ pub fn stamp_leader_epoch(wire: &mut [u8], epoch: i32) -> usize {
 }
 
 /// The epoch stamped on the first batch of `wire`, if it is a v2 batch.
+#[cfg(test)]
 pub fn read_leader_epoch(wire: &[u8]) -> Option<i32> {
     if wire.len() < MIN_BATCH_HEADER || wire[MAGIC_OFFSET] as i8 != 2 {
         return None;

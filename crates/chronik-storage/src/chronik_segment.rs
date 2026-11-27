@@ -258,8 +258,11 @@ impl BloomFilter {
     }
     
     /// Calculate optimal hash count for given parameters
+    #[allow(clippy::manual_clamp)] // see the NaN note below
     fn optimal_hash_count(bit_count: usize, expected_items: usize) -> u32 {
         let ln2 = std::f64::consts::LN_2;
+        // max/min, not clamp: with no expected items k is NaN, and that must
+        // still give one hash function (clamp would give 0).
         let k = (bit_count as f64 / expected_items as f64 * ln2).round();
         k.max(1.0).min(30.0) as u32
     }

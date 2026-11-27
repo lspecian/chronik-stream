@@ -1,4 +1,4 @@
-/// Core benchmark runner implementation
+//! Core benchmark runner implementation
 
 use anyhow::{Context, Result};
 use hdrhistogram::Histogram;
@@ -705,9 +705,7 @@ impl BenchmarkRunner {
                     let mut payload = vec![0u8; message_size.max(8)];
                     payload[0..8].copy_from_slice(&now_us.to_le_bytes());
                     // Fill rest with pattern
-                    for i in 8..payload.len() {
-                        payload[i] = (local_count % 256) as u8;
-                    }
+                    payload[8..].fill((local_count % 256) as u8);
 
                     // Send message
                     let record = FutureRecord::to(&topic).payload(&payload).key(&key);

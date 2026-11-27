@@ -32,6 +32,12 @@ pub struct StreamingChecksum {
     bytes_processed: u64,
 }
 
+impl Default for StreamingChecksum {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingChecksum {
     /// Create a new streaming checksum calculator
     pub fn new() -> Self {
@@ -230,25 +236,6 @@ impl ChecksumUtils {
         }
         
         Ok(data)
-    }
-}
-
-/// Parallel checksum calculator for large files
-pub struct ParallelChecksum {
-    chunk_size: usize,
-}
-
-impl ParallelChecksum {
-    /// Create new parallel checksum calculator
-    pub fn new(chunk_size: usize) -> Self {
-        Self { chunk_size }
-    }
-    
-    /// Calculate checksum in parallel (simplified - real implementation would use rayon)
-    pub fn calculate(&self, data: &[u8]) -> u32 {
-        // For now, just use the standard calculation
-        // In a real implementation, we'd split data into chunks and process in parallel
-        ChecksumUtils::calculate_checksum(data)
     }
 }
 

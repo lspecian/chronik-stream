@@ -47,7 +47,7 @@ const TANTIVY_MIN_HEAP: usize = 15_000_000;
 /// sequentially). `add_batch` consults this to commit+release eagerly once the
 /// burst cap is exceeded â bursty partitions pay one cheap RAM-only commit per
 /// batch while steady producers stay under the cap and keep their writers.
-
+///
 /// Burst cap on concurrent live hot writers (env: CHRONIK_HOT_TEXT_MAX_LIVE_WRITERS).
 /// 64 writers â 1GB worst-case budget.
 fn hot_writer_burst_cap() -> usize {

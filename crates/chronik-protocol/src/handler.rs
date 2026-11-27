@@ -1810,28 +1810,6 @@ impl ProtocolHandler {
         }
     }
     
-    /// Parse ApiVersions request
-    fn parse_api_versions_request(&self, header: &RequestHeader, _body: &mut Bytes) -> Result<ApiVersionsRequest> {
-        
-
-        let (client_software_name, client_software_version) = if header.api_version >= 3 {
-            // For v3+, just ignore the body completely since fields are "ignorable"
-            // The schema marks them as ignorable: true, so we don't need to parse them
-            // This avoids encoding issues between different Kafka client implementations
-
-            tracing::debug!("ApiVersions v3 request received (body ignored - fields are ignorable)");
-
-            (None, None)
-        } else {
-            (None, None)
-        };
-
-        Ok(ApiVersionsRequest {
-            client_software_name,
-            client_software_version,
-        })
-    }
-
     /// Consume ApiVersions v3+ request body fields (ignorable but must be consumed)
     fn try_consume_api_versions_body(&self, body: &mut Bytes) -> Result<()> {
         // CRITICAL FIX: Different Kafka clients send different v3 body formats:
@@ -3026,13 +3004,6 @@ impl ProtocolHandler {
         })
     }
     
-    /// Create a response for unimplemented APIs
-    fn unimplemented_api_response(&self, correlation_id: i32, api_name: &str) -> Result<Response> {
-        tracing::info!("Received request for unimplemented API: {}", api_name);
-        // Return UNSUPPORTED_VERSION error
-        self.error_response(correlation_id, 35)
-    }
-    
     /// Handle CreateTopics request
     /// Handle CreateTopics request using refactored modules (Phase 2.4 Part 2)
     ///
@@ -3084,19 +3055,6 @@ impl ProtocolHandler {
         Ok(Self::make_response(&header, ApiKey::CreateTopics, body_buf.freeze()))
     }
     
-    /// Encode CreateTopics response using refactored module (Phase 2.4 Part 2)
-    ///
-    /// Complexity: < 5 (delegation to ResponseEncoder)
-    fn encode_create_topics_response(
-        &self,
-        buf: &mut BytesMut,
-        response: &crate::create_topics_types::CreateTopicsResponse,
-        version: i16,
-    ) -> Result<()> {
-        use crate::create_topics::ResponseEncoder;
-        ResponseEncoder::encode(buf, response, version)
-    }
-
     /// Handle DeleteTopics request
     async fn handle_delete_topics(
         &self,
@@ -6098,20 +6056,6 @@ impl ProtocolHandler {
         }
     }
 
-    /// Validate topic name according to Kafka rules
-    fn is_valid_topic_name(name: &str) -> bool {
-        // Topic name must:
-        // - Not be empty
-        // - Not be "." or ".."
-        // - Not exceed 249 characters
-        // - Contain only alphanumeric, '.', '_', or '-'
-        if name.is_empty() || name == "." || name == ".." || name.len() > 249 {
-            return false;
-        }
-        
-        name.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
-    }
-    
     /// Validate topic configurations
     ///
     /// v2.2.23: Self-registers broker if no online brokers found (fixes race condition on startup)

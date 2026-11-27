@@ -148,6 +148,9 @@ pub struct RaftStatus {
 
 type Reply = oneshot::Sender<Result<Applied, ProposeError>>;
 
+// `Step(Message)` dominates the size; boxing it would add an allocation to
+// every Raft message for an enum that only lives in a channel.
+#[allow(clippy::large_enum_variant)]
 enum Event {
     Propose { data: Vec<u8>, reply: Reply },
     ConfChange { cc: ConfChangeV2, reply: Reply },
@@ -585,7 +588,7 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
             self.outbox.send(ready.take_messages());
         }
 
-        if !raft::is_empty_snap(ready.snapshot()) {
+        if !ready.snapshot().is_empty() {
             let snap = ready.snapshot().clone();
             let index = snap.get_metadata().index;
             match self.store.apply_snapshot(snap.clone())? {
@@ -1152,8 +1155,7 @@ mod tests {
         let mut single = raft::eraftpb::ConfChangeSingle::default();
         single.set_change_type(raft::eraftpb::ConfChangeType::AddNode);
         single.node_id = 4;
-        let mut cc = ConfChangeV2::default();
-        cc.changes = vec![single];
+        let cc = ConfChangeV2 { changes: vec![single], ..Default::default() };
         c.h(leader).propose_conf_change(cc).await.unwrap();
         c.join(4);
         let last = c.create_on_leader("after").await.index;

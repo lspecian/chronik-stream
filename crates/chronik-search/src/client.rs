@@ -265,6 +265,7 @@ impl SearchClient {
     }
 
     /// Index Kafka messages for real-time search
+    #[allow(clippy::too_many_arguments)] // one argument per record field
     pub async fn index_kafka_message(
         &self,
         topic: &str,

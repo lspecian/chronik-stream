@@ -331,8 +331,7 @@ impl Core {
             )));
         }
         let term = self.entries[(index - self.first_index()) as usize].term;
-        let mut snapshot = Snapshot::default();
-        snapshot.data = data.into();
+        let mut snapshot = Snapshot { data: data.into(), ..Default::default() };
         let meta = snapshot.mut_metadata();
         meta.index = index;
         meta.term = term;
@@ -707,10 +706,11 @@ fn recover_segments(core: &mut Core) -> io::Result<()> {
     Ok(())
 }
 
-
 /// Records of one segment with their byte offsets, the length of the valid
 /// prefix, and whether anything after it was unreadable.
-fn read_segment(path: &Path) -> io::Result<(Vec<(Entry, u64)>, u64, bool)> {
+type SegmentContents = (Vec<(Entry, u64)>, u64, bool);
+
+fn read_segment(path: &Path) -> io::Result<SegmentContents> {
     let mut buf = Vec::new();
     File::open(path)?.read_to_end(&mut buf)?;
     let mut records = Vec::new();
@@ -764,11 +764,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn entry(index: u64, term: u64) -> Entry {
-        let mut e = Entry::default();
-        e.index = index;
-        e.term = term;
-        e.data = format!("cmd-{}-{}", index, term).into_bytes().into();
-        e
+        Entry { index, term, data: format!("cmd-{}-{}", index, term).into_bytes().into(), ..Default::default() }
     }
 
     fn snapshot(index: u64, term: u64, voters: Vec<u64>) -> Snapshot {
@@ -878,13 +874,9 @@ mod tests {
     fn hard_and_conf_state_persist() {
         let dir = TempDir::new().unwrap();
         let s = fixture(&dir);
-        let mut hs = HardState::default();
-        hs.term = 5;
-        hs.vote = 2;
-        hs.commit = 4;
+        let mut hs = HardState { term: 5, vote: 2, commit: 4 };
         s.set_hardstate(hs).unwrap();
-        let mut cs = ConfState::default();
-        cs.voters = vec![1, 2, 3, 4];
+        let cs = ConfState { voters: vec![1, 2, 3, 4], ..Default::default() };
         s.set_conf_state(cs.clone()).unwrap();
         s.set_commit(5).unwrap();
         drop(s);
@@ -931,8 +923,7 @@ mod tests {
         // Not beyond the commit index.
         assert!(s.create_snapshot(2, ConfState::default(), b"x".to_vec()).is_err());
         s.set_commit(3).unwrap();
-        let mut cs = ConfState::default();
-        cs.voters = vec![1, 2, 3];
+        let cs = ConfState { voters: vec![1, 2, 3], ..Default::default() };
         s.create_snapshot(2, cs.clone(), b"state@2".to_vec()).unwrap();
         assert!(!s.snapshot_requested());
         let got = s.snapshot(2, 2).unwrap();
@@ -953,8 +944,7 @@ mod tests {
         let s = open(&dir);
         s.append(&[entry(1, 1), entry(2, 1), entry(3, 1)]).unwrap();
         s.set_commit(3).unwrap();
-        let mut cs = ConfState::default();
-        cs.voters = vec![1, 2, 3];
+        let mut cs = ConfState { voters: vec![1, 2, 3], ..Default::default() };
         s.create_snapshot(2, cs.clone(), b"state@2".to_vec()).unwrap();
         assert!(s.snapshot(0, 2).is_ok());
         assert!(!s.snapshot_requested());
@@ -1041,8 +1031,7 @@ mod tests {
     fn corrupt_state_file_fails_the_open() {
         let dir = TempDir::new().unwrap();
         let s = fixture(&dir);
-        let mut hs = HardState::default();
-        hs.term = 9;
+        let hs = HardState { term: 9, ..Default::default() };
         s.set_hardstate(hs).unwrap();
         drop(s);
         let path = dir.path().join(STATE_FILE);
@@ -1184,8 +1173,7 @@ mod tests {
 
         {
             let store = open(&dir);
-            let mut cs = ConfState::default();
-            cs.voters = vec![1];
+            let cs = ConfState { voters: vec![1], ..Default::default() };
             store.set_conf_state(cs).unwrap();
             let mut node = RawNode::new(&config, store.clone(), &logger).unwrap();
             node.campaign().unwrap();

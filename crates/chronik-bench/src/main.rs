@@ -1,7 +1,7 @@
-/// Chronik Benchmark Harness
-///
-/// High-performance load testing tool for Chronik streaming platform.
-/// Measures throughput (msgs/sec), latency percentiles (p50-p99.9), and tail behavior.
+//! Chronik Benchmark Harness
+//!
+//! High-performance load testing tool for Chronik streaming platform.
+//! Measures throughput (msgs/sec), latency percentiles (p50-p99.9), and tail behavior.
 
 mod benchmark;
 mod cli;

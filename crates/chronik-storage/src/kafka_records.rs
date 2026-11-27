@@ -1094,13 +1094,13 @@ mod tests {
         assert_eq!(decoded.records.len(), 10);
         assert_eq!(bytes_consumed, encoded.len());
         
-        for i in 0..10 {
+        for (i, record) in decoded.records.iter().enumerate() {
             assert_eq!(
-                decoded.records[i].key.as_ref().map(|b| b.as_ref()), 
+                record.key.as_ref().map(|b| b.as_ref()), 
                 Some(format!("key{}", i).as_bytes())
             );
             assert_eq!(
-                decoded.records[i].value.as_ref().map(|b| b.as_ref()), 
+                record.value.as_ref().map(|b| b.as_ref()), 
                 Some(format!("value{}", i).as_bytes())
             );
         }

@@ -149,7 +149,8 @@ impl ClusterCatalogConfig {
 
 pub struct ClusterCatalog {
     node_id: u64,
-    driver: RaftDriver,
+    /// Held for its `Drop`, which stops the raft thread when the catalog goes.
+    _driver: RaftDriver,
     handle: RaftHandle,
     state: Arc<RwLock<CatalogState>>,
     conf_state: Arc<RwLock<ConfState>>,
@@ -215,7 +216,7 @@ impl ClusterCatalog {
         }
         Ok(Self {
             node_id: config.node_id,
-            driver,
+            _driver: driver,
             handle,
             state,
             conf_state,
@@ -255,6 +256,7 @@ impl ClusterCatalog {
         self.handle.status()
     }
 
+    #[cfg(test)]
     pub fn is_leader(&self) -> bool {
         self.handle.status().is_leader
     }

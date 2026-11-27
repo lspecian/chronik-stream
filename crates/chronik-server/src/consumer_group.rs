@@ -203,9 +203,6 @@ pub struct ConsumerGroup {
     pub previous_member_count: usize, // Member count before rebalance (to detect scale-up/down)
     pub static_members: HashMap<String, String>, // static_member_id -> member_id mapping
 
-    // Metadata persistence
-    #[serde(skip, default)]
-    pub last_persisted: Option<Instant>,
 
     // Async waiting mechanism for JoinGroup responses
     #[serde(skip)]
@@ -256,7 +253,6 @@ impl ConsumerGroup {
             expected_members_count: 0,
             previous_member_count: 0,
             static_members: HashMap::new(),
-            last_persisted: None,
             pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
             pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
             completed_assignments: HashMap::new(),
@@ -472,7 +468,6 @@ impl ConsumerGroup {
                     MemberInfo {
                         member_id: id.clone(),
                         metadata,
-                        owned_partitions: m.owned_partitions.clone(),
                     }
                 }).collect()
             } else {
@@ -499,7 +494,6 @@ impl ConsumerGroup {
                 protocol: protocol_name,
                 leader_id: leader_id.clone(),
                 member_id: member_id.clone(),
-                member_epoch: member.member_epoch,
                 members,
             };
 
@@ -530,7 +524,6 @@ impl Default for ConsumerGroup {
             expected_members_count: 0,
             previous_member_count: 0,
             static_members: HashMap::new(),
-            last_persisted: None,
             pending_join_futures: Arc::new(Mutex::new(HashMap::new())),
             pending_sync_futures: Arc::new(Mutex::new(HashMap::new())),
             completed_assignments: HashMap::new(),
@@ -544,7 +537,6 @@ impl Default for ConsumerGroup {
 pub struct PartitionInfo {
     pub topic: String,
     pub partition: i32,
-    pub leader: Option<i32>,
 }
 
 /// Assignment context for strategies
@@ -755,9 +747,8 @@ impl GroupManager {
             }
         }
         // Not in memory — check durable metadata (offsets-only / restarted groups).
-        match self.metadata_store.get_consumer_group(group_id).await {
-            Ok(Some(_)) => return Some(false), // persisted groups have no live members
-            _ => {}
+        if let Ok(Some(_)) = self.metadata_store.get_consumer_group(group_id).await {
+            return Some(false); // persisted groups have no live members
         }
         // A group known only by its committed offsets (after a coordinator
         // change, or one that never kept members on this broker).
@@ -1010,7 +1001,6 @@ impl GroupManager {
                         protocol: group.protocol.clone().unwrap_or_else(|| "range".to_string()),
                         leader_id: group.leader_id.clone().unwrap_or_default(),
                         member_id: existing_member_id.clone(),
-                        member_epoch: group.members.get(&existing_member_id).map(|m| m.member_epoch).unwrap_or(0),
                         members: vec![],
                     };
                     let _ = tx.send(rebalance_response); // Ignore error if receiver dropped
@@ -1112,7 +1102,6 @@ impl GroupManager {
         protocols: &[(String, Vec<u8>)],
     ) -> JoinGroupResponse {
         let is_leader = group.leader_id.as_ref() == Some(&member_id);
-        let member_epoch_val = group.members.get(&member_id).map(|m| m.member_epoch).unwrap_or(0);
 
         // Select protocol name - use first available, or use "range" as default
         // CRITICAL: NEVER use empty string as it causes JoinGroup v5 protocol encoding errors
@@ -1132,14 +1121,12 @@ impl GroupManager {
             protocol: protocol_name,
             leader_id: group.leader_id.clone().unwrap_or_default(),
             member_id: member_id.clone(),
-            member_epoch: member_epoch_val,
             members: if is_leader {
                 group.members.iter().map(|(id, m)| MemberInfo {
                     member_id: id.clone(),
                     metadata: m.protocols.first()
                         .map(|(_, data)| data.clone())
                         .unwrap_or_default(),
-                    owned_partitions: m.owned_partitions.clone(),
                 }).collect()
             } else {
                 vec![]
@@ -1152,6 +1139,7 @@ impl GroupManager {
     /// Handles static/dynamic membership, rebalancing, and state transitions.
     /// **Refactored**: Reduced from 228 lines (~80-100 complexity) to ~60 lines (<25 complexity)
     /// Complexity: < 25 (simple routing to extracted helpers)
+    #[allow(clippy::too_many_arguments)] // one argument per JoinGroup request field
     pub async fn join_group(
         &self,
         group_id: String,
@@ -1353,16 +1341,9 @@ impl GroupManager {
                 );
                 
                 for partition in 0..partition_count {
-                    // Get partition leader from metadata store
-                    let leader = self.metadata_store.get_partition_leader(topic, partition)
-                        .await
-                        .ok()
-                        .flatten();
-
                     partitions.push(PartitionInfo {
                         topic: topic.clone(),
                         partition: partition as i32,
-                        leader,
                     });
                 }
             } else {
@@ -2137,7 +2118,6 @@ pub struct JoinGroupResponse {
     pub protocol: String,
     pub leader_id: String,
     pub member_id: String,
-    pub member_epoch: i32, // KIP-848
     pub members: Vec<MemberInfo>,
 }
 
@@ -2146,7 +2126,6 @@ pub struct JoinGroupResponse {
 pub struct MemberInfo {
     pub member_id: String,
     pub metadata: Vec<u8>,
-    pub owned_partitions: HashMap<String, Vec<i32>>, // KIP-848
 }
 
 /// Sync group response with KIP-848 support
@@ -2154,7 +2133,6 @@ pub struct MemberInfo {
 pub struct SyncGroupResponse {
     pub error_code: i16,
     pub assignment: Vec<u8>,
-    pub member_epoch: i32, // KIP-848
 }
 
 /// Heartbeat response
@@ -2172,15 +2150,11 @@ pub trait PartitionAssignor: Send + Sync {
 }
 
 /// Cooperative sticky assignor for KIP-848
-pub struct CooperativeStickyAssignor {
-    sticky_threshold: f64,
-}
+pub struct CooperativeStickyAssignor;
 
 impl CooperativeStickyAssignor {
     pub fn new() -> Self {
-        Self {
-            sticky_threshold: 0.8, // Try to keep 80% of assignments stable
-        }
+        Self
     }
 }
 
@@ -2246,7 +2220,6 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                     unassigned_partitions.push(PartitionInfo {
                         topic: topic.clone(),
                         partition,
-                        leader: None,
                     });
                 }
             }
@@ -2494,7 +2467,7 @@ mod tests {
             "test-group".to_string(),
             join_response.generation_id,
             join_response.member_id.clone(),
-            join_response.member_epoch,
+            0, // member epoch (always 0: no client sends one)
             Some(vec![]), // Leader sends empty assignments for this test
         ).await.unwrap();
         assert_eq!(sync_response.error_code, 0);
@@ -2504,7 +2477,7 @@ mod tests {
             "test-group".to_string(),
             join_response.member_id.clone(),
             join_response.generation_id,
-            Some(join_response.member_epoch),
+            Some(0),
         ).await.unwrap();
         
         assert_eq!(heartbeat_response.error_code, 0);
@@ -2548,7 +2521,7 @@ mod tests {
                 group_id.to_string(),
                 joined.generation_id,
                 joined.member_id.clone(),
-                joined.member_epoch,
+                0, // member epoch (always 0: no client sends one)
                 Some(vec![]),
             )
             .await

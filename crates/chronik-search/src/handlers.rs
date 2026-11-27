@@ -1356,7 +1356,8 @@ fn keep_best_candidates(candidates: &mut Vec<Candidate>, window: usize) {
 /// Reads the candidates' documents into hits, archive by archive; an archive
 /// that cannot be read is left out (as a segment that fails its search is).
 fn read_candidates(candidates: Vec<Candidate>) -> Vec<Hit> {
-    let mut by_source: Vec<(Arc<CandidateSource>, Vec<(tantivy::Score, tantivy::DocAddress)>)> = Vec::new();
+    type SourceDocs = (Arc<CandidateSource>, Vec<(tantivy::Score, tantivy::DocAddress)>);
+    let mut by_source: Vec<SourceDocs> = Vec::new();
     for c in candidates {
         match by_source.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &c.source)) {
             Some((_, docs)) => docs.push((c.key.score, c.addr)),
@@ -1916,8 +1917,8 @@ async fn search_in_index(
             .to_string();
         
         // Generate highlights if requested
-        let highlight = if request.highlight.is_some() {
-            generate_highlights(&doc, &query, &state.schema, request.highlight.as_ref().unwrap())?
+        let highlight = if let Some(config) = request.highlight.as_ref() {
+            generate_highlights(&doc, &query, &state.schema, config)?
         } else {
             None
         };
@@ -2950,7 +2951,7 @@ fn index_creation_error(error: Error) -> (StatusCode, Json<ErrorResponse>) {
 /// Generate highlights for matching fields
 fn generate_highlights(
     _doc: &tantivy::TantivyDocument,
-    _query: &Box<dyn TantivyQuery>,
+    _query: &dyn TantivyQuery,
     _schema: &tantivy::schema::Schema,
     _config: &HighlightConfig,
 ) -> Result<Option<HashMap<String, Vec<String>>>> {

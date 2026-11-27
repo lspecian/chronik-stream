@@ -53,8 +53,6 @@ struct ActiveSegment {
     timestamp_max: i64,
     record_count: u64,
     current_size: u64,
-    /// Stores raw Kafka batches for v2 format
-    has_raw_kafka: bool,
     /// Time when the segment was created
     created_at: Instant,
 }
@@ -64,8 +62,6 @@ pub struct SegmentWriter {
     config: SegmentWriterConfig,
     object_store: Box<dyn ObjectStoreTrait>,
     active_segments: Arc<RwLock<HashMap<(String, i32), ActiveSegment>>>,
-    /// Track the last offset written for each partition to ensure continuity
-    last_offsets: Arc<RwLock<HashMap<(String, i32), i64>>>,
 }
 
 impl SegmentWriter {
@@ -87,7 +83,6 @@ impl SegmentWriter {
             config,
             object_store,
             active_segments: Arc::new(RwLock::new(HashMap::new())),
-            last_offsets: Arc::new(RwLock::new(HashMap::new())),
         })
     }
     
@@ -119,7 +114,6 @@ impl SegmentWriter {
                 timestamp_max: first_record.timestamp,
                 record_count: 0,
                 current_size: 0,
-                has_raw_kafka: false, // v1 format - indexed only
                 created_at: Instant::now(),
             }
         });

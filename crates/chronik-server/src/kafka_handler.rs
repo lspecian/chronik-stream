@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_protocol::{ProtocolHandler, handler::Response, parser::{parse_request_header, ApiKey, write_response_header, ResponseHeader}};
-use chronik_storage::{SegmentReader, ObjectStoreTrait};
+use chronik_storage::ObjectStoreTrait;
 use crate::produce_handler::ProduceHandler;
 use crate::consumer_group::GroupManager;
 use crate::fetch_handler::FetchHandler;
@@ -17,7 +17,7 @@ use crate::connection::ConnectionContext;
 use crate::acl::AclStore;
 use crate::authorizer::{Authorizer, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_GROUP_AUTHORIZATION_FAILED};
 use chronik_protocol::describe_acls_types::{AclOperation, ResourceType};
-use bytes::{Bytes, BytesMut, Buf};
+use bytes::{Bytes, BytesMut};
 use tokio::sync::RwLock;
 use tracing::{debug, instrument};
 
@@ -35,8 +35,6 @@ pub struct KafkaProtocolHandler {
     produce_handler: Arc<ProduceHandler>,
     /// WAL handler for durability (MANDATORY - no longer optional)
     wal_handler: Arc<WalProduceHandler>,
-    /// Segment reader for fetch operations
-    segment_reader: Arc<SegmentReader>,
     /// Metadata store
     metadata_store: Arc<dyn MetadataStore>,
     /// Consumer group manager
@@ -51,8 +49,6 @@ pub struct KafkaProtocolHandler {
     port: i32,
     /// Expected topics tracker for v0 metadata compatibility
     expected_topics: Arc<RwLock<HashSet<String>>>,
-    /// Default number of partitions for auto-created topics
-    default_num_partitions: u32,
     /// ACL authorization (Security Phase 3). Disabled unless CHRONIK_ACL_ENABLED.
     authorizer: Authorizer,
 }
@@ -60,9 +56,9 @@ pub struct KafkaProtocolHandler {
 impl KafkaProtocolHandler {
     /// Create a new Kafka protocol handler with WAL (MANDATORY)
     /// WAL is now required for all Chronik Stream instances - no optional paths
+    #[allow(clippy::too_many_arguments)] // the handler's components, wired once at startup
     pub async fn new(
         produce_handler: Arc<ProduceHandler>,
-        segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
         _object_store: Arc<dyn ObjectStoreTrait>,
         fetch_handler: Arc<FetchHandler>,
@@ -119,7 +115,6 @@ impl KafkaProtocolHandler {
             }),
             produce_handler,
             wal_handler,
-            segment_reader,
             metadata_store,
             group_manager,
             fetch_handler,
@@ -127,7 +122,6 @@ impl KafkaProtocolHandler {
             host: host.clone(),
             port,
             expected_topics: Arc::new(RwLock::new(HashSet::new())),
-            default_num_partitions,
             authorizer: Authorizer::new(acl_store),
         })
     }

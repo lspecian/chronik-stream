@@ -12,7 +12,6 @@ use serde::{Serialize, Deserialize};
 
 use std::path::{Path, PathBuf};
 use std::fs::{self, File};
-use std::io::{Write, Read};
 use std::sync::Arc;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
@@ -1248,8 +1247,8 @@ mod tests {
         assert_eq!(results.len(), 1000);
 
         // Verify sorting
-        for i in 0..1000 {
-            assert_eq!(results[i].offset, i as i64);
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r.offset, i as i64);
         }
 
         // Query middle range

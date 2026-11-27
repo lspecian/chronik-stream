@@ -168,7 +168,8 @@ pub async fn sweep_orphans(store: &Arc<dyn ObjectStore>, index: &Arc<SegmentInde
     let norm = |k: &str| k.trim_start_matches('/').to_string();
     // Per archive directory (one partition): the referenced keys and the
     // offset ranges they cover.
-    let mut dirs: BTreeMap<String, (HashSet<String>, Vec<(i64, i64)>)> = BTreeMap::new();
+    type DirRefs = (HashSet<String>, Vec<(i64, i64)>);
+    let mut dirs: BTreeMap<String, DirRefs> = BTreeMap::new();
     for s in index.get_all_segments().await.unwrap_or_default() {
         if let Some((dir, _)) = s.object_store_path.rsplit_once('/') {
             let entry = dirs.entry(format!("{dir}/")).or_default();

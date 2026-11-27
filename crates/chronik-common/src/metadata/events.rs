@@ -382,7 +382,7 @@ pub trait EventApplicator {
 }
 
 /// Event log for storing and replaying metadata events
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EventLog {
     events: Vec<MetadataEvent>,
 }

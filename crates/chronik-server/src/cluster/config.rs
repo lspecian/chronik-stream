@@ -5,7 +5,6 @@
 
 use anyhow::{Result, Context};
 use std::path::PathBuf;
-use chronik_storage::ObjectStoreConfig;
 use chronik_config::ClusterConfig;
 
 use crate::Cli;
@@ -20,7 +19,6 @@ pub struct ClusterInitConfig {
     pub advertised_host: String,
     pub advertised_port: i32,
     pub data_dir: PathBuf,
-    pub object_store_config: Option<ObjectStoreConfig>,
     pub replication_factor: u32,
     pub kafka_bind_addr: String,
     pub wal_bind_addr: String,
@@ -54,9 +52,6 @@ impl ClusterInitConfig {
             parse_kafka_addr(&this_node.kafka)?
         };
 
-        // Parse object store configuration from environment
-        let object_store_config = crate::parse_object_store_config_from_env();
-
         // Extract Raft peers
         let raft_peers: Vec<(u64, String)> = config.peer_nodes()
             .iter()
@@ -82,7 +77,6 @@ impl ClusterInitConfig {
             advertised_host,
             advertised_port,
             data_dir: PathBuf::from(&config.data_dir),
-            object_store_config,
             replication_factor: config.replication_factor as u32,
             kafka_bind_addr,
             wal_bind_addr,

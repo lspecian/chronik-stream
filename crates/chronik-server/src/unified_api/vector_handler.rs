@@ -366,7 +366,7 @@ pub async fn search(
             };
 
             // Distributed fan-out: merge results from peer nodes
-            // Use all_peers() instead of nodes_for_topic() because with RF=3 and 3 nodes,
+            // Use all_peers() instead of partition-based peer selection because with RF=3 and 3 nodes,
             // partition-based routing returns empty (all partitions are local), but vector
             // indexes are per-node and may differ.
             let response = if needs_fan_out(&state, &headers, &topic).await {

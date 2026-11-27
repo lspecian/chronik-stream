@@ -2,7 +2,7 @@
 
 use chronik_storage::object_store::{
     ObjectStoreFactory, ObjectStoreConfig, StorageBackend, 
-    AuthConfig, S3Credentials, ObjectStore as ObjectStoreTrait,
+    AuthConfig, S3Credentials,
     PutOptions, GetOptions, ListOptions,
 };
 use chronik_common::Bytes;

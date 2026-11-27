@@ -227,15 +227,11 @@ pub struct SchemaVersion {
     pub schema: String,
     /// Schema type
     pub schema_type: SchemaType,
-    /// References
-    pub references: Vec<SchemaReference>,
 }
 
 /// Subject metadata
 #[derive(Debug, Clone)]
 pub struct Subject {
-    /// Subject name (e.g., "my-topic-value")
-    pub name: String,
     /// Compatibility level for this subject
     pub compatibility: CompatibilityLevel,
     /// Schema versions (version number -> schema version)
@@ -245,9 +241,8 @@ pub struct Subject {
 }
 
 impl Subject {
-    fn new(name: String) -> Self {
+    fn new() -> Self {
         Self {
-            name,
             compatibility: CompatibilityLevel::default(),
             versions: HashMap::new(),
             latest_version: 0,
@@ -448,7 +443,7 @@ impl SchemaRegistry {
                 debug!("Schema already registered with ID {}", existing_id);
 
                 // Still need to register version under this subject if not already
-                self.register_version(subject, existing_id, &normalized_schema, schema_type, references.clone())
+                self.register_version(subject, existing_id, &normalized_schema, schema_type)
                     .await?;
 
                 return Ok(existing_id);
@@ -470,7 +465,7 @@ impl SchemaRegistry {
                     id: schema_id,
                     schema: normalized_schema.clone(),
                     schema_type,
-                    references: references.clone(),
+                    references,
                 },
             );
         }
@@ -482,7 +477,7 @@ impl SchemaRegistry {
         }
 
         // Register version under subject
-        self.register_version(subject, schema_id, &normalized_schema, schema_type, references)
+        self.register_version(subject, schema_id, &normalized_schema, schema_type)
             .await?;
 
         info!(
@@ -500,13 +495,12 @@ impl SchemaRegistry {
         schema_id: u32,
         schema: &str,
         schema_type: SchemaType,
-        references: Vec<SchemaReference>,
     ) -> Result<u32, SchemaRegistryError> {
         let mut subjects = self.subjects.write().await;
 
         let subject = subjects
             .entry(subject_name.to_string())
-            .or_insert_with(|| Subject::new(subject_name.to_string()));
+            .or_insert_with(Subject::new);
 
         // Check if this schema is already registered under this subject
         for (version, sv) in &subject.versions {
@@ -524,7 +518,6 @@ impl SchemaRegistry {
                 schema_id,
                 schema: schema.to_string(),
                 schema_type,
-                references,
             },
         );
         subject.latest_version = version;

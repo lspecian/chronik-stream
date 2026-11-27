@@ -805,28 +805,6 @@ impl WalMetadataStore {
         Ok(())
     }
 
-    /// Re-broadcast the whole catalog — topics **and** their partition
-    /// assignments — via the event bus.
-    ///
-    /// Called by the leader after startup once metadata replication is wired up,
-    /// so followers that restarted (or joined late, or missed an event) heal.
-    ///
-    /// ## Why assignments are not optional here
-    ///
-    /// This used to re-broadcast `TopicCreated` only. A healed follower then knew
-    /// every topic and *no* partition assignment — which under push cost nothing,
-    /// because the leader drives replication and only the leader's view has to be
-    /// right. Under follower-pull it is fatal: a follower with no assignment
-    /// cannot tell who leads a partition, so it fetches nothing and replicates
-    /// nothing, silently, while the leader's `/admin/status` still reports
-    /// `isr:[1,2,3]` from its own intact view.
-    ///
-    /// Measured on a 3-node cluster before this fix, same moment, 69 partitions:
-    /// node 1 knew a leader for 66, node 3 for 21, node 2 for **zero**.
-    ///
-    /// Safe to call repeatedly — `apply_replicated_event` is idempotent for both
-    /// event types (topic created only if absent; assignment is an upsert).
-
     /// Both with-assignments create paths, differing only in provenance.
     async fn with_assignments_inner(
         &self,
@@ -1804,7 +1782,8 @@ mod transaction_coordinator_tests {
 
         // Replay captured events into a fresh store.
         let fresh = noop_store(0);
-        for ev in events.lock().unwrap().iter() {
+        let captured = events.lock().unwrap().clone();
+        for ev in &captured {
             fresh.state.apply_event(ev).await.unwrap();
         }
         let t = fresh.get_transaction("tx").await.unwrap().unwrap();
@@ -2240,47 +2219,6 @@ mod topic_provenance_tests {
             _ => panic!("wrong variant"),
         }
     }
-}
-
-#[cfg(test)]
-mod config_convergence_tests {
-    use super::*;
-
-    fn store(node_id: u64) -> WalMetadataStore {
-        let wal_append: WalAppendFn = Arc::new(|_bytes| Box::pin(async { Ok(0i64) }));
-        WalMetadataStore::new(node_id, wal_append)
-    }
-
-    /// Collects what a node publishes, so one node's output can be fed to another.
-    fn recording_store(node_id: u64) -> (WalMetadataStore, Arc<std::sync::Mutex<Vec<MetadataEvent>>>) {
-        let mut s = store(node_id);
-        let seen: Arc<std::sync::Mutex<Vec<MetadataEvent>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = Arc::clone(&seen);
-        s.set_event_bus(Arc::new(move |event: MetadataEvent| {
-            sink.lock().unwrap().push(event);
-            1
-        }));
-        (s, seen)
-    }
-
-    fn with_key(key: &str, value: &str) -> TopicConfig {
-        let mut c = TopicConfig::default();
-        c.config.insert(key.to_string(), value.to_string());
-        c
-    }
-
-    async fn key_of(store: &WalMetadataStore, topic: &str, key: &str) -> Option<String> {
-        store
-            .get_topic(topic)
-            .await
-            .unwrap()
-            .expect("topic exists")
-            .config
-            .config
-            .get(key)
-            .cloned()
-    }
-
 }
 
 #[cfg(test)]

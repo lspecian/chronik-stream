@@ -121,9 +121,6 @@ impl LeaderAssignment {
             if mid != leader_member_id {  // Don't send to leader (we return directly below)
                 if let Some(tx) = pending_sync.remove(mid) {
                     let member_assignment = encode_assignment(assignment);
-                    let member_epoch = group.members.get(mid)
-                        .map(|m| m.member_epoch)
-                        .unwrap_or(0);
 
                     // Log assignment details for monitoring
                     for (topic, partitions) in assignment {
@@ -139,7 +136,6 @@ impl LeaderAssignment {
                     let response = SyncGroupResponse {
                         error_code: 0,
                         assignment: member_assignment,
-                        member_epoch,
                     };
 
                     if tx.send(response).is_err() {
@@ -172,9 +168,6 @@ impl LeaderAssignment {
             .cloned()
             .unwrap_or_default();
         let encoded_assignment = encode_assignment(&leader_assignment);
-        let leader_epoch = group.members.get(member_id)
-            .map(|m| m.member_epoch)
-            .unwrap_or(0);
 
         // Log leader's assignment details for monitoring
         for (topic, partitions) in &leader_assignment {
@@ -197,7 +190,6 @@ impl LeaderAssignment {
         SyncGroupResponse {
             error_code: 0,
             assignment: encoded_assignment,
-            member_epoch: leader_epoch,
         }
     }
 }

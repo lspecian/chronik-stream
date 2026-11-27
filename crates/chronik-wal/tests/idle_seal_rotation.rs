@@ -47,8 +47,7 @@ async fn append(manager: &WalManager, topic: &str, partition: i32, offsets: std:
 #[tokio::test]
 async fn idle_seal_rotates_so_sealed_segments_stop_growing() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = WalConfig::default();
-    config.data_dir = dir.path().to_path_buf();
+    let config = WalConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
 
     let manager = WalManager::new(config).await.unwrap();
     let (topic, partition) = ("rotate-test", 0);
@@ -99,8 +98,7 @@ async fn idle_seal_rotates_so_sealed_segments_stop_growing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_commits_never_land_in_a_sealed_segment() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = WalConfig::default();
-    config.data_dir = dir.path().to_path_buf();
+    let config = WalConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
 
     let manager = std::sync::Arc::new(WalManager::new(config).await.unwrap());
     let (topic, partition) = ("rotate-race", 0);
@@ -161,8 +159,7 @@ async fn concurrent_commits_never_land_in_a_sealed_segment() {
 #[tokio::test]
 async fn all_records_remain_readable_across_the_rotation() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = WalConfig::default();
-    config.data_dir = dir.path().to_path_buf();
+    let config = WalConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
 
     let manager = WalManager::new(config).await.unwrap();
     let (topic, partition) = ("rotate-read", 0);

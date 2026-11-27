@@ -236,7 +236,6 @@ pub struct SegmentSearcher {
     reader: IndexReader,
     query_parser: QueryParser,
     offset_field: Field,
-    timestamp_field: Field,
 }
 
 impl SegmentSearcher {
@@ -253,7 +252,7 @@ impl SegmentSearcher {
         // Create a simple schema for searching
         let mut schema_builder = Schema::builder();
         let offset_field = schema_builder.add_i64_field("_offset", NumericOptions::default().set_indexed().set_stored());
-        let timestamp_field = schema_builder.add_i64_field("_timestamp", NumericOptions::default().set_indexed().set_stored());
+        schema_builder.add_i64_field("_timestamp", NumericOptions::default().set_indexed().set_stored());
         let content_field = schema_builder.add_text_field("_content", TEXT | STORED);
         let schema = schema_builder.build();
         
@@ -275,7 +274,6 @@ impl SegmentSearcher {
             reader,
             query_parser,
             offset_field,
-            timestamp_field,
         })
     }
     

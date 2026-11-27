@@ -2,7 +2,7 @@
 
 use chronik_storage::object_store::{
     ObjectStoreFactory, ObjectStoreConfig, StorageBackend, AuthConfig,
-    ObjectStoreTrait, PutOptions, ChronikStorageAdapter, SegmentLocation,
+    PutOptions, ChronikStorageAdapter, SegmentLocation,
     PerformanceConfig,
 };
 // `ObjectStoreConfig::retry` takes the config-file form of the retry policy;

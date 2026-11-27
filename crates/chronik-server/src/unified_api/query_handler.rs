@@ -874,6 +874,7 @@ fn query_response_json(response: QueryResponse) -> axum::response::Response {
 }
 
 /// Run `request` against this node's backends.
+#[allow(clippy::result_large_err)] // axum error response, built once per failed request
 async fn run_local_query(
     state: &UnifiedApiState,
     request: &QueryRequest,

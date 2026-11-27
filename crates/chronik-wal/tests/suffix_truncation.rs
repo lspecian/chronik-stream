@@ -58,9 +58,7 @@ async fn readable_offsets(manager: &WalManager, topic: &str, partition: i32) -> 
 }
 
 fn config_at(dir: &Path) -> WalConfig {
-    let mut config = WalConfig::default();
-    config.data_dir = dir.to_path_buf();
-    config
+    WalConfig { data_dir: dir.to_path_buf(), ..Default::default() }
 }
 
 #[tokio::test]

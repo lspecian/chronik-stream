@@ -70,8 +70,6 @@ pub struct UnifiedApiConfig {
     pub enable_admin: bool,
     /// Enable search endpoints (Elasticsearch-compatible)
     pub enable_search: bool,
-    /// Maximum query timeout in seconds
-    pub query_timeout_secs: u64,
 }
 
 impl Default for UnifiedApiConfig {
@@ -83,36 +81,6 @@ impl Default for UnifiedApiConfig {
             enable_vector: true,
             enable_admin: true,
             enable_search: true,
-            query_timeout_secs: 30,
-        }
-    }
-}
-
-/// v2.2.23: Configuration for hot buffer (in-memory SQL queries)
-#[derive(Debug, Clone)]
-pub struct HotBufferConfig {
-    /// Whether hot buffer is enabled
-    pub enabled: bool,
-    /// Maximum records to include in hot buffer per partition
-    pub max_records_per_partition: usize,
-    /// Refresh interval in milliseconds
-    pub refresh_interval_ms: u64,
-}
-
-impl Default for HotBufferConfig {
-    fn default() -> Self {
-        Self {
-            enabled: std::env::var("CHRONIK_HOT_BUFFER_ENABLED")
-                .map(|v| v.to_lowercase() == "true")
-                .unwrap_or(true),  // Enabled by default
-            max_records_per_partition: std::env::var("CHRONIK_HOT_BUFFER_MAX_RECORDS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000),
-            refresh_interval_ms: std::env::var("CHRONIK_HOT_BUFFER_REFRESH_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1000),
         }
     }
 }
@@ -133,8 +101,6 @@ pub struct UnifiedApiState {
     /// v2.2.23: WAL manager for hot buffer (in-memory SQL queries)
     /// Enables <1s query latency by reading recent records from WAL
     pub wal_manager: Option<Arc<chronik_wal::WalManager>>,
-    /// v2.2.23: Hot buffer configuration
-    pub hot_buffer_config: HotBufferConfig,
     /// v2.2.23: Hot data buffer for sub-second SQL queries
     pub hot_buffer: Option<Arc<HotDataBuffer>>,
     /// v2.4.0: SearchApi for full-text search via query orchestrator
@@ -272,7 +238,6 @@ impl UnifiedApiState {
             metadata_store,
             config,
             wal_manager: None,
-            hot_buffer_config: HotBufferConfig::default(),
             hot_buffer: None,
             #[cfg(feature = "search")]
             search_api: None,
@@ -564,6 +529,7 @@ impl UnifiedApiState {
 }
 
 /// Create the unified API router
+#[cfg(test)]
 pub fn create_router(state: UnifiedApiState) -> Router {
     create_router_full(state, None, None)
 }
@@ -816,14 +782,6 @@ async fn spawn_api_server(
     }
 }
 
-/// Get the unified API port from environment or default
-pub fn get_unified_api_port() -> u16 {
-    std::env::var("CHRONIK_UNIFIED_API_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(6092)
-}
-
 /// Serve the Unified API over TLS.
 ///
 /// Written against hyper directly because `axum::serve` has no TLS entry
@@ -904,7 +862,6 @@ mod tests {
             enable_vector: true,
             enable_admin: false,
             enable_search: true,
-            query_timeout_secs: 60,
         };
         assert_eq!(config.port, 8080);
         assert_eq!(config.bind_addr, "127.0.0.1");
@@ -912,7 +869,6 @@ mod tests {
         assert!(config.enable_vector);
         assert!(!config.enable_admin);
         assert!(config.enable_search);
-        assert_eq!(config.query_timeout_secs, 60);
     }
 
     #[tokio::test]
@@ -1072,13 +1028,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn test_get_unified_api_port_default() {
-        // Clear env var to test default
-        std::env::remove_var("CHRONIK_UNIFIED_API_PORT");
-        assert_eq!(get_unified_api_port(), 6092);
     }
 
     #[test]

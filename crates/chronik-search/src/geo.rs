@@ -70,12 +70,6 @@ pub enum GeoQuery {
     },
 }
 
-/// Geo field mapping in schema
-pub struct GeoFieldMapping {
-    lat_field: Field,
-    lon_field: Field,
-}
-
 /// Extension trait for Schema to support geo fields
 pub trait GeoSchemaExt {
     fn add_geo_point_field(&mut self, field_name: &str) -> (Field, Field);
@@ -245,7 +239,6 @@ fn euclidean_distance(p1: &GeoPoint, p2: &GeoPoint) -> f64 {
 
 /// Calculate bounding box for a distance query
 fn calculate_bounding_box(center: &GeoPoint, distance_meters: f64) -> Result<GeoBoundingBox> {
-    const EARTH_RADIUS_M: f64 = 6_371_000.0;
     const METERS_PER_DEGREE_LAT: f64 = 111_319.9;
     
     // Calculate latitude difference

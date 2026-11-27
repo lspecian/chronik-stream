@@ -150,73 +150,73 @@ impl PooledBuffer {
     }
     
     /// Get a reference to the inner buffer
-    pub fn as_ref(&self) -> &BytesMut {
+    pub fn buffer(&self) -> &BytesMut {
         self.buffer.as_ref().expect("Buffer already taken")
     }
     
     /// Get a mutable reference to the inner buffer
-    pub fn as_mut(&mut self) -> &mut BytesMut {
+    pub fn buffer_mut(&mut self) -> &mut BytesMut {
         self.buffer.as_mut().expect("Buffer already taken")
     }
     
     /// Write data to the buffer
     pub fn put_slice(&mut self, data: &[u8]) {
-        self.as_mut().put_slice(data);
+        self.buffer_mut().put_slice(data);
     }
     
     /// Write a single byte to the buffer
     pub fn put_u8(&mut self, val: u8) {
-        self.as_mut().put_u8(val);
+        self.buffer_mut().put_u8(val);
     }
     
     /// Write a u16 to the buffer
     pub fn put_u16(&mut self, val: u16) {
-        self.as_mut().put_u16(val);
+        self.buffer_mut().put_u16(val);
     }
     
     /// Write a u32 to the buffer
     pub fn put_u32(&mut self, val: u32) {
-        self.as_mut().put_u32(val);
+        self.buffer_mut().put_u32(val);
     }
     
     /// Write a u64 to the buffer  
     pub fn put_u64(&mut self, val: u64) {
-        self.as_mut().put_u64(val);
+        self.buffer_mut().put_u64(val);
     }
     
     /// Write an i32 to the buffer
     pub fn put_i32(&mut self, val: i32) {
-        self.as_mut().put_i32(val);
+        self.buffer_mut().put_i32(val);
     }
     
     /// Write an i64 to the buffer
     pub fn put_i64(&mut self, val: i64) {
-        self.as_mut().put_i64(val);
+        self.buffer_mut().put_i64(val);
     }
     
     /// Get the current length of data in the buffer
     pub fn len(&self) -> usize {
-        self.as_ref().len()
+        self.buffer().len()
     }
     
     /// Check if the buffer is empty
     pub fn is_empty(&self) -> bool {
-        self.as_ref().is_empty()
+        self.buffer().is_empty()
     }
     
     /// Clear the buffer
     pub fn clear(&mut self) {
-        self.as_mut().clear();
+        self.buffer_mut().clear();
     }
     
     /// Reserve additional capacity
     pub fn reserve(&mut self, additional: usize) {
-        self.as_mut().reserve(additional);
+        self.buffer_mut().reserve(additional);
     }
     
     /// Split the buffer at the given index
     pub fn split_to(&mut self, at: usize) -> BytesMut {
-        self.as_mut().split_to(at)
+        self.buffer_mut().split_to(at)
     }
     
     /// Freeze the buffer into immutable Bytes
@@ -237,13 +237,13 @@ impl Drop for PooledBuffer {
 
 impl AsRef<[u8]> for PooledBuffer {
     fn as_ref(&self) -> &[u8] {
-        self.as_ref().as_ref()
+        self.buffer().as_ref()
     }
 }
 
 impl AsMut<[u8]> for PooledBuffer {
     fn as_mut(&mut self) -> &mut [u8] {
-        self.as_mut().as_mut()
+        self.buffer_mut().as_mut()
     }
 }
 
@@ -292,7 +292,7 @@ mod tests {
         {
             let buffer = PooledBuffer::acquire(1024);
             assert!(buffer.is_empty());
-            assert!(buffer.as_ref().capacity() >= 1024);
+            assert!(buffer.buffer().capacity() >= 1024);
         }
         
         // After drop, buffer should be in pool
@@ -303,7 +303,7 @@ mod tests {
         // Second acquisition should reuse
         {
             let buffer = PooledBuffer::acquire(1024);
-            assert!(buffer.as_ref().capacity() >= 1024);
+            assert!(buffer.buffer().capacity() >= 1024);
         }
         
         let stats_reused = pool_stats();
@@ -375,7 +375,7 @@ mod tests {
         // Smaller request should reuse the larger buffer
         {
             let buffer = PooledBuffer::acquire(4096);
-            assert!(buffer.as_ref().capacity() >= 8192);
+            assert!(buffer.buffer().capacity() >= 8192);
         }
         
         let stats = pool_stats();
@@ -418,6 +418,6 @@ mod tests {
         
         let split = buffer.split_to(7);
         assert_eq!(&split[..], b"Hello, ");
-        assert_eq!(&buffer.as_ref()[..], b"World!");
+        assert_eq!(&buffer.buffer()[..], b"World!");
     }
 }

@@ -1021,6 +1021,7 @@ impl WalIndexer {
 
     /// Index sealed segments (internal implementation)
     #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, indexing_in_progress, indexed_segments, segment_failures, vector_index_manager, is_leader, hot_buffer, replication_progress, cold_flush_listener, hot_vector_index))]
+    #[allow(clippy::too_many_arguments)] // the indexer's state, passed to a free-standing pass
     async fn index_sealed_segments_internal(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -1574,6 +1575,7 @@ impl WalIndexer {
 
     /// Index a single sealed WAL segment
     #[instrument(skip(config, wal_manager, object_store, segment_index, metadata_store, vector_index_manager, stats, is_leader, hot_buffer, replication_progress, cold_flush_listener, hot_vector_index, prepared))]
+    #[allow(clippy::too_many_arguments)] // the indexer's state, passed to a free-standing pass
     async fn index_segment(
         config: &WalIndexerConfig,
         wal_manager: &Arc<WalManager>,
@@ -1870,8 +1872,7 @@ impl WalIndexer {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(3)
-                .max(1)
-                .min(8);
+                .clamp(1, 8);
 
             // HP-2 follow-up A: snapshot the hot vector index once.
             let hot_vec_for_reuse = hot_vector_index.read().await.clone();
@@ -2881,16 +2882,17 @@ impl WalIndexer {
 
     /// v2.2.21: Build ColumnarConfig from TopicConfig settings
     fn build_columnar_config(topic_config: &chronik_common::metadata::traits::TopicConfig) -> ColumnarConfig {
-        let mut config = ColumnarConfig::default();
-
-        // Set compression from topic config
-        config.compression = match topic_config.columnar_compression() {
-            "none" => CompressionCodec::None,
-            "snappy" => CompressionCodec::Snappy,
-            "gzip" => CompressionCodec::Gzip,
-            "lz4" => CompressionCodec::Lz4,
-            "zstd" => CompressionCodec::Zstd,
-            _ => CompressionCodec::Zstd, // Default
+        let mut config = ColumnarConfig {
+            // Compression from the topic config
+            compression: match topic_config.columnar_compression() {
+                "none" => CompressionCodec::None,
+                "snappy" => CompressionCodec::Snappy,
+                "gzip" => CompressionCodec::Gzip,
+                "lz4" => CompressionCodec::Lz4,
+                "zstd" => CompressionCodec::Zstd,
+                _ => CompressionCodec::Zstd, // Default
+            },
+            ..Default::default()
         };
 
         // Set row group size
@@ -3058,8 +3060,7 @@ impl WalIndexer {
         partition: Option<i32>,
         model_id: Option<&str>,
     ) -> Result<BackfillStats> {
-        let mut stats = BackfillStats::default();
-        stats.model_id = model_id.map(|s| s.to_string());
+        let mut stats = BackfillStats { model_id: model_id.map(|s| s.to_string()), ..Default::default() };
         let start_time = std::time::Instant::now();
 
         // 1. Verify topic exists and has vector enabled
@@ -3447,10 +3448,9 @@ mod tests {
     /// segment being indexed at all.
     #[test]
     fn quarantine_is_reachable_but_not_hair_trigger() {
-        assert!(
-            MAX_SEGMENT_ATTEMPTS >= 4,
-            "a transient failure must get several attempts"
-        );
+        const {
+            assert!(MAX_SEGMENT_ATTEMPTS >= 4, "a transient failure must get several attempts")
+        };
         // The passes a segment waits before its final attempt, summed, is the
         // grace period an operator gets to notice the warnings.
         let total_waited: u32 = (1..MAX_SEGMENT_ATTEMPTS).map(backoff_passes).sum();
@@ -4276,8 +4276,8 @@ mod cold_range_tests {
 /// The lock serializing Parquet writes for one partition (see
 /// `WalIndexer::create_parquet_segment`).
 fn parquet_flush_lock(tp: &TopicPartition) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: std::sync::LazyLock<dashmap::DashMap<(String, i32), Arc<tokio::sync::Mutex<()>>>> =
-        std::sync::LazyLock::new(dashmap::DashMap::new);
+    type Locks = dashmap::DashMap<(String, i32), Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::LazyLock<Locks> = std::sync::LazyLock::new(dashmap::DashMap::new);
     LOCKS.entry((tp.topic.clone(), tp.partition)).or_default().clone()
 }
 
@@ -4320,8 +4320,7 @@ mod prepare_tests {
     }
 
     async fn indexer(dir: &std::path::Path) -> WalIndexer {
-        let mut wal_config = chronik_wal::config::WalConfig::default();
-        wal_config.data_dir = dir.join("wal");
+        let wal_config = chronik_wal::config::WalConfig { data_dir: dir.join("wal"), ..Default::default() };
         let wal = Arc::new(WalManager::new(wal_config).await.unwrap());
         for b in 0..10 {
             let data = bincode::serialize(&batch(b * 10, 10)).unwrap();

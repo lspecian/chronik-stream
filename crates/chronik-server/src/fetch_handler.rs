@@ -4,7 +4,7 @@ use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_monitoring::MetricsRecorder;
 use chronik_protocol::{FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition};
-use chronik_storage::{SegmentReader, Segment, ObjectStoreTrait, SegmentIndex};
+use chronik_storage::{Segment, ObjectStoreTrait, SegmentIndex};
 use chronik_storage::kafka_records::{KafkaRecordBatch, RecordHeader as KafkaRecordHeader, CompressionType};
 use chronik_storage::tantivy_segment::TantivySegmentReader;
 use chronik_wal::WalManager;
@@ -31,8 +31,6 @@ struct PartitionBuffer {
     batch_metadata: Vec<BatchMetadata>,
     base_offset: i64,
     high_watermark: i64,
-    /// Highest offset that has been flushed to segments
-    flushed_offset: i64,
     /// Minimum offset actually present in buffer after trimming (v1.3.48)
     /// Used to detect gaps and trigger WAL fallback when old batches are trimmed
     min_offset_in_buffer: i64,
@@ -43,8 +41,6 @@ struct PartitionBuffer {
 struct BatchMetadata {
     base_offset: i64,
     last_offset: i64,
-    record_count: i32,
-    size_bytes: usize,
 }
 
 /// Fetch handler state
@@ -63,46 +59,18 @@ struct SegmentInfo {
 }
 
 /// Configuration for FetchHandler behavior
-#[derive(Debug, Clone)]
+///
+/// There is no follower fetching (KIP-392): every node serves fetches from its
+/// own log and clients route to the partition leader, which applies COMMIT/ABORT
+/// markers synchronously, so the Last Stable Offset is correct the instant
+/// `commitTransaction` returns. Follower fetching would reintroduce a
+/// replication-lag visibility window on read_committed, so any future wiring
+/// must keep read_committed on the leader (or make the follower wait for the
+/// marker).
+#[derive(Debug, Clone, Default)]
 pub struct FetchHandlerConfig {
-    /// NOT WIRED. Kept for forward-compatibility with KIP-392 follower fetching, but
-    /// the fetch path does not currently branch on it: every node serves fetches from
-    /// its own local log, and clients route to the partition leader via the Metadata
-    /// response, so in practice reads are always served by the leader. This is
-    /// deliberate for read_committed — the leader applies the COMMIT/ABORT markers
-    /// synchronously (see transaction_index::apply_log_batch on the produce path), so
-    /// the Last Stable Offset is correct the instant `commitTransaction` returns
-    /// (measured: committed records become visible to a read_committed consumer in
-    /// ~6ms server-side). Enabling true follower fetching here would reintroduce a
-    /// replication-lag visibility window on read_committed, so any future wiring must
-    /// force read_committed to the leader (or make the follower wait for the marker).
-    pub allow_follower_reads: bool,
-
-    /// NOT WIRED (see `allow_follower_reads`). Intended follower-read commit wait.
-    pub follower_read_max_wait_ms: u64,
-
     /// Node ID (for preferred_read_replica)
     pub node_id: i32,
-}
-
-impl Default for FetchHandlerConfig {
-    fn default() -> Self {
-        let allow_follower_reads = std::env::var("CHRONIK_FETCH_FROM_FOLLOWERS")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true);
-
-        let follower_read_max_wait_ms = std::env::var("CHRONIK_FETCH_FOLLOWER_MAX_WAIT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000); // 1 second default
-
-        Self {
-            allow_follower_reads,
-            follower_read_max_wait_ms,
-            node_id: 0,
-        }
-    }
 }
 
 /// Fetch request handler
@@ -110,7 +78,6 @@ impl Default for FetchHandlerConfig {
 /// v1.3.66+: Raft-aware with follower read support using RaftReplicaManager
 /// v2.0.0+: Read-your-writes consistency with ReadIndex protocol
 pub struct FetchHandler {
-    segment_reader: Arc<SegmentReader>,
     metadata_store: Arc<dyn MetadataStore>,
     object_store: Arc<dyn ObjectStoreTrait>,
     wal_manager: Option<Arc<WalManager>>,
@@ -151,13 +118,12 @@ pub struct FetchHandler {
 
 impl FetchHandler {
     /// Create a new fetch handler
+    #[cfg(test)]
     pub fn new(
-        segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
         object_store: Arc<dyn ObjectStoreTrait>,
     ) -> Self {
         Self {
-            segment_reader,
             metadata_store,
             object_store,
             wal_manager: None,
@@ -177,14 +143,12 @@ impl FetchHandler {
     /// Create a new fetch handler with WAL and ProduceHandler integration (v1.3.39+)
     /// v1.3.47+: Accepts Arc<WalManager> directly (no RwLock - WalManager uses DashMap internally)
     pub fn new_with_wal(
-        segment_reader: Arc<SegmentReader>,
         metadata_store: Arc<dyn MetadataStore>,
         object_store: Arc<dyn ObjectStoreTrait>,
         wal_manager: Arc<WalManager>,
         produce_handler: Arc<crate::produce_handler::ProduceHandler>,
     ) -> Self {
         Self {
-            segment_reader,
             metadata_store,
             object_store,
             wal_manager: Some(wal_manager),
@@ -872,6 +836,7 @@ impl FetchHandler {
     /// Tries fetch_raw_bytes() first (CRC-preserving), falls back to fetch_records()
     ///
     /// Complexity: < 25 (timeout handling + raw bytes path + fallback path + encoding)
+    #[allow(clippy::too_many_arguments)] // internal call that threads its caller's state through
     async fn fetch_data_available_path(
         &self,
         topic: &str,
@@ -1606,6 +1571,7 @@ impl FetchHandler {
     /// Complexity: < 25 (gap detection + WAL fetch + merge)
     ///
     /// Returns: updated records vector with WAL records merged in
+    #[allow(clippy::too_many_arguments)] // internal call that threads its caller's state through
     async fn try_fetch_from_wal_phase(
         &self,
         topic: &str,
@@ -2595,6 +2561,7 @@ impl FetchHandler {
 
     /// Update in-memory buffer with raw Kafka batch bytes (v1.3.32 FIX)
     /// CRITICAL: Stores original wire-format bytes to preserve CRC
+    #[allow(clippy::too_many_arguments)] // internal call that threads its caller's state through
     pub async fn update_buffer_with_raw_batch(
         &self,
         topic: &str,
@@ -2622,7 +2589,6 @@ impl FetchHandler {
             batch_metadata: Vec::new(),
             base_offset,
             high_watermark,
-            flushed_offset: -1,
             min_offset_in_buffer: base_offset,  // v1.3.48: Track actual minimum offset in buffer
         });
 
@@ -2635,8 +2601,6 @@ impl FetchHandler {
             buffer.batch_metadata.push(BatchMetadata {
                 base_offset,
                 last_offset,
-                record_count,
-                size_bytes: raw_bytes.len(),
             });
 
             tracing::debug!(
@@ -3127,28 +3091,27 @@ mod fetch_wait_budget_tests {
         let temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
 
-        let mut object_store_config = chronik_storage::object_store::ObjectStoreConfig::default();
-        object_store_config.backend = chronik_storage::object_store::StorageBackend::Local {
-            path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+        let object_store_config = chronik_storage::object_store::ObjectStoreConfig {
+            backend: chronik_storage::object_store::StorageBackend::Local {
+                path: temp_dir.path().join("segments").to_str().unwrap().to_string(),
+            },
+            ..Default::default()
         };
         let object_store: Arc<dyn ObjectStoreTrait> = Arc::from(
             chronik_storage::object_store::ObjectStoreFactory::create(object_store_config)
                 .await
                 .unwrap(),
         );
-        let segment_reader = Arc::new(chronik_storage::SegmentReader::new(
-            chronik_storage::SegmentReaderConfig::default(),
-            object_store.clone(),
-        ));
-
-        let mut topic_config = TopicConfig::default();
-        topic_config.partition_count = partitions;
+        let topic_config = TopicConfig {
+            partition_count: partitions,
+            ..Default::default()
+        };
         metadata_store
             .create_topic("orders", topic_config)
             .await
             .unwrap();
 
-        let handler = FetchHandler::new(segment_reader, metadata_store.clone(), object_store);
+        let handler = FetchHandler::new(metadata_store.clone(), object_store);
         (handler, metadata_store, temp_dir)
     }
 

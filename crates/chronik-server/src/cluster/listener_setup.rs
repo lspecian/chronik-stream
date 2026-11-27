@@ -105,7 +105,6 @@ mod tests {
             advertised_host: "localhost".to_string(),
             advertised_port: 9092,
             data_dir: PathBuf::from("./data"),
-            object_store_config: None,
             replication_factor: 3,
             kafka_bind_addr: "0.0.0.0:9092".to_string(),
             wal_bind_addr: "0.0.0.0:9291".to_string(),

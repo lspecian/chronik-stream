@@ -114,11 +114,3 @@ pub fn create_admin_router_for_unified_api(
     admin_router(state)
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_module_compiles() {
-        // Basic compile test
-        assert!(true);
-    }
-}

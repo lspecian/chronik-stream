@@ -191,6 +191,7 @@ impl WalManager {
         base_offset = base_offset,
         last_offset = last_offset
     ))]
+    #[allow(clippy::too_many_arguments)] // the WAL append API: one call per produce batch
     pub async fn append_canonical_with_acks(
         &self,
         topic: String,
@@ -236,6 +237,7 @@ impl WalManager {
     /// in file order and hand out the first batch at or past the requested
     /// offset, so a batch appended *after* a higher-offset one is skipped by
     /// every consumer — it is in the log and unreachable.
+    #[allow(clippy::too_many_arguments)] // the WAL append API: one call per produce batch
     pub async fn append_canonical_enqueued(
         &self,
         topic: String,

@@ -115,8 +115,8 @@ impl MetadataRequestParser {
     /// Complexity: < 5 (simple loop)
     fn skip_topic_uuid(decoder: &mut Decoder) -> Result<()> {
         let mut topic_id = [0u8; 16];
-        for j in 0..16 {
-            topic_id[j] = decoder.read_i8()? as u8;
+        for byte in &mut topic_id {
+            *byte = decoder.read_i8()? as u8;
         }
         tracing::trace!("Topic ID: {:02x?}", &topic_id);
         Ok(())

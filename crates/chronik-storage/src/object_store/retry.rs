@@ -304,26 +304,6 @@ impl RetryPolicy {
     }
 }
 
-/// Retry decorator for storage operations
-pub struct RetryableOperation<T> {
-    operation: T,
-    policy: RetryPolicy,
-}
-
-impl<T> RetryableOperation<T> {
-    pub fn new(operation: T, policy: RetryPolicy) -> Self {
-        Self { operation, policy }
-    }
-    
-    pub fn with_exponential_backoff(operation: T, config: RetryConfig) -> Self {
-        Self::new(operation, RetryPolicy::Exponential(config))
-    }
-    
-    pub fn with_fixed_retry(operation: T, delay: Duration, max_attempts: u32) -> Self {
-        Self::new(operation, RetryPolicy::Fixed { delay, max_attempts })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

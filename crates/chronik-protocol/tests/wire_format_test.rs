@@ -346,27 +346,21 @@ fn test_null_value_encoding() {
     // Null string (legacy)
     {
         let mut buf = BytesMut::new();
-        let mut encoder = Encoder::new(&mut buf);
-        encoder.write_string(None);
-        drop(encoder); // Release the borrow
+        Encoder::new(&mut buf).write_string(None);
         assert_eq!(&buf[..2], &[0xff, 0xff]); // -1 in big-endian
     }
     
     // Null bytes
     {
         let mut buf = BytesMut::new();
-        let mut encoder = Encoder::new(&mut buf);
-        encoder.write_bytes(None);
-        drop(encoder); // Release the borrow
+        Encoder::new(&mut buf).write_bytes(None);
         assert_eq!(&buf[..4], &[0xff, 0xff, 0xff, 0xff]); // -1 in big-endian
     }
     
     // Null compact string
     {
         let mut buf = BytesMut::new();
-        let mut encoder = Encoder::new(&mut buf);
-        encoder.write_compact_string(None);
-        drop(encoder); // Release the borrow
+        Encoder::new(&mut buf).write_compact_string(None);
         assert_eq!(&buf[..1], &[0x00]); // 0 in varint
     }
 }

@@ -127,6 +127,7 @@ impl IsrPublisher {
         })
     }
 
+    #[cfg(test)]
     pub fn published(&self) -> u64 {
         self.published.load(Ordering::Relaxed)
     }
@@ -334,8 +335,10 @@ mod tests {
             crate::produce_handler::tests::handler_with_pipeline(&temp_dir, store.clone()).await,
         );
 
-        let mut config = TopicConfig::default();
-        config.partition_count = 2;
+        let config = TopicConfig {
+            partition_count: 2,
+            ..Default::default()
+        };
         store.create_topic("orders", config).await.unwrap();
         for (partition, isr) in [(0u32, vec![1, 2]), (1u32, vec![1])] {
             store

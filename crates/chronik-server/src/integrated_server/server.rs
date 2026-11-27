@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tracing::{info, error, debug, warn, trace};
 use crate::error_handler::{ErrorHandler, ErrorRecovery};
 use crate::tls::{TlsConfig, TlsConnectionAcceptor, MaybeTlsReadHalf, MaybeTlsWriteHalf};
@@ -42,8 +42,6 @@ pub struct IntegratedServerConfig {
     pub num_partitions: u32,
     /// Default replication factor
     pub replication_factor: u32,
-    /// Enable background WAL indexing (WAL → Tantivy → Object Store)
-    pub enable_wal_indexing: bool,
     /// WAL indexing interval in seconds
     pub wal_indexing_interval_secs: u64,
     /// Optional object store configuration (overrides default local storage)
@@ -69,7 +67,6 @@ impl Default for IntegratedServerConfig {
             auto_create_topics: true,
             num_partitions: 3,
             replication_factor: 1,
-            enable_wal_indexing: true, // Enable WAL→Tantivy indexing by default
             wal_indexing_interval_secs: 30, // Index every 30 seconds
             object_store_config: None, // Use default local storage unless specified
             enable_metadata_dr: true, // Enable metadata DR by default
@@ -119,6 +116,7 @@ impl Clone for IntegratedKafkaServer {
 impl IntegratedKafkaServer {
     /// Create a new integrated Kafka server from pre-initialized components
     /// This is used by the builder pattern to avoid the monolithic new() constructor
+    #[allow(clippy::too_many_arguments)] // the server's components, wired once at startup
     pub(crate) fn new_from_components(
         config: IntegratedServerConfig,
         kafka_handler: Arc<KafkaProtocolHandler>,
@@ -334,11 +332,7 @@ impl IntegratedKafkaServer {
             // Try to recover instead of breaking connection
             // Clear the socket buffer and continue
             let mut discard_buf = vec![0u8; 1024];
-            loop {
-                let n = match socket_reader.read(&mut discard_buf).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
+            while let Ok(n) = socket_reader.read(&mut discard_buf).await {
                 if n == 0 { break; }
             }
 
@@ -553,11 +547,6 @@ impl IntegratedKafkaServer {
                     api_key,
                     api_version,
                 ))
-            }
-            ErrorRecovery::Throttle(ms) => {
-                debug!("Throttling client {} for {}ms", addr, ms);
-                tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
-                None
             }
             ErrorRecovery::CloseConnection => {
                 info!("Error from {} → sending no response (connection closes on next read)", addr);
@@ -939,11 +928,7 @@ impl IntegratedKafkaServer {
             error!("Invalid request size {} from {}", request_size, addr);
 
             let mut discard_buf = vec![0u8; 1024];
-            loop {
-                let n = match socket_reader.read(&mut discard_buf).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
+            while let Ok(n) = socket_reader.read(&mut discard_buf).await {
                 if n == 0 { break; }
             }
             return Ok(None);
@@ -1007,30 +992,23 @@ impl IntegratedKafkaServer {
     }
 
     /// Get server statistics
+    #[cfg(test)]
     pub async fn get_stats(&self) -> Result<ServerStats> {
-        let topics = self.metadata_store.list_topics().await?;
         let brokers = self.metadata_store.list_brokers().await?;
-        
         Ok(ServerStats {
             node_id: self.config.node_id,
-            topics_count: topics.len(),
             brokers_count: brokers.len(),
-            advertised_address: format!("{}:{}", 
-                self.config.advertised_host,
-                self.config.advertised_port
-            ),
         })
     }
 
 }
 
 /// Server statistics
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct ServerStats {
     pub node_id: i32,
-    pub topics_count: usize,
     pub brokers_count: usize,
-    pub advertised_address: String,
 }
 
 /// What the per-connection ordered writer does with one request's slot.

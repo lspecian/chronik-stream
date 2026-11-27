@@ -283,6 +283,12 @@ impl Segment {
     }
 }
 
+impl Default for SegmentBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SegmentBuilder {
     /// Create a new segment builder.
     pub fn new() -> Self {

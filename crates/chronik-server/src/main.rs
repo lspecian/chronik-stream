@@ -1456,10 +1456,12 @@ async fn run_cluster_mode(
     let columnar_query_engine = Arc::new(ColumnarQueryEngine::new());
     info!("✓ Columnar Query Engine initialized for SQL queries");
 
-    let mut unified_api_config = unified_api::UnifiedApiConfig::default();
-    // Use node-specific port to avoid conflicts in cluster mode (6091 + node_id)
-    unified_api_config.port = 6091 + init_config.node_id as u16;
-    unified_api_config.bind_addr = bind.clone();
+    let unified_api_config = unified_api::UnifiedApiConfig {
+        // Node-specific port to avoid conflicts in cluster mode (6091 + node_id)
+        port: 6091 + init_config.node_id as u16,
+        bind_addr: bind.clone(),
+        ..Default::default()
+    };
     // v2.2.23: Create hot buffer for sub-second SQL queries on recent data
     let hot_buffer = if std::env::var("CHRONIK_HOT_BUFFER_ENABLED")
         .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -1681,7 +1683,6 @@ async fn run_single_node_mode(
         auto_create_topics: true,
         num_partitions: 3,  // Default to 3 partitions for better parallelism (configurable via --num-partitions)
         replication_factor: 1,
-        enable_wal_indexing: true,
         wal_indexing_interval_secs: 30,
         object_store_config,
         enable_metadata_dr: true,
@@ -1746,9 +1747,11 @@ async fn run_single_node_mode(
     {
         let wal_indexer = server.get_wal_indexer();
         let vector_index_manager = wal_indexer.vector_index_manager().clone();
-        let mut unified_config = unified_api::UnifiedApiConfig::default();
-        unified_config.port = 6092;
-        unified_config.bind_addr = bind.clone();
+        let unified_config = unified_api::UnifiedApiConfig {
+            port: 6092,
+            bind_addr: bind.clone(),
+            ..Default::default()
+        };
 
         // v2.2.23: Create ColumnarQueryEngine for SQL queries in single-node mode
         let columnar_query_engine = Arc::new(ColumnarQueryEngine::new());
@@ -2400,8 +2403,10 @@ async fn handle_compaction_command(cli: &Cli, action: CompactAction) -> Result<(
             };
 
             // Create compaction config
-            let mut compact_config = CompactionConfig::default();
-            compact_config.strategy = compact_strategy;
+            let compact_config = CompactionConfig {
+                strategy: compact_strategy,
+                ..Default::default()
+            };
 
             // Create compactor
             let compactor = WalCompactor::new(wal_config.clone(), compact_config);

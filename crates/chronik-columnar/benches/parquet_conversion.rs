@@ -110,11 +110,13 @@ fn bench_parquet_write(c: &mut Criterion) {
             &batch,
             |b, batch| {
                 b.iter(|| {
-                    let mut config = ColumnarConfig::default();
-                    config.enabled = true;
-                    config.compression = compression;
-                    config.row_group_size = 10000;
-                    config.bloom_filter_enabled = false;
+                    let config = ColumnarConfig {
+                        enabled: true,
+                        compression,
+                        row_group_size: 10000,
+                        bloom_filter_enabled: false,
+                        ..Default::default()
+                    };
 
                     let schema = kafka_message_schema();
                     let writer = ParquetSegmentWriter::new(schema, config);
@@ -146,11 +148,13 @@ fn bench_end_to_end(c: &mut Criterion) {
                     let batch = converter.convert(black_box(records)).unwrap();
 
                     // Write to Parquet
-                    let mut config = ColumnarConfig::default();
-                    config.enabled = true;
-                    config.compression = CompressionCodec::Zstd;
-                    config.row_group_size = 10000;
-                    config.bloom_filter_enabled = true;
+                    let config = ColumnarConfig {
+                        enabled: true,
+                        compression: CompressionCodec::Zstd,
+                        row_group_size: 10000,
+                        bloom_filter_enabled: true,
+                        ..Default::default()
+                    };
 
                     let schema = kafka_message_schema();
                     let writer = ParquetSegmentWriter::new(schema, config);
@@ -204,11 +208,13 @@ fn bench_with_embeddings(c: &mut Criterion) {
                 let converter = RecordBatchConverter::new();
                 let batch = converter.convert(black_box(records)).unwrap();
 
-                let mut config = ColumnarConfig::default();
-                config.enabled = true;
-                config.compression = CompressionCodec::Zstd;
-                config.row_group_size = 10000;
-                config.bloom_filter_enabled = false;
+                let config = ColumnarConfig {
+                    enabled: true,
+                    compression: CompressionCodec::Zstd,
+                    row_group_size: 10000,
+                    bloom_filter_enabled: false,
+                    ..Default::default()
+                };
 
                 let schema = kafka_message_schema();
                 let writer = ParquetSegmentWriter::new(schema, config);
@@ -252,11 +258,13 @@ fn bench_storage_efficiency(c: &mut Criterion) {
             CompressionCodec::Snappy,
             CompressionCodec::Zstd,
         ] {
-            let mut config = ColumnarConfig::default();
-            config.enabled = true;
-            config.compression = compression;
-            config.row_group_size = 10000;
-            config.bloom_filter_enabled = false;
+            let config = ColumnarConfig {
+                enabled: true,
+                compression,
+                row_group_size: 10000,
+                bloom_filter_enabled: false,
+                ..Default::default()
+            };
 
             let writer = ParquetSegmentWriter::new(schema.clone(), config);
             let (bytes, _stats) = writer.write_to_bytes(std::slice::from_ref(&batch)).unwrap();

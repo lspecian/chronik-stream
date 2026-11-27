@@ -90,11 +90,8 @@ impl S3Backend {
                     };
                     aws_config_builder = aws_config_builder.credentials_provider(creds);
                 }
-                S3Credentials::FromSharedCredentials { profile } => {
-                    if let Some(profile_name) = profile {
-                        aws_config_builder = aws_config_builder
-                            .profile_name(profile_name);
-                    }
+                S3Credentials::FromSharedCredentials { profile: Some(profile_name) } => {
+                    aws_config_builder = aws_config_builder.profile_name(profile_name);
                 }
                 // Other credential types use default provider chain
                 _ => {}

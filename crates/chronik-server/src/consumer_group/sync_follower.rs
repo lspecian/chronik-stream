@@ -134,14 +134,10 @@ impl FollowerSync {
         for (mid, assignment) in &computed_assignments {
             if let Some(tx) = pending_sync.remove(mid) {
                 let member_assignment = encode_assignment(assignment);
-                let member_epoch = group.members.get(mid)
-                    .map(|m| m.member_epoch)
-                    .unwrap_or(0);
 
                 let response = SyncGroupResponse {
                     error_code: 0,
                     assignment: member_assignment,
-                    member_epoch,
                 };
 
                 let _ = tx.send(response);

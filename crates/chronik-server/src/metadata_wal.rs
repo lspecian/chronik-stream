@@ -188,19 +188,6 @@ impl MetadataWal {
         self.next_offset.load(Ordering::SeqCst)
     }
 
-    /// Get topic name for replication routing
-    ///
-    /// Always returns "__chronik_metadata" - this is used by WalReplicationManager
-    /// to route metadata replication correctly.
-    pub fn topic_name(&self) -> &str {
-        &self.topic_name
-    }
-
-    /// Get partition ID (always 0)
-    pub fn partition(&self) -> i32 {
-        self.partition
-    }
-
     /// Recover metadata WAL state on startup: the events after `after` (the
     /// offset a checkpoint covers, if any), oldest first, and the next offset
     /// to assign — past every record on disk and past the checkpoint, so an
@@ -583,8 +570,6 @@ mod tests {
     async fn appends_get_consecutive_offsets() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wal = MetadataWal::new(temp_dir.path().to_path_buf()).await.unwrap();
-        assert_eq!(wal.topic_name(), "__chronik_metadata");
-        assert_eq!(wal.partition(), 0);
         assert_eq!(wal.append_bytes(b"first".to_vec()).await.unwrap(), 0);
         assert_eq!(wal.append_bytes(b"second".to_vec()).await.unwrap(), 1);
     }

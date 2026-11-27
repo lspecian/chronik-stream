@@ -41,6 +41,7 @@ pub(crate) struct RankKey {
 /// second), so collectors pass it over before building its key.
 pub(crate) type Floor = (Score, i64);
 
+#[cfg(test)]
 fn below_floor(floor: Option<Floor>, score: Score, second: impl FnOnce() -> i64) -> (bool, Option<i64>) {
     match floor {
         Some((s, _)) if score < s => (true, None),
@@ -585,7 +586,7 @@ fn newest_of_all(searcher: &Searcher, fields: RankFields, limit: usize, floor: O
     // place; at 1.0 the floor's second bounds which are worth reading.
     let oldest_s = match floor {
         Some((s, _)) if s > 1.0 => return Vec::new(),
-        Some((s, t)) if s == 1.0 => t,
+        Some((1.0, t)) => t,
         _ => i64::MIN,
     };
 

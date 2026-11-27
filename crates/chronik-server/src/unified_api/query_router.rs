@@ -10,12 +10,10 @@
 //! and CockroachDB DistSQL patterns. See docs/DISTRIBUTED_QUERY_LAYER.md.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
-use dashmap::DashMap;
 use reqwest::Client;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -76,97 +74,11 @@ pub struct PartitionMap {
     pub replicas: HashMap<String, HashMap<u32, Vec<u64>>>,
 }
 
-/// Per-peer performance metrics for Adaptive Replica Selection (ARS).
-///
-/// Tracks EWMA response latency and outstanding (in-flight) request count.
-/// Used to score peers and prefer faster/less-loaded replicas when multiple
-/// replicas own the same partition. Inspired by Elasticsearch's ARS.
-///
-/// All operations are lock-free using atomics (CAS loops for EWMA updates).
-pub struct PeerMetrics {
-    /// EWMA response latency in microseconds.
-    /// Updated via CAS loop on each response. Initial value: 50ms.
-    latency_ewma_us: AtomicU64,
-    /// Number of currently in-flight requests to this peer.
-    outstanding: AtomicU64,
-}
-
-impl PeerMetrics {
-    /// Create new metrics with default EWMA of 50ms.
-    fn new() -> Self {
-        Self {
-            latency_ewma_us: AtomicU64::new(50_000), // 50ms in microseconds
-            outstanding: AtomicU64::new(0),
-        }
-    }
-
-    /// Increment outstanding request count before sending a request.
-    fn request_start(&self) {
-        self.outstanding.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement outstanding and record response latency via EWMA.
-    /// EWMA formula: new = alpha * latest + (1-alpha) * old, alpha = 0.3
-    /// Integer math: (3 * latest + 7 * old) / 10
-    fn request_end(&self, latency: Duration) {
-        self.outstanding.fetch_sub(1, Ordering::Relaxed);
-        let latency_us = latency.as_micros() as u64;
-        loop {
-            let old = self.latency_ewma_us.load(Ordering::Relaxed);
-            let new = (3 * latency_us + 7 * old) / 10;
-            if self
-                .latency_ewma_us
-                .compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
-    /// Record a failed request: decrement outstanding and penalize EWMA.
-    /// Doubles the EWMA to make this peer less preferred (capped at 10s).
-    fn request_failed(&self) {
-        self.outstanding.fetch_sub(1, Ordering::Relaxed);
-        loop {
-            let old = self.latency_ewma_us.load(Ordering::Relaxed);
-            let new = old.saturating_mul(2).min(10_000_000); // Cap at 10s
-            if self
-                .latency_ewma_us
-                .compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
-    /// Compute ARS score: latency_ewma * (1 + outstanding / 10).
-    /// Lower score = preferred peer.
-    pub fn ars_score(&self) -> f64 {
-        let latency_us = self.latency_ewma_us.load(Ordering::Relaxed) as f64;
-        let outstanding = self.outstanding.load(Ordering::Relaxed) as f64;
-        latency_us * (1.0 + outstanding / 10.0)
-    }
-
-    /// Get current EWMA latency in microseconds (for monitoring/debugging).
-    pub fn latency_ewma_us(&self) -> u64 {
-        self.latency_ewma_us.load(Ordering::Relaxed)
-    }
-
-    /// Get current outstanding request count (for monitoring/debugging).
-    pub fn outstanding(&self) -> u64 {
-        self.outstanding.load(Ordering::Relaxed)
-    }
-}
-
 /// Configuration for query routing behavior.
 #[derive(Debug, Clone)]
 pub struct QueryRouterConfig {
     /// HTTP request timeout for peer calls
     pub timeout: Duration,
-    /// Maximum fan-out depth (prevents loops)
-    pub max_depth: u32,
 }
 
 impl Default for QueryRouterConfig {
@@ -178,7 +90,6 @@ impl Default for QueryRouterConfig {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(30),
             ),
-            max_depth: 1,
         }
     }
 }
@@ -187,9 +98,6 @@ impl Default for QueryRouterConfig {
 ///
 /// Created once at startup from ClusterConfig and stored in UnifiedApiState.
 /// In single-node mode, no QueryRouter is created (field is None).
-///
-/// Includes Adaptive Replica Selection (ARS) metrics for preferring
-/// faster/less-loaded peers when multiple replicas own the same partition.
 #[derive(Clone)]
 pub struct QueryRouter {
     /// HTTP client (connection-pooled, reused across requests)
@@ -205,11 +113,6 @@ pub struct QueryRouter {
     env_port: Option<u16>,
     /// Partition-to-node mapping (refreshed from metadata store)
     partition_map: Arc<RwLock<PartitionMap>>,
-    /// Configuration
-    config: QueryRouterConfig,
-    /// Per-peer ARS metrics (EWMA latency + outstanding request count).
-    /// Shared via Arc so spawned fan-out tasks can update metrics.
-    peer_metrics: Arc<DashMap<u64, PeerMetrics>>,
 }
 
 impl QueryRouter {
@@ -281,9 +184,6 @@ impl QueryRouter {
             .build()
             .expect("Failed to create reqwest client for QueryRouter");
 
-        let peer_metrics: DashMap<u64, PeerMetrics> =
-            peers.iter().map(|p| (p.node_id, PeerMetrics::new())).collect();
-
         Self {
             client,
             peers: Arc::new(std::sync::RwLock::new(Arc::new(peers))),
@@ -291,8 +191,6 @@ impl QueryRouter {
             scheme,
             env_port,
             partition_map: Arc::new(RwLock::new(PartitionMap::default())),
-            config,
-            peer_metrics: Arc::new(peer_metrics),
         }
     }
 
@@ -334,9 +232,6 @@ impl QueryRouter {
             peers = ?peers.iter().map(|p| &p.url).collect::<Vec<_>>(),
             "Query peers changed (cluster membership)"
         );
-        for peer in &peers {
-            self.peer_metrics.entry(peer.node_id).or_insert_with(PeerMetrics::new);
-        }
         *self.peers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(peers);
     }
 
@@ -381,72 +276,6 @@ impl QueryRouter {
         }
     }
 
-    /// Get the optimal set of peer nodes to query for a topic using ARS.
-    ///
-    /// For each partition NOT available locally, selects the replica peer
-    /// with the lowest ARS score (fastest + least loaded). This minimizes
-    /// fan-out while ensuring all partitions are covered.
-    ///
-    /// Falls back to all peers if partition map is empty.
-    pub async fn nodes_for_topic(&self, topic: &str) -> Vec<PeerNode> {
-        let peers = self.peers();
-        let map = self.partition_map.read().await;
-
-        if let Some(replicas) = map.replicas.get(topic) {
-            if replicas.is_empty() {
-                // Partition map exists but empty — fall through to all peers
-                return peers.to_vec();
-            }
-
-            let mut selected_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-            for partition_replicas in replicas.values() {
-                // Skip partitions available locally (handled by local execution)
-                if partition_replicas.contains(&self.self_node_id) {
-                    continue;
-                }
-
-                // Pick the peer with lowest ARS score among replicas
-                let best_peer_id = partition_replicas
-                    .iter()
-                    .filter(|&&nid| nid != self.self_node_id)
-                    .min_by(|&&a, &&b| {
-                        let score_a = self
-                            .peer_metrics
-                            .get(&a)
-                            .map(|m| m.ars_score())
-                            .unwrap_or(f64::MAX);
-                        let score_b = self
-                            .peer_metrics
-                            .get(&b)
-                            .map(|m| m.ars_score())
-                            .unwrap_or(f64::MAX);
-                        score_a
-                            .partial_cmp(&score_b)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-
-                if let Some(&peer_id) = best_peer_id {
-                    selected_ids.insert(peer_id);
-                }
-            }
-
-            // Return selected peers — may be empty if all partitions are local
-            if !selected_ids.is_empty() {
-                debug!(
-                    topic = topic,
-                    selected_peers = ?selected_ids,
-                    total_peers = peers.len(),
-                    "ARS selected peers for topic"
-                );
-            }
-            return peers.iter().filter(|p| selected_ids.contains(&p.node_id)).cloned().collect();
-        }
-
-        // Fallback: no partition info for topic — return all peers
-        peers.to_vec()
-    }
-
     /// Check if all partitions for a topic are local (no fan-out needed).
     ///
     /// This is true when every partition has this node as a replica,
@@ -463,38 +292,6 @@ impl QueryRouter {
         } else {
             false // No partition info for topic
         }
-    }
-
-    /// Check if all partitions for ALL known topics are local (no fan-out needed).
-    ///
-    /// Returns true when every partition of every topic in the partition map
-    /// has this node as a replica.
-    ///
-    /// # Do not use this to decide whether to skip a query fan-out
-    ///
-    /// It answers "am I a replica of everything", which at RF=node_count is
-    /// always true and says nothing about whether this node can *answer* for
-    /// everything. `/_sql` used it that way and returned partial,
-    /// non-deterministic results (#22): a node's cold table is built from
-    /// Parquet segment metadata registered by each partition's leader, filtered
-    /// by whether those paths resolve on the local filesystem, so what any one
-    /// node can see is a subset that varies by node.
-    ///
-    /// Use [`Self::leads_all_partitions`] instead — leadership partitions the
-    /// work exactly once, which is what a distributed read needs.
-    pub async fn all_topics_local(&self) -> bool {
-        let map = self.partition_map.read().await;
-        if map.replicas.is_empty() {
-            return false;
-        }
-        for replicas in map.replicas.values() {
-            for partition_replicas in replicas.values() {
-                if !partition_replicas.contains(&self.self_node_id) {
-                    return false;
-                }
-            }
-        }
-        true
     }
 
     /// Does this node lead every partition of every known topic?
@@ -566,8 +363,8 @@ impl QueryRouter {
 
     /// Refresh partition maps for all topics from the metadata store.
     ///
-    /// Used by SQL handler before checking `all_topics_local()` to ensure
-    /// the partition map is current.
+    /// Used by the SQL handler before checking `leads_all_partitions()` to
+    /// ensure the partition map is current.
     pub async fn refresh_all_partition_maps(&self, metadata_store: &dyn MetadataStore) {
         if let Ok(topics) = metadata_store.list_topics().await {
             for topic in &topics {
@@ -582,34 +379,10 @@ impl QueryRouter {
         self.peers().to_vec()
     }
 
-    /// Get ARS scores for all peers (for monitoring and debugging).
-    ///
-    /// Returns (node_id, ars_score, latency_ewma_ms, outstanding) tuples.
-    pub fn peer_ars_scores(&self) -> Vec<(u64, f64, f64, u64)> {
-        self.peers()
-            .iter()
-            .map(|p| {
-                let (score, latency_ms, outstanding) = self
-                    .peer_metrics
-                    .get(&p.node_id)
-                    .map(|m| {
-                        (
-                            m.ars_score(),
-                            m.latency_ewma_us() as f64 / 1000.0,
-                            m.outstanding(),
-                        )
-                    })
-                    .unwrap_or((0.0, 0.0, 0));
-                (p.node_id, score, latency_ms, outstanding)
-            })
-            .collect()
-    }
-
     /// Fan out a POST request to target peer nodes and collect responses.
     ///
     /// - Sends the serialized request body to `{peer_url}{path}` with X-Chronik-Depth: 1
     /// - All peer requests run in parallel via tokio::spawn
-    /// - ARS metrics: tracks outstanding requests and records response latency
     /// - Returns both the responses and the peers that did not answer
     ///
     /// The caller is handed the failures because only the caller knows what a
@@ -661,12 +434,6 @@ impl QueryRouter {
             let client = self.client.clone();
             let body = body.clone();
             let peer_id = peer.node_id;
-            let metrics = self.peer_metrics.clone();
-
-            // Track request start (ARS)
-            if let Some(m) = metrics.get(&peer_id) {
-                m.request_start();
-            }
 
             let handle = tokio::spawn(async move {
                 let start = Instant::now();
@@ -681,10 +448,6 @@ impl QueryRouter {
                 match result {
                     Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
                         Ok(parsed) => {
-                            // Record success latency (ARS)
-                            if let Some(m) = metrics.get(&peer_id) {
-                                m.request_end(start.elapsed());
-                            }
                             debug!(
                                 peer_id = peer_id,
                                 url = %url,
@@ -694,25 +457,16 @@ impl QueryRouter {
                             Ok(parsed)
                         }
                         Err(e) => {
-                            if let Some(m) = metrics.get(&peer_id) {
-                                m.request_failed();
-                            }
                             warn!(peer_id = peer_id, url = %url, error = %e, "Failed to parse peer response");
                             Err(format!("response could not be parsed: {e}"))
                         }
                     },
                     Ok(resp) => {
-                        if let Some(m) = metrics.get(&peer_id) {
-                            m.request_failed();
-                        }
                         let status = resp.status();
                         warn!(peer_id = peer_id, url = %url, status = %status, "Peer returned error");
                         Err(format!("peer returned HTTP {status}"))
                     }
                     Err(e) => {
-                        if let Some(m) = metrics.get(&peer_id) {
-                            m.request_failed();
-                        }
                         warn!(peer_id = peer_id, url = %url, error = %e, "Peer request failed");
                         Err(if e.is_timeout() {
                             format!("peer did not answer within the query timeout: {e}")
@@ -1327,6 +1081,10 @@ fn emit_derived_helpers(
     });
     Ok(())
 }
+/// The SQL sent to each node, how to merge each column, the derived columns,
+/// and the SQL the coordinator runs over the merged rows.
+type RewrittenAggregate = (String, Vec<Option<AggMerge>>, Vec<DerivedColumn>, String);
+
 /// Plan the columns whose shape has to be rebuilt after the merge.
 ///
 /// Each aggregate that was buried inside an expression is projected on its own
@@ -1340,7 +1098,7 @@ fn plan_computed(
     query: &chronik_columnar::datafusion::sql::sqlparser::ast::Query,
     select: &chronik_columnar::datafusion::sql::sqlparser::ast::Select,
     columns: &[ColumnMerge],
-) -> Result<(String, Vec<Option<AggMerge>>, Vec<DerivedColumn>, String), String> {
+) -> Result<RewrittenAggregate, String> {
     use chronik_columnar::datafusion::sql::sqlparser::ast::SelectItem;
 
     let mut projection = Vec::new();
@@ -1929,8 +1687,8 @@ fn finish_quantile(
 ) {
     // Gather (value, count) per group, keeping the key values for the output.
     let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, (HashMap<String, serde_json::Value>, Vec<(f64, f64)>)> =
-        HashMap::new();
+    type Group = (HashMap<String, serde_json::Value>, Vec<(f64, f64)>);
+    let mut groups: HashMap<String, Group> = HashMap::new();
 
     for row in rows.iter() {
         let identity = spec
@@ -2192,7 +1950,7 @@ pub fn finish_derived(response: &mut SqlResponse, derived: &[DerivedColumn]) {
 /// The same, over the parts, for callers that have not built a response yet.
 fn finish_derived_rows(
     columns: &mut Vec<String>,
-    rows: &mut Vec<HashMap<String, serde_json::Value>>,
+    rows: &mut [HashMap<String, serde_json::Value>],
     derived: &[DerivedColumn],
 ) {
     if derived.is_empty() {
@@ -4151,303 +3909,6 @@ mod tests {
         assert!(merged.truncated);
     }
 
-    // =========================================================================
-    // ARS (Adaptive Replica Selection) Tests
-    // =========================================================================
-
-    #[test]
-    fn test_peer_metrics_ewma_default() {
-        let m = PeerMetrics::new();
-        assert_eq!(m.latency_ewma_us(), 50_000); // 50ms default
-        assert_eq!(m.outstanding(), 0);
-    }
-
-    #[test]
-    fn test_peer_metrics_ewma_update() {
-        let m = PeerMetrics::new();
-        m.request_start();
-        assert_eq!(m.outstanding(), 1);
-
-        // Record a 10ms response
-        m.request_end(Duration::from_millis(10));
-        // EWMA: (3 * 10_000 + 7 * 50_000) / 10 = (30_000 + 350_000) / 10 = 38_000
-        assert_eq!(m.latency_ewma_us(), 38_000);
-        assert_eq!(m.outstanding(), 0);
-    }
-
-    #[test]
-    fn test_peer_metrics_ars_score_no_outstanding() {
-        let m = PeerMetrics::new();
-        // 50ms, 0 outstanding → score = 50_000 * (1 + 0/10) = 50_000
-        assert_eq!(m.ars_score(), 50_000.0);
-    }
-
-    #[test]
-    fn test_peer_metrics_ars_score_with_outstanding() {
-        let m = PeerMetrics::new();
-        for _ in 0..10 {
-            m.request_start();
-        }
-        // 50ms, 10 outstanding → score = 50_000 * (1 + 10/10) = 100_000
-        assert_eq!(m.ars_score(), 100_000.0);
-    }
-
-    #[test]
-    fn test_peer_metrics_failure_penalty() {
-        let m = PeerMetrics::new();
-        m.request_start();
-        m.request_failed();
-        // Penalty: double EWMA → 100_000
-        assert_eq!(m.latency_ewma_us(), 100_000);
-        assert_eq!(m.outstanding(), 0);
-    }
-
-    #[test]
-    fn test_peer_metrics_failure_cap() {
-        let m = PeerMetrics::new();
-        // Repeatedly fail to hit the 10s cap
-        for _ in 0..30 {
-            m.request_start();
-            m.request_failed();
-        }
-        // Should be capped at 10_000_000 (10s)
-        assert_eq!(m.latency_ewma_us(), 10_000_000);
-    }
-
-    #[test]
-    fn test_peer_metrics_ewma_convergence() {
-        let m = PeerMetrics::new();
-        // Simulate 20 responses at 20ms — EWMA should converge toward 20ms
-        for _ in 0..20 {
-            m.request_start();
-            m.request_end(Duration::from_millis(20));
-        }
-        let ewma = m.latency_ewma_us();
-        // After 20 iterations with alpha=0.3, should be within ~2ms of 20ms
-        assert!(
-            ewma > 19_000 && ewma < 22_000,
-            "EWMA should converge to ~20ms, got {}us",
-            ewma
-        );
-    }
-
-    #[test]
-    fn test_peer_metrics_fast_recovery() {
-        let m = PeerMetrics::new();
-        // Fail once (EWMA → 100ms)
-        m.request_start();
-        m.request_failed();
-        assert_eq!(m.latency_ewma_us(), 100_000);
-
-        // 10 fast responses at 10ms should recover
-        for _ in 0..10 {
-            m.request_start();
-            m.request_end(Duration::from_millis(10));
-        }
-        let ewma = m.latency_ewma_us();
-        // Should have recovered significantly from 100ms toward 10ms
-        assert!(
-            ewma < 40_000,
-            "EWMA should recover toward 10ms after fast responses, got {}us",
-            ewma
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ars_selects_fastest_peer() {
-        // Create a QueryRouter with 3 peers (self=2, peers=[1, 3])
-        let config = ClusterConfig {
-            enabled: true,
-            node_id: 2,
-            data_dir: "/tmp".to_string(),
-            replication_factor: 3,
-            min_insync_replicas: 2,
-            peers: vec![
-                chronik_config::NodeConfig {
-                    id: 1,
-                    kafka: "192.0.2.1:9092".to_string(),
-                    wal: "192.0.2.1:9291".to_string(),
-                    raft: "192.0.2.1:5001".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-                chronik_config::NodeConfig {
-                    id: 2,
-                    kafka: "192.0.2.2:9093".to_string(),
-                    wal: "192.0.2.2:9292".to_string(),
-                    raft: "192.0.2.2:5002".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-                chronik_config::NodeConfig {
-                    id: 3,
-                    kafka: "192.0.2.3:9094".to_string(),
-                    wal: "192.0.2.3:9293".to_string(),
-                    raft: "192.0.2.3:5003".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-            ],
-            bind: None,
-            advertise: None,
-            gossip: None,
-            auto_recover: true,
-        };
-
-        let router = QueryRouter::new(&config);
-
-        // Set up partition map: partition 0 is only on nodes 1 and 3 (not self=2)
-        {
-            let mut map = router.partition_map.write().await;
-            let mut replicas = HashMap::new();
-            replicas.insert(0_u32, vec![1_u64, 3_u64]); // Not on node 2
-            replicas.insert(1_u32, vec![2_u64, 3_u64]); // On node 2 (local)
-            map.replicas.insert("test_topic".to_string(), replicas);
-        }
-
-        // Make node 1 "slow" (high latency) and node 3 "fast" (low latency)
-        if let Some(m) = router.peer_metrics.get(&1) {
-            for _ in 0..10 {
-                m.request_start();
-                m.request_end(Duration::from_millis(100)); // 100ms
-            }
-        }
-        if let Some(m) = router.peer_metrics.get(&3) {
-            for _ in 0..10 {
-                m.request_start();
-                m.request_end(Duration::from_millis(5)); // 5ms
-            }
-        }
-
-        let selected = router.nodes_for_topic("test_topic").await;
-        // Should select only node 3 (fastest) for partition 0
-        // Partition 1 is local, so no peer needed for it
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].node_id, 3);
-    }
-
-    #[tokio::test]
-    async fn test_ars_all_local_no_fanout() {
-        let config = ClusterConfig {
-            enabled: true,
-            node_id: 2,
-            data_dir: "/tmp".to_string(),
-            replication_factor: 3,
-            min_insync_replicas: 2,
-            peers: vec![
-                chronik_config::NodeConfig {
-                    id: 1,
-                    kafka: "192.0.2.1:9092".to_string(),
-                    wal: "192.0.2.1:9291".to_string(),
-                    raft: "192.0.2.1:5001".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-                chronik_config::NodeConfig {
-                    id: 2,
-                    kafka: "192.0.2.2:9093".to_string(),
-                    wal: "192.0.2.2:9292".to_string(),
-                    raft: "192.0.2.2:5002".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-                chronik_config::NodeConfig {
-                    id: 3,
-                    kafka: "192.0.2.3:9094".to_string(),
-                    wal: "192.0.2.3:9293".to_string(),
-                    raft: "192.0.2.3:5003".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-            ],
-            bind: None,
-            advertise: None,
-            gossip: None,
-            auto_recover: true,
-        };
-
-        let router = QueryRouter::new(&config);
-
-        // All partitions include self (node 2) — no fan-out needed
-        {
-            let mut map = router.partition_map.write().await;
-            let mut replicas = HashMap::new();
-            replicas.insert(0_u32, vec![1_u64, 2_u64, 3_u64]);
-            replicas.insert(1_u32, vec![2_u64, 3_u64, 1_u64]);
-            replicas.insert(2_u32, vec![3_u64, 1_u64, 2_u64]);
-            map.replicas.insert("test_topic".to_string(), replicas);
-        }
-
-        let selected = router.nodes_for_topic("test_topic").await;
-        // All partitions are local — empty selection (no peers needed)
-        assert!(
-            selected.is_empty(),
-            "Should not select any peers when all partitions are local"
-        );
-    }
-
-    #[test]
-    fn test_peer_ars_scores_reporting() {
-        let config = ClusterConfig {
-            enabled: true,
-            node_id: 2,
-            data_dir: "/tmp".to_string(),
-            replication_factor: 3,
-            min_insync_replicas: 2,
-            peers: vec![
-                chronik_config::NodeConfig {
-                    id: 1,
-                    kafka: "192.0.2.1:9092".to_string(),
-                    wal: "192.0.2.1:9291".to_string(),
-                    raft: "192.0.2.1:5001".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-                chronik_config::NodeConfig {
-                    id: 2,
-                    kafka: "192.0.2.2:9093".to_string(),
-                    wal: "192.0.2.2:9292".to_string(),
-                    raft: "192.0.2.2:5002".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-                chronik_config::NodeConfig {
-                    id: 3,
-                    kafka: "192.0.2.3:9094".to_string(),
-                    wal: "192.0.2.3:9293".to_string(),
-                    raft: "192.0.2.3:5003".to_string(),
-                    replication: None,
-                    addr: None,
-                    raft_port: None,
-                },
-            ],
-            bind: None,
-            advertise: None,
-            gossip: None,
-            auto_recover: true,
-        };
-
-        let router = QueryRouter::new(&config);
-        let scores = router.peer_ars_scores();
-        assert_eq!(scores.len(), 2); // Peers 1 and 3 (self=2 excluded)
-
-        // Initial scores should be (50_000, 50.0ms, 0 outstanding)
-        for (node_id, score, latency_ms, outstanding) in &scores {
-            assert!(*node_id == 1 || *node_id == 3);
-            assert_eq!(*score, 50_000.0);
-            assert_eq!(*latency_ms, 50.0);
-            assert_eq!(*outstanding, 0);
-        }
-    }
-
     #[tokio::test]
     async fn test_peer_url_computation() {
         // Simulate ClusterConfig peers
@@ -4537,7 +3998,6 @@ mod tests {
             urls,
             vec![(1, "http://192.0.2.1:6092".to_string()), (4, "http://192.0.2.4:6095".to_string())]
         );
-        assert!(router.peer_metrics.contains_key(&4), "the added peer is scored like the others");
     }
 
     #[test]
@@ -4601,27 +4061,20 @@ mod partition_ownership_tests {
             scheme: "http",
             env_port: None,
             partition_map: Arc::new(RwLock::new(map)),
-            config: QueryRouterConfig::default(),
-            peer_metrics: Default::default(),
         }
     }
 
     /// #22, stated as a test: at RF=node_count every node is a replica of every
-    /// partition, so the old predicate said "everything is local, skip the
-    /// fan-out" — on every node. Each then answered from whatever it could see
-    /// locally, which is a partial and node-dependent subset.
+    /// partition, so a replica-based predicate said "everything is local, skip
+    /// the fan-out" — on every node. Each then answered from whatever it could
+    /// see locally, which is a partial and node-dependent subset. Leadership is
+    /// what decides.
     #[tokio::test]
-    async fn replica_based_locality_is_true_for_every_node_at_full_replication() {
+    async fn every_node_fans_out_at_full_replication() {
         let leaders: &[(u32, u64)] = &[(0, 1), (1, 2), (2, 3)];
 
         for node in [1u64, 2, 3] {
             let router = router_with(node, &[("orders", leaders)]);
-            assert!(
-                router.all_topics_local().await,
-                "node {} is a replica of every partition, which is why this predicate \
-                 cannot decide whether to fan out",
-                node
-            );
             assert!(
                 !router.leads_all_partitions().await,
                 "node {} leads only one of three partitions and must fan out",
@@ -4679,7 +4132,6 @@ mod partition_ownership_tests {
     async fn an_empty_map_never_claims_to_lead_everything() {
         let router = router_with(1, &[]);
         assert!(!router.leads_all_partitions().await);
-        assert!(!router.all_topics_local().await);
     }
 }
 

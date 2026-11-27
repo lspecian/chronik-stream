@@ -421,7 +421,7 @@ impl UnifiedMetrics {
         // ========== Phase 3: Metadata Performance & Lease Metrics ==========
         let write_count = self.metadata_write_count.load(Ordering::Relaxed);
         let write_sum = self.metadata_write_latency_sum_ms.load(Ordering::Relaxed);
-        let write_avg = if write_count > 0 { write_sum / write_count } else { 0 };
+        let write_avg = write_sum.checked_div(write_count).unwrap_or(0);
 
         output.push_str("# HELP chronik_metadata_write_latency_ms Metadata write latency in milliseconds\n");
         output.push_str("# TYPE chronik_metadata_write_latency_ms gauge\n");
@@ -429,7 +429,7 @@ impl UnifiedMetrics {
 
         let read_count = self.metadata_read_count.load(Ordering::Relaxed);
         let read_sum = self.metadata_read_latency_sum_ms.load(Ordering::Relaxed);
-        let read_avg = if read_count > 0 { read_sum / read_count } else { 0 };
+        let read_avg = read_sum.checked_div(read_count).unwrap_or(0);
 
         output.push_str("# HELP chronik_metadata_read_latency_ms Metadata read latency in milliseconds\n");
         output.push_str("# TYPE chronik_metadata_read_latency_ms gauge\n");
@@ -576,11 +576,7 @@ impl UnifiedMetrics {
 
         // ========== WAL Batch Size Histogram ==========
         let wal_batch_count = self.wal_batch_count.load(Ordering::Relaxed);
-        let avg_batch_size = if wal_batch_count > 0 {
-            self.wal_batch_size_sum.load(Ordering::Relaxed) / wal_batch_count
-        } else {
-            0
-        };
+        let avg_batch_size = self.wal_batch_size_sum.load(Ordering::Relaxed).checked_div(wal_batch_count).unwrap_or(0);
         output.push_str("# HELP chronik_wal_batch_size_avg Average WAL batch size (messages per fsync)\n");
         output.push_str("# TYPE chronik_wal_batch_size_avg gauge\n");
         output.push_str(&format!("chronik_wal_batch_size_avg {}\n", avg_batch_size));
@@ -596,11 +592,7 @@ impl UnifiedMetrics {
             self.produce_flush_total.load(Ordering::Relaxed)));
 
         let produce_flush_count = self.produce_flush_total.load(Ordering::Relaxed);
-        let avg_batches_per_flush = if produce_flush_count > 0 {
-            self.produce_batches_flushed_sum.load(Ordering::Relaxed) / produce_flush_count
-        } else {
-            0
-        };
+        let avg_batches_per_flush = self.produce_batches_flushed_sum.load(Ordering::Relaxed).checked_div(produce_flush_count).unwrap_or(0);
         output.push_str("# HELP chronik_produce_batches_per_flush_avg Average batches per flush\n");
         output.push_str("# TYPE chronik_produce_batches_per_flush_avg gauge\n");
         output.push_str(&format!("chronik_produce_batches_per_flush_avg {}\n", avg_batches_per_flush));
@@ -721,7 +713,7 @@ impl UnifiedMetrics {
         // ========== Embedding Metrics (v2.2.22) ==========
         let emb_count = self.embedding_latency_count.load(Ordering::Relaxed);
         let emb_sum = self.embedding_latency_sum_ms.load(Ordering::Relaxed);
-        let emb_avg = if emb_count > 0 { emb_sum / emb_count } else { 0 };
+        let emb_avg = emb_sum.checked_div(emb_count).unwrap_or(0);
 
         output.push_str("# HELP chronik_embedding_latency_ms Embedding API latency in milliseconds\n");
         output.push_str("# TYPE chronik_embedding_latency_ms gauge\n");
@@ -833,7 +825,7 @@ impl UnifiedMetrics {
 
         let q_count = self.query_latency_count.load(Ordering::Relaxed);
         let q_sum = self.query_latency_sum_ms.load(Ordering::Relaxed);
-        let q_avg = if q_count > 0 { q_sum / q_count } else { 0 };
+        let q_avg = q_sum.checked_div(q_count).unwrap_or(0);
 
         output.push_str("# HELP chronik_query_latency_ms Query latency in milliseconds\n");
         output.push_str("# TYPE chronik_query_latency_ms gauge\n");
@@ -843,7 +835,7 @@ impl UnifiedMetrics {
 
         let c_count = self.query_candidates_count.load(Ordering::Relaxed);
         let c_sum = self.query_candidates_sum.load(Ordering::Relaxed);
-        let c_avg = if c_count > 0 { c_sum / c_count } else { 0 };
+        let c_avg = c_sum.checked_div(c_count).unwrap_or(0);
 
         output.push_str("# HELP chronik_query_candidates_total Candidates collected per query\n");
         output.push_str("# TYPE chronik_query_candidates_total gauge\n");
@@ -891,7 +883,7 @@ impl UnifiedMetrics {
 
         let ht_count = self.hot_text_search_count.load(Ordering::Relaxed);
         let ht_sum = self.hot_text_search_latency_us_sum.load(Ordering::Relaxed);
-        let ht_avg = if ht_count > 0 { ht_sum / ht_count } else { 0 };
+        let ht_avg = ht_sum.checked_div(ht_count).unwrap_or(0);
         output.push_str("# HELP chronik_hot_text_search_latency_us Hot text search latency in microseconds\n");
         output.push_str("# TYPE chronik_hot_text_search_latency_us gauge\n");
         output.push_str(&format!("chronik_hot_text_search_latency_us{{stat=\"avg\"}} {}\n", ht_avg));
@@ -926,7 +918,7 @@ impl UnifiedMetrics {
 
         let hv_count = self.hot_vector_search_count.load(Ordering::Relaxed);
         let hv_sum = self.hot_vector_search_latency_us_sum.load(Ordering::Relaxed);
-        let hv_avg = if hv_count > 0 { hv_sum / hv_count } else { 0 };
+        let hv_avg = hv_sum.checked_div(hv_count).unwrap_or(0);
         output.push_str("# HELP chronik_hot_vector_search_latency_us Hot vector search latency in microseconds\n");
         output.push_str("# TYPE chronik_hot_vector_search_latency_us gauge\n");
         output.push_str(&format!("chronik_hot_vector_search_latency_us{{stat=\"avg\"}} {}\n", hv_avg));
@@ -947,7 +939,7 @@ impl UnifiedMetrics {
         // HP-3 Item 2: freshness histograms (produce → visible-in-hot-index).
         let ht_fresh_count = self.hot_text_visibility_lag_count.load(Ordering::Relaxed);
         let ht_fresh_sum = self.hot_text_visibility_lag_ms_sum.load(Ordering::Relaxed);
-        let ht_fresh_avg = if ht_fresh_count > 0 { ht_fresh_sum / ht_fresh_count } else { 0 };
+        let ht_fresh_avg = ht_fresh_sum.checked_div(ht_fresh_count).unwrap_or(0);
         output.push_str("# HELP chronik_hot_text_visibility_lag_ms Freshness: produce timestamp → visible in hot text index (ms)\n");
         output.push_str("# TYPE chronik_hot_text_visibility_lag_ms gauge\n");
         output.push_str(&format!("chronik_hot_text_visibility_lag_ms{{stat=\"avg\"}} {}\n", ht_fresh_avg));
@@ -956,7 +948,7 @@ impl UnifiedMetrics {
 
         let hv_fresh_count = self.hot_vector_visibility_lag_count.load(Ordering::Relaxed);
         let hv_fresh_sum = self.hot_vector_visibility_lag_ms_sum.load(Ordering::Relaxed);
-        let hv_fresh_avg = if hv_fresh_count > 0 { hv_fresh_sum / hv_fresh_count } else { 0 };
+        let hv_fresh_avg = hv_fresh_sum.checked_div(hv_fresh_count).unwrap_or(0);
         output.push_str("# HELP chronik_hot_vector_visibility_lag_ms Freshness: produce timestamp → visible in hot vector index (ms)\n");
         output.push_str("# TYPE chronik_hot_vector_visibility_lag_ms gauge\n");
         output.push_str(&format!("chronik_hot_vector_visibility_lag_ms{{stat=\"avg\"}} {}\n", hv_fresh_avg));

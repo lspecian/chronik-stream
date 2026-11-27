@@ -19,9 +19,9 @@ use crate::IntegratedKafkaServer;
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_storage::{
     WalIndexer, WalIndexerConfig, ObjectStoreFactory, ObjectStoreTrait, ObjectStoreConfig,
-    SegmentReader, SegmentReaderConfig, SegmentWriterConfig,
+    SegmentWriterConfig,
 };
-use crate::storage::{StorageService, StorageConfig as IngestStorageConfig};
+use crate::storage::StorageConfig as IngestStorageConfig;
 use chronik_wal::{
     WalConfig, WalManager, CompressionType, CheckpointConfig,
     RecoveryConfig, RotationConfig, FsyncConfig,
@@ -61,8 +61,6 @@ pub struct IntegratedKafkaServerBuilder {
     // Storage and handlers (Stage 3)
     object_store: Option<Arc<dyn chronik_storage::ObjectStoreTrait>>,
     storage_config: Option<IngestStorageConfig>,
-    storage_service: Option<Arc<StorageService>>,
-    segment_reader: Option<Arc<SegmentReader>>,
     wal_manager: Option<Arc<WalManager>>,
     produce_handler_base: Option<Arc<ProduceHandler>>,
 
@@ -116,8 +114,6 @@ impl IntegratedKafkaServerBuilder {
             metadata_store: None,
             object_store: None,
             storage_config: None,
-            storage_service: None,
-            segment_reader: None,
             wal_manager: None,
             produce_handler_base: None,
             append_notify: Arc::new(dashmap::DashMap::new()),
@@ -338,28 +334,15 @@ impl IntegratedKafkaServerBuilder {
 
         // Convert common MetadataEvent to server MetadataEvent
         let server_event = match &common_event.payload {
-            MetadataEventPayload::TopicCreated { name, config, auto_created: _ } => {
-                Some(ServerEvent::TopicCreated {
-                    topic: name.clone(),
-                    num_partitions: config.partition_count as i32,
-                })
-            }
-            MetadataEventPayload::TopicDeleted { name } => {
-                Some(ServerEvent::TopicDeleted {
-                    topic: name.clone(),
-                })
-            }
+            MetadataEventPayload::TopicCreated { .. } => Some(ServerEvent::TopicCreated),
+            MetadataEventPayload::TopicDeleted { .. } => Some(ServerEvent::TopicDeleted),
             MetadataEventPayload::PartitionAssigned { assignment } => {
                 Some(ServerEvent::PartitionAssigned {
                     topic: assignment.topic.clone(),
                     partition: assignment.partition as i32,
                     replicas: assignment.replicas.clone(),
                     leader: assignment.leader_id,
-                    // Every field, because followers rebuild the assignment from
-                    // exactly these. Dropping one here sets it to its default on
-                    // every other node.
                     leader_epoch: assignment.leader_epoch,
-                    isr: assignment.isr.clone(),
                 })
             }
             MetadataEventPayload::HighWatermarkUpdated { topic, partition, new_watermark } => {
@@ -369,16 +352,7 @@ impl IntegratedKafkaServerBuilder {
                     offset: *new_watermark,
                 })
             }
-            // v2.2.15 CRITICAL FIX: Replicate BrokerRegistered events to followers
-            // Without this, followers don't know about brokers and return fallback metadata
-            MetadataEventPayload::BrokerRegistered { metadata } => {
-                Some(ServerEvent::BrokerRegistered {
-                    broker_id: metadata.broker_id,
-                    host: metadata.host.clone(),
-                    port: metadata.port,
-                    rack: metadata.rack.clone(),
-                })
-            }
+            MetadataEventPayload::BrokerRegistered { .. } => Some(ServerEvent::BrokerRegistered),
             // A config change replicates by the same route as a creation: the
             // replicator re-reads the topic and ships its current config, so
             // `TopicCreated` is simply "here is this topic's config now", and
@@ -390,12 +364,7 @@ impl IntegratedKafkaServerBuilder {
             // cluster (`vector.enabled`, `columnar.enabled`, `searchable`,
             // retention) took effect only on the broker that served the
             // request, with the client told it had succeeded.
-            MetadataEventPayload::TopicUpdated { name, config } => {
-                Some(ServerEvent::TopicCreated {
-                    topic: name.clone(),
-                    num_partitions: config.partition_count as i32,
-                })
-            }
+            MetadataEventPayload::TopicUpdated { .. } => Some(ServerEvent::TopicCreated),
             // Security state must be the same on every broker: a credential or
             // rule revoked through one broker has to stop working on all of
             // them. These used to fall into `_ => None` below, so they never
@@ -404,7 +373,7 @@ impl IntegratedKafkaServerBuilder {
             | MetadataEventPayload::AclDeleted { .. }
             | MetadataEventPayload::ScramCredentialUpserted { .. }
             | MetadataEventPayload::ScramCredentialDeleted { .. } => {
-                Some(ServerEvent::SecurityChanged { event: common_event.clone() })
+                Some(ServerEvent::SecurityChanged)
             }
             _ => None, // Skip other event types (e.g., OffsetUpdated)
         };
@@ -455,14 +424,10 @@ impl IntegratedKafkaServerBuilder {
                             replicas: a.replicas.clone(),
                             leader: a.leader_id,
                             leader_epoch: a.leader_epoch,
-                            isr: a.isr.clone(),
                         })
                     };
                     let topic_event = |topic: &str| {
-                        state.topic(topic).map(|t| ServerEvent::TopicCreated {
-                            topic: t.name.clone(),
-                            num_partitions: t.config.partition_count as i32,
-                        })
+                        state.topic(topic).map(|_| ServerEvent::TopicCreated)
                     };
                     match &change {
                         CatalogChange::TopicCreated(t) | CatalogChange::TopicConfigChanged(t) => {
@@ -475,18 +440,13 @@ impl IntegratedKafkaServerBuilder {
                             v.extend((*from..*to).filter_map(|p| assignment_event(topic, p)));
                             v
                         }
-                        CatalogChange::TopicDeleted(t) => vec![ServerEvent::TopicDeleted { topic: t.clone() }],
+                        CatalogChange::TopicDeleted(_) => vec![ServerEvent::TopicDeleted],
                         CatalogChange::AssignmentChanged { topic, partition } => {
                             assignment_event(topic, *partition).into_iter().collect()
                         }
                         CatalogChange::BrokersChanged => state
                             .brokers()
-                            .map(|b| ServerEvent::BrokerRegistered {
-                                broker_id: b.broker_id,
-                                host: b.host.clone(),
-                                port: b.port,
-                                rack: b.rack.clone(),
-                            })
+                            .map(|_| ServerEvent::BrokerRegistered)
                             .collect(),
                         CatalogChange::Reset => state.topics().filter_map(|t| topic_event(&t.name)).collect(),
                         CatalogChange::AclsChanged
@@ -532,7 +492,7 @@ impl IntegratedKafkaServerBuilder {
         Ok(())
     }
 
-    /// Stage 7: Initialize storage layer (ObjectStore, StorageService, SegmentReader)
+    /// Stage 7: Initialize storage layer (ObjectStore)
     /// Complexity: < 20 (configuration and component creation)
     async fn init_storage(&mut self) -> Result<()> {
         info!("Stage 7: Initializing storage layer");
@@ -567,7 +527,7 @@ impl IntegratedKafkaServerBuilder {
         let object_store = ObjectStoreFactory::create(object_store_config.clone()).await?;
         let object_store_arc: Arc<dyn ObjectStoreTrait> = Arc::from(object_store);
 
-        // Create storage service with proper configuration
+        // Storage configuration (segment writer settings for the produce path)
         let storage_config = IngestStorageConfig {
             object_store_config: object_store_config.clone(),
             segment_writer_config: SegmentWriterConfig {
@@ -582,21 +542,10 @@ impl IntegratedKafkaServerBuilder {
                 retention_period_secs: 7 * 24 * 3600, // 7 days
                 enable_cleanup: true,
             },
-            segment_reader_config: SegmentReaderConfig::default(),
         };
-
-        let storage_service = Arc::new(StorageService::new(storage_config.clone()).await?);
-
-        // Initialize segment reader with object store
-        let segment_reader = Arc::new(SegmentReader::new(
-            SegmentReaderConfig::default(),
-            storage_service.object_store(),
-        ));
 
         self.object_store = Some(object_store_arc);
         self.storage_config = Some(storage_config);
-        self.storage_service = Some(storage_service);
-        self.segment_reader = Some(segment_reader);
 
         // First boot after a disaster-recovery restore: drop restored records of
         // files that did not survive, before anything reads them.
@@ -608,7 +557,7 @@ impl IntegratedKafkaServerBuilder {
                 .context("reconciling restored metadata")?;
         }
 
-        info!("✅ Storage layer initialized (ObjectStore + StorageService + SegmentReader)");
+        info!("✅ Storage layer initialized (ObjectStore)");
         Ok(())
     }
 
@@ -847,8 +796,8 @@ impl IntegratedKafkaServerBuilder {
         let idx = Arc::new(HotVectorIndex::new(config));
 
         // Background trim timer — keeps RAM bounded independent of eviction.
-        let _ = Arc::clone(&idx)
-            .start_trim_timer(std::time::Duration::from_millis(250));
+        // Already spawned; dropping the handle detaches it.
+        drop(Arc::clone(&idx).start_trim_timer(std::time::Duration::from_millis(250)));
 
         let slot = Arc::new(std::sync::OnceLock::new());
         info!(
@@ -1166,21 +1115,11 @@ impl IntegratedKafkaServerBuilder {
     /// Helper: Build ProduceHandler configuration
     fn create_produce_handler_config(&self, storage_config: &IngestStorageConfig) -> ProduceHandlerConfig {
         let flush_profile = ProduceFlushProfile::auto_select();
-        let compression_type = if self.config.enable_compression {
-            chronik_storage::kafka_records::CompressionType::Snappy
-        } else {
-            chronik_storage::kafka_records::CompressionType::None
-        };
 
         ProduceHandlerConfig {
             node_id: self.config.node_id,
             storage_config: storage_config.clone(),
             enable_idempotence: true,
-            enable_transactions: false,
-            max_in_flight_requests: 5,
-            batch_size: 16384,
-            linger_ms: flush_profile.linger_ms(),
-            compression_type,
             request_timeout_ms: 120000,
             buffer_memory: flush_profile.buffer_memory(),
             auto_create_topics_enable: self.config.auto_create_topics,
@@ -1317,12 +1256,6 @@ impl IntegratedKafkaServerBuilder {
                  the WAL only, and lost for archived records on every restart.",
                 epoch_dir, e
             ),
-        }
-
-        // CRITICAL FIX (v1.3.52): Clear all partition buffers before WAL recovery
-        info!("Clearing all partition buffers before WAL recovery...");
-        if let Err(e) = produce_handler_base.clear_all_buffers().await {
-            warn!("Failed to clear partition buffers: {}. Recovery may have duplicates.", e);
         }
 
         // Replay WAL to restore high watermarks after crash
@@ -1517,8 +1450,6 @@ impl IntegratedKafkaServerBuilder {
     async fn init_fetch_handler(&mut self) -> Result<()> {
         info!("Stage 11: Initializing FetchHandler");
 
-        let segment_reader = self.segment_reader.as_ref()
-            .context("segment_reader not initialized")?;
         let metadata_store = self.metadata_store.as_ref()
             .context("metadata_store not initialized")?;
         let object_store = self.object_store.as_ref()
@@ -1531,7 +1462,6 @@ impl IntegratedKafkaServerBuilder {
         // Create FetchHandler with WAL and ProduceHandler integration
         // FetchHandler needs ProduceHandler to get the real-time high watermark
         let mut fetch_handler = FetchHandler::new_with_wal(
-            segment_reader.clone(),
             metadata_store.clone(),
             object_store.clone(),
             wal_manager.clone(),
@@ -1570,8 +1500,6 @@ impl IntegratedKafkaServerBuilder {
 
         let produce_handler_base = self.produce_handler_base.as_ref()
             .context("produce_handler_base not initialized")?;
-        let segment_reader = self.segment_reader.as_ref()
-            .context("segment_reader not initialized")?;
         let metadata_store = self.metadata_store.as_ref()
             .context("metadata_store not initialized")?;
         let object_store = self.object_store.as_ref()
@@ -1585,7 +1513,6 @@ impl IntegratedKafkaServerBuilder {
         // WAL is MANDATORY - no longer optional
         let kafka_handler = Arc::new(KafkaProtocolHandler::new(
             produce_handler_base.clone(),
-            segment_reader.clone(),
             metadata_store.clone(),
             object_store.clone(),
             fetch_handler.clone(),
@@ -2375,8 +2302,6 @@ mod tests {
         // Verify storage components created
         assert!(builder.object_store.is_some());
         assert!(builder.storage_config.is_some());
-        assert!(builder.storage_service.is_some());
-        assert!(builder.segment_reader.is_some());
     }
 
     #[tokio::test]
@@ -2535,7 +2460,7 @@ mod tests {
     }
 
     /// Security events used to fall into the adapter's `_ => None` and never
-    /// reach the replicator. Each must come out the other side, whole.
+    /// reached the event bus. Each must arrive as `SecurityChanged`.
     #[test]
     fn security_events_are_forwarded_to_the_replicator() {
         use chronik_common::metadata::{
@@ -2575,9 +2500,7 @@ mod tests {
                 IntegratedKafkaServerBuilder::convert_and_publish_metadata_event(&bus, sent.clone());
             assert_eq!(delivered, 1, "dropped: {:?}", sent.payload);
             match rx.try_recv().unwrap() {
-                ServerEvent::SecurityChanged { event } => {
-                    assert_eq!(event.to_bytes().unwrap(), sent.to_bytes().unwrap());
-                }
+                ServerEvent::SecurityChanged => {}
                 other => panic!("unexpected event: {:?}", other),
             }
         }

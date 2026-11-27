@@ -78,7 +78,8 @@ impl DataAuthConfig {
         }
     }
 
-    /// Build with an explicit key (tests, embedding).
+    /// Build with an explicit key (tests).
+    #[cfg(test)]
     pub fn with_key(key: Option<String>) -> Self {
         Self {
             key: key.filter(|k| !k.trim().is_empty()),

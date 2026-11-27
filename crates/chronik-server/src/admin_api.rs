@@ -962,6 +962,7 @@ fn admin_error_response(status: StatusCode, reason: &str, hint: &str) -> Respons
 }
 
 /// Authentication middleware for Admin API (X-API-Key header)
+#[allow(clippy::result_large_err)] // axum error response, built once per failed request
 async fn auth_middleware(
     State(state): State<AdminApiState>,
     headers: HeaderMap,
@@ -1003,6 +1004,7 @@ async fn auth_middleware(
 ///
 /// Validates credentials from `Authorization: Basic <base64>` header.
 /// If auth is disabled via config, requests pass through without validation.
+#[allow(clippy::result_large_err)] // axum error response, built once per failed request
 async fn schema_registry_auth_middleware(
     State(state): State<AdminApiState>,
     headers: HeaderMap,

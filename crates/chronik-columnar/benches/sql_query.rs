@@ -60,10 +60,12 @@ fn setup_query_engine(record_count: usize) -> (ColumnarQueryEngine, tempfile::Te
     let batch = converter.convert(&records).unwrap();
 
     // Write to Parquet
-    let mut config = ColumnarConfig::default();
-    config.enabled = true;
-    config.compression = CompressionCodec::Zstd;
-    config.row_group_size = 10000;
+    let config = ColumnarConfig {
+        enabled: true,
+        compression: CompressionCodec::Zstd,
+        row_group_size: 10000,
+        ..Default::default()
+    };
 
     let schema = kafka_message_schema();
     let writer = ParquetSegmentWriter::new(schema, config);

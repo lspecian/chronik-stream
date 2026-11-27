@@ -4,10 +4,10 @@
 //!   - v0:      request `[name STRING]`, response `[name STRING, error_code INT16]`.
 //!   - v1-v3:   response gains `throttle_time_ms`. Still non-flexible.
 //!   - v4-v5:   FLEXIBLE — compact strings/arrays + trailing tagged fields. v5 adds a
-//!              per-result `error_message` (compact nullable string).
+//!     per-result `error_message` (compact nullable string).
 //!   - v6:      the request `topics` array becomes `[DeleteTopicState{ name
-//!              COMPACT_NULLABLE_STRING, topic_id UUID }]` (delete by name OR by id),
-//!              and each response result gains a `topic_id UUID`.
+//!     COMPACT_NULLABLE_STRING, topic_id UUID }]` (delete by name OR by id),
+//!     and each response result gains a `topic_id UUID`.
 //!
 //! The previous implementation encoded/decoded everything as non-flexible (i32 array
 //! lengths, non-compact strings, no tagged fields, no topic_id), so v4+ requests were

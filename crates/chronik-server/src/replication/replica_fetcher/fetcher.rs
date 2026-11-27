@@ -236,12 +236,8 @@ const PLAN_CHANGE_SETTLE: Duration = Duration::from_millis(20);
 fn event_changes_plan(event: &crate::metadata_events::MetadataEvent) -> bool {
     use crate::metadata_events::MetadataEvent::*;
     match event {
-        PartitionAssigned { .. }
-        | LeaderChanged { .. }
-        | TopicCreated { .. }
-        | TopicDeleted { .. }
-        | BrokerRegistered { .. } => true,
-        HighWatermarkUpdated { .. } | ISRUpdated { .. } | SecurityChanged { .. } => false,
+        PartitionAssigned { .. } | TopicCreated | TopicDeleted | BrokerRegistered => true,
+        HighWatermarkUpdated { .. } | SecurityChanged => false,
     }
 }
 
@@ -448,6 +444,7 @@ impl ReplicaFetcher {
 
     /// Partitions rebuilt from the leader because their divergence could not be
     /// placed by the leader-epoch exchange.
+    #[cfg(test)]
     pub fn rebuilds(&self) -> u64 {
         self.rebuilds.load(Ordering::Relaxed)
     }
@@ -1562,19 +1559,15 @@ mod tests {
     fn only_assignment_changes_trigger_a_replan() {
         use crate::metadata_events::MetadataEvent;
         let hwm = MetadataEvent::HighWatermarkUpdated { topic: "t".into(), partition: 0, offset: 7 };
-        let isr = MetadataEvent::ISRUpdated { topic: "t".into(), partition: 0, isr: vec![1, 2] };
-        let leader = MetadataEvent::LeaderChanged { topic: "t".into(), partition: 0, new_leader: 2 };
         let assigned = MetadataEvent::PartitionAssigned {
             topic: "t".into(),
             partition: 0,
             replicas: vec![1, 2, 3],
             leader: 1,
             leader_epoch: 0,
-            isr: vec![1, 2, 3],
         };
         assert!(!event_changes_plan(&hwm));
-        assert!(!event_changes_plan(&isr));
-        assert!(event_changes_plan(&leader));
+        assert!(!event_changes_plan(&MetadataEvent::SecurityChanged));
         assert!(event_changes_plan(&assigned));
     }
 
@@ -1890,8 +1883,10 @@ mod tests {
         epoch: i32,
         addr: &str,
     ) -> (Arc<ReplicaFetcher>, Arc<FakeState>, Arc<chronik_wal::WalManager>) {
-        let mut config = chronik_wal::config::WalConfig::default();
-        config.data_dir = dir.to_path_buf();
+        let config = chronik_wal::config::WalConfig {
+            data_dir: dir.to_path_buf(),
+            ..Default::default()
+        };
         let wal = Arc::new(chronik_wal::WalManager::new(config).await.unwrap());
 
         let epochs = Arc::new(crate::replication::leader_epoch::LeaderEpochStore::new());

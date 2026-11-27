@@ -219,15 +219,12 @@ impl WalCompactor {
     /// Get partitions that need compaction
     async fn get_partitions_for_compaction(&self, wal_manager: Arc<RwLock<WalManager>>) -> Result<Vec<TopicPartition>> {
         let manager = wal_manager.read().await;
-        let mut candidates = Vec::new();
-
-        // Get all partitions from WAL manager
-        // Note: This would need to be implemented in WalManager
-        // For now, we'll implement a simple approach for metadata topic
-        candidates.push(TopicPartition {
+        // Only the metadata topic for now: WalManager does not list its
+        // partitions.
+        let candidates = vec![TopicPartition {
             topic: "__meta".to_string(),
             partition: 0,
-        });
+        }];
 
         // Filter based on compaction criteria
         let mut partitions_to_compact = Vec::new();

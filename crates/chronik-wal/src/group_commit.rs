@@ -1025,12 +1025,6 @@ impl GroupCommitWal {
         Ok(())
     }
 
-    /// Enqueue and wait for commit (acks=1 or acks=-1 mode)
-    ///
-    /// PERFORMANCE OPTIMIZATION (P1): Reduced lock acquisitions from 4 to 1
-    /// - Before: 4 separate lock acquisitions (backpressure check, enqueue, bytes update, commit check)
-    /// - After: 1 lock acquisition combining all operations
-    /// - Expected gain: 2-4x throughput at high concurrency
     /// Enqueue a write that wants an fsync confirmation, and return the receiver
     /// that will carry it. Waiting is the caller's business (see [`CommitWait`]),
     /// so the enqueue itself is short and its position in the queue is fixed on

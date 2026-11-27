@@ -245,30 +245,25 @@ impl SegmentMarks {
         file.take(len - self.indexed_len).read_to_end(&mut tail).await?;
 
         let mut cursor = 0usize;
-        loop {
-            match parse_record(&tail[cursor..]) {
-                Parsed::Record(layout) => {
-                    let position = self.indexed_len + cursor as u64;
-                    let want_mark = match self.marks.last() {
-                        None => true,
-                        Some((_, last_pos)) => position - last_pos >= MARK_INTERVAL,
-                    };
-                    if want_mark {
-                        self.marks.push((self.max_last_offset.unwrap_or(i64::MIN), position));
-                    }
-                    self.max_last_offset = Some(
-                        self.max_last_offset.map_or(layout.last_offset, |m| m.max(layout.last_offset)),
-                    );
-                    self.min_base_offset = Some(
-                        self.min_base_offset.map_or(layout.base_offset, |m| m.min(layout.base_offset)),
-                    );
-                    cursor += layout.total_len;
-                }
-                // Stop at the first incomplete or torn record and leave
-                // `indexed_len` below it, so the next refresh retries from
-                // there once the writer has finished.
-                Parsed::Incomplete | Parsed::Invalid => break,
+        // Stop at the first incomplete or torn record and leave `indexed_len`
+        // below it, so the next refresh retries from there once the writer has
+        // finished.
+        while let Parsed::Record(layout) = parse_record(&tail[cursor..]) {
+            let position = self.indexed_len + cursor as u64;
+            let want_mark = match self.marks.last() {
+                None => true,
+                Some((_, last_pos)) => position - last_pos >= MARK_INTERVAL,
+            };
+            if want_mark {
+                self.marks.push((self.max_last_offset.unwrap_or(i64::MIN), position));
             }
+            self.max_last_offset = Some(
+                self.max_last_offset.map_or(layout.last_offset, |m| m.max(layout.last_offset)),
+            );
+            self.min_base_offset = Some(
+                self.min_base_offset.map_or(layout.base_offset, |m| m.min(layout.base_offset)),
+            );
+            cursor += layout.total_len;
         }
 
         self.indexed_len += cursor as u64;

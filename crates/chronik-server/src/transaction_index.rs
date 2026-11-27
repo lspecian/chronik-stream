@@ -88,6 +88,7 @@ impl TransactionIndex {
     /// `first_record_key` is the key of the batch's first record — for a control
     /// batch it encodes the marker type (i16 version, i16 type: 0 = ABORT,
     /// 1 = COMMIT). Non-transactional / non-producer batches are ignored.
+    #[allow(clippy::too_many_arguments)] // one argument per record-batch header field it reads
     pub fn apply_log_batch(
         &self,
         topic: &str,

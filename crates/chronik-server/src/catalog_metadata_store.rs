@@ -119,6 +119,7 @@ impl CatalogMetadataStore {
     ///   3. the leader enables the feature once every voter has merged; from
     ///      then on offsets are read from the catalog, which by now holds every
     ///      node's offsets and every commit made since step 2.
+    ///
     /// Until step 2, offsets stay on each node as before, so a cluster
     /// mid-upgrade never sends a command an older node would skip.
     pub fn spawn_group_offsets_rollout(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -257,6 +258,7 @@ impl CatalogMetadataStore {
         Self { catalog, local, security_generation, offsets_gate: tokio::sync::RwLock::new(()) }
     }
 
+    #[cfg(test)]
     pub fn catalog(&self) -> &Arc<ClusterCatalog> {
         &self.catalog
     }
