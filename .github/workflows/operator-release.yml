@@ -264,6 +264,9 @@ jobs:
           VERSION="${TAG#operator-}"
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          # Charts are published under the bare SemVer (0.4.1); `helm install
+          # --version v0.4.1` answers "not found".
+          echo "bare_version=${TAG#operator-v}" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -292,14 +295,14 @@ jobs:
             ```bash
             # Add OCI registry
             helm install chronik-operator \
-              oci://ghcr.io/chronik-stream/charts/chronik-operator \
-              --version ${{ steps.version.outputs.version }} \
+              oci://ghcr.io/${{ github.repository_owner }}/charts/chronik-operator \
+              --version ${{ steps.version.outputs.bare_version }} \
               --namespace chronik-system --create-namespace
             ```
 
             #### Docker Image
             ```bash
-            docker pull ghcr.io/chronik-stream/chronik-operator:${{ steps.version.outputs.version }}
+            docker pull ghcr.io/${{ github.repository_owner }}/chronik-operator:${{ steps.version.outputs.bare_version }}
             ```
 
             #### Binary Downloads
