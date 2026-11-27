@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Deleted records came back.** DeleteRecords (and the log start in
+  general) did not hold across replicas or restarts:
+  - It moved the log start on the leader only. Followers kept the deleted
+    records, and once one of them led it served them again. Followers now
+    take the leader's log start from every fetch response, as Kafka's do.
+  - Partition state rebuilt at boot (WAL recovery) or by a follower's first
+    replicated batch started its log start at 0, not at the stored value.
+    The deleted records were readable after a restart, and the watermark
+    sync then stored the 0 over the deletion for good.
+
+  On 2.20.4, with 9,000 records and a DeleteRecords to 7,500 on a 3-node
+  cluster, the new leader after a failover served all 9,000. After a
+  restart of every node, the leader served from 3,000 (only the WAL segment
+  the deletion had already removed stayed gone). Now every replica serves
+  7,500 onwards, in both cases. Retention was not affected on followers,
+  because it runs on every node, but its log start was lost on a restart
+  the same way.
+- **The leader-epoch history was never trimmed from the start.** It kept one
+  entry per leadership for the life of a partition, describing records that
+  retention or DeleteRecords had removed. Moving the log start now drops the
+  history below it, in memory and in the checkpoint (Kafka's
+  `truncateFromStart`). Test: `tests/cluster/e2e/epoch_trim.sh`.
 - **A full disk lost acknowledged records.** Two causes, both since the
   group-commit WAL:
   - tokio's `File::sync_all` keeps the error of the write before it for

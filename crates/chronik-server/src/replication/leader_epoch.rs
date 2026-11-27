@@ -155,6 +155,26 @@ impl LeaderEpochCache {
         self.entries.retain(|e| e.start_offset < end_offset);
         self.entries.len() != before
     }
+
+    /// Drop history below `start_offset`, after retention or DeleteRecords
+    /// moved the log start there (Kafka's `truncateFromStart`). The entry that
+    /// covers `start_offset` stays, starting there; every older one goes.
+    /// Returns whether the history changed.
+    pub fn truncate_from_start(&mut self, start_offset: i64) -> bool {
+        // The last entry that began below the new start covers it.
+        let Some(covering) = self.entries.iter().rposition(|e| e.start_offset < start_offset) else {
+            return false;
+        };
+        let starts_exactly = self.entries.get(covering + 1).is_some_and(|e| e.start_offset == start_offset);
+        if starts_exactly {
+            // The next epoch begins at the new start: nothing below it is left.
+            self.entries.drain(..=covering);
+        } else {
+            self.entries.drain(..covering);
+            self.entries[0].start_offset = start_offset;
+        }
+        true
+    }
 }
 
 /// Per-partition leader epoch histories for this node.
@@ -302,6 +322,18 @@ impl LeaderEpochStore {
             .caches
             .get_mut(&(topic.to_string(), partition))
             .and_then(|mut cache| cache.truncate_from_end(end_offset).then(|| cache.entries().to_vec()));
+        if let Some(entries) = snapshot {
+            self.write_checkpoint(topic, partition, &entries);
+        }
+    }
+
+    /// The log now starts at `start_offset`: drop the history below it, in
+    /// memory and in the checkpoint.
+    pub fn truncate_from_start(&self, topic: &str, partition: i32, start_offset: i64) {
+        let snapshot = self
+            .caches
+            .get_mut(&(topic.to_string(), partition))
+            .and_then(|mut cache| cache.truncate_from_start(start_offset).then(|| cache.entries().to_vec()));
         if let Some(entries) = snapshot {
             self.write_checkpoint(topic, partition, &entries);
         }
@@ -473,6 +505,34 @@ mod checkpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Retention moved the log start past two leaderships: their entries go,
+    /// the epoch that covers the new start now starts there, and a restart
+    /// reads the trimmed history back.
+    #[test]
+    fn a_new_log_start_trims_the_history_below_it() {
+        let dir = temp_dir("trim-start");
+        let live = LeaderEpochStore::new();
+        live.enable_checkpoints(dir.clone()).unwrap();
+        for (epoch, start) in [(0, 0), (1, 100), (2, 200), (3, 300)] {
+            live.observe_append("t", 0, epoch, start);
+        }
+
+        live.truncate_from_start("t", 0, 250);
+        let trimmed = vec![
+            EpochEntry { epoch: 2, start_offset: 250 },
+            EpochEntry { epoch: 3, start_offset: 300 },
+        ];
+        assert_eq!(live.snapshot("t", 0), trimmed);
+        // A follower that only knows an epoch older than the log start is
+        // sent to the log start, the oldest offset this replica can vouch for.
+        assert_eq!(live.end_offset_for_epoch("t", 0, 1, 400), (1, 250));
+
+        let recovered = LeaderEpochStore::new();
+        recovered.enable_checkpoints(dir.clone()).unwrap();
+        assert_eq!(recovered.snapshot("t", 0), trimmed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn unreadable_lines_are_skipped_not_fatal() {
         assert_eq!(
@@ -492,6 +552,27 @@ mod tests {
             c.assign(epoch, start);
         }
         c
+    }
+
+    #[test]
+    fn trimming_from_the_start_keeps_the_epoch_that_covers_it() {
+        let entries = |c: &LeaderEpochCache| c.entries().iter().map(|e| (e.epoch, e.start_offset)).collect::<Vec<_>>();
+
+        let mut c = cache(&[(0, 0), (1, 100), (2, 200)]);
+        assert!(!c.truncate_from_start(0), "nothing starts below 0");
+        assert_eq!(entries(&c), vec![(0, 0), (1, 100), (2, 200)]);
+
+        assert!(c.truncate_from_start(150));
+        assert_eq!(entries(&c), vec![(1, 150), (2, 200)], "epoch 1 covers 150");
+
+        assert!(c.truncate_from_start(200));
+        assert_eq!(entries(&c), vec![(2, 200)], "epoch 2 begins exactly at the new start");
+
+        assert!(c.truncate_from_start(500));
+        assert_eq!(entries(&c), vec![(2, 500)], "the current epoch always stays");
+
+        let mut empty = cache(&[]);
+        assert!(!empty.truncate_from_start(10));
     }
 
     /// A leader writing many batches under one epoch produces one entry, not one
