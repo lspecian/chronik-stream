@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use tantivy::{
-    collector::{Count, TopDocs},
+    collector::Count,
     query::{QueryParser, RangeQuery},
     schema::{Field, NumericOptions, Schema, STORED, STRING, TEXT},
     Index, IndexReader, IndexWriter, ReloadPolicy, Term,
@@ -537,7 +537,7 @@ impl HotPartitionIndex {
         let max = self.config.max_burst_writers;
         let reserved = self
             .burst_writers
-            .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
+            .try_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| {
                 (n < max).then_some(n + 1)
             })
             .is_ok();

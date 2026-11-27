@@ -214,7 +214,7 @@ async fn run_io_uring_loop(mut cmd_rx: Receiver<IoUringCommand>) -> Result<()> {
                     async move {
                         let result = match file_ref {
                             Some(file) => {
-                                file.sync_all().await.map_err(|e| crate::WalError::Io(e))
+                                file.sync_all().await.map_err(crate::WalError::Io)
                             }
                             None => {
                                 Err(crate::WalError::IoError(format!("File not found for partition: {}", partition_key)))

@@ -1,6 +1,5 @@
 //! WAL manager for coordinating segments and partitions
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, debug, warn, instrument};
 use serde::{Serialize, Deserialize};
@@ -1000,6 +999,103 @@ impl WalManager {
     }
 }
 
+/// Extract offset range (base_offset, last_offset) from CanonicalRecord bincode data.
+///
+/// v1.3.49: We can't depend on chronik-storage due to circular dependency,
+/// so we manually deserialize just the fields we need using a minimal struct.
+///
+/// CanonicalRecord format (bincode serialized):
+/// - base_offset: i64
+/// - partition_leader_epoch: i32
+/// - producer_id: i64
+/// - producer_epoch: i16
+/// - base_sequence: i32
+/// - is_transactional: bool
+/// - is_control: bool
+/// - compression: u8 (enum)
+/// - timestamp_type: u8 (enum)
+/// - records: Vec<CanonicalRecordEntry> where each has { offset: i64, ... }
+///
+/// We only need base_offset and the last record's offset.
+fn extract_offset_range(canonical_data: &[u8]) -> Result<(i64, i64)> {
+    use serde::Deserialize;
+
+    // Minimal struct that matches CanonicalRecord field order for bincode deserialization
+    // CRITICAL: Must match EXACT field order and types from chronik-storage/src/canonical_record.rs
+    #[derive(Deserialize)]
+    struct MinimalCanonicalRecord {
+        base_offset: i64,
+        #[allow(dead_code)]
+        partition_leader_epoch: i32,
+        #[allow(dead_code)]
+        producer_id: i64,
+        #[allow(dead_code)]
+        producer_epoch: i16,
+        #[allow(dead_code)]
+        base_sequence: i32,
+        #[allow(dead_code)]
+        is_transactional: bool,
+        #[allow(dead_code)]
+        is_control: bool,
+        #[allow(dead_code)]
+        compression: MinimalCompressionType,
+        #[allow(dead_code)]
+        timestamp_type: MinimalTimestampType,
+        #[allow(dead_code)]
+        base_timestamp: i64,
+        #[allow(dead_code)]
+        max_timestamp: i64,
+        records: Vec<MinimalRecordEntry>,
+        // compressed_records_wire_bytes is Option<Vec<u8>> with skip_serializing_if
+        // We don't need to declare it because serde will stop reading after records
+    }
+
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    enum MinimalCompressionType {
+        None,
+        Gzip,
+        Snappy,
+        Lz4,
+        Zstd,
+    }
+
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    enum MinimalTimestampType {
+        CreateTime,
+        LogAppendTime,
+    }
+
+    #[derive(Deserialize)]
+    struct MinimalRecordEntry {
+        offset: i64,
+    }
+
+    let canonical: MinimalCanonicalRecord = bincode::deserialize(canonical_data)
+        .map_err(|e| WalError::CorruptRecord {
+            offset: 0,
+            reason: format!("Failed to deserialize CanonicalRecord for offset extraction: {}", e)
+        })?;
+
+    let base_offset = canonical.base_offset;
+    let last_offset = canonical.records.last()
+        .map(|r| r.offset)
+        .unwrap_or(base_offset);
+
+    Ok((base_offset, last_offset))
+}
+
+impl WalManager {
+    /// Shutdown the WAL manager and flush all pending data
+    /// This seals all active WAL segments to disk so they can be indexed
+    pub async fn shutdown(&self) {
+        info!("Shutting down WAL manager...");
+        self.group_commit_wal.shutdown().await;
+        info!("WAL manager shutdown complete");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,102 +1191,5 @@ mod tests {
         let recovery_result = recovered_manager.get_recovery_result();
         assert_eq!(recovery_result.partitions, 3);
         assert_eq!(recovery_result.total_records, 0); // total_records not tracked, just partition existence
-    }
-}
-
-/// Extract offset range (base_offset, last_offset) from CanonicalRecord bincode data.
-///
-/// v1.3.49: We can't depend on chronik-storage due to circular dependency,
-/// so we manually deserialize just the fields we need using a minimal struct.
-///
-/// CanonicalRecord format (bincode serialized):
-/// - base_offset: i64
-/// - partition_leader_epoch: i32
-/// - producer_id: i64
-/// - producer_epoch: i16
-/// - base_sequence: i32
-/// - is_transactional: bool
-/// - is_control: bool
-/// - compression: u8 (enum)
-/// - timestamp_type: u8 (enum)
-/// - records: Vec<CanonicalRecordEntry> where each has { offset: i64, ... }
-///
-/// We only need base_offset and the last record's offset.
-fn extract_offset_range(canonical_data: &[u8]) -> Result<(i64, i64)> {
-    use serde::Deserialize;
-
-    // Minimal struct that matches CanonicalRecord field order for bincode deserialization
-    // CRITICAL: Must match EXACT field order and types from chronik-storage/src/canonical_record.rs
-    #[derive(Deserialize)]
-    struct MinimalCanonicalRecord {
-        base_offset: i64,
-        #[allow(dead_code)]
-        partition_leader_epoch: i32,
-        #[allow(dead_code)]
-        producer_id: i64,
-        #[allow(dead_code)]
-        producer_epoch: i16,
-        #[allow(dead_code)]
-        base_sequence: i32,
-        #[allow(dead_code)]
-        is_transactional: bool,
-        #[allow(dead_code)]
-        is_control: bool,
-        #[allow(dead_code)]
-        compression: MinimalCompressionType,
-        #[allow(dead_code)]
-        timestamp_type: MinimalTimestampType,
-        #[allow(dead_code)]
-        base_timestamp: i64,
-        #[allow(dead_code)]
-        max_timestamp: i64,
-        records: Vec<MinimalRecordEntry>,
-        // compressed_records_wire_bytes is Option<Vec<u8>> with skip_serializing_if
-        // We don't need to declare it because serde will stop reading after records
-    }
-
-    #[derive(Deserialize)]
-    #[allow(dead_code)]
-    enum MinimalCompressionType {
-        None,
-        Gzip,
-        Snappy,
-        Lz4,
-        Zstd,
-    }
-
-    #[derive(Deserialize)]
-    #[allow(dead_code)]
-    enum MinimalTimestampType {
-        CreateTime,
-        LogAppendTime,
-    }
-
-    #[derive(Deserialize)]
-    struct MinimalRecordEntry {
-        offset: i64,
-    }
-
-    let canonical: MinimalCanonicalRecord = bincode::deserialize(canonical_data)
-        .map_err(|e| WalError::CorruptRecord {
-            offset: 0,
-            reason: format!("Failed to deserialize CanonicalRecord for offset extraction: {}", e)
-        })?;
-
-    let base_offset = canonical.base_offset;
-    let last_offset = canonical.records.last()
-        .map(|r| r.offset)
-        .unwrap_or(base_offset);
-
-    Ok((base_offset, last_offset))
-}
-
-impl WalManager {
-    /// Shutdown the WAL manager and flush all pending data
-    /// This seals all active WAL segments to disk so they can be indexed
-    pub async fn shutdown(&self) {
-        info!("Shutting down WAL manager...");
-        self.group_commit_wal.shutdown().await;
-        info!("WAL manager shutdown complete");
     }
 }

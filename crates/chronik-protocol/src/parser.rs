@@ -502,8 +502,8 @@ impl<'a> Encoder<'a> {
     
     /// Write an unsigned varint
     pub fn write_unsigned_varint(&mut self, mut value: u32) {
-        let original_value = value;
-        let start_pos = self.buf.len();
+        let _original_value = value;
+        let _start_pos = self.buf.len();
         while (value & !0x7F) != 0 {
             self.buf.put_u8((value & 0x7F) as u8 | 0x80);
             value >>= 7;

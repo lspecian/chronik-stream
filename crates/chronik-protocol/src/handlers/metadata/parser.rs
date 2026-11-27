@@ -4,7 +4,7 @@
 //! Handles version-specific parsing for Kafka Metadata API v0-v13.
 
 use bytes::Bytes;
-use chronik_common::{Error, Result};
+use chronik_common::Result;
 use crate::types::MetadataRequest;
 use crate::parser::Decoder;
 use crate::RequestHeader;
@@ -144,7 +144,7 @@ impl MetadataRequestParser {
         api_version: i16,
     ) -> Result<bool> {
         // Removed in v11
-        if api_version >= 8 && api_version <= 10 {
+        if (8..=10).contains(&api_version) {
             decoder.read_bool()
         } else {
             Ok(false)
@@ -204,7 +204,7 @@ mod tests {
         let request = MetadataRequestParser::parse(&header, &mut body).unwrap();
 
         assert_eq!(request.topics, None);
-        assert_eq!(request.allow_auto_topic_creation, true);
+        assert!(request.allow_auto_topic_creation);
     }
 
     #[test]
@@ -227,7 +227,7 @@ mod tests {
         let request = MetadataRequestParser::parse(&header, &mut body).unwrap();
 
         assert_eq!(request.topics, None);
-        assert_eq!(request.allow_auto_topic_creation, true);
+        assert!(request.allow_auto_topic_creation);
     }
 
     #[test]
@@ -253,7 +253,7 @@ mod tests {
         let mut body = buf.freeze();
         let request = MetadataRequestParser::parse(&header, &mut body).unwrap();
 
-        assert_eq!(request.include_cluster_authorized_operations, false);
-        assert_eq!(request.include_topic_authorized_operations, false);
+        assert!(!request.include_cluster_authorized_operations);
+        assert!(!request.include_topic_authorized_operations);
     }
 }

@@ -95,7 +95,7 @@ impl ProfileStore {
         profiles
             .get(name)
             .cloned()
-            .unwrap_or_else(|| Self::default_profile())
+            .unwrap_or_else(Self::default_profile)
     }
 
     /// List all available profile names.
@@ -125,7 +125,7 @@ impl ProfileStore {
         let mut entries = tokio::fs::read_dir(dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
+            if path.extension().is_some_and(|ext| ext == "json") {
                 match self.load_profile_file(&path).await {
                     Ok(profile) => {
                         tracing::info!(name = %profile.name, "Loaded ranking profile");

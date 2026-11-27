@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// How long an `acks=all` wait may sit before it is failed and released.
 /// Matches Kafka's default `request.timeout.ms`.

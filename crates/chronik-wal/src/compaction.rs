@@ -485,7 +485,7 @@ impl WalCompactor {
     async fn create_temp_compacted_segment(&self, partition: &TopicPartition, records: &[WalRecord]) -> Result<PathBuf> {
         let temp_dir = self.base_path.join("tmp");
         tokio::fs::create_dir_all(&temp_dir).await
-            .map_err(|e| WalError::Io(e))?;
+            .map_err(WalError::Io)?;
 
         let temp_file = temp_dir.join(format!("compact_{}_{}.wal", partition.topic, partition.partition));
 
@@ -500,13 +500,13 @@ impl WalCompactor {
         }
 
         tokio::fs::write(&temp_file, data).await
-            .map_err(|e| WalError::Io(e))?;
+            .map_err(WalError::Io)?;
 
         Ok(temp_file)
     }
 
     /// Replace partition data with compacted version
-    async fn replace_partition_data(&self, manager: &mut WalManager, partition: &TopicPartition, temp_path: &Path) -> Result<()> {
+    async fn replace_partition_data(&self, _manager: &mut WalManager, _partition: &TopicPartition, temp_path: &Path) -> Result<()> {
         // This is a placeholder - in a real implementation, you'd need to:
         // 1. Stop writes to the partition
         // 2. Replace the segment files atomically

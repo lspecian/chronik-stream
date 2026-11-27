@@ -5,12 +5,12 @@
 //! like the ingest service to index documents and perform searches.
 
 use chronik_common::{Result, Error};
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::warn;
 
 /// Configuration for the search client
 #[derive(Debug, Clone)]

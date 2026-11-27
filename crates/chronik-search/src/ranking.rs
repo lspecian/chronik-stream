@@ -102,7 +102,7 @@ impl RankFields {
             },
         ];
         candidates.into_iter().find(|c| {
-            fast(c.timestamp) && fast(c.offset) && c.partition.map_or(true, |p| fast(p))
+            fast(c.timestamp) && fast(c.offset) && c.partition.is_none_or(&fast)
         })
     }
 
@@ -1158,13 +1158,11 @@ mod tests {
 
     #[test]
     fn score_then_newest_then_position() {
-        let mut v = vec![
-            hit("t", 1.0, 100, 0, 1),
+        let mut v = [hit("t", 1.0, 100, 0, 1),
             hit("t", 2.0, 50, 0, 2),
             hit("t", 1.0, 200, 1, 9),
             hit("t", 1.0, 100, 0, 3),
-            hit("a", 1.0, 100, 2, 0),
-        ];
+            hit("a", 1.0, 100, 2, 0)];
         v.sort_by(hit_order);
         let ids: Vec<_> = v.iter().map(|h| format!("{}/{}", h._index, h._id)).collect();
         assert_eq!(ids, ["t/0-2", "t/1-9", "a/2-0", "t/0-3", "t/0-1"]);

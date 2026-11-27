@@ -2167,7 +2167,7 @@ mod topic_provenance_tests {
             },
             2,
         );
-        e.timestamp = e.timestamp + chrono::Duration::seconds(age_s);
+        e.timestamp += chrono::Duration::seconds(age_s);
         e
     }
 

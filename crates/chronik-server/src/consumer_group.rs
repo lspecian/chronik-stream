@@ -19,7 +19,6 @@ mod sync_leader;
 mod sync_response;
 
 // Re-export for internal use
-pub use assignment::{encode_assignment, decode_assignment};
 pub use sync_validation::SyncValidator;
 pub use sync_follower::FollowerSync;
 pub use sync_leader::LeaderAssignment;
@@ -1071,7 +1070,7 @@ impl GroupManager {
                         );
                         drop(pending_futures); // Release lock before calling complete_join_phase
                         let mut pending_futures_mut = pending_futures_arc.lock().await;
-                        group.complete_join_phase(&mut *pending_futures_mut).await;
+                        group.complete_join_phase(&mut pending_futures_mut).await;
                         break; // Exit loop after completing
                     }
 
@@ -2195,7 +2194,7 @@ impl PartitionAssignor for CooperativeStickyAssignor {
         let mut partitions_by_topic: HashMap<String, Vec<i32>> = HashMap::new();
         for partition in &context.partitions {
             partitions_by_topic.entry(partition.topic.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(partition.partition);
         }
         
@@ -2256,8 +2255,7 @@ impl PartitionAssignor for CooperativeStickyAssignor {
         // Second pass: assign unassigned partitions
         if !unassigned_partitions.is_empty() {
             // Get members that can receive assignments
-            let mut eligible_members: Vec<(String, usize)> = context.subscriptions.iter()
-                .map(|(member_id, topics)| {
+            let mut eligible_members: Vec<(String, usize)> = context.subscriptions.keys().map(|member_id| {
                     let current_load = assignments.get(member_id)
                         .map(|a| a.values().map(|ps| ps.len()).sum())
                         .unwrap_or(0);
@@ -2280,9 +2278,9 @@ impl PartitionAssignor for CooperativeStickyAssignor {
                         if topics.contains(&partition.topic) {
                             // Assign partition to this member
                             assignments.entry(member_id.clone())
-                                .or_insert_with(HashMap::new)
+                                .or_default()
                                 .entry(partition.topic.clone())
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(partition.partition);
                             
                             // Update load
@@ -2332,7 +2330,7 @@ fn parse_subscription_metadata(bytes: &[u8]) -> Result<Vec<String>> {
     // Version 1: topics + user_data
     // Version 2: topics + user_data + owned_partitions (we can skip this)
     // Version 3: topics + user_data + owned_partitions + generation_id + rack_id (we can skip these)
-    if version < 0 || version > 3 {
+    if !(0..=3).contains(&version) {
         return Err(Error::Protocol(format!("Unsupported subscription version: {}", version)));
     }
     
@@ -2372,7 +2370,7 @@ fn parse_subscription_metadata(bytes: &[u8]) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    
     use chronik_common::metadata::InMemoryMetadataStore;
 
     /// Coordination fixed for a test: `local` is what `is_local` answers.

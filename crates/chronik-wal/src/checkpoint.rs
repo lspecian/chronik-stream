@@ -151,7 +151,7 @@ impl CheckpointManager {
         
         // Record path in span
         tracing::Span::current()
-            .record("checkpoint_path", &tracing::field::display(&checkpoint_path.display()));
+            .record("checkpoint_path", tracing::field::display(&checkpoint_path.display()));
         
         let json = serde_json::to_string(&checkpoint)?;
         tokio::fs::write(&checkpoint_path, json).await?;

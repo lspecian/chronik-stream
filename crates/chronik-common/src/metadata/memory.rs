@@ -37,6 +37,12 @@ impl InMemoryMetadataStore {
     }
 }
 
+impl Default for InMemoryMetadataStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl MetadataStore for InMemoryMetadataStore {
     async fn create_topic(&self, name: &str, config: TopicConfig) -> Result<TopicMetadata> {

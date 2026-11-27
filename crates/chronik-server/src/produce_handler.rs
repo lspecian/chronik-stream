@@ -8,7 +8,7 @@
 //! - Provides compression support
 //! - Ensures high-throughput message ingestion
 
-use crate::storage::{StorageConfig, StorageService};
+use crate::storage::StorageConfig;
 use crate::fetch_handler::FetchHandler;
 use crate::cluster_catalog::ClusterCatalog;
 use chronik_common::{Result, Error};
@@ -18,24 +18,22 @@ use chronik_protocol::{
     kafka_protocol::ErrorCode,
 };
 use chronik_storage::kafka_records::{
-    KafkaRecordBatch, CompressionType, TimestampType, RecordHeader as KafkaRecordHeader,
+    KafkaRecordBatch, CompressionType, TimestampType,
 };
 use chronik_search::hot_text_index::{HotTextIndex, HotDoc};
 use chronik_columnar::hot_vector_batcher::{MicroBatcherHandle, PendingEmbed};
-use serde_json::Map as JsonMap;
 use chronik_storage::{
-    RecordBatch, Record, SegmentWriter,
+    SegmentWriter,
     object_store::storage::ObjectStore,
 };
-use chronik_common::metadata::traits::{MetadataStore, PartitionAssignment};
+use chronik_common::metadata::traits::MetadataStore;
 use chronik_wal::WalManager;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Mutex, mpsc, oneshot};  // v2.2.10: oneshot for ResponsePipeline
 use tokio::time::timeout;
-use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn, trace, instrument};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
@@ -44,7 +42,7 @@ use crossbeam::queue::SegQueue;
 
 
 /// v2.2.9: Async pipelined connection for leader forwarding (eliminates 168x slowdown)
-use crate::pipelined_connection::{PipelinedConnection, PipelinedConnectionPool};
+use crate::pipelined_connection::PipelinedConnectionPool;
 
 /// `client_id` on produce requests one broker forwards to the partition leader
 /// for a client. The receiving broker uses it to refuse to forward the write a
@@ -134,10 +132,12 @@ impl Default for ProduceHandlerConfig {
 /// Controls when buffered messages in `pending_batches` become visible to consumers.
 /// Similar to WAL profiles, but optimizes the in-memory flush layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ProduceFlushProfile {
     /// Low-latency profile: Minimal buffering, instant visibility
     /// Use case: Real-time analytics, instant messaging, live dashboards
     /// Performance: 37K msg/s, 6.84ms p99 latency (with LOW WAL profile)
+    #[default]
     LowLatency,
 
     /// Balanced profile: Good balance of throughput and latency
@@ -156,11 +156,6 @@ pub enum ProduceFlushProfile {
     Extreme,
 }
 
-impl Default for ProduceFlushProfile {
-    fn default() -> Self {
-        Self::LowLatency
-    }
-}
 
 impl ProduceFlushProfile {
     /// Auto-select profile based on environment variable or default to LowLatency
@@ -1304,7 +1299,7 @@ impl ProduceHandler {
         for key in keys {
             if let Some(state) = self.partition_states.get(&key) {
                 let mut count = 0;
-                while let Some(_) = state.pending_batches.pop() {
+                while state.pending_batches.pop().is_some() {
                     count += 1;
                 }
                 total_cleared += count;
@@ -1557,7 +1552,7 @@ impl ProduceHandler {
 
         info!("Starting ProduceHandler metadata event listener for < 10ms watermark replication");
 
-        let handler = Arc::clone(&self);
+        let _handler = Arc::clone(&self);
         tokio::spawn(async move {
             let mut rx = event_bus.subscribe();
 
@@ -2175,7 +2170,7 @@ impl ProduceHandler {
         records_data: &[u8],
         acks: i16,
     ) -> Result<ProduceResponsePartition> {
-        use bytes::{Bytes, BytesMut, BufMut};
+        use bytes::{BytesMut, BufMut};
         use chronik_protocol::parser::{Encoder, Decoder};
 
         // Get leader's Kafka address from metadata store
@@ -2345,7 +2340,7 @@ impl ProduceHandler {
     ) -> Result<ProduceResponsePartition> {
         use std::time::Instant;
         let start_time = Instant::now();
-        let mut last_checkpoint = start_time;
+        let _last_checkpoint = start_time;
 
         // ENTRY POINT LOGGING (v1.3.47 debugging)
         debug!("→ produce_to_partition({}-{}) bytes={} acks={}", topic, partition, records_data.len(), acks);
@@ -2429,7 +2424,7 @@ impl ProduceHandler {
         //
         // Solution: Get record count first, then atomically reserve the offset range.
         // This ensures each request gets a unique, non-overlapping offset range.
-        use chronik_storage::canonical_record::CanonicalRecord;
+        
 
         // Parse incoming base_offset from records_data
         let incoming_base_offset = if records_data.len() >= 8 {
@@ -2673,7 +2668,7 @@ impl ProduceHandler {
 
         // Assign offsets and prepare records
         let mut records = Vec::with_capacity(kafka_batch.records.len());
-        let mut current_offset = base_offset;
+        let current_offset = base_offset;
         let mut total_bytes = 0u64;
         
         for (i, kafka_record) in kafka_batch.records.iter().enumerate() {
@@ -3477,7 +3472,7 @@ impl ProduceHandler {
         }
         
         // Create segment writer
-        let segment_path = format!("{}/{}/partition-{}", self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), topic, partition);
+        let _segment_path = format!("{}/{}/partition-{}", self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), topic, partition);
         let writer = Arc::new(Mutex::new(
             SegmentWriter::new(
                 self.config.storage_config.segment_writer_config.clone(),
@@ -3627,8 +3622,8 @@ impl ProduceHandler {
                     // (see `CommittingSequences`): wait for it to end. It
                     // either wrote the records, or failed before the log and
                     // rolled the sequence back, so this batch is next.
-                    if mode == SequenceCheck::WaitForTurn {
-                        if self.original_still_committing(batch, topic, partition) {
+                    if mode == SequenceCheck::WaitForTurn
+                        && self.original_still_committing(batch, topic, partition) {
                             if Instant::now() >= hard_deadline {
                                 // Not a duplicate answer: that is success to the
                                 // client, and the original may still fail.
@@ -3641,7 +3636,6 @@ impl ProduceHandler {
                             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                             continue;
                         }
-                    }
                     // Duplicate (already applied).
                     warn!(
                         "Duplicate sequence number detected: producer={}, topic={}, partition={}, expected={}, received={}",
@@ -3967,7 +3961,7 @@ impl ProduceHandler {
                 self.flush_partition(topic, *partition, state).await?;
                 
                 // Create new segment writer
-                let segment_path = format!("{}/{}/partition-{}", 
+                let _segment_path = format!("{}/{}/partition-{}", 
                     self.config.storage_config.segment_writer_config.data_dir.to_string_lossy(), topic, partition);
                     
                 let new_writer = SegmentWriter::new(
@@ -4277,7 +4271,7 @@ pub(crate) mod tests {
     use chronik_storage::object_store::backends::local::LocalBackend;
     use chronik_protocol::types::{ProduceRequestTopic, ProduceRequestPartition};
     use tempfile::TempDir;
-    use bytes::BufMut;
+    
 
     // Regression: the in-flight produce-memory reservation must be released on
     // EVERY exit path. Before the MemoryReservation guard, the 17 `?`
@@ -4375,7 +4369,7 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
+        let _pd_endpoints = ["localhost:2379".to_string()];
         let temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
@@ -5269,8 +5263,8 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
-        let temp_dir = TempDir::new().unwrap();
+        let _pd_endpoints = ["localhost:2379".to_string()];
+        let _temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
@@ -5336,8 +5330,8 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
-        let temp_dir = TempDir::new().unwrap();
+        let _pd_endpoints = ["localhost:2379".to_string()];
+        let _temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
@@ -5393,8 +5387,8 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
-        let temp_dir = TempDir::new().unwrap();
+        let _pd_endpoints = ["localhost:2379".to_string()];
+        let _temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
@@ -5568,8 +5562,8 @@ pub(crate) mod tests {
         let storage: Arc<dyn chronik_storage::object_store::ObjectStore> = Arc::new(
             LocalBackend::new(storage_config).await.unwrap()
         );
-        let pd_endpoints = vec!["localhost:2379".to_string()];
-        let temp_dir = TempDir::new().unwrap();
+        let _pd_endpoints = ["localhost:2379".to_string()];
+        let _temp_dir = TempDir::new().unwrap();
         let metadata_store = Arc::new(InMemoryMetadataStore::new());
         
         let config = ProduceHandlerConfig {
@@ -5683,7 +5677,7 @@ pub(crate) mod tests {
         let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
             Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(object_store_config).await.unwrap());
 
-        let mut handler = ProduceHandler::new(
+        let handler = ProduceHandler::new(
             produce_config,
             object_store,
             metadata_store.clone(),
@@ -5737,7 +5731,7 @@ pub(crate) mod tests {
         let object_store: Arc<dyn chronik_storage::object_store::ObjectStoreTrait> =
             Arc::from(chronik_storage::object_store::ObjectStoreFactory::create(object_store_config).await.unwrap());
 
-        let mut handler = ProduceHandler::new(
+        let handler = ProduceHandler::new(
             produce_config,
             object_store,
             metadata_store.clone(),

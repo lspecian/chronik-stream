@@ -106,7 +106,7 @@ pub async fn run(
     // Use BaseConsumer with manual partition assignment to avoid consumer group protocol issues
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &bootstrap_servers)
-        .set("group.id", &format!("perf-assign-{}", std::process::id()))
+        .set("group.id", format!("perf-assign-{}", std::process::id()))
         .set("enable.auto.commit", "false")
         .set("fetch.min.bytes", "1")
         .set("fetch.wait.max.ms", "100")

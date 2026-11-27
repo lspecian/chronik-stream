@@ -70,7 +70,7 @@ impl RequestParser {
             actual_len as usize
         } else {
             let len = decoder.read_i32()?;
-            if len < 0 || len > 1000 {
+            if !(0..=1000).contains(&len) {
                 return Err(Error::Protocol("CreateTopics topic count invalid".into()));
             }
             len as usize

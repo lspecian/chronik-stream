@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use tracing::{debug, warn, error, info};
+use tracing::{debug, warn, error};
 
 use chronik_protocol::produce_types::ProduceResponsePartition;
 

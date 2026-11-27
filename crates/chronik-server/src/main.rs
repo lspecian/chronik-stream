@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
-use chronik_monitoring::{init_monitoring, TracingConfig};
+use chronik_monitoring::init_monitoring;
 
 // mimalloc instead of the system allocator: search requests allocate many
 // short-lived buffers (column reads, aggregation buckets, JSON), and glibc
@@ -84,9 +84,8 @@ use integrated_server::{IntegratedKafkaServer, IntegratedServerConfig, Integrate
 use chronik_wal::compaction::{WalCompactor, CompactionConfig, CompactionStrategy};
 use chronik_wal::config::{WalConfig, CompressionType};
 use chronik_storage::object_store::{ObjectStoreConfig, StorageBackend, AuthConfig, S3Credentials, EncryptionConfig, EncryptionType};
-use chronik_config::{ClusterConfig, NodeConfig};
+use chronik_config::ClusterConfig;
 use chronik_columnar::ColumnarQueryEngine;
-use serde_json;
 
 /// Default Kafka listen port, used when neither `--kafka-port` nor a cluster
 /// config file says otherwise.
@@ -573,7 +572,7 @@ fn parse_advertise_addr(advertise: Option<&str>, bind: &str, default_port: u16) 
 ///
 /// Returns None with a log message if provider cannot be created (e.g., missing API key).
 fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::EmbeddingProvider>> {
-    use chronik_embeddings::{VectorSearchConfig, EmbeddingModelConfig};
+    use chronik_embeddings::EmbeddingModelConfig;
     use chronik_embeddings::config::EmbeddingProvider as ProviderType;
 
     // Check if embedding is explicitly disabled
@@ -611,7 +610,7 @@ fn try_create_embedding_provider() -> Option<Arc<dyn chronik_embeddings::Embeddi
     let endpoint = std::env::var("CHRONIK_EMBEDDING_ENDPOINT").ok();
 
     let model_config = EmbeddingModelConfig {
-        provider: provider_enum.clone(),
+        provider: provider_enum,
         model,
         dimensions,
         endpoint,
@@ -1516,7 +1515,7 @@ async fn run_cluster_mode(
     // HP-2.6/2.8: Build the micro-batcher once we have an embedder, populate
     // the shared slot, wire the hot vector index into WalIndexer for
     // eviction, and expose it to the unified API for query-time merge.
-    if let (Some(ref provider), Some(hot_vec_idx), Some(slot)) = (
+    if let (Some(provider), Some(hot_vec_idx), Some(slot)) = (
         embedder.as_ref(),
         server.get_hot_vector_index(),
         server.get_hot_vector_batcher_slot(),
@@ -1816,7 +1815,7 @@ async fn run_single_node_mode(
             wal_indexer.set_cold_flush_listener(adapter).await;
         }
         // HP-2.x: Hot vector batcher + cold-flush adapter + unified state wiring.
-        if let (Some(ref provider), Some(hot_vec_idx), Some(slot)) = (
+        if let (Some(provider), Some(hot_vec_idx), Some(slot)) = (
             embedder.as_ref(),
             server.get_hot_vector_index(),
             server.get_hot_vector_batcher_slot(),
@@ -2370,7 +2369,7 @@ async fn handle_compaction_command(cli: &Cli, action: CompactAction) -> Result<(
     use chronik_wal::manager::WalManager;
 
     match action {
-        CompactAction::Now { partition, strategy, dry_run } => {
+        CompactAction::Now { partition: _, strategy, dry_run } => {
             info!("Running manual WAL compaction");
 
             // Parse strategy

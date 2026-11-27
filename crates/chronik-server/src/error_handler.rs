@@ -3,7 +3,6 @@
 //! This module provides robust error handling, recovery, and logging
 //! to ensure operational excellence and reliability.
 
-use std::fmt;
 use std::io;
 use tracing::{error, warn, info, debug};
 use thiserror::Error;
@@ -278,13 +277,12 @@ impl ErrorHandler {
             return ServerError::GroupAuthorizationFailed(error_string);
         }
 
-        if error_string.contains("topic") || error_string.contains("Topic") {
-            if error_string.contains("not found") || error_string.contains("does not exist") {
+        if (error_string.contains("topic") || error_string.contains("Topic"))
+            && (error_string.contains("not found") || error_string.contains("does not exist")) {
                 return ServerError::TopicNotFound { 
                     topic: extract_topic_name(&error_string).unwrap_or_default() 
                 };
             }
-        }
         
         if error_string.contains("controller") || error_string.contains("Controller") {
             return ServerError::ControllerNotAvailable;

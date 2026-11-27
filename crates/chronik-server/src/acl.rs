@@ -266,7 +266,7 @@ impl AclStore {
             for entry in entries {
                 if filter.matches(entry) {
                     let key = (entry.resource_type, entry.resource_name.clone(), entry.pattern_type);
-                    results.entry(key).or_insert_with(Vec::new).push(AclEntry {
+                    results.entry(key).or_default().push(AclEntry {
                         principal: entry.principal.clone(),
                         host: entry.host.clone(),
                         operation: entry.operation,
@@ -382,15 +382,14 @@ impl AclStore {
             }
 
             for entry in entries {
-                if entry.pattern_type == PatternType::Prefixed && resource_name.starts_with(rn) {
-                    if self.entry_matches(entry, principal, host, operation) {
+                if entry.pattern_type == PatternType::Prefixed && resource_name.starts_with(rn)
+                    && self.entry_matches(entry, principal, host, operation) {
                         return if entry.permission_type == AclPermissionType::Allow {
                             AuthorizationResult::Allowed
                         } else {
                             AuthorizationResult::Denied
                         };
                     }
-                }
             }
         }
 
@@ -1029,7 +1028,7 @@ impl AclStore {
         for binding in persisted.chain(bootstrap) {
             let entries = index
                 .entry((binding.resource_type, binding.resource_name.clone()))
-                .or_insert_with(Vec::new);
+                .or_default();
             if !entries.iter().any(|e| e == &binding) {
                 entries.push(binding);
             }

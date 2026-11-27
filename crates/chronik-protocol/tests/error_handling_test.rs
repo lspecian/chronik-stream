@@ -302,7 +302,7 @@ async fn test_sequential_error_handling() {
         let response = result.unwrap();
         assert_eq!(
             response.header.correlation_id,
-            i as i32,
+            i,
             "Correlation ID should be preserved"
         );
     }

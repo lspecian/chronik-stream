@@ -2,7 +2,7 @@
 //!
 //! Reads Parquet files and returns Arrow RecordBatches with predicate pushdown support.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;

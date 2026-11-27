@@ -29,16 +29,17 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 /// Schema types supported by the registry
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
+#[derive(Default)]
 pub enum SchemaType {
     /// Apache Avro schema
+    #[default]
     Avro,
     /// JSON Schema
     Json,
@@ -46,11 +47,6 @@ pub enum SchemaType {
     Protobuf,
 }
 
-impl Default for SchemaType {
-    fn default() -> Self {
-        SchemaType::Avro
-    }
-}
 
 impl std::fmt::Display for SchemaType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,10 +61,12 @@ impl std::fmt::Display for SchemaType {
 /// Compatibility levels for schema evolution
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Default)]
 pub enum CompatibilityLevel {
     /// No compatibility checking
     None,
     /// New schema can read data written by old schema
+    #[default]
     Backward,
     /// New schema can read data written by all previous schemas
     BackwardTransitive,
@@ -82,11 +80,6 @@ pub enum CompatibilityLevel {
     FullTransitive,
 }
 
-impl Default for CompatibilityLevel {
-    fn default() -> Self {
-        CompatibilityLevel::Backward
-    }
-}
 
 /// Direction of a compatibility check between a new and a prior schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

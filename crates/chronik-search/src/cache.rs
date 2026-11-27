@@ -1,12 +1,11 @@
 //! Query result caching for improved performance
 
 use crate::api::{SearchRequest, SearchResponse};
-use chronik_common::Result;
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 use sha2::{Sha256, Digest};
 

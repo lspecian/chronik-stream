@@ -135,7 +135,7 @@ async fn fetch_from_unauthorized_topic_is_denied() -> Result<()> {
         .expect("writing to the write-only topic must succeed");
 
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &cluster.bootstrap_servers())
+        .set("bootstrap.servers", cluster.bootstrap_servers())
         .set("security.protocol", "SASL_PLAINTEXT")
         .set("sasl.mechanism", "SCRAM-SHA-256")
         .set("sasl.username", USER)
@@ -210,7 +210,7 @@ async fn acls_disabled_by_default_allows_everything() -> Result<()> {
     .await?;
 
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", &cluster.bootstrap_servers())
+        .set("bootstrap.servers", cluster.bootstrap_servers())
         .set("message.timeout.ms", "8000")
         .set("retries", "0")
         .create()?;
@@ -298,7 +298,7 @@ async fn offset_commit_on_an_unauthorized_group_is_denied() -> Result<()> {
 
     // "acl-group" is granted Read; this one is not.
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &cluster.bootstrap_servers())
+        .set("bootstrap.servers", cluster.bootstrap_servers())
         .set("security.protocol", "SASL_PLAINTEXT")
         .set("sasl.mechanism", "SCRAM-SHA-256")
         .set("sasl.username", USER)
@@ -353,7 +353,7 @@ async fn metadata_omits_unauthorized_topics() -> Result<()> {
     // alice has Describe on both of those, and on nothing else. Fetching all
     // metadata must return exactly the topics she may describe.
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &cluster.bootstrap_servers())
+        .set("bootstrap.servers", cluster.bootstrap_servers())
         .set("security.protocol", "SASL_PLAINTEXT")
         .set("sasl.mechanism", "SCRAM-SHA-256")
         .set("sasl.username", USER)

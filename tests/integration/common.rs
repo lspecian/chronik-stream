@@ -7,7 +7,7 @@ use std::process::{Child, Command};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Test cluster configuration
 #[derive(Debug, Clone)]

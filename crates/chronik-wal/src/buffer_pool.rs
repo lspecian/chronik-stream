@@ -291,7 +291,7 @@ mod tests {
         let stats_before = pool_stats();
         {
             let buffer = PooledBuffer::acquire(1024);
-            assert!(buffer.len() == 0);
+            assert!(buffer.is_empty());
             assert!(buffer.as_ref().capacity() >= 1024);
         }
         

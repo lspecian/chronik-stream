@@ -1,6 +1,5 @@
 use chronik_common::{Result, Error};
 use crate::parser::{Decoder, Encoder, KafkaDecodable, KafkaEncodable};
-use bytes::Bytes;
 
 #[derive(Debug, Clone)]
 pub struct IncrementalAlterConfigsRequest {
@@ -37,7 +36,7 @@ pub struct AlterConfigsResourceResponse {
 }
 
 impl KafkaDecodable for IncrementalAlterConfigsRequest {
-    fn decode(decoder: &mut Decoder, api_version: i16) -> Result<Self> {
+    fn decode(decoder: &mut Decoder, _api_version: i16) -> Result<Self> {
         // For v0, use regular arrays and strings
         // For v1+, use compact arrays and strings (simplified for stub)
 
@@ -97,7 +96,7 @@ impl KafkaEncodable for IncrementalAlterConfigsResponse {
         encoder.write_i32(self.resources.len() as i32);
         for resource in &self.resources {
             encoder.write_i16(resource.error_code);
-            encoder.write_string(resource.error_message.as_ref().map(|s| s.as_str()));
+            encoder.write_string(resource.error_message.as_deref());
             encoder.write_i8(resource.resource_type);
             encoder.write_string(Some(&resource.resource_name));
         }

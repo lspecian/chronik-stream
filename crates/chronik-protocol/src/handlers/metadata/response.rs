@@ -405,7 +405,7 @@ impl MetadataResponseBuilder {
     ) -> Result<()> {
         // Cluster authorized operations (v8-v10 only, removed in v11+)
         // KIP-430: cluster_authorized_operations was removed starting from v11
-        if version >= 8 && version <= 10 {
+        if (8..=10).contains(&version) {
             if let Some(ops) = cluster_authorized_operations {
                 encoder.write_i32(ops);
             } else {
@@ -468,7 +468,7 @@ mod tests {
 
         let result = MetadataResponseBuilder::encode(&mut buf, &response, 0);
         assert!(result.is_ok());
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 
     #[test]
@@ -487,6 +487,6 @@ mod tests {
 
         let result = MetadataResponseBuilder::encode(&mut buf, &response, 9);
         assert!(result.is_ok());
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 }

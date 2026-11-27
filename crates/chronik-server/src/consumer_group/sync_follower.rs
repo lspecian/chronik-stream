@@ -29,7 +29,7 @@ impl FollowerSync {
     ///
     /// Complexity: < 25 (spawns background task with assignment computation)
     pub fn spawn_fallback_task(
-        group: &ConsumerGroup,
+        _group: &ConsumerGroup,
         groups_clone: Arc<RwLock<std::collections::HashMap<String, ConsumerGroup>>>,
         metadata_store_clone: Arc<dyn chronik_common::metadata::MetadataStore>,
         assignor_clone: Arc<tokio::sync::Mutex<Box<dyn super::PartitionAssignor>>>,

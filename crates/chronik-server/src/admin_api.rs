@@ -50,9 +50,9 @@ use tracing::{debug, error, info, warn};
 use crate::isr_tracker::IsrTracker;
 use crate::cluster_catalog::ClusterCatalog;
 use crate::schema_registry::{
-    CompatibilityConfig, CompatibilityLevel, GetSchemaResponse, GetSubjectVersionResponse,
-    RegisterSchemaRequest, RegisterSchemaResponse, SchemaRegistry, SchemaRegistryConfig,
-    SchemaRegistryError, SchemaType, SchemaVersionRef,
+    CompatibilityConfig, GetSchemaResponse, GetSubjectVersionResponse,
+    RegisterSchemaRequest, RegisterSchemaResponse, SchemaRegistry,
+    SchemaRegistryError, SchemaVersionRef,
 };
 use chronik_common::metadata::traits::MetadataStore;
 

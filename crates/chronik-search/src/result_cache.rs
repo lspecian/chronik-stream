@@ -241,7 +241,7 @@ mod tests {
         cache.put_merged(&[a.clone(), b.clone()], &req, partial(9));
         assert_eq!(cache.get_merged(&[b.clone(), a.clone()], &req).unwrap().count, 9, "any order");
         assert!(cache.get_merged(&[a.clone(), b.clone(), c], &req).is_none(), "an archive added");
-        assert!(cache.get_merged(&[a.clone()], &req).is_none(), "an archive removed");
+        assert!(cache.get_merged(std::slice::from_ref(&a), &req).is_none(), "an archive removed");
         assert!(cache.get_merged(&[a.clone(), archive("b.tar", 2)], &req).is_none(), "an archive rewritten");
         assert!(cache.get_merged(&[a.clone(), b.clone()], &Arc::from("q2")).is_none(), "another request");
         assert!(cache.get(&a, &req).is_none(), "not an entry for one archive");

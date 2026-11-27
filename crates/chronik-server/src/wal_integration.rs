@@ -8,9 +8,7 @@ use chronik_wal::WalManager;
 use chronik_common::Result;
 use chronik_protocol::{ProduceRequest, ProduceResponse};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{error, info, instrument};
-use bytes::{Bytes, BytesMut, BufMut};
 
 /// WAL-integrated produce handler wrapper
 /// v1.3.47+: Uses Arc<WalManager> directly for lock-free concurrent access
@@ -102,7 +100,7 @@ impl WalProduceHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[tokio::test]
     async fn test_wal_integration() {

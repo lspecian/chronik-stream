@@ -229,19 +229,19 @@ mod tests {
     #[test]
     fn test_should_include_config_no_filter() {
         // No filter = include all
-        assert_eq!(ConfigProvider::should_include_config("retention.ms", &None), true);
+        assert!(ConfigProvider::should_include_config("retention.ms", &None));
     }
 
     #[test]
     fn test_should_include_config_with_filter_match() {
         let keys = Some(vec!["retention.ms".to_string(), "segment.bytes".to_string()]);
-        assert_eq!(ConfigProvider::should_include_config("retention.ms", &keys), true);
+        assert!(ConfigProvider::should_include_config("retention.ms", &keys));
     }
 
     #[test]
     fn test_should_include_config_with_filter_no_match() {
         let keys = Some(vec!["retention.ms".to_string()]);
-        assert_eq!(ConfigProvider::should_include_config("segment.bytes", &keys), false);
+        assert!(!ConfigProvider::should_include_config("segment.bytes", &keys));
     }
 
     #[tokio::test]

@@ -748,7 +748,7 @@ impl PartitionIndex {
 
         Some(BuildJob {
             instance: self.instance,
-            metric: self.config.metric.clone(),
+            metric: self.config.metric,
             build_dims: self.config.effective_search_dims(),
             dimensions: self.config.dimensions,
             ef_construction: self.config.ef_construction,

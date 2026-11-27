@@ -473,7 +473,7 @@ impl QueryOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    
     use std::time::Duration;
 
     /// Mock backend that returns predetermined candidates.
@@ -870,7 +870,7 @@ mod filter_application_tests {
             Candidate::new("logs".into(), 1, 2, QueryMode::Vector, 0.8, 1),
             Candidate::new("logs".into(), 2, 3, QueryMode::Vector, 0.7, 2),
         ];
-        let wanted = vec![0, 2];
+        let wanted = [0, 2];
         candidates.retain(|c| wanted.contains(&c.partition));
 
         assert_eq!(candidates.len(), 2);

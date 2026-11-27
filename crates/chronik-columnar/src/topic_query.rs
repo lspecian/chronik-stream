@@ -33,7 +33,7 @@ use anyhow::{anyhow, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::query_engine::{ColumnarQueryEngine, QueryEngineConfig};
 

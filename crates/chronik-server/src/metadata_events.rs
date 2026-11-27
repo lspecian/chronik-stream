@@ -1,16 +1,5 @@
-/// Metadata Event System for WAL-Based Replication
-///
-/// This module implements an event-based architecture for metadata replication
-/// where RaftMetadataStore emits events that MetadataWalReplicator subscribes to.
-///
-/// Architecture:
-/// ```
-/// RaftMetadataStore → emit(MetadataEvent) → MetadataEventBus → MetadataWalReplicator
-/// ```
-
-use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Metadata events that trigger WAL replication
 #[derive(Debug, Clone)]

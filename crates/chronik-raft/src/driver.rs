@@ -303,7 +303,7 @@ impl RaftDriver {
             meta.mut_conf_state().voters = initial_voters.to_vec();
             store
                 .apply_snapshot(snap)?
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bootstrap snapshot: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("bootstrap snapshot: {}", e)))?;
         }
         // Rebuild the state machine from the snapshot; raft re-delivers every
         // committed entry after it.
@@ -328,7 +328,7 @@ impl RaftDriver {
         raft_config.validate().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let logger = slog::Logger::root(slog::Drain::fuse(slog_stdlog::StdLog), slog::o!("raft_id" => config.id));
         let node = RawNode::new(&raft_config, store.clone(), &logger)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("raft: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("raft: {}", e)))?;
 
         let (tx, rx) = mpsc::channel();
         let (status_tx, status_rx) = watch::channel(RaftStatus { id: config.id, applied: snap_index, ..Default::default() });
@@ -606,7 +606,7 @@ impl<S: StateMachine, O: Outbox> DriverCore<S, O> {
 
         self.store.append(ready.entries())?;
         if let Some(hs) = ready.hs() {
-            self.store.set_hardstate(hs.clone())?;
+            self.store.set_hardstate(*hs)?;
         }
         if !ready.persisted_messages().is_empty() {
             self.outbox.send(ready.take_persisted_messages());

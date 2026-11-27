@@ -293,7 +293,7 @@ mod tests {
         let mut buf = BytesMut::new();
         let result = JoinGroupResponseEncoder::encode(&mut buf, &response, 0);
         assert!(result.is_ok());
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
         let mut buf = BytesMut::new();
         let result = JoinGroupResponseEncoder::encode(&mut buf, &response, 9);
         assert!(result.is_ok());
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 
     #[test]
@@ -330,6 +330,6 @@ mod tests {
 
         let result = JoinGroupResponseEncoder::encode_member(&mut encoder, &member, 0, 0, false);
         assert!(result.is_ok());
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 }

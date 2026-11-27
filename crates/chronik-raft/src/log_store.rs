@@ -295,7 +295,7 @@ impl Core {
         if self.first_index() > index {
             return Ok(Err(RaftError::Store(StorageError::SnapshotOutOfDate)));
         }
-        let mut hs = self.raft_state.hard_state.clone();
+        let mut hs = self.raft_state.hard_state;
         hs.term = cmp::max(hs.term, snapshot.get_metadata().term);
         hs.commit = index;
         let cs = snapshot.mut_metadata().take_conf_state();
@@ -449,7 +449,7 @@ impl RaftLogStore {
     /// Persist only a new commit index (a `LightReady` carries no full `HardState`).
     pub fn set_commit(&self, commit: u64) -> io::Result<()> {
         let mut core = self.wl();
-        let mut hs = core.raft_state.hard_state.clone();
+        let mut hs = core.raft_state.hard_state;
         hs.commit = commit;
         core.set_hardstate(hs)
     }
@@ -882,7 +882,7 @@ mod tests {
         hs.term = 5;
         hs.vote = 2;
         hs.commit = 4;
-        s.set_hardstate(hs.clone()).unwrap();
+        s.set_hardstate(hs).unwrap();
         let mut cs = ConfState::default();
         cs.voters = vec![1, 2, 3, 4];
         s.set_conf_state(cs.clone()).unwrap();
@@ -1162,7 +1162,7 @@ mod tests {
                 let mut ready = node.ready();
                 store.append(ready.entries()).unwrap();
                 if let Some(hs) = ready.hs() {
-                    store.set_hardstate(hs.clone()).unwrap();
+                    store.set_hardstate(*hs).unwrap();
                 }
                 for e in ready.take_committed_entries() {
                     if !e.data.is_empty() {

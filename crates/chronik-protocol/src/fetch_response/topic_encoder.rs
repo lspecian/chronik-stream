@@ -130,7 +130,7 @@ mod tests {
         TopicEncoder::encode_topic(&mut encoder, &topic, 0, false);
 
         // Topic name + partitions array
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 
     #[test]
@@ -142,6 +142,6 @@ mod tests {
         TopicEncoder::encode_topic(&mut encoder, &topic, 12, true);
 
         // Flexible encoding with compact strings and tagged fields
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 }

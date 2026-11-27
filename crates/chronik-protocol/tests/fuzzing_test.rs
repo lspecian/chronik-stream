@@ -171,7 +171,7 @@ proptest! {
             encoder.write_i32(len);
 
             // For non-negative lengths, write that many dummy items
-            if len >= 0 && len < 100 {
+            if (0..100).contains(&len) {
                 // Limit to reasonable size
                 for _ in 0..len {
                     encoder.write_i16(0); // Dummy item
@@ -339,7 +339,7 @@ mod tests {
     fn test_proptest_setup() {
         // Verify proptest is working
         proptest!(|(x: i32)| {
-            prop_assert_eq!(x + 0, x);
+            prop_assert_eq!(x, x);
         });
     }
     

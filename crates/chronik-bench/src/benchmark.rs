@@ -923,7 +923,7 @@ impl BenchmarkRunner {
             }
 
             // Log progress periodically
-            if topic_counter % 10 == 0 {
+            if topic_counter.is_multiple_of(10) {
                 let completed = ops_completed.load(Ordering::Relaxed);
                 let failed = ops_failed.load(Ordering::Relaxed);
                 let histogram = latency_histogram.lock().await;

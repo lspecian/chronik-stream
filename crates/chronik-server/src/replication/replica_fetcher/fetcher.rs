@@ -807,7 +807,7 @@ impl ReplicaFetcher {
                     if !got_records {
                         empties = empties.wrapping_add(1);
                     }
-                    if cycles % 200 == 0 {
+                    if cycles.is_multiple_of(200) {
                         debug!(
                             "replication cycle {}: build {:?}, fetch {:?}, apply {:?}, total {:?}, empty {}/{}",
                             cycles,
@@ -832,7 +832,7 @@ impl ReplicaFetcher {
                     if diverged {
                         let round = repair_rounds.saturating_add(1);
                         repair_rounds = round;
-                        if round % 20 == 0 {
+                        if round.is_multiple_of(20) {
                             warn!(
                                 "Replication from leader {} has re-detected divergence {} times \
                                  without making progress — the repair is not converging.",

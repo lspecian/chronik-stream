@@ -7,7 +7,6 @@ use crate::consumer_group::{ConsumerGroup, GroupState, SyncGroupResponse, GroupM
 use crate::consumer_group::assignment::{decode_assignment, encode_assignment};
 use chronik_common::Result;
 use std::collections::HashMap;
-use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 /// Leader assignment coordinator

@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Result};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array,
     Int8Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Schema};
@@ -324,6 +324,7 @@ impl RecordBatchConverter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{FixedSizeListArray, Float32Array};
 
     fn make_test_record(offset: i64) -> KafkaRecord {
         KafkaRecord {
@@ -432,7 +433,7 @@ mod tests {
         let converter = RecordBatchConverter::with_schema(schema);
 
         // Mix of records with and without embeddings
-        let mut records: Vec<_> = (0..5).map(|i| make_test_record(i)).collect();
+        let mut records: Vec<_> = (0..5).map(make_test_record).collect();
         records.extend((5..10).map(|i| make_test_record_with_embedding(i, 384)));
 
         let batch = converter.convert(&records).unwrap();

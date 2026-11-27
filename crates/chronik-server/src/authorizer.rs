@@ -278,7 +278,7 @@ pub fn required_access(api_key: i16) -> RequiredAccess {
         25 => RequiredAccess::TransactionalId(Write), // AddOffsetsToTxn
         26 => RequiredAccess::TransactionalId(Write), // EndTxn
         28 => RequiredAccess::TransactionalId(Write), // TxnOffsetCommit
-        29 | 30 | 31 => RequiredAccess::Cluster(Alter), // Describe/Create/DeleteAcls
+        29..=31 => RequiredAccess::Cluster(Alter), // Describe/Create/DeleteAcls
         32 => RequiredAccess::Cluster(DescribeConfigs), // DescribeConfigs
         33 => RequiredAccess::Cluster(AlterConfigs), // AlterConfigs
         35 => RequiredAccess::Cluster(Describe),  // DescribeLogDirs

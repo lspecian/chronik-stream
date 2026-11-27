@@ -142,7 +142,7 @@ impl Segment {
         // Read header
         let mut magic = [0u8; 4];
         cursor.read_exact(&mut magic)?;
-        if &magic != SEGMENT_MAGIC {
+        if magic != SEGMENT_MAGIC {
             return Err(Error::InvalidSegment("Invalid magic bytes".into()));
         }
         

@@ -147,7 +147,7 @@ impl MicroBatcherHandle {
                     .fetch_add(1, Ordering::Relaxed)
                     + 1;
                 chronik_monitoring::MetricsRecorder::record_hot_vector_enqueue(true);
-                if dropped == 1 || dropped % 1000 == 0 {
+                if dropped == 1 || dropped.is_multiple_of(1000) {
                     warn!(
                         hot_path = "vector",
                         event = "queue_overflow",
@@ -330,7 +330,7 @@ async fn flush(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    for (pending, embedding) in batch.into_iter().zip(embeddings.embeddings.into_iter()) {
+    for (pending, embedding) in batch.into_iter().zip(embeddings.embeddings) {
         let produce_ts = pending.produce_timestamp_ms;
         if let Err(e) = index
             .add_vector(

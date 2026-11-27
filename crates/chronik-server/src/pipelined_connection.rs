@@ -259,7 +259,7 @@ async fn receive_task(
 
             // Notify all pending requests of failure
             let mut pending = pending_responses.lock().await;
-            for (correlation_id, tx) in pending.drain() {
+            for (_correlation_id, tx) in pending.drain() {
                 let _ = tx.send(Err(Error::Internal("Connection closed".into())));
             }
 

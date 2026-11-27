@@ -353,7 +353,7 @@ fn extract_common_name(der: &[u8]) -> Option<String> {
                     0x0c | 0x13 | 0x16 | 0x14 => String::from_utf8(bytes.to_vec()).ok(),
                     // BMPString: UTF-16BE
                     0x1e if bytes.len() % 2 == 0 => String::from_utf16(
-                        &bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<_>>(),
+                        &bytes.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<_>>(),
                     )
                     .ok(),
                     _ => None,

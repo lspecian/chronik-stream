@@ -59,7 +59,7 @@ fn test_canonical_record_with_java_kafka_batch() {
 /// Create a simple Kafka RecordBatch v2 for testing
 fn create_simple_kafka_batch() -> Bytes {
     use bytes::{BufMut, BytesMut};
-    use std::io::Cursor;
+    
     use crc32fast::Hasher as Crc32;
 
     let mut buf = BytesMut::new();

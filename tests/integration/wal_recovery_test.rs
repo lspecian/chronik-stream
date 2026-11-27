@@ -10,9 +10,8 @@ use rdkafka::producer::Producer;
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{Result, Context, anyhow};
 use chrono::Utc;
@@ -325,7 +324,7 @@ async fn run_crash_recovery_test(server: &mut TestServer) -> Result<RecoveryTest
     
     // Phase 4: Simulate ungraceful shutdown
     info!("Phase 4: Simulating ungraceful server crash");
-    let crash_start = Instant::now();
+    let _crash_start = Instant::now();
     server.crash().context("Failed to crash server")?;
     
     // Wait a moment to ensure crash is complete
@@ -367,7 +366,7 @@ async fn run_crash_recovery_test(server: &mut TestServer) -> Result<RecoveryTest
 /// Write test messages to the server
 async fn write_test_messages(port: u16, count: usize, id_offset: usize) -> Result<Vec<TestMessage>> {
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", &format!("localhost:{}", port))
+        .set("bootstrap.servers", format!("localhost:{}", port))
         .set("message.timeout.ms", "10000")
         .set("queue.buffering.max.messages", "100000")
         .set("batch.num.messages", "1000")
@@ -423,7 +422,7 @@ async fn write_test_messages(port: u16, count: usize, id_offset: usize) -> Resul
 /// Read and validate messages match expected set
 async fn read_and_validate_messages(port: u16, expected: &[TestMessage]) -> Result<Vec<TestMessage>> {
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &format!("localhost:{}", port))
+        .set("bootstrap.servers", format!("localhost:{}", port))
         .set("group.id", "wal-recovery-validator")
         .set("auto.offset.reset", "earliest")
         .set("enable.auto.commit", "false")

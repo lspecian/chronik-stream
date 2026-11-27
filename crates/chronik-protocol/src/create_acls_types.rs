@@ -2,7 +2,7 @@
 
 use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
-use chronik_common::{Error, Result};
+use chronik_common::Result;
 
 /// ACL creation entry
 #[derive(Debug, Clone, Serialize, Deserialize)]

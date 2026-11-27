@@ -299,7 +299,7 @@ mod wal_manager_tests {
     async fn test_manager_append_new_partition() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = create_test_config(&temp_dir);
-        let mut manager = WalManager::new(config).await.expect("Manager creation should succeed");
+        let manager = WalManager::new(config).await.expect("Manager creation should succeed");
         
         let records = vec![
             create_test_record(0, Some("key1"), "value1"),
@@ -320,7 +320,7 @@ mod wal_manager_tests {
         let segment_files: Vec<_> = std::fs::read_dir(&partition_dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "log"))
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
             .collect();
         
         assert_eq!(segment_files.len(), 1);
@@ -330,7 +330,7 @@ mod wal_manager_tests {
     async fn test_manager_append_existing_partition() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = create_test_config(&temp_dir);
-        let mut manager = WalManager::new(config).await.expect("Manager creation should succeed");
+        let manager = WalManager::new(config).await.expect("Manager creation should succeed");
         
         // First append to create partition
         let initial_records = vec![create_test_record(0, Some("key1"), "value1")];
@@ -353,7 +353,7 @@ mod wal_manager_tests {
     async fn test_manager_multiple_partitions() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = create_test_config(&temp_dir);
-        let mut manager = WalManager::new(config).await.expect("Manager creation should succeed");
+        let manager = WalManager::new(config).await.expect("Manager creation should succeed");
         
         // Create multiple partitions
         let topics_partitions = vec![
@@ -387,7 +387,7 @@ mod wal_manager_tests {
         // Set very small segment size to force rotation
         config.rotation.max_segment_size = 500;
         
-        let mut manager = WalManager::new(config).await.expect("Manager creation should succeed");
+        let manager = WalManager::new(config).await.expect("Manager creation should succeed");
         
         // Add records to force rotation
         let mut records = Vec::new();
@@ -405,7 +405,7 @@ mod wal_manager_tests {
         let segment_files: Vec<_> = std::fs::read_dir(&partition_dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "log"))
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
             .collect();
         
         // Should have rotated at least once, so multiple segments
@@ -416,7 +416,7 @@ mod wal_manager_tests {
     async fn test_manager_flush_all() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = create_test_config(&temp_dir);
-        let mut manager = WalManager::new(config).await.expect("Manager creation should succeed");
+        let manager = WalManager::new(config).await.expect("Manager creation should succeed");
         
         // Add records to multiple partitions
         let partitions = vec![("topic1", 0), ("topic1", 1), ("topic2", 0)];
@@ -435,7 +435,7 @@ mod wal_manager_tests {
             let segment_files: Vec<_> = std::fs::read_dir(&partition_dir)
                 .unwrap()
                 .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "log"))
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
                 .collect();
             
             assert!(!segment_files.is_empty(), "Should have segment files for {}-{}", topic, partition);
@@ -468,7 +468,7 @@ mod wal_manager_tests {
         
         // First manager: create some data
         {
-            let mut manager1 = WalManager::new(config.clone()).await.expect("First manager creation should succeed");
+            let manager1 = WalManager::new(config.clone()).await.expect("First manager creation should succeed");
             
             let records = vec![
                 create_test_record(0, Some("recovery-key1"), "recovery-value1"),
@@ -609,7 +609,7 @@ mod integration_edge_cases {
             let manager_clone = Arc::clone(&manager);
             let handle = tokio::spawn(async move {
                 let records = vec![create_test_record(i * 100, Some(&format!("concurrent-key-{}", i)), &format!("concurrent-value-{}", i))];
-                let mut mgr = manager_clone.lock().await;
+                let mgr = manager_clone.lock().await;
                 mgr.append("concurrent-topic".to_string(), 0, records).await
             });
             handles.push(handle);
@@ -628,7 +628,7 @@ mod integration_edge_cases {
     async fn test_append_empty_records_list() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = create_test_config(&temp_dir);
-        let mut manager = WalManager::new(config).await.expect("Manager creation should succeed");
+        let manager = WalManager::new(config).await.expect("Manager creation should succeed");
         
         // Append empty list - should succeed but do nothing
         manager.append("empty-topic".to_string(), 0, vec![]).await

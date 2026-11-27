@@ -159,7 +159,7 @@ impl Reporter for CsvReporter {
         let mut writer = Writer::from_writer(file);
 
         // Write header
-        writer.write_record(&[
+        writer.write_record([
             "timestamp",
             "mode",
             "duration_secs",

@@ -302,7 +302,7 @@ async fn convert_one(
         let _ = store.put(&term_filter_key(new_key), bytes::Bytes::from(f.to_bytes())).await;
     }
     let replacement = SegmentMetadata { object_store_path: new_key.to_string(), size_bytes, ..seg.clone() };
-    if !index.replace_segments(&[seg.segment_id.clone()], replacement).await? {
+    if !index.replace_segments(std::slice::from_ref(&seg.segment_id), replacement).await? {
         let _ = store.delete(new_key).await;
         let _ = store.delete(&term_filter_key(new_key)).await;
         return Ok(false);

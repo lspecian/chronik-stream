@@ -30,18 +30,15 @@ impl GeoPoint {
 
 /// Distance calculation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum DistanceType {
     /// Great circle distance (accurate)
+    #[default]
     Arc,
     /// Euclidean distance (faster, less accurate)
     Plane,
 }
 
-impl Default for DistanceType {
-    fn default() -> Self {
-        Self::Arc
-    }
-}
 
 /// Bounding box for geo queries
 #[derive(Debug, Clone)]

@@ -2820,12 +2820,11 @@ fn query_has_nested_dedup(
                         return ControlFlow::Break(());
                     }
                 }
-                SetExpr::SetOperation { set_quantifier, .. } => {
-                    if !matches!(set_quantifier, SetQuantifier::All) {
+                SetExpr::SetOperation { set_quantifier, .. }
+                    if !matches!(set_quantifier, SetQuantifier::All) => {
                         self.found = true;
                         return ControlFlow::Break(());
                     }
-                }
                 _ => {}
             }
             ControlFlow::Continue(())
@@ -6951,7 +6950,7 @@ mod staging_type_tests {
     #[test]
     fn a_number_too_large_for_i64_survives_as_a_float() {
         let big = serde_json::json!(u64::MAX);
-        assert_eq!(kind(&[big.clone()]).0, DataType::Float64);
+        assert_eq!(kind(std::slice::from_ref(&big)).0, DataType::Float64);
         assert!(
             big.as_f64().is_some(),
             "and the staged array can read it back"

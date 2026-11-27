@@ -147,8 +147,8 @@ mod tests {
         let mut decoder = Decoder::new(&mut bytes_clone);
 
         // v0 has no include flags
-        assert_eq!(RequestParser::parse_include_synonyms(&mut decoder, 0).unwrap(), false);
-        assert_eq!(RequestParser::parse_include_documentation(&mut decoder, 0).unwrap(), false);
+        assert!(!RequestParser::parse_include_synonyms(&mut decoder, 0).unwrap());
+        assert!(!RequestParser::parse_include_documentation(&mut decoder, 0).unwrap());
     }
 
     #[test]
@@ -163,8 +163,8 @@ mod tests {
         let mut bytes_clone = bytes.clone();
         let mut decoder = Decoder::new(&mut bytes_clone);
 
-        assert_eq!(RequestParser::parse_include_synonyms(&mut decoder, 1).unwrap(), true);
-        assert_eq!(RequestParser::parse_include_documentation(&mut decoder, 1).unwrap(), false);
+        assert!(RequestParser::parse_include_synonyms(&mut decoder, 1).unwrap());
+        assert!(!RequestParser::parse_include_documentation(&mut decoder, 1).unwrap());
     }
 
     #[test]
@@ -180,8 +180,8 @@ mod tests {
         let mut bytes_clone = bytes.clone();
         let mut decoder = Decoder::new(&mut bytes_clone);
 
-        assert_eq!(RequestParser::parse_include_synonyms(&mut decoder, 3).unwrap(), true);
-        assert_eq!(RequestParser::parse_include_documentation(&mut decoder, 3).unwrap(), false);
+        assert!(RequestParser::parse_include_synonyms(&mut decoder, 3).unwrap());
+        assert!(!RequestParser::parse_include_documentation(&mut decoder, 3).unwrap());
     }
 
     #[test]

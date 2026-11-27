@@ -688,8 +688,8 @@ impl ObjectStore for S3Backend {
         let response = self.get(key).await?;
         
         use tokio::io::AsyncWriteExt;
-        writer.write_all(&response).await.map_err(|e| ObjectStoreError::Io(e))?;
-        writer.flush().await.map_err(|e| ObjectStoreError::Io(e))?;
+        writer.write_all(&response).await.map_err(ObjectStoreError::Io)?;
+        writer.flush().await.map_err(ObjectStoreError::Io)?;
         
         Ok(response.len() as u64)
     }
@@ -704,7 +704,7 @@ impl ObjectStore for S3Backend {
         use tokio::io::AsyncReadExt;
         
         let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await.map_err(|e| ObjectStoreError::Io(e))?;
+        reader.read_to_end(&mut buffer).await.map_err(ObjectStoreError::Io)?;
         
         self.put(key, Bytes::from(buffer)).await
     }

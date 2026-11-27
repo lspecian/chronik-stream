@@ -714,7 +714,7 @@ impl ProtocolCodec {
         }
         
         // Cluster authorized operations (v8+)
-        if version >= 8 && version < 10 {
+        if (8..10).contains(&version) {
             buf.put_i32(-2147483648); // INT32_MIN = no auth operations
         }
         

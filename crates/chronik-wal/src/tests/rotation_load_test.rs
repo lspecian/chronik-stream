@@ -195,7 +195,7 @@ async fn collect_segment_info(data_dir: &std::path::Path, topic: &str, partition
     
     while let Some(entry) = dir_entries.next_entry().await? {
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "log") {
+        if path.extension().is_some_and(|ext| ext == "log") {
             if let Some(file_name) = path.file_stem().and_then(|n| n.to_str()) {
                 // Filename format is wal_{partition}_{segment_id}.log — see
                 // GroupCommitWal::segment_path in group_commit.rs. Capture group 1
@@ -221,7 +221,7 @@ async fn collect_segment_info(data_dir: &std::path::Path, topic: &str, partition
     }
     
     // Sort by segment ID
-    segments.sort_by(|a, b| a.0.cmp(&b.0));
+    segments.sort_by_key(|a| a.0);
     Ok(segments)
 }
 
@@ -233,7 +233,7 @@ async fn test_rotation_load_single_partition() {
     
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, SEGMENT_SIZE_KB);
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     let mut metrics = PerformanceMetrics::new();
     metrics.start_timer();
@@ -365,7 +365,7 @@ async fn test_rotation_load_multiple_partitions() {
                 }
                 
                 {
-                    let mut mgr = manager_clone.lock().await;
+                    let mgr = manager_clone.lock().await;
                     mgr.append("multi-test-topic".to_string(), partition, batch_records).await
                         .expect("Batch append should succeed");
                 }
@@ -456,7 +456,7 @@ async fn test_rotation_under_memory_pressure() {
     
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, SEGMENT_SIZE_KB);
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     let mut metrics = PerformanceMetrics::new();
     metrics.start_timer();
@@ -565,7 +565,7 @@ async fn test_rotation_data_integrity() {
     
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, SEGMENT_SIZE_KB);
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     println!("Starting data integrity test with checksums and verification...");
     
@@ -636,7 +636,7 @@ async fn test_rotation_performance_benchmarks() {
     
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, SEGMENT_SIZE_KB);
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     println!("Starting performance benchmark test...");
     
@@ -726,7 +726,7 @@ async fn test_rotation_performance_benchmarks() {
 async fn test_rotation_edge_cases() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = create_load_test_config(&temp_dir, 128); // Very small 128KB segments
-    let mut manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
+    let manager = WalManager::new(config.clone()).await.expect("Manager creation should succeed");
     
     println!("Testing rotation edge cases...");
     

@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use chronik_common::Result;
 
 pub mod error_codes {

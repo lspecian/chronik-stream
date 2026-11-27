@@ -462,7 +462,7 @@ impl CanonicalRecord {
 
         let crc = cursor.get_u32_le(); // CRC is little-endian
         let attributes = cursor.get_u16();
-        let last_offset_delta = cursor.get_i32();
+        let _last_offset_delta = cursor.get_i32();
         let base_timestamp = cursor.get_i64();
         let max_timestamp = cursor.get_i64();
         let producer_id = cursor.get_i64();
@@ -813,7 +813,7 @@ impl CanonicalRecord {
     ///
     /// Updated v1 MessageSet with offsets matching self.records[].offset values
     fn update_v1_messageset_offsets(&self, v1_bytes: &[u8]) -> Result<Vec<u8>> {
-        use byteorder::{BigEndian, WriteBytesExt};
+        
 
         let mut updated = v1_bytes.to_vec();
         let mut cursor_pos = 0;

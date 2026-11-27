@@ -4,7 +4,6 @@
 //! Handles generation ID and member epoch validation.
 
 use crate::consumer_group::{ConsumerGroup, SyncGroupResponse};
-use chronik_common::Result;
 
 /// SyncGroup validator
 ///
@@ -68,7 +67,7 @@ impl SyncValidator {
 mod tests {
     use super::*;
     use crate::consumer_group::ConsumerGroup;
-    use std::collections::{HashMap, HashSet};
+    
 
     #[test]
     fn test_validate_generation_success() {

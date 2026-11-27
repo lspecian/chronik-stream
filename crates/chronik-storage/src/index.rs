@@ -145,7 +145,7 @@ impl IndexBuilder {
             }
             JsonValue::Bool(b) => {
                 let field = self.get_or_create_text_field(prefix)?;
-                doc.add_text(field, &b.to_string());
+                doc.add_text(field, b.to_string());
             }
             JsonValue::Array(arr) => {
                 // For arrays, concatenate values
@@ -159,7 +159,7 @@ impl IndexBuilder {
                     .collect();
                 if !values.is_empty() {
                     let field = self.get_or_create_text_field(prefix)?;
-                    doc.add_text(field, &values.join(" "));
+                    doc.add_text(field, values.join(" "));
                 }
             }
             JsonValue::Null => {
@@ -225,8 +225,7 @@ impl IndexBuilder {
     pub fn doc_count(&mut self) -> usize {
         self.index_writer.commit().ok();
         self.index.reader()
-            .ok()
-            .and_then(|reader| Some(reader.searcher().num_docs() as usize))
+            .ok().map(|reader| reader.searcher().num_docs() as usize)
             .unwrap_or(0)
     }
 }

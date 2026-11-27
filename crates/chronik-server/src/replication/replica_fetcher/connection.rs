@@ -27,7 +27,7 @@ use chronik_protocol::parser::Decoder;
 
 use super::protocol::{
     decode_fetch_response, encode_epoch_request_header, encode_fetch_request, frame_request,
-    FetchRequestSpec, FetchResponseFrame, OFFSET_FOR_LEADER_EPOCH_API_VERSION,
+    FetchRequestSpec, FetchResponseFrame,
 };
 
 /// Ceiling on a response frame, independent of what the leader claims. A

@@ -6,8 +6,10 @@ use std::path::PathBuf;
 /// Authentication configuration for different backends
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AuthConfig {
     /// No authentication required (local storage)
+    #[default]
     None,
     
     /// S3 authentication
@@ -136,11 +138,6 @@ pub enum AzureCredentials {
     AzureCli,
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self {
-        AuthConfig::None
-    }
-}
 
 impl S3Credentials {
     /// Create access key credentials
@@ -288,11 +285,10 @@ impl AuthValidation for S3Credentials {
                     return Err("Role ARN cannot be empty".to_string());
                 }
             }
-            S3Credentials::Sso { start_url, region, account_id, role_name } => {
-                if start_url.is_empty() || region.is_empty() || account_id.is_empty() || role_name.is_empty() {
+            S3Credentials::Sso { start_url, region, account_id, role_name }
+                if (start_url.is_empty() || region.is_empty() || account_id.is_empty() || role_name.is_empty()) => {
                     return Err("All SSO fields must be non-empty".to_string());
                 }
-            }
             _ => {}
         }
         Ok(())
@@ -323,11 +319,10 @@ impl AuthValidation for GcsCredentials {
                     return Err("Service account cannot be empty".to_string());
                 }
             }
-            GcsCredentials::ServiceAccount { client_email, private_key, .. } => {
-                if client_email.is_empty() || private_key.is_empty() {
+            GcsCredentials::ServiceAccount { client_email, private_key, .. }
+                if (client_email.is_empty() || private_key.is_empty()) => {
                     return Err("Client email and private key cannot be empty".to_string());
                 }
-            }
             _ => {}
         }
         Ok(())
@@ -363,11 +358,10 @@ impl AuthValidation for AzureCredentials {
                     return Err("Account name and SAS token cannot be empty".to_string());
                 }
             }
-            AzureCredentials::ServicePrincipal { tenant_id, client_id, client_secret } => {
-                if tenant_id.is_empty() || client_id.is_empty() || client_secret.is_empty() {
+            AzureCredentials::ServicePrincipal { tenant_id, client_id, client_secret }
+                if (tenant_id.is_empty() || client_id.is_empty() || client_secret.is_empty()) => {
                     return Err("Tenant ID, client ID, and client secret cannot be empty".to_string());
                 }
-            }
             _ => {}
         }
         Ok(())

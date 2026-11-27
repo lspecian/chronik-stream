@@ -20,8 +20,7 @@ use chronik_common::metadata::catalog::{
     IsrUpdate, OffsetCommitEntry, FEATURE_GROUP_OFFSETS, FEATURE_GROUP_OFFSETS_MIRROR,
 };
 use chronik_common::metadata::{
-    AclBindingRecord, BrokerMetadata, BrokerStatus, ConsumerGroupMetadata, ConsumerOffset, MetadataError,
-    MetadataEvent, MetadataStore, ParquetSegmentMetadata, PartitionAssignment, Result, ScramCredentialRecord,
+    AclBindingRecord, BrokerMetadata, BrokerStatus, ConsumerGroupMetadata, ConsumerOffset, MetadataError, MetadataStore, ParquetSegmentMetadata, PartitionAssignment, Result, ScramCredentialRecord,
     SegmentMetadata, TopicConfig, TopicMetadata, TransactionMetadata, WalMetadataStore,
 };
 use tokio::sync::watch;
@@ -799,6 +798,37 @@ impl MetadataStore for CatalogMetadataStore {
     }
 }
 
+/// Group and transaction coordination from the catalog: off until
+/// [`FEATURE_GROUP_OFFSETS`] is enabled; then the catalog leader coordinates.
+pub struct CatalogCoordination {
+    catalog: Arc<ClusterCatalog>,
+}
+
+impl CatalogCoordination {
+    pub fn new(catalog: Arc<ClusterCatalog>) -> Self {
+        Self { catalog }
+    }
+}
+
+impl crate::consumer_group::Coordination for CatalogCoordination {
+    fn is_local(&self) -> Option<bool> {
+        if !self.catalog.read().has_feature(FEATURE_GROUP_OFFSETS) {
+            return None;
+        }
+        Some(self.catalog.am_i_leader())
+    }
+
+    fn coordinator(&self) -> Option<(i32, String, i32)> {
+        if !self.catalog.read().has_feature(FEATURE_GROUP_OFFSETS) {
+            return None;
+        }
+        let leader = self.catalog.leader_id()?;
+        let state = self.catalog.read();
+        let broker = state.broker(leader as i32)?;
+        Some((broker.broker_id, broker.host.clone(), broker.port))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,36 +1145,5 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "catalogs did not converge: {:?}", views.iter().map(|v| v.len()).collect::<Vec<_>>());
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
-}
-
-/// Group and transaction coordination from the catalog: off until
-/// [`FEATURE_GROUP_OFFSETS`] is enabled; then the catalog leader coordinates.
-pub struct CatalogCoordination {
-    catalog: Arc<ClusterCatalog>,
-}
-
-impl CatalogCoordination {
-    pub fn new(catalog: Arc<ClusterCatalog>) -> Self {
-        Self { catalog }
-    }
-}
-
-impl crate::consumer_group::Coordination for CatalogCoordination {
-    fn is_local(&self) -> Option<bool> {
-        if !self.catalog.read().has_feature(FEATURE_GROUP_OFFSETS) {
-            return None;
-        }
-        Some(self.catalog.am_i_leader())
-    }
-
-    fn coordinator(&self) -> Option<(i32, String, i32)> {
-        if !self.catalog.read().has_feature(FEATURE_GROUP_OFFSETS) {
-            return None;
-        }
-        let leader = self.catalog.leader_id()?;
-        let state = self.catalog.read();
-        let broker = state.broker(leader as i32)?;
-        Some((broker.broker_id, broker.host.clone(), broker.port))
     }
 }

@@ -1,7 +1,7 @@
 // DescribeLogDirs API types for Kafka protocol
 // API key 35, version 0-4
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use chronik_common::Result;
 use serde::{Deserialize, Serialize};
 

@@ -535,7 +535,7 @@ impl TailCache {
         if self
             .records
             .back()
-            .map_or(true, |b| b.get_last_offset() + 1 == base)
+            .is_none_or(|b| b.get_last_offset() + 1 == base)
         {
             if self.records.is_empty() {
                 self.contiguous_from = Some(base);

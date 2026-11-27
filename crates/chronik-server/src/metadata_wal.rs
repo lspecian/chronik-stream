@@ -637,7 +637,7 @@ mod tests {
     async fn compaction_keeps_the_state_and_drops_the_covered_segments() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let (wal, store) = open(dir.path()).await;
+            let (_wal, store) = open(dir.path()).await;
             for i in 0..200 {
                 commit(&store, i % 4, i as i64).await;
             }

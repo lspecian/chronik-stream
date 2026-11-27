@@ -12,7 +12,7 @@
 use anyhow::{Result, Context};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug, warn};
 
 use crate::IntegratedServerConfig;
 use crate::IntegratedKafkaServer;
@@ -31,7 +31,6 @@ use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig, ProduceFlushP
 use crate::wal_integration::WalProduceHandler;
 use crate::fetch_handler::FetchHandler;
 use crate::kafka_handler::KafkaProtocolHandler;
-use std::sync::atomic::Ordering;
 
 /// Builder for IntegratedKafkaServer with staged initialization
 ///
@@ -339,7 +338,7 @@ impl IntegratedKafkaServerBuilder {
 
         // Convert common MetadataEvent to server MetadataEvent
         let server_event = match &common_event.payload {
-            MetadataEventPayload::TopicCreated { name, config, auto_created } => {
+            MetadataEventPayload::TopicCreated { name, config, auto_created: _ } => {
                 Some(ServerEvent::TopicCreated {
                     topic: name.clone(),
                     num_partitions: config.partition_count as i32,
@@ -1731,7 +1730,7 @@ impl IntegratedKafkaServerBuilder {
                 wal_indexer: wal_indexer.clone(),
                 produce,
                 hot: self.hot_text_index.clone(),
-                node_id: self.config.node_id as i32,
+                node_id: self.config.node_id,
             });
         }
 

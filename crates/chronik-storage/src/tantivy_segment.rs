@@ -1,12 +1,11 @@
 //! Tantivy-based segment storage for CanonicalRecord (Tantivy 0.24 API).
 
-use crate::canonical_record::{CanonicalRecord, CanonicalRecordEntry, RecordHeader, CompressionType, TimestampType};
-use crate::object_store::{ObjectStore, PutOptions};
+use crate::canonical_record::{CanonicalRecord, CanonicalRecordEntry, RecordHeader, CompressionType};
+use crate::object_store::ObjectStore;
 use crate::text_analysis;
 use chronik_common::{Result, Error};
 use tantivy::{
-    doc, schema::*, Index, IndexWriter, IndexReader,
-    collector::TopDocs, query::RangeQuery, Term,
+    doc, schema::*, Index, IndexWriter, IndexReader, query::RangeQuery, Term,
     DateTime as TantivyDateTime, TantivyDocument,
 };
 use serde::{Serialize, Deserialize};
@@ -16,8 +15,6 @@ use std::fs::{self, File};
 use std::io::{Write, Read};
 use std::sync::Arc;
 use bytes::Bytes;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use flate2::read::GzDecoder;
 
 /// Tantivy schema fields for storing CanonicalRecord
@@ -263,7 +260,7 @@ impl TantivySegmentWriter {
             if let Some(ref v) = record.value {
                 doc.add_bytes(self.schema_fields.value, v);
                 // Tokenized, searchable copy for full-text `/_search`.
-                doc.add_text(self.schema_fields.value_text, &String::from_utf8_lossy(v));
+                doc.add_text(self.schema_fields.value_text, String::from_utf8_lossy(v));
                 add_json_document(&mut doc, self.schema_fields.json, v);
             }
 
@@ -285,8 +282,8 @@ impl TantivySegmentWriter {
 
             doc.add_bool(self.schema_fields.is_transactional, canonical.is_transactional);
             doc.add_bool(self.schema_fields.is_control, canonical.is_control);
-            doc.add_u64(self.schema_fields.compression, canonical.compression.clone() as u64);
-            doc.add_u64(self.schema_fields.timestamp_type, canonical.timestamp_type.clone() as u64);
+            doc.add_u64(self.schema_fields.compression, canonical.compression as u64);
+            doc.add_u64(self.schema_fields.timestamp_type, canonical.timestamp_type as u64);
 
             self.writer.add_document(doc)
                 .map_err(|e| Error::Internal(format!("Failed to add document: {}", e)))?;
@@ -881,6 +878,7 @@ impl TantivySegmentReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical_record::TimestampType;
 
     /// A byte flipped inside an index file of an archive is caught by
     /// `verify`; the intact archive passes.
@@ -1096,7 +1094,7 @@ mod tests {
             let mut writer = TantivySegmentWriter::new_in_ram("test-topic".to_string(), 0, 0).unwrap();
 
             let mut canonical = create_test_canonical_record(0, 5);
-            canonical.compression = compression.clone();
+            canonical.compression = *compression;
 
             writer.write_batch(&canonical).unwrap();
             let (_index, metadata) = writer.commit().unwrap();
@@ -1303,7 +1301,7 @@ mod tests {
         let canonical = create_test_canonical_record(0, 50);
 
         writer.write_batch(&canonical).unwrap();
-        let (tar_gz_path, metadata) = writer.commit_and_serialize(&output_dir).unwrap();
+        let (tar_gz_path, _metadata) = writer.commit_and_serialize(&output_dir).unwrap();
 
         // Verify tar.gz file exists
         assert!(tar_gz_path.exists());
@@ -1451,6 +1449,7 @@ mod tests {
 #[cfg(test)]
 mod archive_tests {
     use super::*;
+    use flate2::Compression;
 
     fn metadata_file(dir: &Path) -> PathBuf {
         let path = dir.join("metadata.json");

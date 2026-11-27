@@ -13,8 +13,8 @@
 //! - Object store (cold data, hours to days, archived)
 
 use crate::{
-    canonical_record::{CanonicalRecord, CanonicalRecordEntry, TimestampType, RecordHeader},
-    tantivy_segment::{TantivySegmentWriter, SegmentMetadata},
+    canonical_record::{CanonicalRecord, CanonicalRecordEntry, TimestampType},
+    tantivy_segment::TantivySegmentWriter,
     object_store::{ObjectStore, ObjectStoreConfig},
     segment_index::{SegmentIndex, SegmentMetadata as SegmentIndexMetadata, ParquetSegmentMetadata},
 };
@@ -28,7 +28,6 @@ use chronik_columnar::{
     PartitioningStrategy,
     converter::{RecordBatchConverter, KafkaRecord},
     json_schema::InferredJsonSchema,
-    schema::kafka_message_schema,
     HotDataBuffer,
     VectorIndexManager, VectorIndexConfig, HnswIndexConfig, EmbeddingPipeline,
 };

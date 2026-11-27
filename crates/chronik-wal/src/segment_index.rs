@@ -340,7 +340,7 @@ impl PartitionIndex {
         let partition = self.partition;
         let listing = tokio::task::spawn_blocking(move || list_segments(&dir, partition))
             .await
-            .map_err(|e| WalError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|e| WalError::Io(std::io::Error::other(e)))?
             .map_err(|_| {
                 WalError::SegmentNotFound(format!("{:?}/{}", self.dir, self.partition))
             })?;

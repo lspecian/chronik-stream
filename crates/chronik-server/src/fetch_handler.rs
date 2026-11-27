@@ -4,14 +4,12 @@ use chronik_common::{Result, Error};
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_monitoring::MetricsRecorder;
 use chronik_protocol::{FetchRequest, FetchResponse, FetchResponseTopic, FetchResponsePartition};
-use chronik_storage::{SegmentReader, RecordBatch, Record, Segment, ObjectStoreTrait, SegmentIndex};
-use chronik_storage::kafka_records::{KafkaRecordBatch, KafkaRecord, RecordHeader as KafkaRecordHeader, CompressionType};
+use chronik_storage::{SegmentReader, Segment, ObjectStoreTrait, SegmentIndex};
+use chronik_storage::kafka_records::{KafkaRecordBatch, RecordHeader as KafkaRecordHeader, CompressionType};
 use chronik_storage::tantivy_segment::TantivySegmentReader;
-use chronik_storage::canonical_record::CanonicalRecord;
-use chronik_wal::{WalManager, WalRecord};
+use chronik_wal::WalManager;
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -269,12 +267,11 @@ impl FetchHandler {
         let first_serve = started.elapsed();
         let mut waited = Duration::ZERO;
 
-        if request.max_wait_ms > 0 && !any_records(&response_topics) {
-            if self.wait_for_any_partition(&request, wait_deadline).await {
+        if request.max_wait_ms > 0 && !any_records(&response_topics)
+            && self.wait_for_any_partition(&request, wait_deadline).await {
                 waited = started.elapsed() - first_serve;
                 response_topics = self.serve_all_partitions(&request).await?;
             }
-        }
 
         // A replica fetch's cost is the floor on `acks=all` latency and the cap
         // on its throughput: the producer cannot be acknowledged until the
@@ -283,7 +280,7 @@ impl FetchHandler {
         // split it here into the part spent serving and the part spent parked.
         if request.replica_id >= 0 {
             let n = REPLICA_FETCH_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 200 == 0 {
+            if n.is_multiple_of(200) {
                 debug!(
                     "replica fetch {} from node {}: serve {:?}, wait {:?}, total {:?}",
                     n,
@@ -740,13 +737,13 @@ impl FetchHandler {
             return leader_leo;
         };
 
-        let replicas: Vec<u64> = assignment.replicas.iter().map(|&id| id as u64).collect();
+        let replicas: Vec<u64> = assignment.replicas.to_vec();
         let watermark = tracker.replicated_watermark(
             topic,
             partition,
             leader_leo,
             &replicas,
-            assignment.leader_id as u64,
+            assignment.leader_id,
         );
 
         if watermark < leader_leo {
@@ -883,7 +880,7 @@ impl FetchHandler {
         high_watermark: i64,
         log_start_offset: i64,
         max_bytes: i32,
-        max_wait_ms: i32,
+        _max_wait_ms: i32,
         fetch_start: Instant,
     ) -> Result<FetchResponsePartition> {
         // v2.2.7.2: Log data available path
@@ -1786,7 +1783,7 @@ impl FetchHandler {
         );
 
         // PHASE 1: Try in-memory buffer first (fastest path - extracted helper)
-        let (mut records, mut bytes_fetched, buffer_highest_offset, buffer_min_offset) =
+        let (mut records, bytes_fetched, buffer_highest_offset, buffer_min_offset) =
             self.fetch_from_buffer(topic, partition, fetch_offset, high_watermark, max_bytes).await?;
 
         // If we got records from buffer, check if we need more from WAL/segments
@@ -1817,7 +1814,7 @@ impl FetchHandler {
         // starts above the fetch offset: that gap may be in the segment tier
         // (see `fetch_raw_bytes`). Asking whenever the buffer merely reached
         // higher sent nearly every fallback read to the archives.
-        let need_earlier_records = records.iter().map(|r| r.offset).min().map_or(true, |lowest| lowest > fetch_offset);
+        let need_earlier_records = records.iter().map(|r| r.offset).min().is_none_or(|lowest| lowest > fetch_offset);
 
         if records.is_empty() || need_earlier_records {
             records = self.try_fetch_from_s3_phase(

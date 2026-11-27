@@ -38,26 +38,22 @@ pub mod memory_types;
 pub mod ontology;
 
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::info;
 
 use chronik_columnar::{
-    ColumnarQueryEngine, HotDataBuffer, QueryEngineConfig, VectorIndexManager, VectorSearchService,
+    ColumnarQueryEngine, HotDataBuffer, VectorIndexManager,
 };
 use chronik_common::metadata::traits::MetadataStore;
 use chronik_storage::wal_indexer::WalIndexer;
 use chronik_embeddings::EmbeddingProvider;
 use chronik_embeddings::reranker::RerankerProvider;
 
-pub use sql_handler::{SqlHandler, SqlRequest, SqlResponse};
-pub use admin_handler::{create_admin_state, admin_router, create_admin_router_for_unified_api};
+pub use admin_handler::create_admin_router_for_unified_api;
 
 /// Unified API configuration
 #[derive(Debug, Clone)]
@@ -828,6 +824,51 @@ pub fn get_unified_api_port() -> u16 {
         .unwrap_or(6092)
 }
 
+/// Serve the Unified API over TLS.
+///
+/// Written against hyper directly because `axum::serve` has no TLS entry
+/// point and `axum-server` would introduce a second, incompatible rustls
+/// version alongside the one `crate::tls` already uses for the Kafka listener.
+///
+/// A failed handshake logs and drops that connection only: one client with a
+/// bad certificate must not take the API down for everyone else.
+async fn serve_https(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    app: Router,
+) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("Unified API accept failed: {}", e);
+                continue;
+            }
+        };
+
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("Unified API TLS handshake from {} failed: {}", peer, e);
+                    return;
+                }
+            };
+
+            let service = hyper_util::service::TowerToHyperService::new(app);
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), service)
+                .await
+            {
+                tracing::debug!("Unified API connection from {} ended: {}", peer, e);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,50 +1096,5 @@ mod tests {
         assert!(json.contains("\"status\":\"ok\""));
         assert!(json.contains("\"sql_enabled\":true"));
         assert!(json.contains("\"vector_enabled\":false"));
-    }
-}
-
-/// Serve the Unified API over TLS.
-///
-/// Written against hyper directly because `axum::serve` has no TLS entry
-/// point and `axum-server` would introduce a second, incompatible rustls
-/// version alongside the one `crate::tls` already uses for the Kafka listener.
-///
-/// A failed handshake logs and drops that connection only: one client with a
-/// bad certificate must not take the API down for everyone else.
-async fn serve_https(
-    listener: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    app: Router,
-) {
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!("Unified API accept failed: {}", e);
-                continue;
-            }
-        };
-
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::debug!("Unified API TLS handshake from {} failed: {}", peer, e);
-                    return;
-                }
-            };
-
-            let service = hyper_util::service::TowerToHyperService::new(app);
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), service)
-                .await
-            {
-                tracing::debug!("Unified API connection from {} ended: {}", peer, e);
-            }
-        });
     }
 }

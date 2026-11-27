@@ -130,7 +130,7 @@ impl SegmentHeader {
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
         
-        if &magic != CHRONIK_MAGIC {
+        if magic != CHRONIK_MAGIC {
             return Err(Error::InvalidSegment("Invalid magic number".into()));
         }
         
@@ -206,7 +206,7 @@ impl BloomFilter {
         let hash_count = Self::optimal_hash_count(bit_count, expected_items);
         
         Self {
-            bits: vec![0u8; (bit_count + 7) / 8],
+            bits: vec![0u8; bit_count.div_ceil(8)],
             hash_count,
             bit_count,
         }
@@ -476,18 +476,18 @@ impl ChronikSegment {
         }
         
         // Reserve space for header
-        let header_pos = writer.seek(SeekFrom::Current(0))?;
-        writer.write_all(&vec![0u8; SegmentHeader::SIZE])?;
+        let header_pos = writer.stream_position()?;
+        writer.write_all(&[0u8; SegmentHeader::SIZE])?;
         
         // Write metadata
-        let metadata_offset = writer.seek(SeekFrom::Current(0))?;
+        let metadata_offset = writer.stream_position()?;
         let metadata_data = bincode::serialize(&self.metadata)
             .map_err(|e| Error::Serialization(format!("Failed to serialize metadata: {}", e)))?;
         writer.write_all(&metadata_data)?;
         let metadata_size = metadata_data.len() as u64;
         
         // Write Kafka data with compression
-        let kafka_offset = writer.seek(SeekFrom::Current(0))?;
+        let kafka_offset = writer.stream_position()?;
         let kafka_data = bincode::serialize(&self.kafka_data)
             .map_err(|e| Error::Serialization(format!("Failed to serialize Kafka data: {}", e)))?;
         let kafka_uncompressed_size = kafka_data.len() as u64;
@@ -512,13 +512,13 @@ impl ChronikSegment {
         };
         
         // Write Tantivy index
-        let index_offset = writer.seek(SeekFrom::Current(0))?;
+        let index_offset = writer.stream_position()?;
         let index_data = self.serialize_tantivy_index()?;
         writer.write_all(&index_data)?;
         let index_size = index_data.len() as u64;
         
         // Write bloom filter
-        let bloom_offset = writer.seek(SeekFrom::Current(0))?;
+        let bloom_offset = writer.stream_position()?;
         let bloom_data = if let Some(bloom) = &self.bloom_filter {
             bincode::serialize(bloom)
                 .map_err(|e| Error::Serialization(format!("Failed to serialize bloom filter: {}", e)))?
@@ -529,7 +529,7 @@ impl ChronikSegment {
         let bloom_size = bloom_data.len() as u64;
         
         // Calculate checksum using streaming approach
-        let end_pos = writer.seek(SeekFrom::Current(0))?;
+        let end_pos = writer.stream_position()?;
         
         // Calculate checksum of all data sections (using compressed data)
         let mut checksum_calculator = StreamingChecksum::new();

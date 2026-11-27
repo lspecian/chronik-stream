@@ -12,22 +12,19 @@ use tracing::{debug, warn, error};
 
 /// Checksum verification mode
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum ChecksumMode {
     /// Skip checksum verification (fast but unsafe)
     Skip,
     /// Verify checksum and log warning on mismatch
     Warn,
     /// Verify checksum and fail on mismatch (default)
+    #[default]
     Strict,
     /// Try to repair checksum if mismatched
     Repair,
 }
 
-impl Default for ChecksumMode {
-    fn default() -> Self {
-        ChecksumMode::Strict
-    }
-}
 
 /// Checksum calculator for streaming data
 pub struct StreamingChecksum {

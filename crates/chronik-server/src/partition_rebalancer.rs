@@ -314,12 +314,12 @@ impl PartitionRebalancer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_calculate_assignments_basic() {
         // Mock rebalancer (only need calculate_assignments method)
-        let nodes = vec![1, 2, 3];
+        let nodes = [1, 2, 3];
         let partition_count = 6;
         let replication_factor = 3;
 
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_calculate_assignments_4_nodes() {
-        let nodes = vec![1, 2, 3, 4];
+        let nodes = [1, 2, 3, 4];
         let partition_count = 4;
         let replication_factor = 3;
 
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn test_calculate_assignments_rf_exceeds_nodes() {
         // Replication factor > node count
-        let nodes = vec![1, 2];
+        let nodes = [1, 2];
         let partition_count = 3;
         let replication_factor = 3;
 

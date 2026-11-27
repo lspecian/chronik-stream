@@ -48,10 +48,6 @@ pub struct ConsumerGroupState {
     pub groups: HashMap<String, ConsumerGroup>,
 }
 
-use crate::types::{
-    ConfigEntry, ConfigSynonym, config_source, config_type,
-    DescribeConfigsResponse
-};
 
 /// Response for an API request
 pub struct Response {
@@ -737,7 +733,7 @@ impl ProtocolHandler {
             if count < 0 { 0 } else { count as usize }
         } else {
             let count = decoder.read_i32()?;
-            if count < 0 || count > 10000 {
+            if !(0..=10000).contains(&count) {
                 return Err(Error::Protocol(format!("Invalid topic count: {}", count)));
             }
             count as usize
@@ -757,7 +753,7 @@ impl ProtocolHandler {
                 if count < 0 { 0 } else { count as usize }
             } else {
                 let count = decoder.read_i32()?;
-                if count < 0 || count > 10000 {
+                if !(0..=10000).contains(&count) {
                     return Err(Error::Protocol(format!("Invalid partition count: {}", count)));
                 }
                 count as usize
@@ -1815,8 +1811,8 @@ impl ProtocolHandler {
     }
     
     /// Parse ApiVersions request
-    fn parse_api_versions_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<ApiVersionsRequest> {
-        use crate::parser::Decoder;
+    fn parse_api_versions_request(&self, header: &RequestHeader, _body: &mut Bytes) -> Result<ApiVersionsRequest> {
+        
 
         let (client_software_name, client_software_version) = if header.api_version >= 3 {
             // For v3+, just ignore the body completely since fields are "ignorable"
@@ -1969,7 +1965,7 @@ impl ProtocolHandler {
             // v4+: error_code, api_versions, throttle_time_ms, tagged_fields
 
             // Write throttle_time_ms FIRST for v1-2 only
-            if version >= 1 && version <= 2 {
+            if (1..=2).contains(&version) {
                 encoder.write_i32(response.throttle_time_ms);
             }
 
@@ -1983,7 +1979,7 @@ impl ProtocolHandler {
                 let array_len = (response.api_versions.len() + 1) as u32;
                 encoder.write_unsigned_varint(array_len);
 
-                for (i, api) in response.api_versions.iter().enumerate() {
+                for api in response.api_versions.iter() {
                     // CRITICAL: librdkafka compatibility issue
                     // Kafka spec says v3+ uses INT8 for min/max, but librdkafka v2.11.1
                     // seems to expect INT16. Let's try INT16 for compatibility.
@@ -2302,7 +2298,7 @@ impl ProtocolHandler {
                     tracing::debug!("Partition tagged fields: {}", tag_count);
                     // Skip any tagged fields
                     for _ in 0..tag_count {
-                        let tag_id = decoder.read_unsigned_varint()?;
+                        let _tag_id = decoder.read_unsigned_varint()?;
                         let tag_size = decoder.read_unsigned_varint()? as usize;
                         decoder.advance(tag_size)?;
                     }
@@ -2315,7 +2311,7 @@ impl ProtocolHandler {
                 tracing::debug!("Topic tagged fields: {}", tag_count);
                 // Skip any tagged fields
                 for _ in 0..tag_count {
-                    let tag_id = decoder.read_unsigned_varint()?;
+                    let _tag_id = decoder.read_unsigned_varint()?;
                     let tag_size = decoder.read_unsigned_varint()? as usize;
                     decoder.advance(tag_size)?;
                 }
@@ -2333,7 +2329,7 @@ impl ProtocolHandler {
             tracing::debug!("Request tagged fields: {}", tag_count);
             // Skip any tagged fields
             for _ in 0..tag_count {
-                let tag_id = decoder.read_unsigned_varint()?;
+                let _tag_id = decoder.read_unsigned_varint()?;
                 let tag_size = decoder.read_unsigned_varint()? as usize;
                 decoder.advance(tag_size)?;
             }
@@ -2540,7 +2536,7 @@ impl ProtocolHandler {
 
         // Use real SASL authenticator
         let mut sasl = self.sasl_authenticator.lock().await;
-        let handshake_result = sasl.handle_handshake(header.api_version, &[mechanism.clone()]);
+        let handshake_result = sasl.handle_handshake(header.api_version, std::slice::from_ref(&mechanism));
 
         let response = match handshake_result {
             Ok(sasl_response) => {
@@ -2787,7 +2783,7 @@ impl ProtocolHandler {
             // Try to get filesystem stats
             #[cfg(unix)]
             {
-                use std::os::unix::fs::MetadataExt;
+                
                 let total = metadata.len() as i64;
                 // On Unix, we can get more accurate disk space info
                 // For now, use a simple heuristic
@@ -2849,20 +2845,17 @@ impl ProtocolHandler {
 
                             // Get all partitions for this topic
                             for partition_idx in 0..topic_meta.config.partition_count {
-                                match metadata_store.list_segments(&topic_meta.name, Some(partition_idx as u32)).await {
-                                    Ok(segments) => {
-                                        let total_size: i64 = segments.iter()
-                                            .map(|s| (s.end_offset - s.start_offset + 1) * 1024) // Estimate 1KB per record
-                                            .sum();
+                                if let Ok(segments) = metadata_store.list_segments(&topic_meta.name, Some(partition_idx)).await {
+                                    let total_size: i64 = segments.iter()
+                                        .map(|s| (s.end_offset - s.start_offset + 1) * 1024) // Estimate 1KB per record
+                                        .sum();
 
-                                        partitions_result.push(DescribeLogDirsPartitionResult {
-                                            partition: partition_idx as i32,
-                                            size: total_size,
-                                            offset_lag: 0,
-                                            is_future_key: false,
-                                        });
-                                    }
-                                    Err(_) => {}
+                                    partitions_result.push(DescribeLogDirsPartitionResult {
+                                        partition: partition_idx as i32,
+                                        size: total_size,
+                                        offset_lag: 0,
+                                        is_future_key: false,
+                                    });
                                 }
                             }
 
@@ -4701,7 +4694,7 @@ impl ProtocolHandler {
 
         // Check if we know about this group
         let group_state = self.consumer_groups.lock().await;
-        let group_exists = group_state.groups.contains_key(&request.key);
+        let _group_exists = group_state.groups.contains_key(&request.key);
         drop(group_state);
 
         // Return appropriate response based on group existence
@@ -5242,7 +5235,7 @@ impl ProtocolHandler {
                 JoinGroupResponseMember {
                     member_id: m.member_id.clone(),
                     group_instance_id: m.group_instance_id.clone(),
-                    metadata: m.metadata.clone().map(Bytes::from).unwrap_or_else(|| Bytes::new()),
+                    metadata: m.metadata.clone().map(Bytes::from).unwrap_or_else(Bytes::new),
                 }
             }).collect()
         } else {
@@ -5773,7 +5766,7 @@ impl ProtocolHandler {
                     // This is a limitation - we might need to enhance the metadata store API
                     // For now, try common partition numbers (0-31)
                     let topic_offsets = offsets_map.entry(topic_name.clone())
-                        .or_insert_with(HashMap::new);
+                        .or_default();
 
                     for partition in 0..32 {
                         match metadata_store.get_consumer_offset(&request.group_id, topic_name, partition).await {
@@ -5814,7 +5807,7 @@ impl ProtocolHandler {
 
                     if include_topic {
                         let topic_map = offsets_map.entry(topic_name.clone())
-                            .or_insert_with(HashMap::new);
+                            .or_default();
                         for (partition_id, offset_info) in topic_offsets {
                             topic_map.insert(*partition_id, (offset_info.offset, offset_info.metadata.clone()));
                         }

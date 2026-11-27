@@ -3,24 +3,17 @@
 //! This module properly integrates the complete, production-ready implementation
 //! from chronik-ingest instead of reimplementing everything from scratch.
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::io::IoSlice;
 use tracing::{info, error, debug, warn, trace};
-use crate::error_handler::{ErrorHandler, ErrorCode, ErrorRecovery, ServerError};
+use crate::error_handler::{ErrorHandler, ErrorRecovery};
 use crate::tls::{TlsConfig, TlsConnectionAcceptor, MaybeTlsReadHalf, MaybeTlsWriteHalf};
 use crate::connection::{ConnectionContext, SaslConfig};
 
 // Use the local server components (moved from chronik-ingest)
 use crate::kafka_handler::KafkaProtocolHandler;
-use crate::produce_handler::{ProduceHandler, ProduceHandlerConfig};
-use crate::fetch_handler::FetchHandler;
-use crate::storage::{StorageConfig as IngestStorageConfig, StorageService};
-use crate::wal_integration::WalProduceHandler;
 
 // Storage components
 use chronik_storage::{ObjectStoreConfig, WalIndexer};
@@ -29,7 +22,6 @@ use chronik_storage::{ObjectStoreConfig, WalIndexer};
 use chronik_common::metadata::traits::MetadataStore;
 
 // Protocol types - BrokerMetadata is in chronik_common
-use chronik_common::metadata::traits::BrokerMetadata;
 
 /// Configuration for the integrated Kafka server
 #[derive(Clone)]

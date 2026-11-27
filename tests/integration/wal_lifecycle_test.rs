@@ -17,7 +17,6 @@
 use rdkafka::producer::Producer;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{Result, Context};
 use chrono::Utc;
@@ -26,13 +25,12 @@ use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     consumer::{Consumer, StreamConsumer},
     config::ClientConfig,
-    message::{Message, ToBytes},
+    message::Message,
 };
 use tokio::time::timeout;
 use tempfile::TempDir;
 use tracing::{info, debug, warn};
 
-use chronik_common::metadata::TopicMetadata;
 
 /// Test configuration
 const TEST_TOPIC: &str = "wal-lifecycle-test";
@@ -132,7 +130,7 @@ async fn create_test_topic() -> Result<()> {
 /// Produce test messages with sequential ordering
 async fn produce_test_messages(stats: &mut TestStatistics) -> Result<Vec<TestMessage>> {
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", &format!("localhost:{}", KAFKA_PORT))
+        .set("bootstrap.servers", format!("localhost:{}", KAFKA_PORT))
         .set("message.timeout.ms", "30000")
         .set("queue.buffering.max.messages", "100000")
         .set("batch.num.messages", "1000")
@@ -204,7 +202,7 @@ async fn validate_message_consistency(
     stats: &mut TestStatistics
 ) -> Result<()> {
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &format!("localhost:{}", KAFKA_PORT))
+        .set("bootstrap.servers", format!("localhost:{}", KAFKA_PORT))
         .set("group.id", "wal-lifecycle-test-consumer")
         .set("auto.offset.reset", "earliest")
         .set("enable.auto.commit", "false")
@@ -433,8 +431,8 @@ async fn test_concurrent_wal_operations() -> Result<()> {
     for producer_id in 0..concurrent_producers {
         let handle = tokio::spawn(async move {
             let producer: FutureProducer = ClientConfig::new()
-                .set("bootstrap.servers", &format!("localhost:{}", KAFKA_PORT))
-                .set("client.id", &format!("producer-{}", producer_id))
+                .set("bootstrap.servers", format!("localhost:{}", KAFKA_PORT))
+                .set("client.id", format!("producer-{}", producer_id))
                 .set("acks", "all")
                 .create()?;
             

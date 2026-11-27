@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use chronik_common::metadata::catalog::IsrUpdate;
 use chronik_common::metadata::traits::MetadataStore;
-use chronik_common::metadata::PartitionAssignment;
 use tracing::{debug, info, warn};
 
 use crate::isr_tracker::IsrTracker;
@@ -261,6 +260,7 @@ impl IsrPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chronik_common::metadata::PartitionAssignment;
 
     /// A partition nobody has reported on is "unknown", not "empty".
     ///

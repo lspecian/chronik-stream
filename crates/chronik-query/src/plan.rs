@@ -207,7 +207,7 @@ pub enum PlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{SourceSpec, QuerySpec, RankSpec, ResultFormat};
+    use crate::types::{SourceSpec, QuerySpec, ResultFormat};
 
     fn make_caps() -> HashMap<String, TopicCapabilities> {
         let mut caps = HashMap::new();

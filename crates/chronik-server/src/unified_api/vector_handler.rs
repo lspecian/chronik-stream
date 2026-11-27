@@ -1196,7 +1196,7 @@ async fn apply_hybrid_reranking(
 /// Used by hybrid search to get BM25 text results for RRF fusion with vector results.
 #[cfg(feature = "search")]
 fn search_tantivy_for_hybrid(
-    topic: &str,
+    _topic: &str,
     state: &chronik_search::api::IndexState,
     query_text: &str,
     k: usize,

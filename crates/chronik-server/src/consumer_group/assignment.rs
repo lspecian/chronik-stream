@@ -74,7 +74,7 @@ pub fn decode_assignment(bytes: &[u8]) -> Result<HashMap<String, Vec<i32>>> {
     // Version 1: topic-partitions + user_data
     // Version 2: topic-partitions + user_data (same as v1)
     // Version 3: topic-partitions + user_data (same as v1, v2)
-    if version < 0 || version > 3 {
+    if !(0..=3).contains(&version) {
         return Err(Error::Protocol(format!("Unsupported assignment version: {}", version)));
     }
 
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_decode_empty_assignment() {
-        let mut assignment = HashMap::new();
+        let assignment = HashMap::new();
         let encoded = encode_assignment(&assignment);
         let decoded = decode_assignment(&encoded).unwrap();
 

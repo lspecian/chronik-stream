@@ -143,6 +143,6 @@ mod tests {
         PartitionEncoder::encode_partition(&mut encoder, &partition, 12, true);
 
         // v12 uses varints and tagged fields
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 }

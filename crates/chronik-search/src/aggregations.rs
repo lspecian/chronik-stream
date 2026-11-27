@@ -2,9 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, BTreeMap};
 use tantivy::{
-    collector::{Count, TopDocs, DocSetCollector},
     query::{Query, EnableScoring},
-    schema::{Field, FieldType},
     IndexReader, Searcher, DocAddress,
 };
 use tantivy::schema::Schema;

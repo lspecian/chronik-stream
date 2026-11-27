@@ -3,7 +3,7 @@
 use crate::{RecordBatch, Segment, SegmentBuilder, ObjectStoreTrait, ObjectStoreFactory, ObjectStoreConfig, ObjectStoreBackend};
 use chronik_common::{Result, types::{SegmentId, TopicPartition}};
 use chronik_common::metadata::traits::SegmentMetadata;
-use chrono::{Utc, DateTime};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -372,7 +372,7 @@ impl SegmentWriter {
         let prefix = format!("{}/{}/", topic, partition);
         let segment_metadata_list = self.object_store.list(&prefix).await?;
         
-        let retention_cutoff = Utc::now() - chrono::Duration::seconds(self.config.retention_period_secs as i64);
+        let _retention_cutoff = Utc::now() - chrono::Duration::seconds(self.config.retention_period_secs as i64);
         
         for segment_metadata in segment_metadata_list {
             // Check if segment is older than retention period
