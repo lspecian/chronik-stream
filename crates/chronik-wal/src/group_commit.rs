@@ -39,6 +39,11 @@ use std::sync::Arc as StdArc;
 /// Args: (topic, partition, min_offset, max_offset)
 pub type CommitCallback = Arc<dyn Fn(&str, i32, i64, i64) + Send + Sync>;
 
+/// Invoked once when a partition's log fails a write or fsync, after every
+/// waiting write has been answered with the error and the partition has
+/// stopped taking writes. Args: (topic, partition, error).
+pub type FailureCallback = Arc<dyn Fn(&str, i32, &WalError) + Send + Sync>;
+
 /// Unified WAL writer abstraction (either io_uring thread or tokio::fs::File)
 enum WalWriter {
     #[cfg(all(target_os = "linux", feature = "async-io"))]
@@ -94,6 +99,14 @@ impl WalWriter {
             }
             WalWriter::Standard(file) => {
                 file.write_all(data).await?;
+                // `tokio::fs::File` hands the bytes to a background write and
+                // returns; that write's error is reported only by the next
+                // write or flush. `sync_all` waits for it but keeps the error
+                // for later and fsyncs anyway, so a batch cut short by a full
+                // disk was fsynced and acknowledged, and the error surfaced on
+                // the batch after it. `flush` waits for the write and returns
+                // its error now.
+                file.flush().await?;
                 Ok(())
             }
         }
@@ -442,6 +455,20 @@ struct PartitionCommitQueue {
     /// no file will ever hold. So the cache may only answer at or below this,
     /// which makes it strictly an accelerator over durable state.
     committed_through: Arc<AtomicI64>,
+
+    /// Set when a write or fsync of this partition's log failed, with the
+    /// error. After a failed fsync the kernel may have dropped the dirty pages
+    /// and cleared the error, so nothing about the file's tail can be trusted,
+    /// and writing on would put later records after a hole: a producer's next
+    /// batch acknowledged while the one before it is lost. So the partition
+    /// takes no more writes until the process restarts and recovery reads what
+    /// the file actually holds. Set under the `pending` lock, and checked under
+    /// it by every enqueue.
+    failed: std::sync::OnceLock<String>,
+
+    /// Test-only: fail the next commit as if the write had failed.
+    #[cfg(test)]
+    inject_failure: std::sync::atomic::AtomicBool,
 }
 
 /// A bounded, in-memory suffix of a partition's log.
@@ -700,6 +727,11 @@ pub struct GroupCommitWal {
     /// Wrapped in Arc<RwLock<>> for interior mutability (can be set after construction)
     commit_callback: Arc<RwLock<Option<CommitCallback>>>,
 
+    /// Told when a partition's log fails a write or fsync (see
+    /// [`FailureCallback`]). Unset, the partition is fenced and nothing else
+    /// happens.
+    failure_callback: Arc<RwLock<Option<FailureCallback>>>,
+
     /// v2.4.0: Runtime handle captured at construction time.
     /// Commit workers are ALWAYS spawned on this handle's runtime, regardless
     /// of which runtime initiates the first write to a partition.
@@ -746,6 +778,7 @@ impl GroupCommitWal {
             #[cfg(all(target_os = "linux", feature = "async-io"))]
             io_uring_handle,
             commit_callback: Arc::new(RwLock::new(None)),  // v2.2.10: Interior mutability for async responses
+            failure_callback: Arc::new(RwLock::new(None)),
             runtime_handle: tokio::runtime::Handle::current(),
         };
 
@@ -794,6 +827,7 @@ impl GroupCommitWal {
             #[cfg(all(target_os = "linux", feature = "async-io"))]
             io_uring_handle,
             commit_callback: Arc::new(RwLock::new(Some(callback))),  // v2.2.10: Interior mutability for async responses
+            failure_callback: Arc::new(RwLock::new(None)),
             runtime_handle: tokio::runtime::Handle::current(),
         };
 
@@ -816,6 +850,15 @@ impl GroupCommitWal {
             info!("✅ Commit callback registered for async response delivery (v2.2.10 - CRITICAL FIX #7)");
         } else {
             warn!("Failed to acquire write lock for commit_callback - callback NOT set");
+        }
+    }
+
+    /// Set what happens when a partition's log fails a write or fsync. The
+    /// partition is fenced either way; the server uses this to stop.
+    pub fn set_failure_callback(&self, callback: FailureCallback) {
+        match self.failure_callback.write() {
+            Ok(mut guard) => *guard = Some(callback),
+            Err(poisoned) => *poisoned.into_inner() = Some(callback),
         }
     }
 
@@ -1008,6 +1051,9 @@ impl GroupCommitWal {
 
         // Enqueue without response channel
         let mut pending = queue.pending.lock().await;
+        if let Some(reason) = queue.failed.get() {
+            return Err(Self::fenced_error(&queue, reason));
+        }
         pending.push_back(PendingWrite {
             data,
             response_tx: None,
@@ -1054,6 +1100,10 @@ impl GroupCommitWal {
         // 4. Return queue depth
         let should_commit = {
             let mut pending = queue.pending.lock().await;
+
+            if let Some(reason) = queue.failed.get() {
+                return Err(Self::fenced_error(&queue, reason));
+            }
 
             // Check backpressure (inside lock to avoid TOCTOU race)
             if !is_raft_topic && pending.len() >= self.config.max_queue_depth {
@@ -1160,6 +1210,9 @@ impl GroupCommitWal {
             truncation_epoch: Arc::new(AtomicU64::new(0)),
             tail: Mutex::new(TailCache::new(tail_cache_bytes())),
             committed_through: Arc::new(AtomicI64::new(i64::MIN)),
+            failed: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            inject_failure: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Publish the queue BEFORE starting its worker. The worker exits as
@@ -1191,6 +1244,7 @@ impl GroupCommitWal {
         #[cfg(all(target_os = "linux", feature = "async-io"))]
         let io_uring_handle = self.io_uring_handle.clone();
         let commit_callback = self.commit_callback.clone();  // v2.2.10: For async response delivery
+        let failure_callback = self.failure_callback.clone();
 
         debug!("🚀 WORKER_SPAWN: Starting partition committer on construction-time runtime (prevents WalIndexer starvation)");
 
@@ -1276,6 +1330,18 @@ impl GroupCommitWal {
                     &commit_callback,  // v2.2.10: Pass callback for async response delivery
                 ).await {
                     error!("❌ WORKER_ERROR: Commit batch failed: {}", e);
+                    if queue.failed.get().is_some() {
+                        // Fenced: every waiter has its answer and nothing more
+                        // will be queued, so there is nothing left to commit.
+                        let callback = match failure_callback.read() {
+                            Ok(guard) => guard.clone(),
+                            Err(poisoned) => poisoned.into_inner().clone(),
+                        };
+                        if let Some(callback) = callback {
+                            callback(&queue.topic, queue.partition, &e);
+                        }
+                        return;
+                    }
                 } else {
                     trace!("✅ WORKER_SUCCESS: commit_batch completed successfully");
                 }
@@ -1285,6 +1351,53 @@ impl GroupCommitWal {
         debug!("🎯 WORKER_SPAWNED: tokio::spawn returned (worker should be running in background)");
     }
 
+
+    /// The error an append to a fenced partition gets.
+    fn fenced_error(queue: &PartitionCommitQueue, reason: &str) -> WalError {
+        WalError::CommitFailed(format!(
+            "{}-{}: the log failed a write ({}) and takes no more until the broker restarts",
+            queue.topic, queue.partition, reason
+        ))
+    }
+
+    /// A write or fsync of `batch` failed: fence the partition (see
+    /// `PartitionCommitQueue::failed`) and answer every write that was waiting,
+    /// the batch and everything queued behind it, with the error at once
+    /// instead of letting each wait out its timeout. Returns `error`.
+    async fn fail_partition(
+        queue: &PartitionCommitQueue,
+        batch: Vec<PendingWrite>,
+        batch_bytes: usize,
+        error: WalError,
+    ) -> WalError {
+        let reason = error.to_string();
+        let queued: Vec<PendingWrite> = {
+            let mut pending = queue.pending.lock().await;
+            let _ = queue.failed.set(reason.clone());
+            pending.drain(..).collect()
+        };
+        let queued_bytes: usize = queued.iter().map(|w| w.data.len()).sum();
+        queue
+            .total_queued_bytes
+            .fetch_sub((batch_bytes + queued_bytes) as u64, Ordering::Relaxed);
+        // None of these records is known to be on disk.
+        queue.tail.lock().await.clear();
+
+        error!(
+            topic = %queue.topic,
+            partition = queue.partition,
+            error = %reason,
+            failed_writes = batch.len() + queued.len(),
+            "WAL write failed; the partition takes no more writes"
+        );
+        let message = format!("{}-{}: WAL write failed: {}", queue.topic, queue.partition, reason);
+        for write in batch.into_iter().chain(queued) {
+            if let Some(tx) = write.response_tx {
+                let _ = tx.send(Err(WalError::CommitFailed(message.clone())));
+            }
+        }
+        error
+    }
 
     /// Commit a batch of writes with single fsync
     ///
@@ -1373,12 +1486,26 @@ impl GroupCommitWal {
             return Ok(());
         }
 
-        file.write_all(&combined_buffer).await?;
+        #[cfg(test)]
+        let injected = queue
+            .inject_failure
+            .swap(false, Ordering::SeqCst)
+            .then(|| WalError::Io(std::io::Error::other("injected write failure")));
+        #[cfg(not(test))]
+        let injected: Option<WalError> = None;
 
-        debug!("🔄 COMMIT_FSYNC: Starting fsync for {} bytes", total_bytes);
-        // Single fsync for entire batch ⭐
-        file.sync_all().await?;
+        // Single write + single fsync for the entire batch ⭐
+        let io = match injected {
+            Some(e) => Err(e),
+            None => match file.write_all(&combined_buffer).await {
+                Ok(()) => file.sync_all().await,
+                Err(e) => Err(e),
+            },
+        };
         drop(file);
+        if let Err(e) = io {
+            return Err(Self::fail_partition(queue, batch, total_bytes, e).await);
+        }
         debug!("✅ COMMIT_FSYNC_DONE: fsync completed successfully");
 
         // Update last fsync time
@@ -2195,6 +2322,17 @@ impl GroupCommitWal {
     /// lock, synchronously, on a runtime thread. Enough of those and no thread
     /// is left to resume the iterating task: the broker stops for good (the
     /// same freeze `ProduceHandler::partition_snapshot` describes).
+    /// Test-only: make the partition's next commit fail as a write would.
+    #[cfg(test)]
+    fn inject_commit_failure(&self, topic: &str, partition: i32) {
+        let queue = self
+            .partition_queues
+            .get(&(topic.to_string(), partition))
+            .map(|e| Arc::clone(e.value()))
+            .expect("partition has a queue");
+        queue.inject_failure.store(true, Ordering::SeqCst);
+    }
+
     fn partition_queue_snapshot(&self) -> Vec<((String, i32), Arc<PartitionCommitQueue>)> {
         self.partition_queues
             .iter()
@@ -2761,6 +2899,71 @@ mod tail_cache_tests {
             wal.read_tail("t", 0, 0, 1000, usize::MAX).await.is_none(),
             "after a cut the cache must not answer — the file is authoritative again"
         );
+    }
+
+    /// A write or fsync that fails used to leave its waiters to time out, and
+    /// the partition kept writing: later records landed after the lost ones,
+    /// so a producer's next batch could be acknowledged while the one before
+    /// it was gone. Now every waiter hears at once and the partition stops.
+    #[tokio::test]
+    async fn a_failed_write_answers_every_waiter_and_fences_the_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = GroupCommitWal::new(dir.path().to_path_buf(), GroupCommitConfig::default());
+        wal.append("t".to_string(), 0, record(0, 9, 64), 1).await.unwrap();
+
+        let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&failures);
+        wal.set_failure_callback(Arc::new(move |topic: &str, partition: i32, _e: &WalError| {
+            seen.lock().unwrap().push((topic.to_string(), partition));
+        }));
+
+        wal.inject_commit_failure("t", 0);
+        let started = Instant::now();
+        let failed = wal.append("t".to_string(), 0, record(10, 19, 64), 1).await;
+        assert!(failed.is_err(), "the waiter hears about the failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "at once, not after a timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            wal.read_tail("t", 0, 10, 1000, usize::MAX).await.is_none(),
+            "a record that never reached the file is not served from memory"
+        );
+
+        for acks in [1i16, 0] {
+            let err = wal
+                .append("t".to_string(), 0, record(20, 29, 64), acks)
+                .await
+                .expect_err("a fenced partition refuses writes");
+            assert!(err.to_string().contains("takes no more"), "acks={acks}: {err}");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while failures.lock().unwrap().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*failures.lock().unwrap(), vec![("t".to_string(), 0)], "told once");
+
+        wal.append("t".to_string(), 1, record(0, 9, 64), 1)
+            .await
+            .expect("other partitions keep working");
+    }
+
+    /// `tokio::fs::File::write_all` returns before the bytes are written, and
+    /// `sync_all` swallowed the failed write's error, so a batch cut short by a
+    /// full disk was acknowledged. Measured with a real disk full: 1,092
+    /// acknowledged records missing after the restart.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_write_to_a_full_disk_fails_before_the_fsync() {
+        let file = OpenOptions::new().append(true).open("/dev/full").await.unwrap();
+        let mut writer = WalWriter::Standard(file);
+        let err = writer
+            .write_all(&[7u8; 64 * 1024])
+            .await
+            .expect_err("ENOSPC must come back from the write itself");
+        assert!(err.to_string().contains("space"), "{err}");
     }
 
     #[tokio::test]

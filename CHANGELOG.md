@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A full disk lost acknowledged records.** Two causes, both since the
+  group-commit WAL:
+  - tokio's `File::sync_all` keeps the error of the write before it for
+    later and fsyncs anyway, so a batch cut short by a full disk was
+    fsynced and acknowledged, and the error was reported on the batch after
+    it. The write's error is now taken before the fsync.
+  - After a failed write the partition kept writing. Later batches landed
+    behind the partial record the failure left in the file, where neither
+    WAL recovery nor fetch can reach them.
+
+  Measured with a real full disk (a tmpfs data directory, an idempotent Java
+  producer at `acks=all`, the space freed right after the first failed
+  write). On 2.20.4, 2,443,506 records were acknowledged, the end offset
+  after a restart was 1,776,531, and consumers stalled for good after 57,710
+  records, so even records written after the restart could not be read. Now
+  a failed WAL write or fsync, of the message WAL or the metadata WAL,
+  stops the partition at once:
+  - every write waiting on it gets the error immediately (an `acks=1`
+    producer used to wait out a 30 s timeout);
+  - nothing more is written behind the failure;
+  - the broker exits with code 74 and says why, as Kafka does when its only
+    log directory fails.
+
+  After the disk is fixed and the broker restarted, every acknowledged
+  record is readable, at `acks=1` and `acks=all`. In a cluster the node's
+  partitions fail over as for any stopped node.
+  Test: `tests/cluster/e2e/wal_write_failure.sh` (needs passwordless sudo
+  for the tmpfs).
+
 ## [2.20.4] - 2026-11-26
 
 ### Performance

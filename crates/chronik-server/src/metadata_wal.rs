@@ -123,6 +123,7 @@ impl MetadataWal {
         };
 
         let wal = GroupCommitWal::with_callback(wal_dir.clone(), config, Arc::new(dummy_callback));
+        wal.set_failure_callback(crate::wal_integration::halt_on_wal_failure("metadata"));
 
         info!(
             "Metadata WAL created successfully (topic='{}', partition={})",

@@ -1205,6 +1205,9 @@ impl IntegratedKafkaServerBuilder {
         );
 
         wal_manager.group_commit_wal().set_commit_callback(commit_callback);
+        wal_manager
+            .group_commit_wal()
+            .set_failure_callback(crate::wal_integration::halt_on_wal_failure("message"));
         produce_handler.set_response_pipeline(response_pipeline.clone());
         info!("✅ ResponsePipeline wired to GroupCommitWal and ProduceHandler");
 

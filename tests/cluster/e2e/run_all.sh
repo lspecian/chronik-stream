@@ -8,7 +8,8 @@
 # FORMAT_OLD_BIN (a v2.19.x binary, for raw_segment_compression and reindex: it
 # must write plain raw segments and archives without JSON columns, which no
 # v2.20 release does; those checks refuse a newer one), GROUPS_OLD_BIN
-# (a v2.18.x binary, for group_upgrade), kcat and a JDK, and the legacy_index_tool example built
+# (a v2.18.x binary, for group_upgrade), kcat and a JDK, passwordless sudo (wal_write_failure
+# mounts a tmpfs), and the legacy_index_tool example built
 # (cargo build --release -p chronik-search --example legacy_index_tool).
 # Logs go to tests/cluster/data/e2e/<label>/.
 # Each check starts and stops the local 3-node cluster (tests/cluster/), so
@@ -65,6 +66,8 @@ run tantivy_cross_version_down "$E2E/tantivy_cross_version.sh" "$BIN" "$PREV_BIN
 run raw_segment_compression "$E2E/raw_segment_compression.sh" "$BIN" "$FORMAT_OLD_BIN" "$LABEL"
 run epoch_without_history "$E2E/epoch_without_history.sh" "$BIN" "$LABEL"
 run acks0_no_response "$E2E/acks0_no_response.sh" "$BIN" "$LABEL"
+run wal_write_failure "$E2E/wal_write_failure.sh" "$BIN" "$LABEL"
+run wal_write_failure_acks1 env ACKS=1 "$E2E/wal_write_failure.sh" "$BIN" "$LABEL-acks1"
 run hot_buffer_limit "$E2E/hot_buffer_limit.sh" "$BIN" "$LABEL"
 run search_coverage "$E2E/search_coverage.sh" "$BIN" "$LABEL"
 run search_aggregations "$E2E/search_aggregations.sh" "$BIN" "$LABEL"

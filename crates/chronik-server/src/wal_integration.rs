@@ -10,6 +10,38 @@ use chronik_protocol::{ProduceRequest, ProduceResponse};
 use std::sync::Arc;
 use tracing::{error, info, instrument};
 
+/// Exit code of a broker stopped by a failed WAL write.
+pub const WAL_FAILURE_EXIT_CODE: i32 = 74; // EX_IOERR
+
+/// What a failed WAL write or fsync does to the broker: it stops.
+///
+/// The failed partition is already fenced and every waiting producer has its
+/// error (see `GroupCommitWal::set_failure_callback`), but a fenced partition
+/// stays down until a restart, keeps its leadership in a cluster, and keeps
+/// any producer that retries failing. After a failed fsync the file's tail
+/// cannot be trusted anyway (the kernel may have dropped the pages and cleared
+/// the error), and every partition shares the disk that failed. So the broker
+/// stops, as Kafka does when its only log directory fails: on restart,
+/// recovery reads what the files really hold and cuts a torn tail, and in a
+/// cluster another replica leads meanwhile. Nothing acknowledged is lost: a
+/// write is acknowledged only after its fsync succeeded, and producer
+/// sequences live in memory, so a retry is written, not answered as a
+/// duplicate of records that never reached the disk.
+pub fn halt_on_wal_failure(wal: &'static str) -> chronik_wal::group_commit::FailureCallback {
+    Arc::new(move |topic: &str, partition: i32, e: &chronik_wal::WalError| {
+        error!(
+            wal,
+            topic,
+            partition,
+            error = %e,
+            "WAL write failed; stopping the broker (exit {}). Fix the disk and restart: \
+             recovery keeps every acknowledged record",
+            WAL_FAILURE_EXIT_CODE
+        );
+        std::process::exit(WAL_FAILURE_EXIT_CODE);
+    })
+}
+
 /// WAL-integrated produce handler wrapper
 /// v1.3.47+: Uses Arc<WalManager> directly for lock-free concurrent access
 pub struct WalProduceHandler {
