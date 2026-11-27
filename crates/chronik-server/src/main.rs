@@ -1566,6 +1566,9 @@ async fn run_cluster_mode(
     }
     // Distributed query router for cluster-mode scatter-gather fan-out
     let query_router = Arc::new(unified_api::query_router::QueryRouter::new(&init_config.cluster_config));
+    // Membership comes from the catalog: a node added at runtime is in no
+    // founding node's config.
+    query_router.start_peer_refresh(server.metadata_store());
     unified_state = unified_state.with_query_router(query_router.clone());
 
     // Security Phase 4: the HTTP surface enforces the same ACL policy as the
@@ -1575,7 +1578,7 @@ async fn run_cluster_mode(
     unified_state = unified_state.with_authorizer(
         server.kafka_handler().authorizer().clone(),
     );
-    info!("✓ QueryRouter initialized for distributed query fan-out ({} peers)", init_config.cluster_config.peers.len() - 1);
+    info!("✓ QueryRouter initialized for distributed query fan-out ({} configured peers; refreshed from the catalog)", init_config.cluster_config.peers.len() - 1);
     // v2.4.0: Wire SearchApi into state for query orchestrator text search
     #[cfg(feature = "search")]
     if let Some(ref api) = search_api_ref {
