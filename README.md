@@ -266,6 +266,7 @@ Stated up front, so you don't have to dig for them:
 - **Search builds against a Tantivy fork** (0.27 plus an upstream Block-WAND fix) until upstream releases it. See [docs/TANTIVY_FORK.md](docs/TANTIVY_FORK.md).
 - **Vector search needs an embedding provider** (OpenAI or an external endpoint); embedding calls add latency and cost.
 - **Default-off features.** Agent memory (`/memory/v1/*`) and the ontology layer are experimental. They are compiled only with `--features memory` (the Docker image and the `-gnu` release tarballs; not the static `linux-amd64`/`linux-arm64` tarballs or a default `cargo build`), and are switched on at runtime (`CHRONIK_MEMORY_ENABLED`, `CHRONIK_ONTOLOGY_ENABLED=true`). See [Optional add-ons](#optional-add-ons).
+- **The HTTP query API is open by default.** `/_sql`, `/_search`, `/_vector` and `/_query` on port 6092 need no credentials unless you set `CHRONIK_API_KEY`; Chronik logs a warning at startup when it is unset. Kafka-port SASL and ACLs do not apply to this port. The key is a single shared secret: whoever holds it can query every topic. Set it, or keep 6092 off untrusted networks. See [Security](#security).
 - **Benchmarks have caveats.** Cluster streaming throughput is withdrawn pending re-measurement. The search comparison below is one node, one partition, one run, on a synthetic corpus. Read the caveats next to each table.
 
 ## Benchmarks and Validation
@@ -549,6 +550,9 @@ S3_ENDPOINT                   # Custom endpoint (e.g., MinIO)
 
 # Cluster
 CHRONIK_ADMIN_API_KEY         # Admin API authentication (REQUIRED for production clusters)
+
+# Unified API data plane
+CHRONIK_API_KEY               # X-API-Key for /_sql, /_search, /_vector, /_query (unset = open; set it in production)
 ```
 
 ## Security
@@ -571,6 +575,17 @@ CHRONIK_INTER_BROKER_SECRET='<the same 64-hex-char value on every broker>' \
 ```
 
 The Kubernetes operator generates the inter-broker secret for SASL clusters.
+
+The HTTP query endpoints on port 6092 (`/_sql`, `/_search`, `/_vector`, `/_query`) are a separate surface: Kafka-port SASL and ACLs do not cover them. Protect them with a shared API key (v2.14.0+):
+
+```bash
+CHRONIK_API_KEY="$(openssl rand -hex 32)" ./chronik-server start
+
+curl -H "X-API-Key: $CHRONIK_API_KEY" -H 'Content-Type: application/json' \
+  -X POST localhost:6092/_sql -d '{"query": "SELECT 1"}'
+```
+
+Without the header these endpoints return `401 {"error":{"code":"unauthorized","message":"X-API-Key required"}}`. Only `X-API-Key` is read (not `Authorization: Bearer`). It is a different key from `CHRONIK_ADMIN_API_KEY`; neither opens the other's endpoints. When `CHRONIK_API_KEY` is unset the endpoints are open and a warning is logged at startup. The key authenticates the caller; it does not restrict which topics a caller can read (see [docs/ROADMAP_SECURITY.md](docs/ROADMAP_SECURITY.md)).
 
 Admin API and Schema Registry support API key and HTTP Basic Auth respectively. See [docs/ADMIN_API_SECURITY.md](docs/ADMIN_API_SECURITY.md).
 
