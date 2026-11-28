@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-cli"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "chronik-ontology",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-columnar"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-common"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-config"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-embeddings"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1503,7 +1503,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-integration-tests"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-monitoring"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-operator"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-protocol"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1686,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-query"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-raft"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1733,7 +1733,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-scram"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "base64 0.21.7",
  "hmac 0.12.1",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-search"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-server"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-storage"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "chronik-wal"
-version = "2.20.6"
+version = "2.20.7"
 dependencies = [
  "anyhow",
  "async-trait",
