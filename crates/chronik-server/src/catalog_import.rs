@@ -259,7 +259,9 @@ mod tests {
         let rb = import(&catalog, read_legacy(&b).await).await.unwrap();
         assert_eq!((rb.topics_added, rb.topics_merged), (1, 1));
         catalog.set_import_pending(false);
-        assert!(catalog.is_caught_up());
+        // Wait rather than sample once: on a loaded host the driver thread can
+        // miss one election timeout (200 ms here), which closes the gate briefly.
+        assert!(catalog.wait_caught_up(Duration::from_secs(10)).await, "the gate opens once the import is done");
 
         let b_assign = b.get_partition_assignments("orders").await.unwrap();
         {
