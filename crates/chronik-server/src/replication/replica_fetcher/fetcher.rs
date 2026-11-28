@@ -463,6 +463,11 @@ pub struct ReplicaFetcher {
     /// Partitions rebuilt for missing history since this broker started, and
     /// whether a repeat was already reported. Never rebuilt twice per run.
     history_rebuilt: Arc<DashMap<(String, i32), bool>>,
+    /// Copies rebuilt from empty by the leader named here, so a byte-for-byte
+    /// prefix of its log: a batch spanning their end is the leader's own
+    /// overlap and is taken as it is ([`super::apply::plan_batches_with`]).
+    /// Dropped when the partition's leader changes.
+    mirrors_leader: Arc<DashMap<(String, i32), u64>>,
     shutdown: Arc<AtomicBool>,
     batches_applied: Arc<AtomicU64>,
     /// Partitions rebuilt from the leader because a straddle could not be placed.
@@ -505,6 +510,7 @@ impl ReplicaFetcher {
             history_missing_since: Arc::new(DashMap::new()),
             history_rebuilding: Arc::new(DashMap::new()),
             history_rebuilt: Arc::new(DashMap::new()),
+            mirrors_leader: Arc::new(DashMap::new()),
             rebuilds: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             batches_applied: Arc::new(AtomicU64::new(0)),
@@ -631,6 +637,12 @@ impl ReplicaFetcher {
                     .collect();
                 self.history_rebuilding.retain(|key, _| followed.contains(key));
                 self.history_missing_since.retain(|key, _| followed.contains(key));
+                let leaders: HashMap<(String, i32), u64> = desired
+                    .values()
+                    .flatten()
+                    .map(|p| ((p.topic.clone(), p.partition), p.leader))
+                    .collect();
+                self.mirrors_leader.retain(|key, leader| leaders.get(key) == Some(leader));
 
                 for (leader, partitions) in &desired {
                     let addr = match peers.get(leader) {
@@ -938,7 +950,7 @@ impl ReplicaFetcher {
                     for topic in response.topics {
                         for partition in topic.partitions {
                             got_records |= !partition.records.is_empty();
-                            if self.handle_partition_response(&topic.name, partition).await
+                            if self.handle_partition_response(leader, &topic.name, partition).await
                                 == PartitionOutcome::Diverged
                             {
                                 needs_reconcile = true;
@@ -1180,6 +1192,7 @@ impl ReplicaFetcher {
                     self.rebuilds.fetch_add(1, Ordering::Relaxed);
                     let local_end = self.position_of(&followed.topic, followed.partition).await;
                     self.truncate_partition(&followed.topic, followed.partition, 0, local_end).await;
+                    self.mirrors_leader.insert(key.clone(), followed.leader);
                     if leader_start > 0 {
                         self.positions.insert(key, leader_start);
                     }
@@ -1240,6 +1253,7 @@ impl ReplicaFetcher {
             self.rebuilds.fetch_add(1, Ordering::Relaxed);
             self.truncate_partition(&followed.topic, followed.partition, 0, straddle.local_end)
                 .await;
+            self.mirrors_leader.insert(key.clone(), followed.leader);
         }
     }
 
@@ -1653,6 +1667,7 @@ impl ReplicaFetcher {
 
     async fn handle_partition_response(
         &self,
+        leader: u64,
         topic: &str,
         partition: super::protocol::FetchedPartition,
     ) -> PartitionOutcome {
@@ -1700,6 +1715,10 @@ impl ReplicaFetcher {
         }
 
         let expected = self.position_of(topic, index).await;
+        let mirror = self
+            .mirrors_leader
+            .get(&(topic.to_string(), index))
+            .is_some_and(|l| *l == leader);
 
         match apply_fetched_records(
             &self.wal_manager,
@@ -1709,6 +1728,7 @@ impl ReplicaFetcher {
             expected,
             self.produce_handler.as_ref(),
             None,
+            mirror,
         )
         .await
         {
@@ -2538,6 +2558,7 @@ mod tests {
     ) -> PartitionOutcome {
         fetcher
             .handle_partition_response(
+                1,
                 topic,
                 super::super::protocol::FetchedPartition {
                     partition,

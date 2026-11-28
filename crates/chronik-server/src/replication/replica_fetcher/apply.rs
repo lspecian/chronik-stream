@@ -94,7 +94,24 @@ impl std::fmt::Display for ApplyRefusal {
 ///
 /// `expected_offset` is the follower's LEO — the offset its log will next
 /// accept. Returns the actions in log order, or the first refusal encountered.
+#[cfg(test)]
 pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<Vec<BatchAction>, ApplyRefusal> {
+    plan_batches_with(bytes, expected_offset, false)
+}
+
+/// [`plan_batches`], optionally taking a batch that spans the log end as the
+/// leader holds it (`mirror`): appended whole, the log end moving to its last
+/// offset. Only for a copy rebuilt from empty by this same leader, whose log
+/// is then a byte-for-byte prefix of the leader's, so a batch reaching below
+/// its end is an overlap inside the leader's own log, not a divergence. Old
+/// write bugs left such overlaps (Thunderbird: a batch [351, 1466] after one
+/// ending at 650); refusing them rebuilt the copy from 0, met the same batch,
+/// and rebuilt again — 1,091 times in 13 minutes on one partition.
+pub fn plan_batches_with(
+    bytes: &[u8],
+    expected_offset: i64,
+    mirror: bool,
+) -> std::result::Result<Vec<BatchAction>, ApplyRefusal> {
     let mut actions = Vec::new();
     let mut cursor = expected_offset;
     let mut pos = 0usize;
@@ -175,7 +192,7 @@ pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<V
         if frame.last_offset < cursor {
             // Entirely below the log end — a duplicate, drop it.
             actions.push(BatchAction::Skip(frame));
-        } else if frame.base_offset == cursor {
+        } else if frame.base_offset == cursor || (frame.base_offset < cursor && mirror) {
             cursor = frame.next_offset();
             actions.push(BatchAction::Apply(frame));
         } else if frame.base_offset < cursor {
@@ -417,6 +434,7 @@ pub async fn apply_canonical_batch(
 ///
 /// Returns the follower's LEO afterwards. A refusal aborts before any append,
 /// so a blob is either applied in full or not at all.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_fetched_records(
     wal_manager: &Arc<chronik_wal::WalManager>,
     topic: &str,
@@ -425,8 +443,9 @@ pub async fn apply_fetched_records(
     expected_offset: i64,
     produce_handler: Option<&Arc<crate::produce_handler::ProduceHandler>>,
     metadata_store: Option<&Arc<dyn MetadataStore>>,
+    mirror: bool,
 ) -> std::result::Result<i64, ApplyRefusal> {
-    let actions = plan_batches(records, expected_offset)?;
+    let actions = plan_batches_with(records, expected_offset, mirror)?;
 
     // A response routinely carries several batches, and waiting for each one's
     // fsync in turn cost one group-commit interval apiece — measured as the
@@ -650,6 +669,25 @@ pub(crate) mod tests {
             err,
             ApplyRefusal::Straddle { expected: 8, base_offset: 5, last_offset: 14 }
         );
+    }
+
+    /// A copy rebuilt from empty by this leader mirrors the leader's own
+    /// overlap: the straddling batch is appended whole, the log end moving past
+    /// it, instead of being refused (which rebuilt the copy again, forever).
+    #[test]
+    fn a_mirroring_copy_takes_the_leaders_overlapping_batch() {
+        let bytes = blob(&[batch(351, 1116, 0), batch(1467, 5, 0)]);
+
+        let actions = plan_batches_with(&bytes, 651, true).expect("a mirror takes the leader's batches");
+        let planned: Vec<(i64, i64)> = actions
+            .iter()
+            .map(|a| match a {
+                BatchAction::Apply(f) => (f.base_offset, f.last_offset),
+                _ => panic!("only applies expected"),
+            })
+            .collect();
+        assert_eq!(planned, vec![(351, 1466), (1467, 1471)]);
+        assert!(plan_batches(&bytes, 651).is_err(), "without mirroring it is still a straddle");
     }
 
     /// The leader truncates its response at a byte budget, so the last batch is

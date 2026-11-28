@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.9] - 2026-11-28
+
+### Fixed
+
+- **A follower rebuilt a copy from scratch every second when the leader's log
+  overlapped itself.** Old write bugs left some leaders with a batch that
+  starts below the end of the batch before it (on Thunderbird: one ending at
+  650, then one covering 351..1466). A follower whose log ends at 651 is sent
+  that batch, which spans its log end, and took it as divergence: the epoch
+  exchange cannot place it, so the copy was rebuilt from 0, reached 651 again,
+  and was rebuilt again. On 2.20.8 the history repair walked two Thunderbird
+  copies into this: 1,091 rebuilds in 13 minutes on one partition (its WAL segment
+  numbers past 3,200), both partitions under-replicated for good. A copy rebuilt
+  from empty by the current leader is a byte-for-byte prefix of that leader's
+  log, so such a batch can only be the leader's own overlap; it is now
+  appended as the leader holds it, until the partition's leader changes.
+
 ## [2.20.8] - 2026-11-28
 
 ### Fixed
