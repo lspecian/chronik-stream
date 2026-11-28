@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A replica missing the start of a partition could lead, leaving the start
+  unreadable.** A follower handed records from X by a leader that stated its
+  log began at 0 took X as its start and carried on. It then held [X, end),
+  counted as in sync once its tail caught up, and could take the leadership.
+  Consumers reading from it got nothing below X, while another replica still
+  held those records on disk. Found on Thunderbird by a read-only scan:
+  9 partitions (about 133,000 offsets) led by a replica missing the start
+  another replica held, and 6 partitions missing offset 0 on every replica.
+  A node now judges a partition by what it can actually serve (WAL, raw
+  archive and the Tantivy archives fetch falls back to), not the log start it
+  was told:
+  - a follower no longer accepts a leader whose first record is past the log
+    start it states: it waits until the records are accounted for;
+  - a follower whose copy starts above its own log start and the leader's
+    checks that the leader holds the missing records, then rebuilds its copy
+    from the leader;
+  - a leader whose copy starts above its log start hands the leadership to an
+    in-sync follower that holds more, with an in-sync set leaving out the
+    replicas that hold less;
+  - when every replica has reported and none holds the missing records, they
+    exist nowhere, and the leader moves its log start to its first record, so
+    the earliest offset is a record consumers can read.
+
+  Followers report where their copy starts in the Fetch request's
+  `log_start_offset` (it was always 0, and ignored by the leader). Copies
+  retention trimmed are not affected: retention moves a node's log start with
+  its data. During a rolling upgrade, followers still on 2.20.5 report 0
+  ("holds everything") until they restart.
+
+  On 2.20.5, with 20,000 records and the first 10,000 removed from one
+  replica, a follower missing them led and served 10,000; a leader missing
+  them served 10,000 for good; with them removed everywhere, the earliest
+  offset said 0 while the first record was 10,000. Now all 20,000 are served
+  in the first two cases, and the earliest offset is 10,000 in the third.
+  Test: `tests/cluster/e2e/replica_missing_history.sh`.
+
 ## [2.20.5] - 2026-11-27
 
 ### Fixed

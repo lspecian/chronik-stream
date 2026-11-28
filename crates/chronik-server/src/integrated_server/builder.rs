@@ -1664,6 +1664,11 @@ impl IntegratedKafkaServerBuilder {
             });
         }
 
+        // So a node counts its Tantivy archives as held (fetch falls back to them).
+        if let Some(produce) = self.produce_handler_base.as_ref() {
+            produce.attach_archive_index(wal_indexer.segment_index().clone());
+        }
+
         // Merge runs of small archives into larger ones, in the background
         // (CHRONIK_ARCHIVE_MERGE=false turns it off).
         chronik_storage::archive_merge::spawn(wal_indexer.object_store(), wal_indexer.segment_index().clone());

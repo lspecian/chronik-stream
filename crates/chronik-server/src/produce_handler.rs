@@ -523,6 +523,9 @@ impl PersistedOffsets {
 /// An in-flight topic creation other requests for the same topic wait on.
 type PendingTopicCreation = Arc<Mutex<Option<chronik_common::metadata::TopicMetadata>>>;
 
+/// A cached `held_log_start` answer and when it was read.
+type HeldStart = (Option<i64>, Instant);
+
 pub struct ProduceHandler {
     config: ProduceHandlerConfig,
     storage: Arc<dyn ObjectStore>,
@@ -535,6 +538,12 @@ pub struct ProduceHandler {
     /// One past the highest archived offset per partition, and when it was
     /// read. See `archived_high_watermark`.
     archived_hwm_cache: Arc<DashMap<(String, i32), (i64, Instant)>>,
+    /// The lowest offset held on disk per partition, and when it was read.
+    /// See `held_log_start`.
+    held_start_cache: Arc<DashMap<(String, i32), HeldStart>>,
+    /// The Tantivy archive catalogue, attached once the WAL indexer exists, so
+    /// `held_log_start` counts archives fetch can fall back to.
+    archive_index: Arc<std::sync::OnceLock<Arc<chronik_storage::SegmentIndex>>>,
     producer_info: Arc<RwLock<HashMap<i64, ProducerInfo>>>,
     /// See [`InFlightSequences`].
     in_flight_sequences: InFlightSequences,
@@ -1322,6 +1331,8 @@ impl ProduceHandler {
             transaction_index: Arc::new(crate::transaction_index::TransactionIndex::new()),
             partition_states: Arc::new(DashMap::new()),  // PERFORMANCE (v2.2.7 - P2): Lock-free concurrent hashmap
             archived_hwm_cache: Arc::new(DashMap::new()),
+            held_start_cache: Arc::new(DashMap::new()),
+            archive_index: Arc::new(std::sync::OnceLock::new()),
             producer_info: Arc::new(RwLock::new(HashMap::new())),
             in_flight_sequences: Arc::new(DashMap::new()),
             committing_sequences: Arc::new(DashMap::new()),
@@ -3290,6 +3301,61 @@ impl ProduceHandler {
         wal_end.max(self.archived_high_watermark(topic, partition).await)
     }
 
+    /// The lowest offset this node can serve for a partition — its WAL, its raw
+    /// archive and the Tantivy archives fetch falls back to, not the log start
+    /// it was told — or `None` when it holds nothing.
+    ///
+    /// The two differ on a replica that lost the start of a partition: before
+    /// v2.20.6 a follower handed records from X by a leader claiming its log
+    /// began at 0 took X as given and carried on from there, so it held
+    /// [X, end) while reporting 0 as its earliest offset, counted as in sync and
+    /// could lead. Consumers reading from it then saw nothing below X. This is
+    /// what replication compares instead.
+    ///
+    /// Cached for a minute: it is asked for every followed partition on every
+    /// fetch, and only truncation (which calls `forget_held_log_start`) or the
+    /// archive's own trimming below the log start can move it.
+    pub async fn held_log_start(&self, topic: &str, partition: i32) -> Option<i64> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let key = (topic.to_string(), partition);
+        if let Some(entry) = self.held_start_cache.get(&key) {
+            if entry.1.elapsed() < TTL {
+                return entry.0;
+            }
+        }
+        let archived = chronik_storage::archive::archived_low_watermark(
+            self.storage.as_ref(),
+            self.archive_index.get(),
+            topic,
+            partition,
+        )
+        .await;
+        let in_wal = match &self.wal_manager {
+            Some(wal) => wal
+                .read_from_bounded(topic, partition, 0, 1, 1)
+                .await
+                .ok()
+                .and_then(|records| records.first().map(|r| r.get_base_offset())),
+            None => None,
+        };
+        let held = match (archived, in_wal) {
+            (Some(a), Some(w)) => Some(a.min(w)),
+            (a, w) => a.or(w),
+        };
+        self.held_start_cache.insert(key, (held, Instant::now()));
+        held
+    }
+
+    /// Attach the Tantivy archive catalogue; see `archive_index`.
+    pub fn attach_archive_index(&self, index: Arc<chronik_storage::SegmentIndex>) {
+        let _ = self.archive_index.set(index);
+    }
+
+    /// Drop the cached `held_log_start` after this node's copy changed shape.
+    pub fn forget_held_log_start(&self, topic: &str, partition: i32) {
+        self.held_start_cache.remove(&(topic.to_string(), partition));
+    }
+
     /// Drop everything this node remembers about a deleted topic: partition
     /// offsets, cached archive watermarks, leader-epoch history. A topic
     /// recreated under the same name is a new log; inheriting the old one's
@@ -3301,6 +3367,7 @@ impl ProduceHandler {
         }
         self.partition_states.retain(|key, _| key.0 != topic);
         self.archived_hwm_cache.retain(|key, _| key.0 != topic);
+        self.held_start_cache.retain(|key, _| key.0 != topic);
         self.leader_epochs.forget_topic(topic);
     }
 
@@ -3978,6 +4045,8 @@ impl Clone for ProduceHandler {
             transaction_index: Arc::clone(&self.transaction_index),
             partition_states: Arc::clone(&self.partition_states),
             archived_hwm_cache: Arc::clone(&self.archived_hwm_cache),
+            held_start_cache: Arc::clone(&self.held_start_cache),
+            archive_index: Arc::clone(&self.archive_index),
             producer_info: Arc::clone(&self.producer_info),
             in_flight_sequences: Arc::clone(&self.in_flight_sequences),
             committing_sequences: Arc::clone(&self.committing_sequences),

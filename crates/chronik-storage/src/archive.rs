@@ -360,6 +360,34 @@ pub async fn archived_partitions(
     Ok(partitions)
 }
 
+/// The lowest offset a fetch can be served from the archive for the
+/// partition: its raw segments and, where the raw tier lacks them, its Tantivy
+/// archives (fetch falls back to those). `None` when neither holds anything.
+/// Parquet is not counted: fetch never reads it.
+pub async fn archived_low_watermark(
+    store: &dyn ObjectStore,
+    segment_index: Option<&Arc<SegmentIndex>>,
+    topic: &str,
+    partition: i32,
+) -> Option<i64> {
+    let raw = list_archived_segments(store, topic, partition)
+        .await
+        .ok()
+        .and_then(|segments| segments.first().map(|s| s.base_offset));
+    let indexed = match segment_index {
+        Some(index) => index
+            .get_segments_for_partition(topic, partition)
+            .await
+            .ok()
+            .and_then(|segments| segments.iter().map(|s| s.min_offset).min()),
+        None => None,
+    };
+    match (raw, indexed) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 async fn archived_ranges(
     store: &dyn ObjectStore,
     segment_index: Option<&Arc<SegmentIndex>>,

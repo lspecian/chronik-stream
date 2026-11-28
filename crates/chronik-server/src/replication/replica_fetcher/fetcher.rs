@@ -176,6 +176,15 @@ pub trait FollowerState: Send + Sync {
         partition: i32,
         new_end: i64,
     ) -> chronik_common::Result<()>;
+
+    /// The lowest offset this node holds for a partition, `None` when it holds
+    /// nothing. See `ProduceHandler::held_log_start`.
+    async fn held_log_start(&self, _topic: &str, _partition: i32) -> Option<i64> {
+        None
+    }
+
+    /// Forget a cached `held_log_start` after this node's copy changed shape.
+    fn forget_held_log_start(&self, _topic: &str, _partition: i32) {}
 }
 
 #[async_trait::async_trait]
@@ -217,6 +226,14 @@ impl FollowerState for crate::produce_handler::ProduceHandler {
     ) -> chronik_common::Result<()> {
         self.reset_offsets_after_truncation(topic, partition, new_end).await
     }
+
+    async fn held_log_start(&self, topic: &str, partition: i32) -> Option<i64> {
+        crate::produce_handler::ProduceHandler::held_log_start(self, topic, partition).await
+    }
+
+    fn forget_held_log_start(&self, topic: &str, partition: i32) {
+        crate::produce_handler::ProduceHandler::forget_held_log_start(self, topic, partition)
+    }
 }
 
 /// One partition this node replicates, and who to get it from.
@@ -225,6 +242,28 @@ pub struct FollowedPartition {
     pub topic: String,
     pub partition: i32,
     pub leader: u64,
+}
+
+/// How often a partition whose copy starts above the leader's log start is
+/// checked against the leader (`check_history`).
+const HISTORY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bytes asked for by a history check: enough for the first batch's header.
+const HISTORY_PROBE_BYTES: i32 = 64 * 1024;
+
+/// Whether a gap the leader served is missing history rather than a hole: the
+/// follower asked for the leader's stated log start (or below it) and the
+/// first record is past it. A gap that starts above the log start is a hole
+/// in the middle of the log (old write bugs left a few) and is taken as is.
+fn leader_lacks_its_start(expected: i64, leader_start: i64, found: i64) -> bool {
+    expected <= leader_start && leader_start < found
+}
+
+/// The base offset of the first batch in a fetched record set (the first 8
+/// bytes of a v2 batch, and of a legacy message set entry), `None` when empty.
+fn first_batch_base_offset(records: &[u8]) -> Option<i64> {
+    let head: [u8; 8] = records.get(..8)?.try_into().ok()?;
+    Some(i64::from_be_bytes(head))
 }
 
 /// How long to let a burst of assignment changes land before re-planning.
@@ -349,6 +388,12 @@ pub struct ReplicaFetcher {
     /// Partitions where the leader sent a batch straddling our log end, not yet
     /// resolved by an epoch truncation. See `rebuild_unresolved_straddles`.
     straddled: Arc<DashMap<(String, i32), Straddle>>,
+    /// Partitions whose copy here starts above the leader's log start, with
+    /// (leader's log start, where our copy starts): checked against the leader
+    /// by `check_history` before the next fetch.
+    missing_history: Arc<DashMap<(String, i32), (i64, i64)>>,
+    /// When each partition's history was last checked against the leader.
+    history_checked: Arc<DashMap<(String, i32), std::time::Instant>>,
     shutdown: Arc<AtomicBool>,
     batches_applied: Arc<AtomicU64>,
     /// Partitions rebuilt from the leader because a straddle could not be placed.
@@ -386,6 +431,8 @@ impl ReplicaFetcher {
             positions: Arc::new(DashMap::new()),
             refused: Arc::new(DashMap::new()),
             straddled: Arc::new(DashMap::new()),
+            missing_history: Arc::new(DashMap::new()),
+            history_checked: Arc::new(DashMap::new()),
             rebuilds: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             batches_applied: Arc::new(AtomicU64::new(0)),
@@ -771,6 +818,10 @@ impl ReplicaFetcher {
             // interval, serial partition serving and partition count were all
             // ruled out one at a time — so the breakdown is logged rather than
             // guessed at again (RP-9).
+            if !self.missing_history.is_empty() {
+                self.check_history(&mut connection, &partitions).await;
+            }
+
             let cycle_start = std::time::Instant::now();
 
             let spec = match self.build_request(&partitions).await {
@@ -887,6 +938,109 @@ impl ReplicaFetcher {
         self.epoch_handshake(connection, partitions).await?;
         self.rebuild_unresolved_straddles(partitions).await;
         Ok(())
+    }
+
+    /// Queue a history check when this copy starts above both the leader's log
+    /// start and its own, at most once per `HISTORY_CHECK_INTERVAL` per
+    /// partition.
+    ///
+    /// Its own log start matters: retention runs on every node on its own
+    /// clock, so a follower may drop expired segments before the leader does.
+    /// Its copy then starts above the leader's log start for a while, and
+    /// rebuilding it would copy back what retention just removed. A copy that
+    /// starts above its own log start is the one missing records.
+    async fn note_history(&self, topic: &str, partition: i32, leader_start: i64) {
+        let Some(state) = &self.follower_state else { return };
+        let Some(held) = state.held_log_start(topic, partition).await else { return };
+        let own_start = match &self.produce_handler {
+            Some(handler) => handler.get_log_start_offset(topic, partition).await,
+            None => 0,
+        };
+        let leader_start = leader_start.max(0);
+        if held <= leader_start || held <= own_start {
+            return;
+        }
+        let key = (topic.to_string(), partition);
+        if self
+            .history_checked
+            .get(&key)
+            .is_some_and(|at| at.elapsed() < HISTORY_CHECK_INTERVAL)
+        {
+            return;
+        }
+        self.history_checked.insert(key.clone(), std::time::Instant::now());
+        self.missing_history.insert(key, (leader_start, held));
+    }
+
+    /// Repair copies that start above the leader's log start.
+    ///
+    /// Such a copy is missing records — unless the leader is missing them too.
+    /// So ask the leader first: a consumer fetch (replica id -1, so it is not
+    /// taken as this follower's progress) at its log start. If its first
+    /// record is below where our copy starts, it holds what we lack, and this
+    /// copy is rebuilt from it, as `rebuild_unresolved_straddles` does, from
+    /// the leader's log start. Nothing is lost: our records are a suffix of the
+    /// leader's, since we only ever append what it sent. If the leader's first
+    /// record is not below ours, it lacks them as well; its ISR publisher hands
+    /// leadership to a replica that has them, or moves the log start up to the
+    /// first record that exists, and a later check sees the result.
+    async fn check_history(&self, connection: &mut LeaderConnection, partitions: &[FollowedPartition]) {
+        for followed in partitions {
+            let key = (followed.topic.clone(), followed.partition);
+            let Some((_, (leader_start, held))) = self.missing_history.remove(&key) else {
+                continue;
+            };
+            let spec = FetchRequestSpec {
+                correlation_id: 0,
+                replica_id: -1,
+                max_wait_ms: 0,
+                min_bytes: 0,
+                max_bytes: HISTORY_PROBE_BYTES,
+                topics: vec![FetchTopicRequest {
+                    name: followed.topic.clone(),
+                    partitions: vec![FetchPartitionRequest {
+                        partition: followed.partition,
+                        fetch_offset: leader_start,
+                        log_start_offset: -1,
+                        current_leader_epoch: -1,
+                        max_bytes: HISTORY_PROBE_BYTES,
+                    }],
+                }],
+            };
+            let first = match connection.fetch(spec).await {
+                Ok(response) => response
+                    .topics
+                    .iter()
+                    .flat_map(|t| t.partitions.iter())
+                    .find(|p| p.partition == followed.partition && p.error_code == 0)
+                    .and_then(|p| first_batch_base_offset(&p.records)),
+                Err(e) => {
+                    debug!("{}-{}: history check failed: {}", followed.topic, followed.partition, e);
+                    continue;
+                }
+            };
+            match first {
+                Some(base) if base < held => {
+                    error!(
+                        "{}-{}: this copy starts at {} but the leader holds records from {} (its log \
+                         starts at {}). Offsets {}..{} are missing here; rebuilding this copy from \
+                         the leader's log start.",
+                        followed.topic, followed.partition, held, base, leader_start, base, held
+                    );
+                    self.rebuilds.fetch_add(1, Ordering::Relaxed);
+                    let local_end = self.position_of(&followed.topic, followed.partition).await;
+                    self.truncate_partition(&followed.topic, followed.partition, 0, local_end).await;
+                    if leader_start > 0 {
+                        self.positions.insert(key, leader_start);
+                    }
+                }
+                _ => debug!(
+                    "{}-{}: this copy starts at {}, above the leader's log start {}, and the leader \
+                     holds nothing below it either",
+                    followed.topic, followed.partition, held, leader_start
+                ),
+            }
+        }
     }
 
     /// Rebuild every partition whose straddle the epoch exchange did not resolve.
@@ -1204,6 +1358,7 @@ impl ReplicaFetcher {
             state
                 .leader_epochs()
                 .truncate_from_end(topic, partition, new_end);
+            state.forget_held_log_start(topic, partition);
             if let Err(e) = state.reset_after_truncation(topic, partition, new_end).await {
                 warn!(
                     "{}-{}: truncated the log to {} but could not reset the watermark: {}",
@@ -1232,13 +1387,24 @@ impl ReplicaFetcher {
                 .position_of(&followed.topic, followed.partition)
                 .await;
 
+            // Where this copy starts, for the leader's in-sync judgement: the
+            // lowest offset held, or the log end when nothing is (Kafka's log
+            // start of an empty log). -1, "unknown", without local state.
+            let log_start_offset = match &self.follower_state {
+                Some(state) => state
+                    .held_log_start(&followed.topic, followed.partition)
+                    .await
+                    .map_or(offset, |start| start.min(offset)),
+                None => -1,
+            };
+
             by_topic
                 .entry(followed.topic.clone())
                 .or_default()
                 .push(FetchPartitionRequest {
                     partition: followed.partition,
                     fetch_offset: offset,
-                    log_start_offset: 0,
+                    log_start_offset,
                     // Left unset: this broker parses `current_leader_epoch` on
                     // the leader side but never validates it, so populating it
                     // would cost a metadata read per fetch and fence nothing.
@@ -1342,6 +1508,23 @@ impl ReplicaFetcher {
     ) -> PartitionOutcome {
         let index = partition.partition;
 
+        // Asked for an offset below the leader's log start: everything this
+        // copy holds is below it, deleted on the leader. Start at the leader's
+        // start, as a Kafka follower does (`truncateFullyAndStartAt`). This used
+        // to go to the epoch handshake, which cannot answer it, and loop.
+        if partition.error_code == 1 {
+            let position = self.position_of(topic, index).await;
+            if partition.log_start_offset > position {
+                warn!(
+                    "{}-{}: our log ends at {}, below the leader's log start {}; continuing from {}",
+                    topic, index, position, partition.log_start_offset, partition.log_start_offset
+                );
+                self.positions.insert((topic.to_string(), index), partition.log_start_offset);
+                self.follow_log_start(topic, index, partition.log_start_offset).await;
+                return PartitionOutcome::Fine;
+            }
+        }
+
         if partition.error_code != 0 {
             return self
                 .handle_partition_error(topic, index, partition.error_code)
@@ -1349,6 +1532,7 @@ impl ReplicaFetcher {
         }
 
         self.follow_log_start(topic, index, partition.log_start_offset).await;
+        self.note_history(topic, index, partition.log_start_offset).await;
 
         if partition.records.is_empty() {
             return PartitionOutcome::Fine; // caught up
@@ -1377,6 +1561,26 @@ impl ReplicaFetcher {
                         topic, index, leo, partition.high_watermark
                     );
                 }
+                PartitionOutcome::Fine
+            }
+            Err(ApplyRefusal::Gap { expected, found })
+                if leader_lacks_its_start(expected, partition.log_start_offset, found) =>
+            {
+                // We are at the start of the leader's log as it states it, and
+                // its first record is past that: the leader is missing records
+                // it claims to have. Taking `found` as the start here is how a
+                // replica came to hold [found, end) while the partition began
+                // below, count as in sync and lead, with the records below
+                // unreadable through it. Stay put until a replica that holds
+                // them leads, or the leader moves its log start to its first
+                // record (both done by the leader's ISR publisher).
+                let wait = self.note_refusal(topic, index);
+                warn!(
+                    "{}-{}: the leader states its log starts at {} but its first record is {}: \
+                     offsets {}..{} are missing on it. Not copying from {} until they are \
+                     accounted for; retrying in {:?}.",
+                    topic, index, partition.log_start_offset, found, partition.log_start_offset, found, found, wait
+                );
                 PartitionOutcome::Fine
             }
             Err(ApplyRefusal::Gap { expected, found }) => {
@@ -1576,6 +1780,28 @@ enum PartitionOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leader stating its log starts at 0 whose first record is 20,185 is
+    /// missing history; a follower used to take 20,185 as the start, count as
+    /// in sync and lead with nothing below it readable. A gap above the log
+    /// start is a hole in the middle and is still taken.
+    #[test]
+    fn a_gap_at_the_leaders_stated_start_is_missing_history() {
+        assert!(leader_lacks_its_start(0, 0, 20_185), "the Thunderbird case");
+        assert!(leader_lacks_its_start(500, 500, 900), "same, after a log start move");
+        assert!(!leader_lacks_its_start(5_000, 0, 5_010), "a hole mid-log");
+        assert!(!leader_lacks_its_start(100, 7_500, 7_500), "below the log start: deleted, not missing");
+        assert!(!leader_lacks_its_start(0, 7_500, 7_400), "first batch spans the log start");
+    }
+
+    #[test]
+    fn the_first_batch_base_offset_is_read_from_the_record_set() {
+        assert_eq!(first_batch_base_offset(&[]), None);
+        assert_eq!(first_batch_base_offset(&[0, 0, 0]), None);
+        let mut batch = 20_185i64.to_be_bytes().to_vec();
+        batch.extend_from_slice(&[0u8; 53]);
+        assert_eq!(first_batch_base_offset(&batch), Some(20_185));
+    }
 
     /// Watermark and ISR updates arrive with every produced batch and every
     /// publisher pass; re-planning on them burned cores re-reading an unchanged

@@ -308,6 +308,20 @@ impl FetchHandler {
         for topic_request in &request.topics {
             let mut served = Vec::with_capacity(topic_request.partitions.len());
             for pr in &topic_request.partitions {
+                // Where the follower's copy starts (Fetch v5+). Decoded and
+                // dropped until v2.20.6; see `in_sync_replicas` for why the
+                // leader needs it.
+                if request.replica_id >= 0 && pr.log_start_offset >= 0 {
+                    if let Some(ref tracker) = self.isr_tracker {
+                        tracker.record_follower_log_start(
+                            request.replica_id as u64,
+                            &topic_request.name,
+                            pr.partition,
+                            pr.log_start_offset,
+                            pr.fetch_offset,
+                        );
+                    }
+                }
                 served.push(
                     self.fetch_partition(
                         &topic_request.name,

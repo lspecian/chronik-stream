@@ -66,6 +66,7 @@ run tantivy_cross_version_down "$E2E/tantivy_cross_version.sh" "$BIN" "$PREV_BIN
 run raw_segment_compression "$E2E/raw_segment_compression.sh" "$BIN" "$FORMAT_OLD_BIN" "$LABEL"
 run epoch_without_history "$E2E/epoch_without_history.sh" "$BIN" "$LABEL"
 run epoch_trim "$E2E/epoch_trim.sh" "$BIN" "$LABEL"
+run replica_missing_history "$E2E/replica_missing_history.sh" "$BIN" "$LABEL"
 run acks0_no_response "$E2E/acks0_no_response.sh" "$BIN" "$LABEL"
 run wal_write_failure "$E2E/wal_write_failure.sh" "$BIN" "$LABEL"
 run wal_write_failure_acks1 env ACKS=1 "$E2E/wal_write_failure.sh" "$BIN" "$LABEL-acks1"
