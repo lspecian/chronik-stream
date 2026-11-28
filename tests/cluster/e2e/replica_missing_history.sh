@@ -29,6 +29,11 @@
 #      leaders re-reading their logs saturated a shared disk). Now they take
 #      turns: never fewer than 2 in sync, one logs that it waits, both end up
 #      holding everything (read with the leader stopped).
+#   E. A hole in the leader's log (5000..9999 gone everywhere) and node 3
+#      missing everything below 10000. Before: the rebuild dropped 0..4999 (the
+#      batches ahead of the hole in the same response), the copy started at
+#      10000 again and was rebuilt over and over. Now node 3 holds 0..4999 and
+#      is rebuilt once.
 #
 # Search archives are off for the topic: fetch falls back to them, and they
 # would keep serving what the plant removes.
@@ -153,6 +158,26 @@ expect "never fewer than 2 in sync during the rebuilds" "$( [ "$least" -ge 2 ] &
 expect "a follower waited for its turn" "$(logged "[23]" "rebuilding it later")" "yes"
 node_kill 1
 expect "served without the leader" "$(until_served "$N 0 $((N - 1))" 120)" "$N 0 $((N - 1))"
+cluster_stop
+
+echo "-- E. a hole in the leader's log"
+setup
+stop_all
+# Offsets 5000..9999 gone everywhere (a hole old write bugs left), and node 3
+# missing everything below 10000. Rebuilding node 3, the leader answers
+# 0..4999 and 10000.. in one response.
+for n in 1 2 3; do ls "$(raw $n)" | awk -F'[-.]' '$1 == 5000' | while read -r f; do rm -f "$(raw $n)/$f"; done; done
+plant 3
+start_all
+rebuilt=no
+for _ in $(seq 100); do [ "$(logged 3 "rebuilt copy caught up")" = yes ] && { rebuilt=yes; break; }; sleep 3; done
+expect "node 3 rebuilt its copy" "$rebuilt" "yes"
+# Its archive holds the records before the hole (it used to skip them, start
+# at 10000 again, and rebuild over and over).
+for _ in $(seq 40); do [ "$(archive_start 3)" = 0 ] && break; sleep 3; done
+expect "node 3 holds the records before the hole" "$(archive_start 3)" "0"
+sleep 70
+expect "node 3 rebuilt once" "$(grep -c "rebuilding this copy" "$DIR"/logs/node3.log)" "1"
 expect "panics" "$(panics)" "0"
 
 if [ $fail = 0 ]; then echo "RESULT $LABEL: PASS"; else echo "RESULT $LABEL: FAIL"; exit 1; fi

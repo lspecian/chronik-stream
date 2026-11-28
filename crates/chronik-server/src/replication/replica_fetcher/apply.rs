@@ -116,6 +116,10 @@ pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<V
                 }
                 LegacyRun::Run(frame) => {
                     if frame.base_offset != cursor {
+                        // See the v2 gap below: apply what precedes the hole.
+                        if has_applies(&actions) {
+                            break;
+                        }
                         return Err(ApplyRefusal::Gap { expected: cursor, found: frame.base_offset });
                     }
                     cursor = frame.next_offset();
@@ -181,6 +185,16 @@ pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<V
                 last_offset: frame.last_offset,
             });
         } else {
+            // A hole after batches this blob already extends the log with:
+            // apply those, and let the next fetch, which starts at the hole,
+            // meet it at its first batch. Refusing the whole blob lost them:
+            // the caller answers a gap by moving its position past the hole
+            // (the records there are absent on the leader), so the batches
+            // before it were skipped, never written. Seen on signal-stream: a
+            // leader serving 0..5 then 9.. gave followers copies starting at 9.
+            if has_applies(&actions) {
+                break;
+            }
             return Err(ApplyRefusal::Gap {
                 expected: cursor,
                 found: frame.base_offset,
@@ -191,6 +205,10 @@ pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<V
     }
 
     Ok(actions)
+}
+
+fn has_applies(actions: &[BatchAction]) -> bool {
+    actions.iter().any(|a| matches!(a, BatchAction::Apply(_)))
 }
 
 /// A legacy message: offset(8) size(4) crc(4) magic(1) attributes(1), then a
@@ -583,15 +601,39 @@ pub(crate) mod tests {
         assert_eq!(err, ApplyRefusal::Gap { expected: 40, found: 100 });
     }
 
-    /// Nothing is applied before a refusal — a blob lands whole or not at all,
-    /// so a later bad batch cannot leave the log half-advanced.
+    /// The batches before a hole are applied; the hole is reported by the next
+    /// fetch, which starts at it. Refusing the whole blob lost them, because
+    /// the caller answers a gap by moving past the hole.
     #[test]
-    fn a_gap_later_in_the_blob_discards_the_whole_plan() {
+    fn the_batches_before_a_hole_are_applied() {
         let bytes = blob(&[batch(0, 5, 0), batch(5, 5, 0), batch(50, 5, 0)]);
 
-        let err = plan_batches(&bytes, 0).expect_err("the trailing hole must refuse the blob");
+        let actions = plan_batches(&bytes, 0).expect("the batches before the hole apply");
+        let applied: Vec<(i64, i64)> = actions
+            .iter()
+            .map(|a| match a {
+                BatchAction::Apply(f) => (f.base_offset, f.last_offset),
+                _ => panic!("only applies expected"),
+            })
+            .collect();
+        assert_eq!(applied, vec![(0, 4), (5, 9)]);
 
+        // The next fetch starts at 10 and meets the hole first.
+        let err = plan_batches(&bytes, 10).expect_err("the hole is refused at the log end");
         assert_eq!(err, ApplyRefusal::Gap { expected: 10, found: 50 });
+    }
+
+    #[test]
+    fn the_legacy_messages_before_a_hole_are_applied() {
+        let mut bytes = legacy_set(10..13);
+        bytes.extend(legacy_set(20..22));
+        let actions = plan_batches(&bytes, 10).expect("the messages before the hole apply");
+        assert!(matches!(actions.last(), Some(BatchAction::Apply(_))));
+        assert!(actions.iter().all(|a| matches!(a, BatchAction::Apply(f) if f.base_offset < 13)));
+        assert_eq!(
+            plan_batches(&bytes, 13).expect_err("the hole is refused at the log end"),
+            ApplyRefusal::Gap { expected: 13, found: 20 }
+        );
     }
 
     /// A batch straddling the log end means the two logs share offsets but not

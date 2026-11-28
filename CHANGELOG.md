@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A follower skipped the records ahead of a hole in the leader's log.**
+  When one fetch response held batches up to a hole and batches after it,
+  the follower refused the whole response and then moved its position past
+  the hole, so the batches before the hole were never written. A follower
+  could therefore miss records the leader holds, without any error. On
+  signal-stream, the leader of `default-logs-2` serves 0..5 and then 9 onward
+  (the hole at 6..8 is from older write bugs), and every rebuilt copy started
+  at 9. The batches before a hole are now applied, and the next fetch meets
+  the hole at its first batch. 2.20.6 and 2.20.7 also rebuilt such a copy
+  again every few minutes, because it still started above the leader's first
+  record: there, 850,000 records each time. A partition is now rebuilt for
+  missing history at most once per broker run. Copies that skipped records
+  this way earlier keep the gap in the middle of the log; the history check
+  only looks at where a copy starts. Test: scenario E of
+  `tests/cluster/e2e/replica_missing_history.sh` (a hole in the leader's log
+  and a follower missing the start: it holds the records before the hole,
+  and is rebuilt once).
+
 ## [2.20.7] - 2026-11-28
 
 ### Fixed
