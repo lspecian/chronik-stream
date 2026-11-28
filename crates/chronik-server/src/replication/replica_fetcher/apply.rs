@@ -94,6 +94,7 @@ impl std::fmt::Display for ApplyRefusal {
 ///
 /// `expected_offset` is the follower's LEO — the offset its log will next
 /// accept. Returns the actions in log order, or the first refusal encountered.
+#[cfg(test)]
 pub fn plan_batches(bytes: &[u8], expected_offset: i64) -> std::result::Result<Vec<BatchAction>, ApplyRefusal> {
     plan_batches_with(bytes, expected_offset, false)
 }
@@ -191,10 +192,7 @@ pub fn plan_batches_with(
         if frame.last_offset < cursor {
             // Entirely below the log end — a duplicate, drop it.
             actions.push(BatchAction::Skip(frame));
-        } else if frame.base_offset == cursor {
-            cursor = frame.next_offset();
-            actions.push(BatchAction::Apply(frame));
-        } else if frame.base_offset < cursor && mirror {
+        } else if frame.base_offset == cursor || (frame.base_offset < cursor && mirror) {
             cursor = frame.next_offset();
             actions.push(BatchAction::Apply(frame));
         } else if frame.base_offset < cursor {
@@ -436,6 +434,7 @@ pub async fn apply_canonical_batch(
 ///
 /// Returns the follower's LEO afterwards. A refusal aborts before any append,
 /// so a blob is either applied in full or not at all.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_fetched_records(
     wal_manager: &Arc<chronik_wal::WalManager>,
     topic: &str,
