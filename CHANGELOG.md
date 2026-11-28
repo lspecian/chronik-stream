@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Repairing copies missing their start left partitions with the leader
+  alone in sync.** 2.20.6 rebuilds a follower copy missing the start of its
+  partition from the leader, and a rebuild takes the follower out of the ISR
+  until it has re-read the whole partition. Rolled onto signal-stream, both
+  followers of three partitions found the same missing start in the same
+  second and rebuilt at once: the leader was the only in-sync replica, so an
+  acks=all write with `min.insync.replicas=2` could not complete, for hours on
+  the largest (1.8 M records). Every rebuild also re-reads its partition from
+  the leader, twice when both followers rebuild; on a leader holding it as
+  about 21,000 small archived segments on a hard disk shared with other
+  clusters, the disk saturated (5 s read latency) and acks=all writes to every
+  cluster with a replica there slowed from milliseconds to seconds. Now a
+  follower rebuilds only when every replica is in sync (one less remains),
+  the followers of a partition take turns (the n-th in the replica list waits
+  n check intervals, then looks at the ISR again), and a node runs at most
+  `CHRONIK_REPLICA_REBUILD_CONCURRENCY` rebuilds at once (default 1). A copy
+  waiting for its turn that comes to lead hands the leadership to a replica
+  holding the start, as before. Test: scenario D of
+  `tests/cluster/e2e/replica_missing_history.sh` (both followers missing the
+  start: never fewer than 2 in sync, one waits its turn, both end up holding
+  everything).
+
 ## [2.20.6] - 2026-11-28
 
 ### Fixed

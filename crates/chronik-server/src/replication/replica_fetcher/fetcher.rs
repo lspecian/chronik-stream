@@ -74,6 +74,9 @@ pub struct ReplicaFetcherConfig {
     /// ~60 cycles/s while the brokers sat at ~570% of 1600% available CPU: the
     /// machine had capacity, the protocol had no concurrency (RP-9).
     pub fetcher_count: usize,
+    /// Copies missing their start rebuilt at once on this node
+    /// (`CHRONIK_REPLICA_REBUILD_CONCURRENCY`). See [`rebuild_gate`].
+    pub rebuild_concurrency: usize,
 }
 
 impl Default for ReplicaFetcherConfig {
@@ -86,6 +89,7 @@ impl Default for ReplicaFetcherConfig {
             refresh_interval: Duration::from_secs(10),
             retry_backoff: Duration::from_millis(500),
             fetcher_count: 4,
+            rebuild_concurrency: 1,
         }
     }
 }
@@ -118,6 +122,11 @@ impl ReplicaFetcherConfig {
         if let Some(v) = env_i32("CHRONIK_REPLICA_FETCHERS") {
             if v > 0 {
                 config.fetcher_count = v as usize;
+            }
+        }
+        if let Some(v) = env_i32("CHRONIK_REPLICA_REBUILD_CONCURRENCY") {
+            if v > 0 {
+                config.rebuild_concurrency = v as usize;
             }
         }
         config
@@ -266,6 +275,57 @@ fn first_batch_base_offset(records: &[u8]) -> Option<i64> {
     Some(i64::from_be_bytes(head))
 }
 
+/// Whether a follower may start rebuilding a copy that is missing its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildGate {
+    Go,
+    /// This node already runs as many rebuilds as it may.
+    Busy,
+    /// A replica is out of the ISR: rebuilding now would leave fewer in sync.
+    IsrShort,
+    /// Another follower of the partition goes first.
+    NotYourTurn,
+}
+
+/// A rebuild discards the copy and re-reads the whole partition, so the
+/// follower leaves the ISR until it has caught up — minutes on a large
+/// partition, and the leader reads its whole log for it.
+///
+/// Seen on the first roll of the history repair: both followers of three
+/// partitions found the same missing start in the same second and rebuilt at
+/// once, leaving the leader alone in the ISR (acks=all with
+/// min.insync.replicas=2 stalls), and the leaders re-reading 1.8 M records
+/// from a slow disk slowed every cluster sharing it. So:
+/// - only when every replica is in the ISR: after this one leaves, RF−1
+///   remain;
+/// - followers take turns: the n-th follower in the replica list waits n
+///   check intervals after it first found the gap, then looks at the ISR
+///   again, by which time an earlier follower's rebuild has taken it out;
+/// - at most `limit` rebuilds at once per node.
+///
+/// Waiting is safe: a copy missing its start that comes to lead hands the
+/// leadership to a replica that holds it (`isr_publisher`).
+fn rebuild_gate(
+    node: u64,
+    leader: u64,
+    replicas: &[u64],
+    isr: &[u64],
+    waited: Duration,
+    running: usize,
+    limit: usize,
+) -> RebuildGate {
+    if running >= limit {
+        return RebuildGate::Busy;
+    }
+    if replicas.is_empty() || !replicas.iter().all(|r| isr.contains(r)) {
+        return RebuildGate::IsrShort;
+    }
+    let turn = replicas.iter().filter(|&&r| r != leader).position(|&r| r == node).unwrap_or(0);
+    if waited < HISTORY_CHECK_INTERVAL * turn as u32 {
+        return RebuildGate::NotYourTurn;
+    }
+    RebuildGate::Go
+}
 /// How long to let a burst of assignment changes land before re-planning.
 const PLAN_CHANGE_SETTLE: Duration = Duration::from_millis(20);
 
@@ -394,6 +454,12 @@ pub struct ReplicaFetcher {
     missing_history: Arc<DashMap<(String, i32), (i64, i64)>>,
     /// When each partition's history was last checked against the leader.
     history_checked: Arc<DashMap<(String, i32), std::time::Instant>>,
+    /// When each partition was first found missing its start and not yet
+    /// rebuilt: how long it has waited for its turn (see [`rebuild_gate`]).
+    history_missing_since: Arc<DashMap<(String, i32), std::time::Instant>>,
+    /// Copies rebuilt because they were missing their start, until they reach
+    /// the leader's high watermark.
+    history_rebuilding: Arc<DashMap<(String, i32), ()>>,
     shutdown: Arc<AtomicBool>,
     batches_applied: Arc<AtomicU64>,
     /// Partitions rebuilt from the leader because a straddle could not be placed.
@@ -433,6 +499,8 @@ impl ReplicaFetcher {
             straddled: Arc::new(DashMap::new()),
             missing_history: Arc::new(DashMap::new()),
             history_checked: Arc::new(DashMap::new()),
+            history_missing_since: Arc::new(DashMap::new()),
+            history_rebuilding: Arc::new(DashMap::new()),
             rebuilds: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             batches_applied: Arc::new(AtomicU64::new(0)),
@@ -550,6 +618,15 @@ impl ReplicaFetcher {
                     debug!("Stopping fetch task {} for leader {}", index, leader);
                     handle.abort();
                 }
+                // A rebuild of a partition this node no longer follows will not
+                // finish here; it must not hold a rebuild slot for good.
+                let followed: std::collections::HashSet<(String, i32)> = desired
+                    .values()
+                    .flatten()
+                    .map(|p| (p.topic.clone(), p.partition))
+                    .collect();
+                self.history_rebuilding.retain(|key, _| followed.contains(key));
+                self.history_missing_since.retain(|key, _| followed.contains(key));
 
                 for (leader, partitions) in &desired {
                     let addr = match peers.get(leader) {
@@ -761,6 +838,22 @@ impl ReplicaFetcher {
         Ok(out)
     }
 
+    /// A partition's replicas and in-sync set as the catalog has them; empty
+    /// when unknown, which `rebuild_gate` takes as "not all in sync".
+    async fn replicas_and_isr(&self, topic: &str, partition: i32) -> (Vec<u64>, Vec<u64>) {
+        match self.metadata_store.get_partition_assignments(topic).await {
+            Ok(assignments) => assignments
+                .into_iter()
+                .find(|a| a.partition as i32 == partition)
+                .map(|a| (a.replicas, a.isr))
+                .unwrap_or_default(),
+            Err(e) => {
+                debug!("{}-{}: cannot read the in-sync set: {}", topic, partition, e);
+                (Vec::new(), Vec::new())
+            }
+        }
+    }
+
     /// The fetch loop for one leader.
     async fn run_leader_loop(
         self: Arc<Self>,
@@ -957,10 +1050,11 @@ impl ReplicaFetcher {
             None => 0,
         };
         let leader_start = leader_start.max(0);
+        let key = (topic.to_string(), partition);
         if held <= leader_start || held <= own_start {
+            self.history_missing_since.remove(&key);
             return;
         }
-        let key = (topic.to_string(), partition);
         if self
             .history_checked
             .get(&key)
@@ -1021,6 +1115,39 @@ impl ReplicaFetcher {
             };
             match first {
                 Some(base) if base < held => {
+                    let since = *self
+                        .history_missing_since
+                        .entry(key.clone())
+                        .or_insert_with(std::time::Instant::now);
+                    let (replicas, isr) = self.replicas_and_isr(&followed.topic, followed.partition).await;
+                    let gate = rebuild_gate(
+                        self.node_id,
+                        followed.leader,
+                        &replicas,
+                        &isr,
+                        since.elapsed(),
+                        self.history_rebuilding.len(),
+                        self.config.rebuild_concurrency,
+                    );
+                    if gate != RebuildGate::Go {
+                        // Checked again after HISTORY_CHECK_INTERVAL (note_history).
+                        warn!(
+                            "{}-{}: this copy starts at {} but the leader holds records from {}; \
+                             rebuilding it later ({:?}: replicas {:?}, in sync {:?}, {} rebuild(s) \
+                             running here).",
+                            followed.topic,
+                            followed.partition,
+                            held,
+                            base,
+                            gate,
+                            replicas,
+                            isr,
+                            self.history_rebuilding.len()
+                        );
+                        continue;
+                    }
+                    self.history_missing_since.remove(&key);
+                    self.history_rebuilding.insert(key.clone(), ());
                     error!(
                         "{}-{}: this copy starts at {} but the leader holds records from {} (its log \
                          starts at {}). Offsets {}..{} are missing here; rebuilding this copy from \
@@ -1534,6 +1661,17 @@ impl ReplicaFetcher {
         self.follow_log_start(topic, index, partition.log_start_offset).await;
         self.note_history(topic, index, partition.log_start_offset).await;
 
+        let key = (topic.to_string(), index);
+        if self.history_rebuilding.contains_key(&key)
+            && self.position_of(topic, index).await >= partition.high_watermark
+        {
+            self.history_rebuilding.remove(&key);
+            info!(
+                "{}-{}: rebuilt copy caught up with the leader at {}",
+                topic, index, partition.high_watermark
+            );
+        }
+
         if partition.records.is_empty() {
             return PartitionOutcome::Fine; // caught up
         }
@@ -1780,6 +1918,31 @@ enum PartitionOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two followers of a partition found the same missing start in the same
+    /// second and both rebuilt, leaving the leader alone in sync.
+    #[test]
+    fn rebuilds_never_leave_the_partition_short_of_in_sync_replicas() {
+        let now = Duration::ZERO;
+        let later = HISTORY_CHECK_INTERVAL;
+        // Leader 1, followers 2 then 3. Follower 2 goes first; follower 3 waits
+        // one interval, then only goes if follower 2 is back in sync.
+        assert_eq!(rebuild_gate(2, 1, &[1, 2, 3], &[1, 2, 3], now, 0, 1), RebuildGate::Go);
+        assert_eq!(rebuild_gate(3, 1, &[1, 2, 3], &[1, 2, 3], now, 0, 1), RebuildGate::NotYourTurn);
+        assert_eq!(rebuild_gate(3, 1, &[1, 2, 3], &[1, 3], later, 0, 1), RebuildGate::IsrShort);
+        assert_eq!(rebuild_gate(3, 1, &[1, 2, 3], &[1, 2, 3], later, 0, 1), RebuildGate::Go);
+        // Turns follow the replica list, leaving the leader out wherever it is.
+        assert_eq!(rebuild_gate(1, 3, &[3, 1, 2], &[3, 1, 2], now, 0, 1), RebuildGate::Go);
+        assert_eq!(rebuild_gate(2, 3, &[3, 1, 2], &[3, 1, 2], now, 0, 1), RebuildGate::NotYourTurn);
+        assert_eq!(rebuild_gate(1, 2, &[1, 2, 3], &[1, 2, 3], now, 0, 1), RebuildGate::Go);
+        // A replica already out of sync (down, or rebuilding) blocks every rebuild.
+        assert_eq!(rebuild_gate(2, 1, &[1, 2, 3], &[1, 2], now, 0, 1), RebuildGate::IsrShort);
+        // Unknown replicas are not "all in sync".
+        assert_eq!(rebuild_gate(2, 1, &[], &[], now, 0, 1), RebuildGate::IsrShort);
+        // One rebuild at a time per node unless configured otherwise.
+        assert_eq!(rebuild_gate(2, 1, &[1, 2, 3], &[1, 2, 3], now, 1, 1), RebuildGate::Busy);
+        assert_eq!(rebuild_gate(2, 1, &[1, 2, 3], &[1, 2, 3], now, 1, 2), RebuildGate::Go);
+    }
 
     /// A leader stating its log starts at 0 whose first record is 20,185 is
     /// missing history; a follower used to take 20,185 as the start, count as

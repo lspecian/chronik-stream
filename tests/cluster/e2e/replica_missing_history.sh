@@ -24,6 +24,11 @@
 #      first record was ~10,000. Now the log start moves to the first record
 #      that exists: earliest offset = first record read, and every record from
 #      there is read.
+#   D. Both followers missing the start. On 2.20.6 both rebuilt at once and
+#      the leader was left alone in sync (seen live: acks=all stalled, and the
+#      leaders re-reading their logs saturated a shared disk). Now they take
+#      turns: never fewer than 2 in sync, one logs that it waits, both end up
+#      holding everything (read with the leader stopped).
 #
 # Search archives are off for the topic: fetch falls back to them, and they
 # would keep serving what the plant removes.
@@ -125,6 +130,29 @@ expect "served from the first record that exists" "$(until_served "$want" 120)" 
 got=""; for _ in $(seq 24); do got=$(earliest); [ "$got" = "$first" ] && break; sleep 5; done
 expect "earliest offset is that record" "$got" "$first"
 expect "the leader moved the log start" "$(logged "[123]" "are on no replica")" "yes"
+cluster_stop
+
+echo "-- D. both followers missing the start"
+setup
+stop_all
+plant 2 3
+start_all
+# Both rebuild, one at a time: the in-sync set never shrinks to the leader
+# alone. Measured from the first time all three are in sync.
+isr_size() { "$K"/kafka-topics.sh --bootstrap-server "$BOOTS" --describe --topic $T 2>/dev/null | grep -o 'Isr: [0-9,]*' | awk '{ print split($2, a, ",") }'; }
+full=0; least=3; done_both=no
+for _ in $(seq 150); do
+  s=$(isr_size)
+  if [ "$full" = 1 ] && [ -n "$s" ] && [ "$s" -lt "$least" ]; then least=$s; fi
+  [ "$s" = 3 ] && full=1
+  if [ "$(logged 2 "rebuilt copy caught up")" = yes ] && [ "$(logged 3 "rebuilt copy caught up")" = yes ]; then done_both=yes; break; fi
+  sleep 2
+done
+expect "both followers rebuilt and caught up" "$done_both" "yes"
+expect "never fewer than 2 in sync during the rebuilds" "$( [ "$least" -ge 2 ] && echo yes || echo "$least")" "yes"
+expect "a follower waited for its turn" "$(logged "[23]" "rebuilding it later")" "yes"
+node_kill 1
+expect "served without the leader" "$(until_served "$N 0 $((N - 1))" 120)" "$N 0 $((N - 1))"
 expect "panics" "$(panics)" "0"
 
 if [ $fail = 0 ]; then echo "RESULT $LABEL: PASS"; else echo "RESULT $LABEL: FAIL"; exit 1; fi
