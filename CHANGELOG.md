@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.6] - 2026-11-28
+
 ### Fixed
 
 - **A replica missing the start of a partition could lead, leaving the start
