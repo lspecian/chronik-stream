@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.9] - 2026-11-28
+
 ### Fixed
 
 - **A follower rebuilt a copy from scratch every second when the leader's log
