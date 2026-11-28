@@ -206,6 +206,9 @@ impl IsrPublisher {
                     .await
                     .unwrap_or(0);
 
+                // Where this node's own copy starts; see `repair_missing_history`.
+                let held_start = self.produce_handler.held_log_start(&topic.name, partition).await;
+
                 let Some(isr) = in_sync_replicas(
                     &self.isr_tracker,
                     &topic.name,
@@ -216,6 +219,12 @@ impl IsrPublisher {
                 ) else {
                     continue; // nothing measured yet — publishing a guess is worse
                 };
+
+                if let Some(start) = held_start {
+                    if self.repair_missing_history(&topic.name, &assignment, start, &isr).await {
+                        continue; // leadership handed away: the new leader publishes
+                    }
+                }
 
                 if assignment.isr == isr {
                     continue; // already what the cluster holds
@@ -256,12 +265,203 @@ impl IsrPublisher {
 
         Ok(())
     }
+
+    /// A leader whose copy starts above the partition's log start is missing
+    /// records it claims to have: consumers asking for them get the next record
+    /// it holds instead. What to do is decided by `plan_history_repair` from
+    /// what every replica reported on its last fetch.
+    ///
+    /// Returns whether leadership was handed away.
+    async fn repair_missing_history(
+        &self,
+        topic: &str,
+        assignment: &chronik_common::metadata::traits::PartitionAssignment,
+        held_start: i64,
+        isr: &[u64],
+    ) -> bool {
+        let partition = assignment.partition as i32;
+        let log_start = self.produce_handler.get_log_start_offset(topic, partition).await;
+        if held_start <= log_start {
+            return false;
+        }
+        // Give followers a full lag window from leadership to report.
+        if !self.isr_tracker.leadership_grace_expired(topic, partition) {
+            return false;
+        }
+        let reports: Vec<FollowerReport> = assignment
+            .replicas
+            .iter()
+            .copied()
+            .filter(|&id| id != self.node_id)
+            .map(|id| FollowerReport {
+                node: id,
+                copy: self.isr_tracker.follower_log_start(id, topic, partition),
+                current: self.isr_tracker.heard_from_recently(id),
+            })
+            .collect();
+
+        match plan_history_repair(held_start, log_start, &reports, isr) {
+            HistoryRepair::Nothing => false,
+            HistoryRepair::HandOff { to, from, isr: new_isr } => {
+                warn!(
+                    "{}-{}: this node's copy starts at {} but the partition's log starts at {}; node {} \
+                     holds from {}. Handing it the leadership (in-sync set {:?}) so offsets {}..{} are \
+                     readable again.",
+                    topic, partition, held_start, log_start, to, from, new_isr, from, held_start
+                );
+                let change = chronik_common::metadata::catalog::AssignmentChange {
+                    topic: topic.to_string(),
+                    partition: assignment.partition,
+                    replicas: None,
+                    leader: Some(to),
+                    isr: Some(new_isr),
+                    expected_epoch: Some(assignment.leader_epoch),
+                };
+                match self.metadata_store.set_assignments(vec![change]).await {
+                    Ok(outcomes) => match outcomes.into_iter().next() {
+                        Some(Ok(())) => true,
+                        Some(Err(e)) => {
+                            debug!("{}-{}: leadership not handed to {}: {}", topic, partition, to, e);
+                            false
+                        }
+                        None => false,
+                    },
+                    Err(e) => {
+                        warn!("{}-{}: could not hand leadership to {}: {}", topic, partition, to, e);
+                        false
+                    }
+                }
+            }
+            HistoryRepair::MoveLogStart => {
+                warn!(
+                    "{}-{}: offsets {}..{} are on no replica (this node holds from {}, and every other \
+                     replica reported holding no more). Moving the log start to {} so consumers start \
+                     where records exist.",
+                    topic, partition, log_start, held_start, held_start, held_start
+                );
+                if let Err(code) = self.produce_handler.delete_records(topic, partition, held_start).await {
+                    warn!("{}-{}: could not move the log start to {} (error {})", topic, partition, held_start, code);
+                }
+                false
+            }
+        }
+    }
 }
+
+/// What a follower last reported about its copy of a partition.
+#[derive(Debug, Clone, Copy)]
+pub struct FollowerReport {
+    pub node: u64,
+    /// (where its copy starts, its fetch offset), from its last fetch.
+    pub copy: Option<(i64, i64)>,
+    /// Heard from within the liveness window.
+    pub current: bool,
+}
+
+/// What a leader missing the start of its copy does about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryRepair {
+    Nothing,
+    /// An in-sync follower holds more of the start: hand it the leadership,
+    /// with an in-sync set leaving out every replica that holds less (this one
+    /// included), so nothing elects them back before they have rebuilt.
+    HandOff { to: u64, from: i64, isr: Vec<u64> },
+    /// No replica holds more, and every one has reported: the records below
+    /// the leader's copy exist nowhere. Move the log start up to its first
+    /// record, so the earliest offset tells the truth and followers copy the
+    /// partition from where it really starts.
+    MoveLogStart,
+}
+
+/// Decide `HistoryRepair` for a leader whose copy starts at `held_start`,
+/// above the partition's log start `log_start`, from its followers' reports
+/// and the in-sync set. Pure: this is the decision that moves leadership or
+/// declares records gone.
+pub fn plan_history_repair(held_start: i64, log_start: i64, reports: &[FollowerReport], isr: &[u64]) -> HistoryRepair {
+    if held_start <= log_start {
+        return HistoryRepair::Nothing;
+    }
+    // An in-sync follower holding records below the leader's start; the one
+    // holding the most.
+    let best = reports
+        .iter()
+        .filter(|r| isr.contains(&r.node))
+        .filter_map(|r| r.copy.and_then(|(start, fetched)| (start < held_start && start < fetched).then_some((start, r.node))))
+        .min();
+    if let Some((from, to)) = best {
+        let isr = isr
+            .iter()
+            .copied()
+            .filter(|&id| {
+                id == to
+                    || reports
+                        .iter()
+                        .any(|r| r.node == id && r.copy.is_some_and(|(start, _)| start <= from))
+            })
+            .collect();
+        return HistoryRepair::HandOff { to, from, isr };
+    }
+    // A follower that holds nothing (its copy starts at its fetch offset) or
+    // starts at or above ours has nothing to offer. Anyone not heard from, or
+    // who has not reported (a node before v2.20.6), might: wait.
+    let nobody_holds_more = reports.iter().all(|r| {
+        r.current && r.copy.is_some_and(|(start, fetched)| start >= held_start || start >= fetched)
+    });
+    if nobody_holds_more {
+        HistoryRepair::MoveLogStart
+    } else {
+        HistoryRepair::Nothing
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chronik_common::metadata::PartitionAssignment;
+
+    fn report(node: u64, start: i64, fetched: i64) -> FollowerReport {
+        FollowerReport { node, copy: Some((start, fetched)), current: true }
+    }
+
+    /// The Thunderbird case: node 1 leads holding from 20,185 of a partition
+    /// whose log starts at 0, node 2 holds all of it, node 3 is like node 1.
+    /// Node 2 takes over, and the in-sync set leaves out the two that hold
+    /// less until they have rebuilt.
+    #[test]
+    fn a_leader_missing_its_start_hands_over_to_a_follower_that_holds_it() {
+        let reports = [report(2, 0, 21_862), report(3, 20_185, 21_862)];
+        assert_eq!(
+            plan_history_repair(20_185, 0, &reports, &[1, 2, 3]),
+            HistoryRepair::HandOff { to: 2, from: 0, isr: vec![2] }
+        );
+        // Not in sync: not a candidate, whatever it holds.
+        assert_eq!(plan_history_repair(20_185, 0, &reports, &[1, 3]), HistoryRepair::Nothing);
+    }
+
+    /// Records no replica holds are gone: the log start moves up to the first
+    /// one that exists. Followers holding nothing (rebuilding) or less do not
+    /// stand in the way.
+    #[test]
+    fn records_on_no_replica_move_the_log_start() {
+        let reports = [report(2, 25_415, 29_449), report(3, 1, 1)];
+        assert_eq!(plan_history_repair(1, 0, &reports, &[1, 2]), HistoryRepair::MoveLogStart);
+    }
+
+    /// Anyone not heard from, or not reporting, might hold the records: wait.
+    #[test]
+    fn records_are_not_declared_gone_while_a_replica_is_unaccounted_for() {
+        let silent = FollowerReport { node: 3, copy: Some((25_415, 29_449)), current: false };
+        assert_eq!(plan_history_repair(1, 0, &[report(2, 25_415, 29_449), silent], &[1, 2]), HistoryRepair::Nothing);
+        let unreported = FollowerReport { node: 3, copy: None, current: true };
+        assert_eq!(plan_history_repair(1, 0, &[report(2, 25_415, 29_449), unreported], &[1, 2]), HistoryRepair::Nothing);
+    }
+
+    /// A leader holding from its log start (retention trimmed both) is whole.
+    #[test]
+    fn a_leader_holding_from_its_log_start_does_nothing() {
+        assert_eq!(plan_history_repair(7_500, 7_500, &[report(2, 0, 9_000)], &[1, 2]), HistoryRepair::Nothing);
+    }
 
     /// A partition nobody has reported on is "unknown", not "empty".
     ///

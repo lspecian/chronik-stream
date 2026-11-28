@@ -104,6 +104,13 @@ pub struct IsrTracker {
     /// set if the follower has not caught up.
     leading_since_ms: DashMap<PartitionKey, u64>,
 
+    /// Where each follower last said its copy starts (the Fetch request's
+    /// `log_start_offset`), with its fetch offset at the time: (node, partition)
+    /// -> (log start, fetch offset). A leader missing the start of its own copy
+    /// reads these to find a replica that holds it; see the ISR publisher's
+    /// `repair_missing_history`.
+    follower_log_starts: DashMap<(u64, PartitionKey), (i64, i64)>,
+
     /// Optional record-count bound on lag; `None` (the default) leaves time
     /// as the only bound, as in Kafka since 0.9. See `from_env`.
     max_lag_entries: Option<u64>,
@@ -131,6 +138,7 @@ impl IsrTracker {
             follower_offsets: DashMap::new(),
             node_last_seen_ms: DashMap::new(),
             leading_since_ms: DashMap::new(),
+            follower_log_starts: DashMap::new(),
             max_lag_entries: Some(max_lag_entries),
             max_lag_ms,
             node_liveness_ms: max_lag_ms.saturating_mul(3),
@@ -148,6 +156,21 @@ impl IsrTracker {
             .unwrap_or_default()
             .as_millis() as u64;
         self.node_last_seen_ms.insert(node_id, now_ms);
+    }
+
+    /// Whether `node_id` was heard from within the liveness window. Unlike
+    /// `node_is_alive`, a node never heard from is not: this answers "do we have
+    /// a current report from it", which deciding that records exist on no
+    /// replica needs.
+    pub fn heard_from_recently(&self, node_id: u64) -> bool {
+        let Some(last) = self.node_last_seen_ms.get(&node_id).map(|v| *v) else {
+            return false;
+        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now_ms.saturating_sub(last) <= self.node_liveness_ms
     }
 
     fn node_is_alive(&self, node_id: u64) -> bool {
@@ -288,7 +311,7 @@ impl IsrTracker {
 
     /// True once this node has led the partition for longer than `max_lag_ms`.
     /// A partition never marked as led has no grace period to expire.
-    fn leadership_grace_expired(&self, topic: &str, partition: i32) -> bool {
+    pub(crate) fn leadership_grace_expired(&self, topic: &str, partition: i32) -> bool {
         let Some(since) = self
             .leading_since_ms
             .get(&(topic.to_string(), partition))
@@ -376,6 +399,29 @@ impl IsrTracker {
             .filter(|e| e.key().1 .0 == topic && e.key().1 .1 == partition)
             .map(|e| e.value().last_fetch_leader_end)
             .max()
+    }
+
+    /// Record where a follower says its copy starts. Followers before v2.20.6
+    /// always sent 0, which reads as "holds everything" and changes nothing.
+    pub fn record_follower_log_start(
+        &self,
+        node_id: u64,
+        topic: &str,
+        partition: i32,
+        log_start: i64,
+        fetch_offset: i64,
+    ) {
+        self.follower_log_starts
+            .insert((node_id, (topic.to_string(), partition)), (log_start, fetch_offset));
+    }
+
+    /// Where `node_id` last said its copy of the partition starts, and its
+    /// fetch offset then. A follower whose start equals its fetch offset holds
+    /// nothing.
+    pub fn follower_log_start(&self, node_id: u64, topic: &str, partition: i32) -> Option<(i64, i64)> {
+        self.follower_log_starts
+            .get(&(node_id, (topic.to_string(), partition)))
+            .map(|v| *v)
     }
 
     /// Get all in-sync replicas for a partition
