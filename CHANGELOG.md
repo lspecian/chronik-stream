@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.20.8] - 2026-11-28
+
 ### Fixed
 
 - **A follower skipped the records ahead of a hole in the leader's log.**
@@ -22,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record: there, 850,000 records each time. A partition is now rebuilt for
   missing history at most once per broker run. Copies that skipped records
   this way earlier keep the gap in the middle of the log; the history check
-  only looks at where a copy starts. Test: scenario E of
+  only looks at where a copy starts. Tests: `the_batches_before_a_hole_are_applied`
+  (unit; the live case, a hole inside an archived segment), scenario E of
   `tests/cluster/e2e/replica_missing_history.sh` (a hole in the leader's log
   and a follower missing the start: it holds the records before the hole,
   and is rebuilt once).
