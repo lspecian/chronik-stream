@@ -460,6 +460,9 @@ pub struct ReplicaFetcher {
     /// Copies rebuilt because they were missing their start, until they reach
     /// the leader's high watermark.
     history_rebuilding: Arc<DashMap<(String, i32), ()>>,
+    /// Partitions rebuilt for missing history since this broker started, and
+    /// whether a repeat was already reported. Never rebuilt twice per run.
+    history_rebuilt: Arc<DashMap<(String, i32), bool>>,
     shutdown: Arc<AtomicBool>,
     batches_applied: Arc<AtomicU64>,
     /// Partitions rebuilt from the leader because a straddle could not be placed.
@@ -501,6 +504,7 @@ impl ReplicaFetcher {
             history_checked: Arc::new(DashMap::new()),
             history_missing_since: Arc::new(DashMap::new()),
             history_rebuilding: Arc::new(DashMap::new()),
+            history_rebuilt: Arc::new(DashMap::new()),
             rebuilds: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             batches_applied: Arc::new(AtomicU64::new(0)),
@@ -1115,6 +1119,24 @@ impl ReplicaFetcher {
             };
             match first {
                 Some(base) if base < held => {
+                    // One rebuild per partition per run. If the copy a rebuild
+                    // produced still starts above the leader's first record,
+                    // another rebuild re-reads the whole partition for the same
+                    // result. Seen on signal-stream: a leader hole at 6..8 left
+                    // rebuilt copies starting at 9 (fixed in `plan_batches`),
+                    // and followers rebuilt 850,000 records every few minutes.
+                    if let Some(mut warned) = self.history_rebuilt.get_mut(&key) {
+                        if !*warned {
+                            *warned = true;
+                            warn!(
+                                "{}-{}: this copy starts at {} but the leader holds records from {}, \
+                                 although it was rebuilt from the leader since this broker started. \
+                                 Not rebuilding it again until a restart.",
+                                followed.topic, followed.partition, held, base
+                            );
+                        }
+                        continue;
+                    }
                     let since = *self
                         .history_missing_since
                         .entry(key.clone())
@@ -1148,6 +1170,7 @@ impl ReplicaFetcher {
                     }
                     self.history_missing_since.remove(&key);
                     self.history_rebuilding.insert(key.clone(), ());
+                    self.history_rebuilt.insert(key.clone(), false);
                     error!(
                         "{}-{}: this copy starts at {} but the leader holds records from {} (its log \
                          starts at {}). Offsets {}..{} are missing here; rebuilding this copy from \
